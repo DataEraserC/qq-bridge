@@ -728,6 +728,7 @@ function loadConfig() {
         feedback: true,
         getMyRecent: true,
         getMessageDetail: true,
+        getMessageMedia: true,
         getActiveMembers: true,
         setWakeConfig: true,
         markRead: true,
@@ -841,6 +842,7 @@ function loadConfig() {
     feedback: true,
     getMyRecent: true,
     getMessageDetail: true,
+    getMessageMedia: true,
     getActiveMembers: true,
     setWakeConfig: true,
     markRead: true,
@@ -4033,7 +4035,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4278,6 +4280,7 @@ async function main() {
             feedback: 'qq_report_feedback',
             getMyRecent: 'qq_get_my_recent_messages',
             getMessageDetail: 'qq_get_message_detail',
+            getMessageMedia: 'qq_get_message_media',
             getActiveMembers: 'qq_get_active_members',
             setWakeConfig: 'qq_set_wake_config',
             markRead: 'qq_mark_read',
@@ -5913,6 +5916,35 @@ async function main() {
           }
           return;
         }
+        // ── 媒体元数据查询端点（MCP qq_get_message_media 走这里） ────────────
+        //
+        // 为什么单独存在：模型视图（src/qq-model-view.js）会把 messages/newMessages 里的
+        // media[].file/url 压成 {kind, index} 句柄（拿本地 seq 换图片本体用），于是模型侧
+        // 再也看不到原始 URL——但 modlens_read_image / web_fetch 这类下游只吃 URL，
+        // 不声明图像输入的模型更是连图片本体都看不到。本端点就是「按需取回原始媒体元数据」
+        // 的正门：只回元数据（url/file/faceId/caption…），不下载图片字节（那是
+        // /api/images/message / qq_get_message_images 的活）。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/message-media') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          const messageId = String(url.searchParams.get('messageId') ?? '').trim();
+          if (!/^(group|private):(\d+)$/.test(key)) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (!messageId) { sendJson({ ok: false, error: 'messageId 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getMessageMedia')) { sendJson({ ok: false, error: '工具未启用：qq_get_message_media' }, 403); return; }
+          try {
+            // 存储层一直保留原始 file/url（只有模型视图压缩它们），findMessageMedia
+            // 同时覆盖 recentMessages 与 unread，按 messageId 或本地 seq 都能命中。
+            const media = findMessageMedia(key, messageId);
+            sendJson({
+              ok: true, key, messageId, media,
+              ...(media.length ? {} : { note: '该消息没有可用的媒体元数据（可能已滑出未读/最近窗口，或本就不是图片/表情消息）' })
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `获取消息媒体失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         // ── 合并转发消息查询端点（MCP qq_get_forward_msg 走这里） ────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/forward-message') {
           const key = String(url.searchParams.get('key') ?? '').trim();
@@ -7198,7 +7230,7 @@ async function main() {
   function mediaHintFor(key, messageRef, mediaList) {
     if (!Array.isArray(mediaList) || mediaList.length === 0 || !messageRef) return '';
     if (currentMode === 'reserved2') {
-      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
+      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。若需要图片 **URL**（交给 modlens_read_image / web_fetch 这类只能吃 URL 的工具，或模型不声明图像输入、看不到图像块），用 mcp__snowluma__qq_get_message_media 取回原始 url，参数同上。`;
     }
     return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
   }

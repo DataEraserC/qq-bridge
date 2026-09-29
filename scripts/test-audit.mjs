@@ -9,7 +9,7 @@ const tests = [
   'test-audit-security.mjs', 'test-audit-security-mcp.mjs',
   'test-audit-setup.mjs', 'test-audit-setup-guards.mjs',
   'test-md-to-plain.mjs', 'test-slang-learn.mjs', 'test-mux-reconnect.mjs',
-  'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-qq-preset-contract.mjs',
+  'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-message-media.mjs', 'test-qq-preset-contract.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',

@@ -122,6 +122,7 @@
       "feedback": true,
       "getMyRecent": true,
       "getMessageDetail": true,
+      "getMessageMedia": true,
       "getActiveMembers": true,
       "setWakeConfig": true,
       "markRead": true,
