@@ -57,6 +57,7 @@ import {
 // 官方文件只留三类挂钩：本 import、startConsoleServer 里的 extDeps() 注入表、
 // 控制台路由分发行（搜 "↓ down (ext)" 即可全量盘点）。
 import { handleSendMediaRoute } from './ext/send-media.js';
+import { handleSendChainRoute } from './ext/send-chain.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -729,6 +730,7 @@ function loadConfig() {
         sendBurst: true,
         sendMessage: true,
         sendMedia: true,
+        sendChain: true,
         waitMessages: true,
         feedback: true,
         getMyRecent: true,
@@ -844,6 +846,7 @@ function loadConfig() {
     sendBurst: true,
     sendMessage: true,
     sendMedia: true,
+    sendChain: true,
     waitMessages: true,
     feedback: true,
     getMyRecent: true,
@@ -4262,7 +4265,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendMedia', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendMedia', 'sendChain', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4504,6 +4507,7 @@ async function main() {
             sendBurst: 'qq_send_burst',
             sendMessage: 'qq_send_message',
             sendMedia: 'qq_send_media',
+            sendChain: 'qq_send_chain',
             waitMessages: 'qq_wait_for_messages',
             feedback: 'qq_report_feedback',
             getMyRecent: 'qq_get_my_recent_messages',
@@ -5589,6 +5593,11 @@ async function main() {
         // ↓ down (ext): qq_send_media（图片/图文/视频），实现见 src/ext/send-media.js。
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-media') {
           await handleSendMediaRoute(extDeps(), { req, readBody, sendJson });
+          return;
+        }
+        // ↓ down (ext): qq_send_chain（图文交错消息链），实现见 src/ext/send-chain.js。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-chain') {
+          await handleSendChainRoute(extDeps(), { req, readBody, sendJson });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/collect-sticker') {

@@ -121,6 +121,7 @@
       "sendBurst": true,
       "sendMessage": true,
       "sendMedia": true,
+      "sendChain": true,
       "waitMessages": true,
       "feedback": true,
       "getMyRecent": true,

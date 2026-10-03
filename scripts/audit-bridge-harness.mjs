@@ -22,6 +22,7 @@ import * as stateAcl from '../src/state-acl.mjs';
 // ↓ down (ext): 下游扩展注入 VM（bridge.js 顶层 import 会被剥掉，分发行要靠
 // context 里的同名绑定才能解析到 ext 的路由处理器）。
 import * as sendMediaExt from '../src/ext/send-media.js';
+import * as sendChainExt from '../src/ext/send-chain.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -135,7 +136,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...sendMediaExt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...sendMediaExt, ...sendChainExt,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

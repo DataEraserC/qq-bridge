@@ -12,7 +12,7 @@
    （少数一行式挂钩用 `// ↓ down:`），同步上游时按注释全文检索即可盘点全部接触面。
 3. **每个功能一次 `feat(ext):` 提交**（中文长说明 + `测试：` 行 + Assisted-by 尾注），
    与上游提交历史交错但各自原子，出问题可整提交回滚，不改写历史。
-4. **四份工具开关保持一致**（新增工具必做，回归测试 `test-send-media.mjs` 断言）：
+4. **四份工具开关保持一致**（新增工具必做，回归测试 `test-send-media.mjs` / `test-send-chain.mjs` 断言）：
    - `src/bridge.js` loadConfig 的两个 tools 默认表；
    - `src/bridge.js` console config API 的 `toolFlags` 数组；
    - `public/console.html` 的开关面板行（+ console 名称映射 `toolMap`）;
@@ -24,18 +24,24 @@
 
 | 文件 | 挂钩 | 作用 |
 | --- | --- | --- |
-| `src/bridge.js` | 顶部 `import ... from './ext/send-media.js'` | 引入路由处理器 |
+| `src/bridge.js` | 顶部 `import ... from './ext/send-media.js'` | 引入路由处理器（`send-chain.js` 同构，一行 import + 一行分发） |
 | `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`） |
-| `src/bridge.js` | `/api/socialV2/send-media` 分发行 | 一行转发给 `handleSendMediaRoute` |
-| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` 开关与控制台映射 |
-| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` 一行 | MCP 工具注册 |
-| `scripts/audit-bridge-harness.mjs` | import + context spread 一行 | VM 夹具里 `handleSendMediaRoute` 可见 |
+| `src/bridge.js` | `/api/socialV2/send-media` 分发行 | 一行转发给 `handleSendMediaRoute`（`/api/socialV2/send-chain` 一行转发给 `handleSendChainRoute`） |
+| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` 开关与控制台映射 |
+| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` / `registerSendChainTool(...)` 各一行 | MCP 工具注册 |
+| `scripts/audit-bridge-harness.mjs` | import + context spread 一行 | VM 夹具里 `handleSendMediaRoute` / `handleSendChainRoute` 可见 |
+| `scripts/test-audit-security-mcp.mjs` | 顶部 import + `vm.runInNewContext` 上下文注入 | import 行被剥离后 ext 注册函数要作为上下文值（否则 `registerSendChainTool is not defined`） |
 
 ## 现有功能
 
 - **`send-media.js`** — `qq_send_media`：图片（≤9）/ 图文 / 视频（≤1）统一发送，
   URL 桥接内下载转 `base64://`，与 sticker 同款 sendChain 串行 + 网关直连。
   端点 `POST /api/socialV2/send-media`；MCP 声明在 `send-media-mcp.js`。
+  同时导出可复用底层：`resolveMediaBase64` / `buildReplyAtSegments` / `postSegmentsV2`。
+- **`send-chain.js`** — `qq_send_chain`：图文交错消息链（段序原样发出），
+  段白名单 `text/image/video/face/at`，text 段**合计**过字数与敏感词闸门（防拆段绕过）。
+  端点 `POST /api/socialV2/send-chain`；MCP 声明在 `send-chain-mcp.js`；
+  发送底层全部复用 `send-media.js` 的导出。
 
 ## 新增一个功能的最短路径（照抄 send-media 的接线）
 

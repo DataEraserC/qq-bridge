@@ -87,7 +87,12 @@ export function normalizeMediaPayload(payload = {}, limits = MEDIA_LIMITS) {
   };
 }
 
-async function resolveMediaBase64(deps, ref, kind, limits = MEDIA_LIMITS) {
+export async function resolveMediaBase64(
+  deps,
+  ref,
+  kind,
+  limits = MEDIA_LIMITS,
+) {
   const maxBytes =
     kind === "video" ? limits.maxVideoBytes : limits.maxImageBytes;
   const classified = classifyMediaRef(ref);
@@ -130,17 +135,11 @@ export async function buildMediaSegments(deps, norm, limits = MEDIA_LIMITS) {
 }
 
 /**
- * 发送本体：与上游 sendStickerV2 相同的 guard / 下载 / sendChain 串行 / 网关直连语义。
- * deps 由 bridge.js 的 extDeps() 注入（含 fetch，保证在桥接 realm 内执行——
- * 测试夹具通过覆盖 fetch 全局就能观测到真实发出的段）。
+ * reply / at 头段（OneBot 要求 reply 排最前）。qq_send_media 与 qq_send_chain
+ * 共用，校验口径一致：reply 为非零整数（消息 id 可能为负数），at 为正整数 QQ 号。
  */
-export async function sendMediaV2(deps, key, payload, options = {}) {
-  const norm = normalizeMediaPayload(payload);
-  const assertSendAllowed = deps.captureSendGuard(key);
-  const [kind, id] = String(key).split(":");
+export function buildReplyAtSegments(replyToMessageId, atUserId) {
   const segments = [];
-  const replyToMessageId = options.replyToMessageId ?? norm.replyToMessageId;
-  const atUserId = options.atUserId ?? norm.atUserId;
   if (
     replyToMessageId !== undefined &&
     replyToMessageId !== null &&
@@ -161,7 +160,18 @@ export async function sendMediaV2(deps, key, payload, options = {}) {
       throw new Error("atUserId 必须是正整数 QQ 号，且不能为 all");
     segments.push({ type: "at", data: { qq: at } });
   }
-  segments.push(...(await buildMediaSegments(deps, norm)));
+  return segments;
+}
+
+/**
+ * 网关直连发送段数组：构造 action/params、走 sendChain 串行队列、
+ * status/retcode 校验——与上游 sendStickerV2 的语义完全一致。
+ * assertSendAllowed 由调用方传入（captureSendGuard(key) 的产物），在真正 POST
+ * 前断言。deps 由 bridge.js 的 extDeps() 注入（含 fetch，保证在桥接 realm 内
+ * 执行——测试夹具通过覆盖 fetch 全局就能观测到真实发出的段）。
+ */
+export async function postSegmentsV2(deps, key, segments, assertSendAllowed) {
+  const [kind, id] = String(key).split(":");
   const action = kind === "private" ? "send_private_msg" : "send_group_msg";
   const params =
     kind === "private"
@@ -199,6 +209,20 @@ export async function sendMediaV2(deps, key, payload, options = {}) {
     }
     return body.data;
   });
+  return data;
+}
+
+/**
+ * 发送本体：guard → 段构建（download 含在 buildMediaSegments 内）→ 网关直连。
+ */
+export async function sendMediaV2(deps, key, payload, options = {}) {
+  const norm = normalizeMediaPayload(payload);
+  const assertSendAllowed = deps.captureSendGuard(key);
+  const replyToMessageId = options.replyToMessageId ?? norm.replyToMessageId;
+  const atUserId = options.atUserId ?? norm.atUserId;
+  const segments = buildReplyAtSegments(replyToMessageId, atUserId);
+  segments.push(...(await buildMediaSegments(deps, norm)));
+  const data = await postSegmentsV2(deps, key, segments, assertSendAllowed);
   return { messageId: data?.message_id ?? null, norm };
 }
 

@@ -18,6 +18,8 @@ const tests = [
   'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-message-media.mjs', 'test-qq-preset-contract.mjs',
   // qq_send_media（图片/图文/视频）：纯函数 + 桥接端点闸门与段观测 + 四份开关一致 + MCP 注册
   'test-send-media.mjs',
+  // qq_send_chain（图文交错消息链）：纯函数 + 桥接端点闸门与段序观测 + 四份开关一致 + MCP 注册
+  'test-send-chain.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
