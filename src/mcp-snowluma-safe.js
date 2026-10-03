@@ -18,6 +18,9 @@ import { z } from 'zod';
 // 在 MCP 里拦会连「安全拒绝理由」都拿不到，反而让模型无法把话说清楚。
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
+// ↓ down (ext): 下游扩展的 MCP 注册（src/ext/DOWNSTREAM.md），官方文件只留 import
+// + TOOL_CONFIG_FLAGS 一行 + 下方 registerSendMediaTool 调用一行。
+import { registerSendMediaTool } from './ext/send-media-mcp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -194,6 +197,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_set_wake_config: 'setWakeConfig',
   qq_send_burst: 'sendBurst',
   qq_send_message: 'sendMessage',
+  qq_send_media: 'sendMedia',
   qq_wait_for_messages: 'waitMessages',
   qq_report_feedback: 'feedback',
   qq_get_my_recent_messages: 'getMyRecent',
@@ -1031,6 +1035,9 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
     }
   );
 }
+
+// ↓ down (ext): qq_send_media（图片/图文/视频），实现见 src/ext/send-media-mcp.js。
+registerSendMediaTool({ server, z, agentApi, serializeModelData, cfg });
 
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
   server.tool(

@@ -120,6 +120,7 @@
       "reply": true,
       "sendBurst": true,
       "sendMessage": true,
+      "sendMedia": true,
       "waitMessages": true,
       "feedback": true,
       "getMyRecent": true,

@@ -53,6 +53,10 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
+// ↓ down (ext): 下游扩展桥接（src/ext/DOWNSTREAM.md）。逻辑全在 ext 侧，
+// 官方文件只留三类挂钩：本 import、startConsoleServer 里的 extDeps() 注入表、
+// 控制台路由分发行（搜 "↓ down (ext)" 即可全量盘点）。
+import { handleSendMediaRoute } from './ext/send-media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -724,6 +728,7 @@ function loadConfig() {
         reply: true,
         sendBurst: true,
         sendMessage: true,
+        sendMedia: true,
         waitMessages: true,
         feedback: true,
         getMyRecent: true,
@@ -838,6 +843,7 @@ function loadConfig() {
     reply: true,
     sendBurst: true,
     sendMessage: true,
+    sendMedia: true,
     waitMessages: true,
     feedback: true,
     getMyRecent: true,
@@ -2998,6 +3004,52 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+
+    // ↓ down (ext): ext 的依赖注入表。ext 模块是独立 realm 的纯函数，一律从这里
+    // 取 cfg/闸门/队列/state；**必须在 startConsoleServer 内**——agentTokenOk /
+    // v2SessionAllowed 是这里的局部 const（同层可见），captureSendGuard /
+    // modeAllowed / getSocialV2State 等闸门是 main 的子作用域（外层可见）。
+    // fetch 也从这里走（在桥接 realm 内解析——夹具的 fakeFetch 覆盖全局后 ext
+    // 发出的真实请求才可观测）。sendChain 是模块级 let，闭包按调用时点求值。
+    function extDeps() {
+      return {
+        get cfg() { return cfg; },
+        currentMode: () => currentMode,
+        log,
+        appendActivity,
+        truncateText,
+        captureSendGuard,
+        safeFetchBuffer,
+        enqueueSend: (fn) => {
+          let resolve;
+          let reject;
+          const result = new Promise((res, rej) => { resolve = res; reject = rej; });
+          sendChain = sendChain.then(async () => {
+            try {
+              resolve(await fn());
+            } catch (error) {
+              reject(error);
+            }
+          });
+          return result;
+        },
+        sleep,
+        randInt,
+        agentTokenOk,
+        v2SessionAllowed,
+        v2ToolEnabled,
+        modeAllowed,
+        shouldBlockSilentReply,
+        getSocialV2State,
+        saveSocialV2State,
+        resolveReplyTargetV2,
+        scheduleReplyCheckV2,
+        redact: (value) => redactKnownTokensOnly(value),
+        isSensitive: (value) => SENSITIVE_RE.test(String(value ?? '')),
+        fetch: (url, init) => fetch(url, init)
+      };
+    }
+
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -4210,7 +4262,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendMedia', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4451,6 +4503,7 @@ async function main() {
             reply: 'qq_reply',
             sendBurst: 'qq_send_burst',
             sendMessage: 'qq_send_message',
+            sendMedia: 'qq_send_media',
             waitMessages: 'qq_wait_for_messages',
             feedback: 'qq_report_feedback',
             getMyRecent: 'qq_get_my_recent_messages',
@@ -5531,6 +5584,11 @@ async function main() {
             log(`[sticker] 工具发送表情失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `发送表情失败：${error?.message ?? error}` }, 500);
           }
+          return;
+        }
+        // ↓ down (ext): qq_send_media（图片/图文/视频），实现见 src/ext/send-media.js。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-media') {
+          await handleSendMediaRoute(extDeps(), { req, readBody, sendJson });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/collect-sticker') {
