@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { z } from 'zod';
 import { registerSendMediaTool } from '../src/ext/send-media-mcp.js';
 import { registerSendChainTool } from '../src/ext/send-chain-mcp.js';
+import { registerMessageMediaTool } from '../src/ext/message-media-mcp.js';
 
 function loadWebTools(safeFetch) {
   const tools = new Map();
@@ -97,6 +98,7 @@ function loadSnowlumaTools(fetchImpl, fixtureConfig = null) {
     // import 行被剥离后，ext 注册函数必须作为上下文值注入（桥接侧同款 ext 挂钩）
     registerSendMediaTool,
     registerSendChainTool,
+    registerMessageMediaTool,
   });
   return async (name, arguments_ = {}) => {
     const tool = tools.get(name);

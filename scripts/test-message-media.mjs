@@ -185,3 +185,67 @@ test('MCP qq_get_message_media is not registered when getMessageMedia is disable
     assert.ok(listed.tools.some((t) => t.name === 'qq_get_message_detail'));
   });
 });
+
+// ── 3. 开关一致性 + ext 挂钩（DOWNSTREAM.md 原则 4 的护栏，同 test-send-media:575）──
+test('getMessageMedia 开关在四份清单 + MCP + preset + 夹具保持同步', async () => {
+  const bridgeSrc = await fs.readFile(path.join(ROOT, 'src/bridge.js'), 'utf8');
+  const defaults = bridgeSrc.match(/^\s*getMessageMedia: true,$/gm) || [];
+  assert.ok(
+    defaults.length >= 2,
+    `loadConfig 两份默认表都要有 getMessageMedia（只找到 ${defaults.length} 处）`,
+  );
+  assert.ok(bridgeSrc.includes("'getMessageMedia'"), 'console config API 的 toolFlags 要登记');
+  assert.ok(
+    bridgeSrc.includes("getMessageMedia: 'qq_get_message_media'"),
+    'console 名称映射 toolMap 要登记',
+  );
+  assert.ok(bridgeSrc.includes("'/api/socialV2/message-media'"), '路由分发行存在');
+  assert.ok(bridgeSrc.includes("from './ext/message-media.js'"), 'ext import 挂钩存在');
+  assert.ok(
+    bridgeSrc.includes('findMessageMedia,'),
+    'extDeps 注入表要带存储层入口 findMessageMedia（端点已 ext 化，桥接只留一行转发）',
+  );
+
+  const example = JSON.parse(await fs.readFile(path.join(ROOT, 'config.example.json'), 'utf8'));
+  assert.equal(example.socialV2.tools.getMessageMedia, true);
+
+  const consoleHtml = await fs.readFile(path.join(ROOT, 'public/console.html'), 'utf8');
+  assert.ok(consoleHtml.includes('data-v2-tool="getMessageMedia"'), '控制台开关行');
+  assert.ok(consoleHtml.includes('<b>qq_get_message_media</b>'), '控制台开关展示工具名');
+
+  const mcpSrc = await fs.readFile(path.join(ROOT, 'src/mcp-snowluma-safe.js'), 'utf8');
+  assert.ok(
+    mcpSrc.includes("qq_get_message_media: 'getMessageMedia'"),
+    'TOOL_CONFIG_FLAGS 登记（漏登记=默认关却仍可见）',
+  );
+  assert.ok(
+    mcpSrc.includes('registerMessageMediaTool({ server, z, agentApi, cfg })'),
+    '注册调用挂钩',
+  );
+  assert.ok(mcpSrc.includes("from './ext/message-media-mcp.js'"), 'MCP ext import 挂钩');
+
+  const preset = await fs.readFile(path.join(ROOT, 'dsh/agent-presets/qq-chat-v2/agent.cordis.yml'), 'utf8');
+  assert.ok(
+    preset.includes('qq_get_message_media(key, messageId, token) 取回原始 url/file 元数据'),
+    'preset 源能力行',
+  );
+  const patch = await fs.readFile(path.join(ROOT, 'plugins/qq-agent-presets/presets/qq-chat-v2.patch.yml'), 'utf8');
+  assert.ok(
+    patch.includes('qq_get_message_media(key, messageId, token) 取回原始 url/file 元数据'),
+    '生成的补丁要同步（跑 build-agent-preset-patches）',
+  );
+
+  const harnessSrc = await fs.readFile(path.join(ROOT, 'scripts/audit-bridge-harness.mjs'), 'utf8');
+  assert.ok(harnessSrc.includes('messageMediaExt'), '桥接夹具要注入 ext 模块');
+  const securitySrc = await fs.readFile(path.join(ROOT, 'scripts/test-audit-security-mcp.mjs'), 'utf8');
+  assert.ok(securitySrc.includes('registerMessageMediaTool'), 'MCP 安全夹具要注入 ext 注册函数');
+
+  await fs.access(path.join(ROOT, 'src/ext/DOWNSTREAM.md'));
+  const downstream = await fs.readFile(path.join(ROOT, 'src/ext/DOWNSTREAM.md'), 'utf8');
+  assert.ok(downstream.includes('message-media'), 'DOWNSTREAM.md 挂钩清单要登记本域');
+  const auditSrc = await fs.readFile(path.join(ROOT, 'scripts/test-audit.mjs'), 'utf8');
+  assert.ok(
+    auditSrc.includes("'test-message-media.mjs'"),
+    '本测试要登记进 test-audit 白名单',
+  );
+});
