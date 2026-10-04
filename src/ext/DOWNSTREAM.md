@@ -34,8 +34,11 @@
 
 ## 现有功能
 
-- **`send-media.js`** — `qq_send_media`：图片（≤9）/ 图文 / 视频（≤1）统一发送，
-  URL 桥接内下载转 `base64://`，与 sticker 同款 sendChain 串行 + 网关直连。
+- **`send-media.js`** — `qq_send_media`：图片（≤9）/ 图文 / 视频（≤1）统一发送。
+  引用形态：本地绝对路径 / `file://`（桥接同机直读，推荐）/ http(s) URL
+  （桥接内下载转 `base64://`）/ 纯 base64 / `data:` / `base64://`；
+  发送前统一魔数校验，损坏字节就地拒绝（不再穿透成网关 opaque 的 921）。
+  与 sticker 同款 sendChain 串行 + 网关直连。
   端点 `POST /api/socialV2/send-media`；MCP 声明在 `send-media-mcp.js`。
   同时导出可复用底层：`resolveMediaBase64` / `buildReplyAtSegments` / `postSegmentsV2`。
 - **`send-chain.js`** — `qq_send_chain`：图文交错消息链（段序原样发出），

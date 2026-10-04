@@ -1,6 +1,7 @@
 // qq_send_chain 回归（三面）：
 //   1. 纯函数单测 —— 段白名单归一化（扁平/嵌套入形状）、**段序原样保持**（图文交错）、
-//      段数/图片/视频上限、text 段合计、计数标签、构建时内联不走网络、下载失败中文错误；
+//      段数/图片/视频上限、text 段合计、计数标签、构建时内联不走网络、
+//      本地绝对路径直读、发送前字节魔数校验（损坏内容就地拒绝）、下载失败中文错误；
 //   2. 桥接端点 /api/socialV2/send-chain —— 真实 HTTP 处理器 + fixture，
 //      用 fakeFetch 观测**实际发给网关的 OneBot 段序**
 //      （reply→at→text→image→text→image→face→at 原样交错，不重排），
@@ -13,6 +14,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -31,7 +33,25 @@ import {
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const KEY = "group:456";
-const INLINE = Buffer.from("meme".repeat(30)).toString("base64"); // ≥64 字符，命中纯 base64 启发式
+// 发送前有字节魔数校验（见 send-media.js），夹具必须用「像图片/视频」的字节：
+// PNG 魔数 + 填充 + 尾部 IEND，≥64 base64 字符仍命中纯 base64 启发式。
+const PNG_BYTES = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(60, 0x61),
+  Buffer.from([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]),
+]);
+const MP4_BYTES = Buffer.concat([
+  Buffer.from([0, 0, 0, 0]),
+  Buffer.from("ftypisom"),
+  Buffer.alloc(16, 0x20),
+]);
+const PNG_B64 = PNG_BYTES.toString("base64");
+const INLINE = PNG_B64; // ≥64 字符，命中纯 base64 启发式
+// 夹具版 safeFetchBuffer：按 URL 分流返回合法图片/视频字节
+const fixtureFetch = async (url, maxBytes, downloads) => {
+  if (downloads) downloads.push({ url, maxBytes });
+  return { buffer: String(url).includes(".mp4") ? MP4_BYTES : PNG_BYTES };
+};
 
 // ── 1. 纯函数 ───────────────────────────────────────────────────────────────
 test("normalizeChainPayload 按原顺序归一化五种段（扁平+嵌套入形状）", () => {
@@ -148,10 +168,8 @@ test("chainText 汇总 text 段 / chainSummaryLabel 按类型计数", () => {
 test("buildChainSegments 保持段序，内联不走网络、URL 按类型上限下载", async () => {
   const downloads = [];
   const deps = {
-    safeFetchBuffer: async (url, maxBytes) => {
-      downloads.push({ url, maxBytes });
-      return { buffer: Buffer.from("PNG") };
-    },
+    safeFetchBuffer: async (url, maxBytes) =>
+      fixtureFetch(url, maxBytes, downloads),
   };
   const norm = normalizeChainPayload({
     segments: [
@@ -170,7 +188,11 @@ test("buildChainSegments 保持段序，内联不走网络、URL 按类型上限
     ["text", "image", "text", "image", "video", "face", "at"],
     "段序与入参完全一致（图文交错）",
   );
-  assert.equal(segments[1].data.file, "base64://UE5H", "URL 下载转 base64://");
+  assert.equal(
+    segments[1].data.file,
+    "base64://" + PNG_B64,
+    "URL 下载转 base64://",
+  );
   assert.equal(segments[3].data.file, "base64://" + INLINE, "内联直接成段");
   assert.equal(segments[5].data.id, 178, "face id 发给网关用数字");
   assert.equal(segments[6].data.qq, "10001", "at 段 qq 保留字符串");
@@ -216,6 +238,60 @@ test("buildChainSegments 拒绝超限内联载荷与下载失败", async () => {
       urlNorm,
     ),
     /下载失败.*DNS 拒绝/,
+  );
+});
+
+test("buildChainSegments 读取本地绝对路径段（不走网络）", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qqc-"));
+  try {
+    const file = path.join(dir, "图 a.png");
+    await fs.writeFile(file, PNG_BYTES);
+    const deps = {
+      safeFetchBuffer: async () => {
+        throw new Error("本地文件不该走网络");
+      },
+    };
+    const norm = normalizeChainPayload({
+      segments: [
+        { type: "text", text: "本地" },
+        { type: "image", url: file },
+        { type: "image", url: `file://${file}` },
+      ],
+    });
+    const segments = await buildChainSegments(deps, norm);
+    assert.equal(segments[1].data.file, "base64://" + PNG_B64);
+    assert.equal(segments[2].data.file, "base64://" + PNG_B64);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("chain 损坏字节走同一套发送前校验（就地中文拒绝）", async () => {
+  const deps = { safeFetchBuffer: async () => ({ buffer: PNG_BYTES }) };
+  // 长度非法（mod 4 = 1）
+  await assert.rejects(
+    buildChainSegments(
+      deps,
+      normalizeChainPayload({
+        segments: [{ type: "image", url: "A".repeat(65) }],
+      }),
+    ),
+    /长度非法/,
+  );
+  // URL 下到 HTML 错误页
+  const htmlFetch = {
+    safeFetchBuffer: async () => ({
+      buffer: Buffer.from("<html><body>500 Internal Error</body></html>"),
+    }),
+  };
+  await assert.rejects(
+    buildChainSegments(
+      htmlFetch,
+      normalizeChainPayload({
+        segments: [{ type: "image", url: "https://cdn/x.png" }],
+      }),
+    ),
+    /无法识别/,
   );
 });
 
@@ -322,7 +398,7 @@ test("send-chain 把 reply→text→image→text→image→face→at 交错段�
       assert.equal(segs[1].data.text, "看这个");
       assert.equal(
         segs[2].data.file,
-        "base64://UE5H",
+        "base64://" + PNG_B64,
         "URL 图必须先在桥接内下载转码（防网关侧 SSRF）",
       );
       assert.equal(segs[3].data.text, "第二张来了");
@@ -354,10 +430,8 @@ test("send-chain 把 reply→text→image→text→image→face→at 交错段�
     },
     {
       globals: {
-        safeFetchBuffer: async (url, maxBytes) => {
-          downloads.push({ url, maxBytes });
-          return { buffer: Buffer.from("PNG") };
-        },
+        safeFetchBuffer: async (url, maxBytes) =>
+          fixtureFetch(url, maxBytes, downloads),
       },
     },
   );

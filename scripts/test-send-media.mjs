@@ -1,6 +1,7 @@
 // qq_send_media 回归（三面）：
-//   1. 纯函数单测 —— 引用分类、归一化上限、段构建顺序（text→image→video）、
-//      内联 base64 不走网络、超限/下载失败的中文错误；
+//   1. 纯函数单测 —— 引用分类（含本地绝对路径 / file://）、归一化上限、
+//      段构建顺序（text→image→video）、内联 base64 不走网络、超限/下载失败
+//      的中文错误、发送前字节魔数校验（损坏内容就地拒绝，不穿透成网关 921）；
 //   2. 桥接端点 /api/socialV2/send-media —— 真实 HTTP 处理器 + fixture，
 //      用 fakeFetch 观测**实际发给网关的 OneBot 段**（reply→at→text→image→…），
 //      守住 flag/token/mode/key/白名单/静默/引用/敏感词/字数/限频闸门与失败回滚；
@@ -12,6 +13,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -23,12 +25,31 @@ import {
   classifyMediaRef,
   normalizeMediaPayload,
   buildMediaSegments,
+  resolveMediaBase64,
   mediaSummaryLabel,
 } from "../src/ext/send-media.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const KEY = "group:456";
-const INLINE = Buffer.from("meme".repeat(30)).toString("base64"); // ≥64 字符，命中纯 base64 启发式
+// 发送前有字节魔数校验（见 send-media.js），夹具必须用「像图片/视频」的字节：
+// PNG 魔数 + 填充 + 尾部 IEND，≥64 base64 字符仍命中纯 base64 启发式。
+const PNG_BYTES = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(60, 0x61),
+  Buffer.from([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]),
+]);
+const MP4_BYTES = Buffer.concat([
+  Buffer.from([0, 0, 0, 0]),
+  Buffer.from("ftypisom"),
+  Buffer.alloc(16, 0x20),
+]);
+const PNG_B64 = PNG_BYTES.toString("base64");
+const INLINE = PNG_B64; // ≥64 字符，命中纯 base64 启发式
+// 夹具版 safeFetchBuffer：按 URL 分流返回合法图片/视频字节
+const fixtureFetch = async (url, maxBytes, downloads) => {
+  if (downloads) downloads.push({ url, maxBytes });
+  return { buffer: String(url).includes(".mp4") ? MP4_BYTES : PNG_BYTES };
+};
 
 // ── 1. 纯函数 ───────────────────────────────────────────────────────────────
 test("classifyMediaRef 分类四种合法引用并拒绝杂散字符串", () => {
@@ -84,17 +105,12 @@ test("normalizeMediaPayload 归一化入参并强制上限", () => {
 test("buildMediaSegments 按 text→image→video 排段，内联 base64 不走网络", async () => {
   const downloads = [];
   const deps = {
-    safeFetchBuffer: async (url, maxBytes) => {
-      downloads.push({ url, maxBytes });
-      return { buffer: Buffer.from("PNG") };
-    },
+    safeFetchBuffer: async (url, maxBytes) =>
+      fixtureFetch(url, maxBytes, downloads),
   };
   const norm = normalizeMediaPayload({
     text: "配文",
-    images: [
-      "https://cdn/img.png",
-      Buffer.from("inline".repeat(30)).toString("base64"),
-    ],
+    images: ["https://cdn/img.png", PNG_B64],
     video: "https://cdn/v.mp4",
   });
   const segments = await buildMediaSegments(deps, norm);
@@ -104,13 +120,10 @@ test("buildMediaSegments 按 text→image→video 排段，内联 base64 不走�
   );
   assert.equal(
     segments[1].data.file,
-    "base64://UE5H",
+    "base64://" + PNG_B64,
     "URL 下载后必须转 base64://",
   );
-  assert.equal(
-    segments[2].data.file,
-    "base64://" + Buffer.from("inline".repeat(30)).toString("base64"),
-  );
+  assert.equal(segments[2].data.file, "base64://" + PNG_B64);
   // 只有 URL 两个走下载，且上限分别来自图片/视频常量
   assert.equal(downloads.length, 2);
   assert.deepEqual(
@@ -159,6 +172,147 @@ test("mediaSummaryLabel 生成 recentMessages 摘要", () => {
     mediaSummaryLabel({ images: ["a"], video: "v" }),
     "[图片x1+视频]",
   );
+});
+
+test("classifyMediaRef 支持本地绝对路径与 file://，并与长 base64 消歧", () => {
+  assert.deepEqual(classifyMediaRef("/home/nixos/state/agents/x.png"), {
+    kind: "path",
+    path: "/home/nixos/state/agents/x.png",
+  });
+  assert.deepEqual(classifyMediaRef("file:///tmp/a%20b.png"), {
+    kind: "path",
+    path: "/tmp/a b.png",
+  });
+  assert.deepEqual(classifyMediaRef("/tmp/x"), {
+    kind: "path",
+    path: "/tmp/x",
+  });
+  // 以 / 开头的长纯 base64（如 /9j/4AA… 正是 JPEG 头）仍按 base64 处理
+  assert.equal(classifyMediaRef("/9j/" + "A".repeat(80)).kind, "base64");
+  // 相对路径依旧拒绝（错误串要指路本地绝对路径）
+  assert.throws(() => classifyMediaRef("relative/a.png"), /格式不支持/);
+});
+
+test("buildMediaSegments 读取本地文件（绝对路径与 file:// 同源，不走网络）", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qqm-"));
+  try {
+    const file = path.join(dir, "图 a.png");
+    await fs.writeFile(file, PNG_BYTES);
+    const deps = {
+      safeFetchBuffer: async () => {
+        throw new Error("本地文件不该走网络");
+      },
+    };
+    const norm = normalizeMediaPayload({ images: [file, `file://${file}`] });
+    const segments = await buildMediaSegments(deps, norm);
+    assert.equal(segments[0].data.file, "base64://" + PNG_B64);
+    assert.equal(segments[1].data.file, "base64://" + PNG_B64);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("本地文件的不存在 / 非普通文件 / 超限都有中文错误", async () => {
+  const deps = {
+    safeFetchBuffer: async () => {
+      throw new Error("不该下载");
+    },
+  };
+  await assert.rejects(
+    buildMediaSegments(
+      deps,
+      normalizeMediaPayload({ images: "/nonexistent-qq-test/x.png" }),
+    ),
+    /不存在/,
+  );
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qqm-dir-"));
+  try {
+    await assert.rejects(
+      buildMediaSegments(deps, normalizeMediaPayload({ images: dir })),
+      /不是普通文件/,
+    );
+    const bigFile = path.join(dir, "big.png");
+    await fs.writeFile(bigFile, PNG_BYTES);
+    await assert.rejects(
+      resolveMediaBase64(deps, bigFile, "image", {
+        ...MEDIA_LIMITS,
+        maxImageBytes: 16,
+      }),
+      /过大/,
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("损坏 / 不可识别的字节就地拒绝（不再穿透成网关 921）", async () => {
+  const deps = { safeFetchBuffer: async () => ({ buffer: PNG_BYTES }) };
+  // 长度非法（mod 4 = 1）：长 base64 经转手抄坏的典型症状
+  await assert.rejects(
+    buildMediaSegments(deps, normalizeMediaPayload({ images: "A".repeat(65) })),
+    /长度非法/,
+  );
+  // data: 载荷混入字母表外字符
+  await assert.rejects(
+    buildMediaSegments(
+      deps,
+      normalizeMediaPayload({ images: "data:image/jpeg;base64,AAAA-BBBB" }),
+    ),
+    /非 base64 字符/,
+  );
+  // URL 下到的不是媒体本体（HTML 错误页）
+  const htmlFetch = {
+    safeFetchBuffer: async () => ({
+      buffer: Buffer.from("<html><body>404 Not Found</body></html>"),
+    }),
+  };
+  await assert.rejects(
+    buildMediaSegments(
+      htmlFetch,
+      normalizeMediaPayload({ images: "https://cdn/x.png" }),
+    ),
+    /无法识别/,
+  );
+  // 本地文件内容不是图片（扩展名骗不过魔数校验）
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qqm-bad-"));
+  try {
+    const bad = path.join(dir, "notes.png");
+    await fs.writeFile(bad, Buffer.from("这不是图片，是文本内容。".repeat(2)));
+    await assert.rejects(
+      buildMediaSegments(deps, normalizeMediaPayload({ images: bad })),
+      /无法识别.*notes\.png/,
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("send-media 端点支持本地绝对路径直读入段（不产生下载）", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qqm-e2e-"));
+  const downloads = [];
+  try {
+    const file = path.join(dir, "shot.png");
+    await fs.writeFile(file, PNG_BYTES);
+    await harnessRequest(
+      {},
+      async ({ h, post }) => {
+        const res = await post({ images: [file], text: "本地文件" });
+        assert.equal(res.status, 200, JSON.stringify(res.data));
+        assert.equal(res.data.ok, true);
+        const segs = h.calls.http.at(-1).body.message;
+        assert.equal(segs.at(-1).data.file, "base64://" + PNG_B64);
+        assert.equal(downloads.length, 0, "本地文件不产生任何下载");
+      },
+      {
+        globals: {
+          safeFetchBuffer: async (url, maxBytes) =>
+            fixtureFetch(url, maxBytes, downloads),
+        },
+      },
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ── 2. 桥接端点 ─────────────────────────────────────────────────────────────
@@ -265,7 +419,7 @@ test("send-media 把 reply→at→text→image→video 段原样发给网关并�
       assert.ok(segs[3].data.file.startsWith("base64://"), "内联图直接成段");
       assert.equal(
         segs[4].data.file,
-        "base64://UE5H",
+        "base64://" + PNG_B64,
         "URL 图必须先在桥接内下载转码（防网关侧 SSRF）",
       );
       // URL 下载经夹具注入的 safeFetchBuffer，没有真实网络请求
@@ -293,10 +447,8 @@ test("send-media 把 reply→at→text→image→video 段原样发给网关并�
     },
     {
       globals: {
-        safeFetchBuffer: async (url, maxBytes) => {
-          downloads.push({ url, maxBytes });
-          return { buffer: Buffer.from("PNG") };
-        },
+        safeFetchBuffer: async (url, maxBytes) =>
+          fixtureFetch(url, maxBytes, downloads),
       },
     },
   );

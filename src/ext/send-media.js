@@ -13,10 +13,19 @@
 // 【安全边界】
 //   - 外部 URL 一律经 deps.safeFetchBuffer 在桥接内下载（DNS 固定、逐跳校验、
 //     大小限制），绝不把 URL 交给网关重新抓取（防网关侧 SSRF，与 sticker 同规）；
+//   - 本地绝对路径（含 file://）由桥接直接读文件：桥接与媒体同机，调用方
+//     （宿主上的 agent 会话）本就拥有文件读取权，不新增权限面；读取同样过
+//     大小闸门，且发送前统一做字节魔数校验（见下一条）；
+//   - 所有来源（URL / base64 / 本地文件）发送前统一魔数校验：不是可识别的
+//     图片/视频就地拒绝并给出可操作中文提示——损坏内容会让网关在全量上传
+//     后返回 opaque 的 error_code=921（实测：长 base64 经模型转手被抄坏、
+//     或 URL 下到 HTML 错误页都撞过这个坑）；
 //   - 图片 ≤9 张、≤4MB/张；视频 ≤16MB（协议侧 mp4/h64、约 60s）；
 //   - text 是同气泡文案：长度按 socialV2.send.maxMessageChars（与文本消息同限），
 //     敏感词走 SENSITIVE_RE 同款闸门，超限/敏感直接拒绝，长文本请用 qq_send_message；
 //   - 所有依赖经 deps 注入（含 fetch），本文件不触碰任何全局，可独立单测。
+
+import { readFile, stat } from "node:fs/promises";
 
 /** 发送上限（集中一处，测试与文档同源引用）。 */
 export const MEDIA_LIMITS = {
@@ -30,6 +39,7 @@ export const MEDIA_LIMITS = {
  * 分类一个媒体引用。返回：
  *   { kind: 'base64', data } — base64://、data: URL、纯 base64（启发式）
  *   { kind: 'url', url }     — http(s) URL（调用方必须走 safeFetchBuffer）
+ *   { kind: 'path', path }   — file:// URL 或本地绝对路径（同机直接读文件）
  * 格式不被认识时抛中文 Error（路由层转 400）。
  */
 export function classifyMediaRef(ref) {
@@ -46,13 +56,33 @@ export function classifyMediaRef(ref) {
     return { kind: "base64", data: s.slice(idx + 1).replace(/\s/g, "") };
   }
   if (/^https?:\/\//i.test(s)) return { kind: "url", url: s };
+  if (s.startsWith("file://")) {
+    let p = s.slice("file://".length);
+    if (!p.startsWith("/")) p = `/${p}`; // file://localhost/… 形式也收敛成绝对路径
+    try {
+      p = decodeURIComponent(p); // file:///a%20b.png → /a/b.png
+    } catch {
+      throw new Error("file:// 路径含无法解码的百分号编码");
+    }
+    return { kind: "path", path: p };
+  }
+  // 本地绝对路径 vs 纯 base64 的消歧（base64 字母表不含「.」，路径几乎都带扩展名）：
+  //   - 以 / 开头且含字母表外字符（. _ - 等）→ 一定是路径（/home/…/a.png）；
+  //   - 以 / 开头、全在字母表内：≥64 字符按 base64（/9j/4AA… 正是 JPEG 头），
+  //     <64 字符按路径（短 base64 本就不接受，短路径 /tmp/x 应被支持）。
+  if (s.startsWith("/")) {
+    const bare = s.replace(/\s/g, "");
+    if (!/^[A-Za-z0-9+/=]+$/.test(bare)) return { kind: "path", path: s };
+    if (bare.length < 64) return { kind: "path", path: s };
+    return { kind: "base64", data: bare };
+  }
   // 纯 base64 启发式：与上游 base64FromMaybe 同口径，要求最小长度避免把
   // 无协议的杂散字符串误判成图片数据。
   if (/^[A-Za-z0-9+/=\s]+$/.test(s) && s.replace(/\s/g, "").length >= 64) {
     return { kind: "base64", data: s.replace(/\s/g, "") };
   }
   throw new Error(
-    "媒体地址格式不支持（需 http(s) URL、data: URL、base64:// 或纯 base64）",
+    "媒体地址格式不支持（需 http(s) URL、data: URL、base64://、纯 base64 或本地绝对路径）",
   );
 }
 
@@ -87,6 +117,63 @@ export function normalizeMediaPayload(payload = {}, limits = MEDIA_LIMITS) {
   };
 }
 
+// ── 发送前字节校验（魔数 + 关键结构）────────────────────────────────────────
+// 损坏内容让网关在全量上传后返回 opaque 的 error_code=921，排查成本极高
+// （实测三例：长 base64 经模型转手被抄坏/截断、URL 下到的非媒体本体）。
+// 这里在桥接内就地拦下，给出「哪里坏了、该怎么发」的可操作中文提示。
+const JPEG_EOI = Buffer.from([0xff, 0xd9]); // JPEG EOI 标记
+const PNG_IEND = Buffer.from([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+
+/** 图片字节是否可识别：JPEG/PNG/GIF/WebP/BMP；JPEG 查尾部 EOI、PNG 查尾部 IEND（拦截断）。 */
+function looksLikeImage(buf) {
+  if (buf.length < 16) return false;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    // EOI 必须出现在尾部 16 字节内（EXIF 等元数据里偶发的 FF D9 不在尾部）
+    return buf.subarray(-18).indexOf(JPEG_EOI) >= 0;
+  }
+  const isPng =
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a;
+  if (isPng) return buf.subarray(-12).indexOf(PNG_IEND) >= 0;
+  const head = buf.subarray(0, 12).toString("latin1");
+  if (head.startsWith("GIF87a") || head.startsWith("GIF89a")) return true;
+  if (head.startsWith("RIFF") && head.slice(8) === "WEBP") return true;
+  if (head.startsWith("BM")) return true;
+  return false;
+}
+
+/** 视频字节是否可识别：MP4/MOV（ftyp）、AVI、MKV/WebM、裸 H264（Annex-B 起始码）。 */
+function looksLikeVideo(buf) {
+  if (buf.length < 12) return false;
+  const head = buf.subarray(0, 12).toString("latin1");
+  if (head.slice(4, 8) === "ftyp") return true;
+  if (head.startsWith("RIFF") && head.slice(8) === "AVI ") return true;
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3)
+    return true;
+  if (
+    (buf[0] === 0 && buf[1] === 0 && buf[2] === 0 && buf[3] === 0x01) ||
+    (buf[0] === 0 && buf[1] === 0 && buf[2] === 0x01)
+  )
+    return true;
+  return false;
+}
+
+/** 不可识别时抛中文 Error；hint 说明来源（base64 转手 / 下载地址 / 本地路径）。 */
+function assertMediaBytes(buf, kind, hint) {
+  const ok = kind === "video" ? looksLikeVideo(buf) : looksLikeImage(buf);
+  if (ok) return;
+  const label = kind === "video" ? "视频" : "图片";
+  const formats =
+    kind === "video" ? "MP4/MOV/AVI/MKV/WebM/H264" : "JPEG/PNG/GIF/WebP/BMP";
+  throw new Error(`${label}内容无法识别（支持 ${formats}），已拒绝发送${hint}`);
+}
+
 export async function resolveMediaBase64(
   deps,
   ref,
@@ -95,16 +182,62 @@ export async function resolveMediaBase64(
 ) {
   const maxBytes =
     kind === "video" ? limits.maxVideoBytes : limits.maxImageBytes;
+  const label = kind === "video" ? "视频" : "图片";
   const classified = classifyMediaRef(ref);
   if (classified.kind === "base64") {
     // 粗略估计 base64 解码后大小，超限直接拒绝，避免超大字符串进内存
     const approx = (classified.data.length * 3) / 4;
     if (approx > maxBytes) {
       throw new Error(
-        `${kind === "video" ? "视频" : "图片"}过大（约 ${Math.round(approx / 1024)}KB，上限 ${Math.round(maxBytes / 1024)}KB）`,
+        `${label}过大（约 ${Math.round(approx / 1024)}KB，上限 ${Math.round(maxBytes / 1024)}KB）`,
       );
     }
-    return classified.data;
+    const data = classified.data;
+    // 字母表/长度校验：长 base64 经模型等转手被抄坏时，常见症状是混入
+    // 字母表外字符或长度 %4 == 1（缺失/多余字符），这里直接点破。
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(data)) {
+      throw new Error(
+        "base64 含非 base64 字符（长串转手可能已损坏），已拒绝发送；请改用本地文件路径或 http(s) URL",
+      );
+    }
+    if (data.length % 4 === 1) {
+      throw new Error(
+        `base64 长度非法（${data.length} 字符，长度 mod 4 = 1，数据已被损坏），已拒绝发送；请改用本地文件路径或 http(s) URL`,
+      );
+    }
+    assertMediaBytes(
+      Buffer.from(data, "base64"),
+      kind,
+      "：base64 数据可能已在转手中损坏/截断，请改用本地文件路径或 http(s) URL",
+    );
+    return data;
+  }
+  if (classified.kind === "path") {
+    // 本地绝对路径：同机直读，不经过请求体/网络（同时绕开 1MB 请求体限制）。
+    const p = classified.path;
+    let info;
+    try {
+      info = await stat(p);
+    } catch (error) {
+      const maybeBase64 =
+        p.replace(/\s/g, "").length >= 64 &&
+        /^[A-Za-z0-9+/=]+$/.test(p.replace(/\s/g, ""));
+      throw new Error(
+        `本地媒体文件不可读（${error?.code === "ENOENT" ? "不存在" : error?.code || "未知错误"}）：${p}` +
+          (maybeBase64
+            ? "；若这其实是 base64 内容，纯 base64 需 ≥64 字符且不带路径特征"
+            : ""),
+      );
+    }
+    if (!info.isFile()) throw new Error(`本地媒体路径不是普通文件：${p}`);
+    if (info.size > maxBytes) {
+      throw new Error(
+        `${label}过大（本地文件 ${Math.round(info.size / 1024)}KB，上限 ${Math.round(maxBytes / 1024)}KB）：${p}`,
+      );
+    }
+    const buf = await readFile(p);
+    assertMediaBytes(buf, kind, `：${p}`);
+    return buf.toString("base64");
   }
   // 桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把 URL 交给网关重抓。
   let fetched;
@@ -113,7 +246,13 @@ export async function resolveMediaBase64(
   } catch (error) {
     throw new Error(`媒体地址下载失败，已拒绝发送：${error?.message ?? error}`);
   }
-  return Buffer.from(fetched.buffer).toString("base64");
+  const buf = Buffer.from(fetched.buffer);
+  assertMediaBytes(
+    buf,
+    kind,
+    `：${classified.url}（下载到的可能不是媒体本体，如 HTML 错误页）`,
+  );
+  return buf.toString("base64");
 }
 
 /**
@@ -253,7 +392,7 @@ export async function handleSendMediaRoute(deps, io) {
         {
           ok: false,
           error:
-            "请求体过大：纯 base64 图片/视频受 1MB 请求体上限限制，大文件请传 http(s) URL（桥接内会安全下载后发送）",
+            "请求体过大：纯 base64 图片/视频受 1MB 请求体上限限制，大文件请传本地绝对路径（桥接同机直读）或 http(s) URL（桥接内会安全下载后发送）",
         },
         400,
       );

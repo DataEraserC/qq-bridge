@@ -206,7 +206,7 @@ export async function handleSendChainRoute(deps, io) {
         {
           ok: false,
           error:
-            "请求体过大：纯 base64 图片/视频受 1MB 请求体上限限制，大文件请传 http(s) URL（桥接内会安全下载后发送）",
+            "请求体过大：纯 base64 图片/视频受 1MB 请求体上限限制，大文件请传本地绝对路径（桥接同机直读）或 http(s) URL（桥接内会安全下载后发送）",
         },
         400,
       );
