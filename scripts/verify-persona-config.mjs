@@ -31,12 +31,12 @@ check('新配置 {prefix} 通过（个人前缀）', () => {
   if (v.prefix.length === 0) throw new Error('prefix 为空');
 });
 
-check('新配置 {prefix, suffix} 通过（含 {{cwd}} 模板）', () => {
+check('新配置 {prefix, suffix} 通过（suffix 原样保留）', () => {
   const v = persona.Config({
     prefix: 'You are a coding agent powered by the {{model}} model.',
-    suffix: 'Your working directory is {{cwd}}.',
+    suffix: 'You may reply in Chinese.',
   });
-  if (v.suffix !== 'Your working directory is {{cwd}}.') throw new Error('suffix 未保留');
+  if (v.suffix !== 'You may reply in Chinese.') throw new Error('suffix 未保留');
   if (v.complete !== false) throw new Error('complete 默认值异常');
   if (v.includeRuntimeContext !== true) throw new Error('includeRuntimeContext 默认值异常');
 });
@@ -58,8 +58,12 @@ for (const preset of ['qq-chat', 'qq-chat-v2']) {
   check('保留了 {{model}} 变量', () => {
     if (!/\{\{model\}\}/.test(row.config.prefix)) throw new Error('prefix 缺少 {{model}}');
   });
-  check('保留了 {{cwd}} 变量', () => {
-    if (!/\{\{cwd\}\}/.test(row.config.suffix ?? '')) throw new Error('suffix 缺少 {{cwd}}');
+  check('不含已失效的 {{cwd}} 变量（0.2.1-alpha.2 起未注册）', () => {
+    // DSH 0.2.1-alpha.2 的 agent loop 只注册 provider/model；persona 段残留 {{cwd}}
+    // 会在装配时抛 "unknown prompt variable"，整轮失败（cwd 改由 runtime context 注入）。
+    if (/\{\{cwd\}\}/.test(`${row.config.prefix}\n${row.config.suffix ?? ''}`)) {
+      throw new Error('仍含 {{cwd}}，DSH 装配会直接失败');
+    }
   });
   check('不再包含已废弃的 text 字段', () => {
     if (Object.hasOwn(row.config, 'text')) throw new Error('仍有 text 字段');

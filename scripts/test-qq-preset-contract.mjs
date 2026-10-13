@@ -14,7 +14,9 @@ const prefix = persona?.config?.prefix ?? '';
 test('reserved2 YAML resolves to the expected persona and template variables', () => {
   assert.equal(persona?.name, '@deepseek-ai/dsh-persona');
   assert.match(prefix, /\{\{model\}\}/);
-  assert.match(persona.config.suffix, /\{\{cwd\}\}/);
+  // DSH 0.2.1-alpha.2 起 agent loop 只注册 provider/model；{{cwd}} 未注册，
+  // persona 残留它会在装配时抛 "unknown prompt variable"，整轮失败。
+  assert.doesNotMatch(`${prefix}\n${persona.config.suffix ?? ''}`, /\{\{cwd\}\}/);
   assert.equal(Object.hasOwn(persona.config, 'text'), false);
 });
 
