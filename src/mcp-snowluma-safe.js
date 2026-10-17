@@ -20,9 +20,10 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
 // ↓ down (ext): 下游扩展的 MCP 注册（src/ext/DOWNSTREAM.md），官方文件只留 import
 // + TOOL_CONFIG_FLAGS 一行 + 下方 registerSendMediaTool / registerSendChainTool /
-// registerMessageMediaTool 调用。
+// registerSendFileTool / registerMessageMediaTool 调用。
 import { registerSendMediaTool } from './ext/send-media-mcp.js';
 import { registerSendChainTool } from './ext/send-chain-mcp.js';
+import { registerSendFileTool } from './ext/send-file-mcp.js';
 import { registerMessageMediaTool } from './ext/message-media-mcp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -202,6 +203,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_send_message: 'sendMessage',
   qq_send_media: 'sendMedia',
   qq_send_chain: 'sendChain',
+  qq_send_file: 'sendFile',
   qq_wait_for_messages: 'waitMessages',
   qq_report_feedback: 'feedback',
   qq_get_my_recent_messages: 'getMyRecent',
@@ -1027,6 +1029,9 @@ registerSendMediaTool({ server, z, agentApi, serializeModelData, cfg });
 
 // ↓ down (ext): qq_send_chain（图文交错消息链），实现见 src/ext/send-chain-mcp.js。
 registerSendChainTool({ server, z, agentApi, serializeModelData, cfg });
+
+// ↓ down (ext): qq_send_file（任意类型文件上传），实现见 src/ext/send-file-mcp.js。
+registerSendFileTool({ server, z, agentApi, serializeModelData, cfg });
 
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
   server.tool(

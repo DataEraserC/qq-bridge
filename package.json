@@ -25,6 +25,7 @@
     "test-stickers": "node scripts/test-stickers.mjs",
     "test-send-media": "node scripts/test-send-media.mjs",
     "test-send-chain": "node scripts/test-send-chain.mjs",
+    "test-send-file": "node scripts/test-send-file.mjs",
     "test-voice": "node scripts/test-voice.mjs",
     "test-voice:gui": "node scripts/test-voice-gui.mjs",
     "test-voice:system": "node scripts/test-voice-system.mjs",

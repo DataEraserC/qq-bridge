@@ -25,12 +25,12 @@
 
 | 文件 | 挂钩 | 作用 |
 | --- | --- | --- |
-| `src/bridge.js` | 顶部 `import ... from './ext/send-media.js'` | 引入路由处理器（`send-chain.js` / `message-media.js` 同构，一行 import + 一行分发） |
-| `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`）。只读域还注入存储层入口 `findMessageMedia` |
-| `src/bridge.js` | `/api/socialV2/send-media` 分发行 | 一行转发给 `handleSendMediaRoute`（`/api/socialV2/send-chain` 一行转发给 `handleSendChainRoute`；只读的 `/api/socialV2/message-media` 一行转发给 `handleMessageMediaRoute`） |
-| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` / `getMessageMedia` 开关与控制台映射 |
-| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` / `registerSendChainTool(...)` / `registerMessageMediaTool(...)` 各一行 | MCP 工具注册 |
-| `scripts/audit-bridge-harness.mjs` | import + context spread 一行 | VM 夹具里 `handleSendMediaRoute` / `handleSendChainRoute` / `handleMessageMediaRoute` 可见 |
+| `src/bridge.js` | 顶部 `import ... from './ext/send-media.js'` | 引入路由处理器（`send-chain.js` / `send-file.js` / `message-media.js` 同构，一行 import + 一行分发） |
+| `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`）。只读域还注入存储层入口 `findMessageMedia`；`wsRequest` 注入网关 **WebSocket 动作通道**（HTTP 直连有 2MiB 请求体硬上限，upload_* 与大媒体段必须走它） |
+| `src/bridge.js` | `/api/socialV2/send-media` 分发行 | 一行转发给 `handleSendMediaRoute`（`/api/socialV2/send-chain` 一行转发给 `handleSendChainRoute`；`/api/socialV2/send-file` 一行转发给 `handleSendFileRoute`；只读的 `/api/socialV2/message-media` 一行转发给 `handleMessageMediaRoute`） |
+| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` / `sendFile` / `getMessageMedia` 开关与控制台映射 |
+| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` / `registerSendChainTool(...)` / `registerSendFileTool(...)` / `registerMessageMediaTool(...)` 各一行 | MCP 工具注册 |
+| `scripts/audit-bridge-harness.mjs` | import + context spread 一行 | VM 夹具里 `handleSendMediaRoute` / `handleSendChainRoute` / `handleSendFileRoute` / `handleMessageMediaRoute` 可见 |
 | `scripts/test-audit-security-mcp.mjs` | 顶部 import + `vm.runInNewContext` 上下文注入 | import 行被剥离后 ext 注册函数要作为上下文值（否则 `registerSendChainTool is not defined`） |
 
 ## 现有功能
@@ -46,6 +46,15 @@
   段白名单 `text/image/video/face/at`，text 段**合计**过字数与敏感词闸门（防拆段绕过）。
   端点 `POST /api/socialV2/send-chain`；MCP 声明在 `send-chain-mcp.js`；
   发送底层全部复用 `send-media.js` 的导出。
+- **`send-file.js`** — `qq_send_file`：**任意类型**文件上传（群文件/私聊文件），
+  走 OneBot `upload_group_file` / `upload_private_file`，**经 extDeps 的 `wsRequest`
+  （网关 WebSocket 主链路）发送**——HTTP 直连 2MiB 请求体上限装不下大文件，
+  WS 帧上限 100MiB（64MiB 文件 ≈ 89MiB 帧）。引用形态复用 `classifyMediaRef`
+  （本地绝对路径 / `file://` / http(s) URL 桥接内下载 / base64）；**不做内容魔数校验**
+  （任意文件类型），只校验 base64 字母表与长度；文件名过敏感词闸门（消息里唯一可见文本）。
+  瞬时传输错误重试一次（实测偶发 TCP connect timeout），OneBot 业务失败不重试。
+  响应只有 `file_id`（协议无 message_id，不可引用），recentMessages 记 `[文件] name`。
+  端点 `POST /api/socialV2/send-file`；MCP 声明在 `send-file-mcp.js`。
 - **`message-media.js`** — `qq_get_message_media`：按需取回**原始媒体元数据**
   （url/file/faceId/caption…），补模型视图把 `media[].file/url` 压成 `{kind, index}` 句柄的洞；
   只回元数据不下载图片字节（那是 `qq_get_message_images` 的活）。只读域：不进

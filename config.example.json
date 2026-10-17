@@ -122,6 +122,7 @@
       "sendMessage": true,
       "sendMedia": true,
       "sendChain": true,
+      "sendFile": true,
       "waitMessages": true,
       "feedback": true,
       "getMyRecent": true,

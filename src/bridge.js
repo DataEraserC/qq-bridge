@@ -58,6 +58,7 @@ import {
 // 控制台路由分发行（搜 "↓ down (ext)" 即可全量盘点）。
 import { handleSendMediaRoute } from './ext/send-media.js';
 import { handleSendChainRoute } from './ext/send-chain.js';
+import { handleSendFileRoute } from './ext/send-file.js';
 import { handleMessageMediaRoute } from './ext/message-media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -732,6 +733,7 @@ function loadConfig() {
         sendMessage: true,
         sendMedia: true,
         sendChain: true,
+        sendFile: true,
         waitMessages: true,
         feedback: true,
         getMyRecent: true,
@@ -848,6 +850,7 @@ function loadConfig() {
     sendMessage: true,
     sendMedia: true,
     sendChain: true,
+    sendFile: true,
     waitMessages: true,
     feedback: true,
     getMyRecent: true,
@@ -3053,7 +3056,10 @@ async function main() {
         scheduleReplyCheckV2,
         redact: (value) => redactKnownTokensOnly(value),
         isSensitive: (value) => SENSITIVE_RE.test(String(value ?? '')),
-        fetch: (url, init) => fetch(url, init)
+        fetch: (url, init) => fetch(url, init),
+        // ↓ down (ext): 网关 WebSocket 动作通道（复用主链路 bot，token/重连/echo 都归它管）。
+        // HTTP 直连有 2MiB 请求体硬上限；upload_* 与大媒体段走这里才装得下（见 ext/send-file.js）。
+        wsRequest: (action, params, options) => bot.request(action, params, options)
       };
     }
 
@@ -4269,7 +4275,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendMedia', 'sendChain', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendMedia', 'sendChain', 'sendFile', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4512,6 +4518,7 @@ async function main() {
             sendMessage: 'qq_send_message',
             sendMedia: 'qq_send_media',
             sendChain: 'qq_send_chain',
+            sendFile: 'qq_send_file',
             waitMessages: 'qq_wait_for_messages',
             feedback: 'qq_report_feedback',
             getMyRecent: 'qq_get_my_recent_messages',
@@ -5602,6 +5609,11 @@ async function main() {
         // ↓ down (ext): qq_send_chain（图文交错消息链），实现见 src/ext/send-chain.js。
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-chain') {
           await handleSendChainRoute(extDeps(), { req, readBody, sendJson });
+          return;
+        }
+        // ↓ down (ext): qq_send_file（任意类型文件上传），实现见 src/ext/send-file.js。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-file') {
+          await handleSendFileRoute(extDeps(), { req, readBody, sendJson });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/collect-sticker') {

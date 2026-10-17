@@ -23,6 +23,7 @@ import * as stateAcl from '../src/state-acl.mjs';
 // context 里的同名绑定才能解析到 ext 的路由处理器）。
 import * as sendMediaExt from '../src/ext/send-media.js';
 import * as sendChainExt from '../src/ext/send-chain.js';
+import * as sendFileExt from '../src/ext/send-file.js';
 import * as messageMediaExt from '../src/ext/message-media.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -37,7 +38,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     consoleToken: 'fixture-console-token', slang: { enabled: false }, ...config,
   }));
   if (savedState) fs.writeFileSync(path.join(temp, 'state/sessions.json'), JSON.stringify(savedState));
-  const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], http: [] };
+  const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], http: [], ws: [] };
   // 语音发送在桥接里是**直接 fetch 网关**（与文本/表情共用 sendChain，但要自己带 record 段），
   // 所以这里给 VM 注入一个记录型 fetch：既不让测试真的发 QQ 消息，又能断言发出的段内容。
   const fakeFetch = async (url, init = {}) => {
@@ -85,7 +86,18 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
       // Valid 1 × 1 PNG, supplied entirely in memory by the fixture gateway.
       return { base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=' };
     }
-    async request() { return { status: 'ok', retcode: 0, data: [{ emoji_id: 'fixture-sticker', url: 'https://public.invalid/sticker' }] }; }
+    // WebSocket 动作通道（ext 的 deps.wsRequest → bot.request）：记录 action/params，
+    // 发送与上传类动作按真实网关同形回执，其余保持旧的数组形态（表情细节查询等依赖它）。
+    async request(action, params) {
+      calls.ws.push({ action, params: params ?? {} });
+      if (action === 'send_group_msg' || action === 'send_private_msg') {
+        return { status: 'ok', retcode: 0, data: { message_id: 9001 } };
+      }
+      if (action === 'upload_group_file' || action === 'upload_private_file') {
+        return { status: 'ok', retcode: 0, data: { file_id: 'fixture-file-1' } };
+      }
+      return { status: 'ok', retcode: 0, data: [{ emoji_id: 'fixture-sticker', url: 'https://public.invalid/sticker' }] };
+    }
   }
   let source = fs.readFileSync(path.join(root, 'src/bridge.js'), 'utf8');
   // 去掉顶层 import（VM 里靠 context 注入提供这些绑定）。
@@ -137,7 +149,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...sendMediaExt, ...sendChainExt, ...messageMediaExt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...sendMediaExt, ...sendChainExt, ...sendFileExt, ...messageMediaExt,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

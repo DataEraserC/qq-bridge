@@ -20,6 +20,8 @@ const tests = [
   'test-send-media.mjs',
   // qq_send_chain（图文交错消息链）：纯函数 + 桥接端点闸门与段序观测 + 四份开关一致 + MCP 注册
   'test-send-chain.mjs',
+  // qq_send_file（任意类型文件上传，WS 通道）：纯函数 + 桥接端点闸门与 upload 观测 + 四份开关一致 + MCP 注册
+  'test-send-file.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
