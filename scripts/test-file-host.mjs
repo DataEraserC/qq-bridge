@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { bridgeHarness } from "./audit-bridge-harness.mjs";
 import {
@@ -237,6 +238,52 @@ test("html 强制 attachment（防同源执行）；png 内联", async () => {
 });
 
 // ── 挂钩一致性 ──────────────────────────────────────────────────────────────
+test("直调缺省 url 时兜底解析：合法走通、坏 URL 回 400 不抛", async () => {
+  const { handleHostedFileRoute } = await import("../src/ext/file-host.js");
+  const h = await bridgeHarness();
+  try {
+    const dir = path.join(h.temp, "state", "hosted", TOKEN);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "a.txt"), "direct");
+
+    // res 要能被 createReadStream().pipe()，用真流挂头部方法
+    const mkRes = () => {
+      const res = new PassThrough();
+      res.statusCode = 0;
+      res.headers = {};
+      res.writeHead = (status, headers) => { res.statusCode = status; res.headers = headers; };
+      res.setHeader = (k, v) => { res.headers[k.toLowerCase()] = v; };
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.ended = new Promise((r) => res.once("end", r));
+      Object.defineProperty(res, "body", { get: () => Buffer.concat(chunks) });
+      return res;
+    };
+
+    // 缺 url → 兜底解析成功，200
+    const okRes = mkRes();
+    await handleHostedFileRoute(
+      { hostedDir: path.join(h.temp, "state", "hosted") },
+      { req: { url: `/files/${TOKEN}`, method: "GET" }, res: okRes },
+    );
+    await okRes.ended;
+    assert.equal(okRes.statusCode, 200);
+    assert.equal(okRes.body.toString(), "direct");
+
+    // 缺 url 且 req.url 非法 → 400，不向上传播异常（挂点在主流程 try 之外）
+    const badRes = mkRes();
+    await handleHostedFileRoute(
+      { hostedDir: path.join(h.temp, "state", "hosted") },
+      { req: { url: "http://[", method: "GET" }, res: badRes },
+    );
+    await badRes.ended;
+    assert.equal(badRes.statusCode, 400);
+    assert.equal(JSON.parse(badRes.body).ok, false);
+  } finally {
+    await h.close();
+  }
+});
+
 test("bridge.js 挂钩与夹具注入齐全（import 被剥离后靠 context 解析）", async () => {
   const bridgeSrc = fs.readFileSync(
     new URL("../src/bridge.js", import.meta.url),

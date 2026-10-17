@@ -139,7 +139,7 @@ function fileHeaders(contentType, disposition, size) {
  * 故意不依赖 sendJson/SECURITY_HEADERS——挂点在控制台令牌门禁**之前**，
  * 自带全套头与 JSON 错误体，夹具里也能脱离开箱单测。
  */
-export async function handleHostedFileRoute({ hostedDir }, { req, res }) {
+export async function handleHostedFileRoute({ hostedDir }, { req, res, url }) {
   const send = (status, obj) => {
     const body = JSON.stringify(obj);
     res.writeHead(status, {
@@ -150,7 +150,15 @@ export async function handleHostedFileRoute({ hostedDir }, { req, res }) {
     res.end(req.method === "HEAD" ? undefined : body);
   };
 
-  const parsed = parseHostedPath(new URL(req.url ?? "/", "http://127.0.0.1").pathname);
+  // 复用控制台主流程已解析的 url（坏 URL 在进入本分支前就已 400）；
+  // 仅在夹具直调缺省时兜底解析一次，且包住 try——挂点在主流程 try 之外，裸解析会悬挂。
+  let pathname;
+  try {
+    pathname = (url ?? new URL(req.url ?? "/", "http://127.0.0.1")).pathname;
+  } catch {
+    return send(400, { ok: false, error: "无效的请求地址" });
+  }
+  const parsed = parseHostedPath(pathname);
   if (!parsed) return send(404, { ok: false, error: "文件不存在" });
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.setHeader?.("allow", "GET, HEAD");

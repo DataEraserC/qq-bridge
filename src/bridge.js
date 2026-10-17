@@ -3164,7 +3164,7 @@ async function main() {
       // 与 consoleToken 零耦合），要求 ?token= 会把管理端全权令牌泄进 URL/日志；
       // 其余一切路由的令牌门禁保持原样（本分支精确匹配 /files/<32hex> 才短路）。
       if (url.pathname === '/files' || url.pathname.startsWith('/files/')) {
-        await handleHostedFileRoute({ hostedDir: path.join(STATE_DIR, 'hosted') }, { req, res });
+        await handleHostedFileRoute({ hostedDir: path.join(STATE_DIR, 'hosted') }, { req, res, url });
         return;
       }
       // 控制台鉴权：所有请求需带 x-console-token 或 ?token=
