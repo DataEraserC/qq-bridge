@@ -6,9 +6,12 @@
 // 详见 src/ext/DOWNSTREAM.md。
 //
 // 【为什么不用 sendToQQ】sendToQQ 只发纯文本（text() 段 + 分条/转义/CQ 转义）；
-// 媒体要以原始 OneBot 段（base64:// 直传）走「网关 HTTP 直连 + sendChain 串行」
-// 通道，语义与上游 sendStickerV2 完全一致（先图片下载、再入队、短暂停顿、
-// 断言可发送、POST、status/retcode 校验）。
+// 媒体要以原始 OneBot 段（base64:// 直传）走「网关 WebSocket 主链路（deps.wsRequest
+// → bot.request）+ sendChain 串行」通道，语义与上游 sendStickerV2 一致（先图片下载、
+// 再入队、短暂停顿、断言可发送、发段、status/retcode 校验）。
+// 走 WS 而非 HTTP 的原因：网关 HTTP 有 2MiB 请求体硬上限（实测超限直接断连），
+// 4MB 图 / 16MB 视频在 HTTP 上根本发不出去；WS 帧上限 100MiB 才装得下协议声明的
+// 这些体积（见 ext/send-file.js 头部的实测数据）。
 //
 // 【安全边界】
 //   - 外部 URL 一律经 deps.safeFetchBuffer 在桥接内下载（DNS 固定、逐跳校验、
@@ -32,7 +35,9 @@ export const MEDIA_LIMITS = {
   maxImages: 9,
   maxImageBytes: 4 * 1024 * 1024, // 与上游接收侧 MAX_MEDIA_BYTES 一致
   maxVideoBytes: 16 * 1024 * 1024, // mp4/h64 协议上限偏保守（约 60s 短视频）
-  requestTimeoutMs: 15000, // 与 sticker 的 AbortSignal.timeout 一致
+  // WS 直传时代：网关收完帧还要往 QQ 上传，15s（HTTP 时代与 sticker 对齐的值）装不下
+  // 16MB 视频的真实上传；发送队列串行，这里放宽不影响并发。
+  requestTimeoutMs: 60000,
 };
 
 /**
@@ -304,10 +309,11 @@ export function buildReplyAtSegments(replyToMessageId, atUserId) {
 
 /**
  * 网关直连发送段数组：构造 action/params、走 sendChain 串行队列、
- * status/retcode 校验——与上游 sendStickerV2 的语义完全一致。
- * assertSendAllowed 由调用方传入（captureSendGuard(key) 的产物），在真正 POST
- * 前断言。deps 由 bridge.js 的 extDeps() 注入（含 fetch，保证在桥接 realm 内
- * 执行——测试夹具通过覆盖 fetch 全局就能观测到真实发出的段）。
+ * status/retcode 校验——与上游 sendStickerV2 的语义一致。
+ * 传输走 deps.wsRequest（网关 WebSocket 主链路，见 bridge.js extDeps 的 ↓ down 挂钩）：
+ * HTTP 直连的 2MiB 请求体上限装不下 4MB 图/16MB 视频，WS 帧上限 100MiB。
+ * assertSendAllowed 由调用方传入（captureSendGuard(key) 的产物），在真正发送前断言。
+ * deps 由 bridge.js 的 extDeps() 注入；测试夹具用 FakeBot.request 观测实际发出的段。
  */
 export async function postSegmentsV2(deps, key, segments, assertSendAllowed) {
   const [kind, id] = String(key).split(":");
@@ -316,37 +322,20 @@ export async function postSegmentsV2(deps, key, segments, assertSendAllowed) {
     kind === "private"
       ? { user_id: Number(id), message: segments }
       : { group_id: Number(id), message: segments };
-  const cfg = deps.cfg;
-  const httpUrl = String(
-    cfg?.snowluma?.httpUrl || "http://127.0.0.1:3000",
-  ).replace(/\/+$/, "");
   // 与文本/表情共用 sendChain，保证「先文字后媒体」的真人顺序不被并发工具调用打乱。
   const data = await deps.enqueueSend(async () => {
     // 真人发图前通常会有短暂停顿，避免「文字刚发完图立刻跟上」的机械感。
     await deps.sleep(deps.randInt(800, 2000));
     assertSendAllowed();
-    const res = await deps.fetch(`${httpUrl}/${action}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(cfg?.snowluma?.accessToken
-          ? { authorization: `Bearer ${cfg.snowluma.accessToken}` }
-          : {}),
-      },
-      body: JSON.stringify(params),
-      signal: AbortSignal.timeout(MEDIA_LIMITS.requestTimeoutMs),
+    const resp = await deps.wsRequest(action, params, {
+      timeoutMs: MEDIA_LIMITS.requestTimeoutMs,
     });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok || body.status !== "ok" || body.retcode !== 0) {
-      const hint =
-        res.status === 426
-          ? "（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）"
-          : "";
+    if (!resp || resp.status !== "ok" || resp.retcode !== 0) {
       throw new Error(
-        `OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`,
+        `OneBot ${action} 失败: ${resp?.wording || resp?.retcode || "无响应"}`,
       );
     }
-    return body.data;
+    return resp.data;
   });
   return data;
 }

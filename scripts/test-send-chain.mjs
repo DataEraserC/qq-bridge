@@ -3,7 +3,7 @@
 //      段数/图片/视频上限、text 段合计、计数标签、构建时内联不走网络、
 //      本地绝对路径直读、发送前字节魔数校验（损坏内容就地拒绝）、下载失败中文错误；
 //   2. 桥接端点 /api/socialV2/send-chain —— 真实 HTTP 处理器 + fixture，
-//      用 fakeFetch 观测**实际发给网关的 OneBot 段序**
+//      用夹具 FakeBot.request（deps.wsRequest 的落点）观测**实际发给网关的 OneBot 段序**
 //      （reply→at→text→image→text→image→face→at 原样交错，不重排），
 //      守住 flag/token/mode/key/白名单/静默/引用/敏感词/合计字数/限频闸门与失败回滚；
 //   3. 开关一致性（bridge 两份默认表 / toolFlags / toolMap / console.html /
@@ -385,10 +385,10 @@ test("send-chain 把 reply→text→image→text→image→face→at 交错段�
       assert.equal(res.data.messageId, 9001, "网关回的 message_id 要透传");
       assert.equal(res.data.summary, "[消息链 文x2+图x2+表情x1+@x1]");
 
-      const call = h.calls.http.at(-1);
-      assert.match(call.url, /\/send_group_msg$/);
-      assert.equal(call.body.group_id, 456);
-      const segs = call.body.message;
+      const call = h.calls.ws.at(-1);
+      assert.equal(call.action, "send_group_msg");
+      assert.equal(call.params.group_id, 456);
+      const segs = call.params.message;
       assert.deepEqual(
         segs.map((s) => s.type),
         ["reply", "text", "image", "text", "image", "face", "at"],
@@ -446,6 +446,7 @@ test("send-chain 守住 flag/token/mode/key/白名单/段白名单/合计字数/
       });
       assert.equal(res.status, 403);
       assert.match(String(res.data.error), /工具未启用：qq_send_chain/);
+      assert.equal(h.calls.ws.length, 0);
       assert.equal(h.calls.http.length, 0);
     },
   );
@@ -549,7 +550,8 @@ test("send-chain 守住 flag/token/mode/key/白名单/段白名单/合计字数/
     });
     assert.equal(long.status, 400);
     assert.match(String(long.data.error), /text 段合计 600 字/);
-    assert.equal(h.calls.http.length, 0, "任何闸门失败都不该真的发消息");
+    assert.equal(h.calls.ws.length, 0, "任何闸门失败都不该真的发消息");
+    assert.equal(h.calls.http.length, 0, "同上：HTTP 通道也不该有动作");
   });
 });
 

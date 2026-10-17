@@ -3,8 +3,9 @@
 //      段构建顺序（text→image→video）、内联 base64 不走网络、超限/下载失败
 //      的中文错误、发送前字节魔数校验（损坏内容就地拒绝，不穿透成网关 921）；
 //   2. 桥接端点 /api/socialV2/send-media —— 真实 HTTP 处理器 + fixture，
-//      用 fakeFetch 观测**实际发给网关的 OneBot 段**（reply→at→text→image→…），
-//      守住 flag/token/mode/key/白名单/静默/引用/敏感词/字数/限频闸门与失败回滚；
+//      用夹具 FakeBot.request（deps.wsRequest 的落点）观测**实际发给网关的 OneBot 段**
+//      （reply→at→text→image→…），守住 flag/token/mode/key/白名单/静默/引用/敏感词/
+//      字数/限频闸门与失败回滚；
 //   3. 开关一致性（bridge 两份默认表 / toolFlags / toolMap / console.html /
 //      config.example.json / TOOL_CONFIG_FLAGS / preset 补丁 / 夹具注入）与
 //      MCP 工具注册转发。
@@ -299,7 +300,7 @@ test("send-media 端点支持本地绝对路径直读入段（不产生下载）
         const res = await post({ images: [file], text: "本地文件" });
         assert.equal(res.status, 200, JSON.stringify(res.data));
         assert.equal(res.data.ok, true);
-        const segs = h.calls.http.at(-1).body.message;
+        const segs = h.calls.ws.at(-1).params.message;
         assert.equal(segs.at(-1).data.file, "base64://" + PNG_B64);
         assert.equal(downloads.length, 0, "本地文件不产生任何下载");
       },
@@ -404,10 +405,10 @@ test("send-media 把 reply→at→text→image→video 段原样发给网关并�
       assert.equal(res.data.messageId, 9001, "网关回的 message_id 要透传");
       assert.equal(res.data.summary, "[图片x2+视频]");
 
-      const call = h.calls.http.at(-1);
-      assert.match(call.url, /\/send_group_msg$/);
-      assert.equal(call.body.group_id, 456);
-      const segs = call.body.message;
+      const call = h.calls.ws.at(-1);
+      assert.equal(call.action, "send_group_msg");
+      assert.equal(call.params.group_id, 456);
+      const segs = call.params.message;
       assert.deepEqual(
         segs.map((s) => s.type),
         ["reply", "at", "text", "image", "image", "video"],
@@ -461,6 +462,7 @@ test("send-media 守住 flag/token/mode/key/白名单/载荷/敏感词/字数闸
       const res = await post({ images: [INLINE] });
       assert.equal(res.status, 403);
       assert.match(String(res.data.error), /工具未启用：qq_send_media/);
+      assert.equal(h.calls.ws.length, 0);
       assert.equal(h.calls.http.length, 0);
     },
   );
@@ -521,7 +523,8 @@ test("send-media 守住 flag/token/mode/key/白名单/载荷/敏感词/字数闸
       400,
       "超单条字数上限",
     );
-    assert.equal(h.calls.http.length, 0, "任何闸门失败都不该真的发消息");
+    assert.equal(h.calls.ws.length, 0, "任何闸门失败都不该真的发消息");
+    assert.equal(h.calls.http.length, 0, "同上：HTTP 通道也不该有动作");
   });
 });
 
