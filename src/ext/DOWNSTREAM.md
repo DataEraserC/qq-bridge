@@ -28,9 +28,10 @@
 | `src/bridge.js` | 顶部 `import ... from './ext/send-media.js'` | 引入路由处理器（`send-chain.js` / `send-file.js` / `message-media.js` 同构，一行 import + 一行分发） |
 | `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`）。只读域还注入存储层入口 `findMessageMedia`；`wsRequest` 注入网关 **WebSocket 动作通道**（HTTP 直连有 2MiB 请求体硬上限，upload_* 与大媒体段必须走它） |
 | `src/bridge.js` | `/api/socialV2/send-media` 分发行 | 一行转发给 `handleSendMediaRoute`（`/api/socialV2/send-chain` 一行转发给 `handleSendChainRoute`；`/api/socialV2/send-file` 一行转发给 `handleSendFileRoute`；只读的 `/api/socialV2/message-media` 一行转发给 `handleMessageMediaRoute`） |
-| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` / `sendFile` / `getMessageMedia` 开关与控制台映射 |
-| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` / `registerSendChainTool(...)` / `registerSendFileTool(...)` / `registerMessageMediaTool(...)` 各一行 | MCP 工具注册 |
-| `scripts/audit-bridge-harness.mjs` | import + context spread 一行 | VM 夹具里 `handleSendMediaRoute` / `handleSendChainRoute` / `handleSendFileRoute` / `handleMessageMediaRoute` 可见 |
+| `src/bridge.js` | Host 校验之后、控制台令牌之前的 `/files` 分支行（`↓ down: file-host`） | 只读文件托管 `handleHostedFileRoute`——**刻意在令牌门禁之前**：能力路径（128-bit 随机）本身即门禁，要求 `?token=` 会把管理端全权令牌泄进 URL/日志；其余路由门禁不动 |
+| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` / `sendFile` / `getMessageMedia` 开关与控制台映射（**file-host 无开关面**：非 MCP 工具、纯只读端点） |
+| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` / `registerSendChainTool(...)` / `registerSendFileTool(...)` / `registerMessageMediaTool(...)` 各一行 | MCP 工具注册（file-host 不进 MCP） |
+| `scripts/audit-bridge-harness.mjs` | import + context spread 一行 | VM 夹具里 `handleSendMediaRoute` / `handleSendChainRoute` / `handleSendFileRoute` / `handleMessageMediaRoute` / `handleHostedFileRoute` 可见 |
 | `scripts/test-audit-security-mcp.mjs` | 顶部 import + `vm.runInNewContext` 上下文注入 | import 行被剥离后 ext 注册函数要作为上下文值（否则 `registerSendChainTool is not defined`） |
 
 ## 现有功能
@@ -62,6 +63,16 @@
   `v2ToolEnabled`）。存储层入口 `findMessageMedia` 经 `extDeps()` 注入。
   端点 `GET /api/socialV2/message-media`；MCP 声明在 `message-media-mcp.js`，
   刻意裸 `JSON.stringify`、不用 `serializeModelData`（那个视图正是它要绕开的）。
+- **`file-host.js`** — **只读文件托管**：给本机文件一个 `http(s)://<host>/files/<token>`
+  能力 URL（`state/hosted/<32hex>/` 放一个文件即"上线"，删除目录即"下线"）。
+  **没有上传端点**——投放是本机文件系统操作，天然绕开 HTTP 2MiB 请求体上限，也不存在
+  写攻击面。门禁 = 128-bit 随机能力路径本身（挂点在 Host 校验之后、控制台令牌之前，
+  刻意不要求 `?token=`——那会把管理端全权令牌泄进 URL/浏览器历史/日志）；其余路由的
+  令牌门禁一字未动。响应头全套：nosniff + `CSP: sandbox` + `no-referrer` + `no-store`，
+  html/svg 等可执行文档强制 `attachment`（防托管页面在控制台同源执行）；
+  CORS 按能力语义放行（ACAO:*，知道 URL 即有权取用）。
+  符号链接/隐藏文件不下发，多文件取字典序首个。不支持 Range（首版全量 200）。
+  **非 MCP 工具、无四份开关面、不进 preset**；端点 `GET|HEAD /files/<32hex>`（其余 405）。
 
 ## 新增一个功能的最短路径（照抄 send-media 的接线）
 

@@ -60,6 +60,7 @@ import { handleSendMediaRoute } from './ext/send-media.js';
 import { handleSendChainRoute } from './ext/send-chain.js';
 import { handleSendFileRoute } from './ext/send-file.js';
 import { handleMessageMediaRoute } from './ext/message-media.js';
+import { handleHostedFileRoute } from './ext/file-host.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -3156,6 +3157,14 @@ async function main() {
       const allowedHosts = [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`];
       if (!allowedHosts.includes(hostHeader.toLowerCase())) {
         sendJson({ ok: false, error: `Host 头不被允许（${hostHeader || '缺失'}）：控制台只接受本机回环访问` }, 403);
+        return;
+      }
+      // ↓ down: file-host —— 只读文件托管 GET|HEAD /files/<能力token>（见 src/ext/file-host.js）。
+      // 刻意卡在 Host 校验之后、控制台令牌之前：能力路径本身就是门禁（128-bit 随机、
+      // 与 consoleToken 零耦合），要求 ?token= 会把管理端全权令牌泄进 URL/日志；
+      // 其余一切路由的令牌门禁保持原样（本分支精确匹配 /files/<32hex> 才短路）。
+      if (url.pathname === '/files' || url.pathname.startsWith('/files/')) {
+        await handleHostedFileRoute({ hostedDir: path.join(STATE_DIR, 'hosted') }, { req, res });
         return;
       }
       // 控制台鉴权：所有请求需带 x-console-token 或 ?token=
