@@ -342,6 +342,35 @@ test("send-file URL 在桥接内下载（不交给网关抓取）", async () => 
   );
 });
 
+test("send-file URL 下载走 safeFetchBytes（不校验图片签名，zip 才发得出去）", async () => {
+  const downloads = [];
+  const zip = Buffer.from("PK\x03\x04 zip bytes are not an image", "latin1");
+  await harnessRequest(
+    {},
+    async ({ h, post }) => {
+      const res = await post({ file: "https://cdn.fixture/pkg.zip" });
+      assert.equal(res.status, 200, JSON.stringify(res.data));
+      assert.equal(res.data.ok, true);
+      assert.deepEqual(downloads.map((d) => d.url), ["https://cdn.fixture/pkg.zip"]);
+      const call = h.calls.ws.at(-1);
+      assert.equal(call.params.file, "base64://" + zip.toString("base64"));
+    },
+    {
+      // 只桩 safeFetchBytes：证明 ext 走的是**不做图片校验**的那条路。
+      // 若哪天退回 safeFetchBuffer，这个用例会因为真实网络解析失败而红。
+      globals: {
+        safeFetchBytes: async (url, maxBytes) => {
+          downloads.push({ url, maxBytes });
+          return { buffer: zip };
+        },
+        safeFetchBuffer: async () => {
+          throw new Error("抓取内容不是有效图片（PNG/JPEG/GIF/WebP）");
+        },
+      },
+    },
+  );
+});
+
 test("send-file 守住 flag/token/mode/key/白名单/文件名/载荷闸门", async () => {
   await harnessRequest(
     { socialV2: { tools: { sendFile: false } } },

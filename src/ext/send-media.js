@@ -283,9 +283,13 @@ export async function resolveMediaBase64(
     return buf.toString("base64");
   }
   // 桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把 URL 交给网关重抓。
+  // 用 safeFetchBytes 而非 safeFetchBuffer：后者硬校验"必须是图片"，视频 URL 会被
+  // 直接拒（"不是有效图片"）。内容判定交给下面的 assertMediaBytes —— 按 kind 分别
+  // 认图片/视频魔数，比"一律当图片"更准。deps 未注入时回落到 safeFetchBuffer。
   let fetched;
   try {
-    fetched = await deps.safeFetchBuffer(classified.url, maxBytes);
+    const fetchBytes = deps.safeFetchBytes ?? deps.safeFetchBuffer;
+    fetched = await fetchBytes(classified.url, maxBytes);
   } catch (error) {
     throw new Error(`媒体地址下载失败，已拒绝发送：${error?.message ?? error}`);
   }

@@ -21,7 +21,7 @@ import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-p
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
-import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { safeFetchBuffer, safeFetchBytes, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -3156,6 +3156,10 @@ async function main() {
         truncateText,
         captureSendGuard,
         safeFetchBuffer,
+        // ↓ down (ext): 不校验内容类型的字节抓取。qq_send_file 发的是任意文件、
+        // qq_send_media 的视频段也不是图片 —— 走 safeFetchBuffer 会被图片签名校验
+        // 挡死（zip/mp4 一律报"不是有效图片"）。SSRF/重定向/大小上限与前者同源。
+        safeFetchBytes,
         enqueueSend: (fn) => {
           let resolve;
           let reject;

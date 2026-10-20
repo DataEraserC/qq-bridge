@@ -25,7 +25,7 @@ dns.promises.lookup = async (host) => {
 let fetchModule;
 try { fetchModule = await import('../src/safe-fetch.js'); }
 finally { dns.promises.lookup = originalLookup; }
-const { isPrivateIp, safeFetch, safeFetchBuffer, validateFetchUrl } = fetchModule;
+const { isPrivateIp, safeFetch, safeFetchBuffer, safeFetchBytes, validateFetchUrl } = fetchModule;
 
 function mockTransport(t, scripts) {
   const requests = [];
@@ -163,6 +163,27 @@ test('image byte limits and signatures are checked', async (t) => {
   await assert.rejects(safeFetchBuffer('http://93.184.216.34/', 11), /大小限制/);
   assert.equal(responses[1].destroyed, true);
   await assert.rejects(safeFetchBuffer('http://93.184.216.34/'), /不是有效图片/);
+});
+
+test('safeFetchBytes returns non-image bytes but keeps every SSRF and size guard', async (t) => {
+  const zip = Buffer.from('PK\x03\x04 and then some file bytes', 'latin1');
+  const { responses } = mockTransport(t, [{ body: zip }, { body: zip }]);
+  // 非图片内容必须能取回（qq_send_file 发 zip、send_media 发 mp4 都走这条）
+  assert.deepEqual((await safeFetchBytes('http://93.184.216.34/')).buffer, zip);
+  // 大小上限仍然生效（与 safeFetchBuffer 同一份 requestOnce 限额）
+  await assert.rejects(safeFetchBytes('http://93.184.216.34/', 8), /大小限制/);
+  assert.equal(responses[1].destroyed, true);
+  // 上限参数非法时仍然在联网前就拒绝
+  await assert.rejects(safeFetchBytes('http://93.184.216.34/', 0), /正整数/);
+});
+
+test('safeFetchBytes keeps SSRF blocking identical to safeFetchBuffer', async (t) => {
+  mockTransport(t, []);
+  for (const fetcher of [safeFetchBuffer, safeFetchBytes]) {
+    await assert.rejects(fetcher('http://127.0.0.1/'), /禁止访问内网\/本机地址/);
+    await assert.rejects(fetcher('http://169.254.169.254/latest/meta-data/'), /禁止访问内网\/本机地址/);
+    await assert.rejects(fetcher('file:///etc/passwd'), /仅允许 http\/https/);
+  }
 });
 
 test('text and image requests have a total deadline despite continuous incoming data', async (t) => {

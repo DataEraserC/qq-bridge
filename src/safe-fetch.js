@@ -360,9 +360,35 @@ export function looksLikeImageBuffer(buf) {
   return false;
 }
 
+/**
+ * 抓取任意二进制字节（带 SSRF 防护，**不**校验内容是不是图片）。
+ *
+ * ↓ down (ext): 下游 ext 的 qq_send_file（任意类型文件）与 qq_send_media 的视频
+ * 分支要的是"把 URL 的字节安全取回来"，内容由调用方按自己的魔数规则判定；
+ * 复用 safeFetchBuffer 会被它的图片签名校验挡死（zip/mp4 一律报"不是有效图片"）。
+ *
+ * 安全逻辑**不复制**：与 safeFetchBuffer 共用同一个 fetchBinary 循环，SSRF 校验、
+ * 重定向逐跳复验、大小上限、地址故障切换只有一份 —— 上游修这类 bug 时我们自动跟着修。
+ * 代价是 safeFetchBuffer 的循环体被提成了 fetchBinary（行为逐字等价，见
+ * test-audit-security.mjs 的图片上限/签名/超时/中断四组用例）。
+ */
+export async function safeFetchBytes(urlString, maxBytes = 8 * 1024 * 1024) {
+  return fetchBinary(urlString, maxBytes, null);
+}
+
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
 export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+  return fetchBinary(urlString, maxBytes, looksLikeImageBuffer);
+}
+
+/**
+ * ↓ down (ext): 二进制抓取本体（由上面的 safeFetchBuffer 原循环体提成）。
+ * validate(buffer) 为 null 表示不做内容校验；what 只影响错误文案。
+ * 上游若改这段，先跑 test-audit-security.mjs —— 它同时钉住两条导出。
+ */
+async function fetchBinary(urlString, maxBytes, validate) {
   validateLimit(maxBytes, 'maxBytes');
+  const what = validate ? '图片' : '文件';
   const MAX_REDIRECTS = 5;
   let { url, addresses } = await validateFetchUrl(urlString);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
@@ -374,9 +400,9 @@ export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
       continue;
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {
-      throw new Error(`图片抓取失败：HTTP ${result.statusCode}`);
+      throw new Error(`${what}抓取失败：HTTP ${result.statusCode}`);
     }
-    if (!looksLikeImageBuffer(result.buffer)) {
+    if (validate && !validate(result.buffer)) {
       throw new Error(`抓取内容不是有效图片（PNG/JPEG/GIF/WebP）`);
     }
     return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };

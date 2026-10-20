@@ -318,6 +318,28 @@ test("本地文件的不存在 / 非普通文件 / 超限都有中文错误", as
   }
 });
 
+test("视频 URL 走 safeFetchBytes（图片签名校验会误杀 mp4）", async () => {
+  const downloads = [];
+  const deps = {
+    // safeFetchBuffer 一律拒（模拟真实实现：mp4 不是有效图片），
+    // 只有 safeFetchBytes 能取回字节 —— 证明视频分支走对了路。
+    safeFetchBuffer: async () => {
+      throw new Error("抓取内容不是有效图片（PNG/JPEG/GIF/WebP）");
+    },
+    safeFetchBytes: async (url, maxBytes) => {
+      downloads.push({ url, maxBytes });
+      return { buffer: MP4_BYTES };
+    },
+  };
+  const norm = normalizeMediaPayload({ video: "https://cdn/v.mp4" });
+  const segments = await buildMediaSegments(deps, norm);
+  assert.equal(segments[0].type, "video");
+  assert.equal(segments[0].data.file, "base64://" + MP4_BYTES.toString("base64"));
+  assert.deepEqual(downloads, [
+    { url: "https://cdn/v.mp4", maxBytes: MEDIA_LIMITS.maxVideoBytes },
+  ]);
+});
+
 test("损坏 / 不可识别的字节就地拒绝（不再穿透成网关 921）", async () => {
   const deps = { safeFetchBuffer: async () => ({ buffer: PNG_BYTES }) };
   // 长度非法（mod 4 = 1）：长 base64 经转手抄坏的典型症状

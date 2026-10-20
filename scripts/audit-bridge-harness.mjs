@@ -203,6 +203,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     cleanupTemp: () => {},
     ...globals,
   });
+  // ext 的下载优先用 safeFetchBytes（不校验内容类型，见 bridge.js extDeps）。
+  // 老测试只桩 safeFetchBuffer；若调用方覆盖了它而没给 safeFetchBytes，就让
+  // safeFetchBytes 转发到同一个桩，避免每个用例都要补第二个键。
+  if (globals.safeFetchBuffer && !globals.safeFetchBytes) {
+    context.safeFetchBytes = (url, maxBytes) => context.safeFetchBuffer(url, maxBytes);
+  }
   // Execute the pure model view in the bridge realm. Its plain-object checks
   // should see the same prototypes as real bridge messages, just as in Node.
   const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8').replace(/^export /gm, '');

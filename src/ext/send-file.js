@@ -138,7 +138,10 @@ export async function resolveFileBase64(deps, classified, limits = FILE_LIMITS) 
   }
   let fetched;
   try {
-    fetched = await deps.safeFetchBuffer(classified.url, limits.maxFileBytes);
+    // safeFetchBytes 而非 safeFetchBuffer：发的是任意文件，后者会以"不是有效图片"
+    // 拒掉 zip/pdf/exe 等一切非图片。SSRF/重定向/大小上限与前者同源。
+    const fetchBytes = deps.safeFetchBytes ?? deps.safeFetchBuffer;
+    fetched = await fetchBytes(classified.url, limits.maxFileBytes);
   } catch (error) {
     throw new Error(`文件下载失败，已拒绝发送：${error?.message ?? error}`);
   }
