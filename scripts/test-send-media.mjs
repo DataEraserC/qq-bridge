@@ -27,6 +27,7 @@ import {
   normalizeMediaPayload,
   buildMediaSegments,
   resolveMediaBase64,
+  resolveMediaLimits,
   mediaSummaryLabel,
 } from "../src/ext/send-media.js";
 
@@ -192,6 +193,54 @@ test("classifyMediaRef 支持本地绝对路径与 file://，并与长 base64 �
   assert.equal(classifyMediaRef("/9j/" + "A".repeat(80)).kind, "base64");
   // 相对路径依旧拒绝（错误串要指路本地绝对路径）
   assert.throws(() => classifyMediaRef("relative/a.png"), /格式不支持/);
+});
+
+test("resolveMediaLimits 跟随桥接注入，非法值回落兜底", () => {
+  // 无注入（脱离桥接的单测）→ 兜底值，与接收侧默认同口径
+  assert.equal(resolveMediaLimits({}).maxImageBytes, 8 * 1024 * 1024);
+  assert.equal(resolveMediaLimits(undefined).maxImageBytes, MEDIA_LIMITS.maxImageBytes);
+  // 注入生效，其余字段保持
+  const injected = resolveMediaLimits({ mediaLimits: () => ({ maxImageBytes: 1024 }) });
+  assert.equal(injected.maxImageBytes, 1024);
+  assert.equal(injected.maxVideoBytes, MEDIA_LIMITS.maxVideoBytes);
+  // 上限是安全闸门：写坏的值不能被当成「无上限」或「零上限」
+  for (const bad of [0, -1, NaN, Infinity, "abc", null, {}]) {
+    assert.equal(
+      resolveMediaLimits({ mediaLimits: () => ({ maxImageBytes: bad }) }).maxImageBytes,
+      MEDIA_LIMITS.maxImageBytes,
+      `非法值 ${String(bad)} 必须回落兜底`,
+    );
+  }
+  // 注入到段构建：内联载荷按注入值拒绝
+  const big = Buffer.concat([PNG_BYTES, Buffer.alloc(2048, 0x61)]).toString("base64");
+  return assert.rejects(
+    buildMediaSegments(
+      { mediaLimits: () => ({ maxImageBytes: 512 }) },
+      normalizeMediaPayload({ images: big }),
+    ),
+    /过大/,
+  );
+});
+
+test("send-media 端点把 socialV2.media.maxBytes 用作发送上限", async () => {
+  // 接收侧与发送侧同源：配置写 1KB 会被桥接收敛到 256KB 下限，发送侧必须
+  // 看到**同一个收敛后的值**（256KB），而不是自己的 8MB 兜底。
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.alloc(300 * 1024, 0x61),
+    Buffer.from([0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]),
+  ]).toString("base64");
+  await harnessRequest(
+    { socialV2: { media: { maxBytes: 1024 } } },
+    async ({ post }) => {
+      const res = await post({ images: [png] });
+      assert.match(
+        res.data.error,
+        /过大（约 300KB，上限 256KB）/,
+        "上限必须是桥接收敛后的 256KB（证明走的是同一份 cfg）",
+      );
+    },
+  );
 });
 
 test("buildMediaSegments 读取本地文件（绝对路径与 file:// 同源，不走网络）", async () => {

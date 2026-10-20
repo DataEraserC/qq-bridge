@@ -3186,6 +3186,11 @@ async function main() {
         redact: (value) => redactKnownTokensOnly(value),
         isSensitive: (value) => SENSITIVE_RE.test(String(value ?? '')),
         fetch: (url, init) => fetch(url, init),
+        // ↓ down (ext): 发送侧媒体上限，直接复用接收侧的 MAX_MEDIA_BYTES
+        // （同一份 cfg.socialV2.media.maxBytes + 同一套收敛规则），避免「能收 8MB
+        // 却发不出 4MB」。闭包按调用时点求值——MAX_MEDIA_BYTES 在 main() 作用域，
+        // 本函数（startConsoleServer 内）可见；startConsoleServer() 在它之后调用。
+        mediaLimits: () => ({ maxImageBytes: MAX_MEDIA_BYTES }),
         // ↓ down (ext): 网关 WebSocket 动作通道（复用主链路 bot，token/重连/echo 都归它管）。
         // HTTP 直连有 2MiB 请求体硬上限；upload_* 与大媒体段走这里才装得下（见 ext/send-file.js）。
         wsRequest: (action, params, options) => bot.request(action, params, options)

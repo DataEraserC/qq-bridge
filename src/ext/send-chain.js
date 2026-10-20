@@ -25,6 +25,7 @@ import {
   MEDIA_LIMITS,
   classifyMediaRef,
   resolveMediaBase64,
+  resolveMediaLimits,
   buildReplyAtSegments,
   postSegmentsV2,
 } from "./send-media.js";
@@ -140,7 +141,11 @@ export function chainText(norm) {
  * 归一化 payload → OneBot 消息段数组（不含 reply/at 头段）。
  * 顺序与入参完全一致——这就是「图文交错」的实现：段序不重排。
  */
-export async function buildChainSegments(deps, norm, limits = MEDIA_LIMITS) {
+export async function buildChainSegments(
+  deps,
+  norm,
+  limits = resolveMediaLimits(deps),
+) {
   const out = [];
   for (const seg of norm.segments) {
     if (seg.type === "text") {
@@ -182,7 +187,7 @@ export async function sendChainV2(deps, key, norm) {
   // 顶层 replyToMessageId/atUserId 作头段（与 media 同构，atUserId=紧跟 reply
   // 的头部 @）；链内 at 段在任意位置——二者独立，调用方自己决定用哪种。
   const segments = buildReplyAtSegments(norm.replyToMessageId, norm.atUserId);
-  segments.push(...(await buildChainSegments(deps, norm)));
+  segments.push(...(await buildChainSegments(deps, norm, resolveMediaLimits(deps))));
   const data = await postSegmentsV2(deps, key, segments, assertSendAllowed);
   return { messageId: data?.message_id ?? null };
 }

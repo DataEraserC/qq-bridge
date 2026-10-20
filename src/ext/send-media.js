@@ -10,7 +10,7 @@
 // → bot.request）+ sendChain 串行」通道，语义与上游 sendStickerV2 一致（先图片下载、
 // 再入队、短暂停顿、断言可发送、发段、status/retcode 校验）。
 // 走 WS 而非 HTTP 的原因：网关 HTTP 有 2MiB 请求体硬上限（实测超限直接断连），
-// 4MB 图 / 16MB 视频在 HTTP 上根本发不出去；WS 帧上限 100MiB 才装得下协议声明的
+// 8MB 图 / 16MB 视频在 HTTP 上根本发不出去；WS 帧上限 100MiB 才装得下协议声明的
 // 这些体积（见 ext/send-file.js 头部的实测数据）。
 //
 // 【安全边界】
@@ -23,22 +23,48 @@
 //     图片/视频就地拒绝并给出可操作中文提示——损坏内容会让网关在全量上传
 //     后返回 opaque 的 error_code=921（实测：长 base64 经模型转手被抄坏、
 //     或 URL 下到 HTML 错误页都撞过这个坑）；
-//   - 图片 ≤9 张、≤4MB/张；视频 ≤16MB（协议侧 mp4/h64、约 60s）；
+//   - 图片 ≤9 张、单张字节上限跟随 `socialV2.media.maxBytes`（默认 8MB，与接收侧同源）；
+//     视频 ≤16MB（协议侧 mp4/h64、约 60s）；
 //   - text 是同气泡文案：长度按 socialV2.send.maxMessageChars（与文本消息同限），
 //     敏感词走 SENSITIVE_RE 同款闸门，超限/敏感直接拒绝，长文本请用 qq_send_message；
 //   - 所有依赖经 deps 注入（含 fetch），本文件不触碰任何全局，可独立单测。
 
 import { readFile, stat } from "node:fs/promises";
 
-/** 发送上限（集中一处，测试与文档同源引用）。 */
+/**
+ * 发送上限兜底值（测试与文档同源引用）。
+ *
+ * `maxImageBytes` 只是**脱离桥接时的默认值**：真实值经 `deps.mediaLimits()` 注入，
+ * 与接收侧同读一份 `socialV2.media.maxBytes`（同一个 cfg、同一套收敛规则），
+ * 避免「能收 8MB 却发不出 4MB」的口径分裂。
+ */
 export const MEDIA_LIMITS = {
-  maxImages: 9,
-  maxImageBytes: 4 * 1024 * 1024, // 与上游接收侧 MAX_MEDIA_BYTES 一致
+  maxImages: 9, // QQ 协议侧单条图片数上限，与 socialV2.media.maxCount 无关
+  maxImageBytes: 8 * 1024 * 1024, // 兜底值，与 socialV2.media.maxBytes 默认一致
   maxVideoBytes: 16 * 1024 * 1024, // mp4/h64 协议上限偏保守（约 60s 短视频）
   // WS 直传时代：网关收完帧还要往 QQ 上传，15s（HTTP 时代与 sticker 对齐的值）装不下
   // 16MB 视频的真实上传；发送队列串行，这里放宽不影响并发。
   requestTimeoutMs: 60000,
 };
+
+/**
+ * 取本次发送的实际上限：兜底值 + 桥接注入的 `deps.mediaLimits()` 覆盖。
+ *
+ * 注入项只接受正有限数，非法值回落到兜底——上限是安全闸门，配置写坏时
+ * 宁可保守，也不能被一个字符串变成「无上限」。`maxVideoBytes` / `requestTimeoutMs`
+ * 不跟随 `socialV2.media`（那是接收侧图片口径，与视频、超时无关）。
+ */
+export function resolveMediaLimits(deps) {
+  const overrides = deps?.mediaLimits?.() ?? {};
+  const pick = (value, fallback) =>
+    Number.isFinite(Number(value)) && Number(value) > 0
+      ? Math.round(Number(value))
+      : fallback;
+  return {
+    ...MEDIA_LIMITS,
+    maxImageBytes: pick(overrides.maxImageBytes, MEDIA_LIMITS.maxImageBytes),
+  };
+}
 
 /**
  * 分类一个媒体引用。返回：
@@ -264,7 +290,11 @@ export async function resolveMediaBase64(
  * 归一化 payload → OneBot 消息段数组（不含 reply/at，由 sendMediaV2 头部追加）。
  * 顺序：text（文案在前）→ images → video。
  */
-export async function buildMediaSegments(deps, norm, limits = MEDIA_LIMITS) {
+export async function buildMediaSegments(
+  deps,
+  norm,
+  limits = resolveMediaLimits(deps),
+) {
   const segments = [];
   if (norm.text) segments.push({ type: "text", data: { text: norm.text } });
   for (const ref of norm.images) {
@@ -344,12 +374,13 @@ export async function postSegmentsV2(deps, key, segments, assertSendAllowed) {
  * 发送本体：guard → 段构建（download 含在 buildMediaSegments 内）→ 网关直连。
  */
 export async function sendMediaV2(deps, key, payload, options = {}) {
-  const norm = normalizeMediaPayload(payload);
+  const limits = resolveMediaLimits(deps);
+  const norm = normalizeMediaPayload(payload, limits);
   const assertSendAllowed = deps.captureSendGuard(key);
   const replyToMessageId = options.replyToMessageId ?? norm.replyToMessageId;
   const atUserId = options.atUserId ?? norm.atUserId;
   const segments = buildReplyAtSegments(replyToMessageId, atUserId);
-  segments.push(...(await buildMediaSegments(deps, norm)));
+  segments.push(...(await buildMediaSegments(deps, norm, limits)));
   const data = await postSegmentsV2(deps, key, segments, assertSendAllowed);
   return { messageId: data?.message_id ?? null, norm };
 }
@@ -512,7 +543,7 @@ export async function handleSendMediaRoute(deps, io) {
   }
   let norm;
   try {
-    norm = normalizeMediaPayload(body);
+    norm = normalizeMediaPayload(body, resolveMediaLimits(deps));
   } catch (error) {
     sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
     return;

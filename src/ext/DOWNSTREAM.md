@@ -26,7 +26,7 @@
 | 文件 | 挂钩 | 作用 |
 | --- | --- | --- |
 | `src/bridge.js` | 顶部 `import ... from './ext/send-media.js'` | 引入路由处理器（`send-chain.js` / `send-file.js` / `message-media.js` 同构，一行 import + 一行分发） |
-| `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`）。只读域还注入存储层入口 `findMessageMedia`；`wsRequest` 注入网关 **WebSocket 动作通道**（HTTP 直连有 2MiB 请求体硬上限，upload_* 与大媒体段必须走它） |
+| `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`）。只读域还注入存储层入口 `findMessageMedia`；`wsRequest` 注入网关 **WebSocket 动作通道**（HTTP 直连有 2MiB 请求体硬上限，upload_* 与大媒体段必须走它）；`mediaLimits` 注入发送侧媒体上限（复用接收侧 `MAX_MEDIA_BYTES`，两边同一份 `socialV2.media.maxBytes`） |
 | `src/bridge.js` | `/api/socialV2/send-media` 分发行 | 一行转发给 `handleSendMediaRoute`（`/api/socialV2/send-chain` 一行转发给 `handleSendChainRoute`；`/api/socialV2/send-file` 一行转发给 `handleSendFileRoute`；只读的 `/api/socialV2/message-media` 一行转发给 `handleMessageMediaRoute`） |
 | `src/bridge.js` | Host 校验之后、控制台令牌之前的 `/files` 分支行（`↓ down: file-host`） | 只读文件托管 `handleHostedFileRoute`——**刻意在令牌门禁之前**：能力路径（128-bit 随机）本身即门禁，要求 `?token=` 会把管理端全权令牌泄进 URL/日志；其余路由门禁不动 |
 | `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` / `sendFile` / `getMessageMedia` 开关与控制台映射（**file-host 无开关面**：非 MCP 工具、纯只读端点） |
@@ -39,10 +39,13 @@
 - **`send-media.js`** — `qq_send_media`：图片（≤9）/ 图文 / 视频（≤1）统一发送。
   引用形态：本地绝对路径 / `file://`（桥接同机直读，推荐）/ http(s) URL
   （桥接内下载转 `base64://`）/ 纯 base64 / `data:` / `base64://`；
+  单张图片字节上限跟随 `socialV2.media.maxBytes`（经 `extDeps().mediaLimits()` 注入，
+  与接收侧同源，默认 8MB），视频 ≤16MB。
   发送前统一魔数校验，损坏字节就地拒绝（不再穿透成网关 opaque 的 921）。
   与 sticker 同款 sendChain 串行 + 网关直连。
   端点 `POST /api/socialV2/send-media`；MCP 声明在 `send-media-mcp.js`。
-  同时导出可复用底层：`resolveMediaBase64` / `buildReplyAtSegments` / `postSegmentsV2`。
+  同时导出可复用底层：`resolveMediaLimits` / `resolveMediaBase64` /
+  `buildReplyAtSegments` / `postSegmentsV2`。
 - **`send-chain.js`** — `qq_send_chain`：图文交错消息链（段序原样发出），
   段白名单 `text/image/video/face/at`，text 段**合计**过字数与敏感词闸门（防拆段绕过）。
   端点 `POST /api/socialV2/send-chain`；MCP 声明在 `send-chain-mcp.js`；
