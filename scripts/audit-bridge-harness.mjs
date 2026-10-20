@@ -18,6 +18,7 @@ import * as sticker from '../src/sticker-lib.js';
 import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
+import * as presetPrompt from '../src/preset-prompt.js';
 import * as stateAcl from '../src/state-acl.mjs';
 // ↓ down (ext): 下游扩展注入 VM（bridge.js 顶层 import 会被剥掉，分发行要靠
 // context 里的同名绑定才能解析到 ext 的路由处理器）。
@@ -29,7 +30,7 @@ import * as fileHostExt from '../src/ext/file-host.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-export async function bridgeHarness({ config = {}, savedState, globals = {} } = {}) {
+export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {} } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-audit-bridge-'));
   fs.mkdirSync(path.join(temp, 'src'));
   fs.mkdirSync(path.join(temp, 'state'));
@@ -39,7 +40,14 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     consoleToken: 'fixture-console-token', slang: { enabled: false }, ...config,
   }));
   if (savedState) fs.writeFileSync(path.join(temp, 'state/sessions.json'), JSON.stringify(savedState));
-  const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], http: [], ws: [] };
+  // 额外状态文件（用于测试"启动时读到损坏/旧版文件"这类路径）。
+  for (const [rel, content] of Object.entries(files)) {
+    const target = path.join(temp, rel);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, typeof content === 'string' ? content : JSON.stringify(content));
+  }
+  // faces：上游 r4 的表情实体查询；ws：下游 ext 的 WebSocket 动作通道。
+  const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], faces: [], http: [], ws: [] };
   // 语音发送在桥接里是**直接 fetch 网关**（与文本/表情共用 sendChain，但要自己带 record 段），
   // 所以这里给 VM 注入一个记录型 fetch：既不让测试真的发 QQ 消息，又能断言发出的段内容。
   const fakeFetch = async (url, init = {}) => {
@@ -66,6 +74,12 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
   const success = (value) => ({ result: { ok: true, value } });
   const api = {
     events: { follow: (id) => calls.follows.push(id) },
+    // settings.describe 的默认桩：没有 qq-mode 命名空间 ⇒ refreshMode() 回退到本地 mode.json。
+    // 测试可覆盖它来验证「DSH 设置里的空 ownerQQ 不得覆盖 config.json」等契约。
+    settings: {
+      describe: async () => success({ namespaces: [] }),
+      update: async () => success({ updated: true })
+    },
     workspace: {
       create: async () => success({ created: false, workspace: { workspaceId: 'fixture-workspace' } }),
       archiveSession: async ({ sessionId }) => { calls.archived.push(sessionId); return success({}); },
@@ -87,6 +101,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
       // Valid 1 × 1 PNG, supplied entirely in memory by the fixture gateway.
       return { base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=' };
     }
+    async fetchFaceEntity(id) { calls.faces.push(id); return null; }
     // WebSocket 动作通道（ext 的 deps.wsRequest → bot.request）：记录 action/params，
     // 发送与上传类动作按真实网关同形回执，其余保持旧的数组形态（表情细节查询等依赖它）。
     async request(action, params) {
@@ -125,6 +140,20 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
+    collectors, setupSleepTimerV2,
+    getInitialPrompt, setInitialPrompt, loadInitialPrompts, formatInitialPromptV2,
+    initialPrompts, initialPromptMaxChars,
+    extractMediaFromSegments, segmentsToText, fetchOneBotImage, fetchMediaData, resolveMediaList,
+    emojiCdnCandidates, getImageDimensions, acceptImageBuffer, MAX_MEDIA_BYTES, bot,
+    isConversationBusyV2, v2TurnStartAt, turnLeaseNoted, TURN_BUSY_LEASE_MS,
+    settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
+    getMode() { return currentMode; },
+    setSelfIdentity(display, id) {
+      selfDisplayName = String(display ?? '');
+      selfUserId = String(id ?? '');
+      selfNickname = selfDisplayName.toLowerCase() || 'deepseek';
+    },
     flushQueue, retireSession,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
@@ -136,7 +165,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
   bot.onPrivateMessage(async (event) => {`);
   const timers = new Set();
   const context = vm.createContext({
-    fs, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
+    fs, os, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
     fetch: fakeFetch,
     // 锁文件探测用（bridge.js 顶层的 consolePortInUse）；
     // 固定桩掉：测试不应该真去 netstat 宿主机。
@@ -150,7 +179,8 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...sendMediaExt, ...sendChainExt, ...sendFileExt, ...messageMediaExt, ...fileHostExt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...sendMediaExt, ...sendChainExt, ...sendFileExt, ...messageMediaExt, ...fileHostExt,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),
