@@ -24,6 +24,7 @@ import { bridgeHarness } from "./audit-bridge-harness.mjs";
 import {
   MEDIA_LIMITS,
   classifyMediaRef,
+  escapeCqText,
   normalizeMediaPayload,
   buildMediaSegments,
   resolveMediaBase64,
@@ -102,6 +103,28 @@ test("normalizeMediaPayload 归一化入参并强制上限", () => {
   assert.equal(norm.text, "配文");
   assert.equal(norm.replyToMessageId, "-9");
   assert.equal(norm.atUserId, "10001");
+});
+
+test("escapeCqText 把 [CQ: 打成全角冒号，杜绝模型输出变成 CQ 码", () => {
+  assert.equal(escapeCqText("[CQ:at,qq=all] 你好"), "[CQ：at,qq=all] 你好");
+  assert.equal(escapeCqText("[cq:face,id=1]"), "[CQ：face,id=1]", "大小写不敏感");
+  assert.equal(escapeCqText("普通文本 [CQ 不完整"), "普通文本 [CQ 不完整");
+  assert.equal(escapeCqText(undefined), "");
+  assert.equal(escapeCqText(null), "");
+});
+
+test("buildMediaSegments 的文案段过 CQ 转义（段内不出现可解析的 CQ 码）", async () => {
+  const deps = {
+    safeFetchBuffer: async (url, maxBytes) => fixtureFetch(url, maxBytes),
+  };
+  const norm = normalizeMediaPayload({
+    text: "[CQ:at,qq=all] 看这个",
+    images: [PNG_B64],
+  });
+  const segments = await buildMediaSegments(deps, norm);
+  assert.equal(segments[0].type, "text");
+  assert.ok(!/\[CQ:/i.test(segments[0].data.text), "text 段里不能再出现可解析的 [CQ:");
+  assert.equal(segments[0].data.text, "[CQ：at,qq=all] 看这个");
 });
 
 test("buildMediaSegments 按 text→image→video 排段，内联 base64 不走网络", async () => {

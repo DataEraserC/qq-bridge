@@ -42,12 +42,15 @@
   单张图片字节上限跟随 `socialV2.media.maxBytes`（经 `extDeps().mediaLimits()` 注入，
   与接收侧同源，默认 8MB），视频 ≤16MB。
   发送前统一魔数校验，损坏字节就地拒绝（不再穿透成网关 opaque 的 921）。
+  文案与所有 text 段过 `escapeCqText()`（`[CQ:` → `[CQ：`，与上游同一份规则）——
+  否则模型写出 `[CQ:at,qq=all]` 就会被网关当 CQ 码解析成 @全体成员。
   与 sticker 同款 sendChain 串行 + 网关直连。
   端点 `POST /api/socialV2/send-media`；MCP 声明在 `send-media-mcp.js`。
-  同时导出可复用底层：`resolveMediaLimits` / `resolveMediaBase64` /
+  同时导出可复用底层：`escapeCqText` / `resolveMediaLimits` / `resolveMediaBase64` /
   `buildReplyAtSegments` / `postSegmentsV2`。
 - **`send-chain.js`** — `qq_send_chain`：图文交错消息链（段序原样发出），
-  段白名单 `text/image/video/face/at`，text 段**合计**过字数与敏感词闸门（防拆段绕过）。
+  段白名单 `text/image/video/face/at`，text 段**合计**过字数与敏感词闸门（防拆段绕过），
+  每个 text 段发送前过 `escapeCqText()`。
   端点 `POST /api/socialV2/send-chain`；MCP 声明在 `send-chain-mcp.js`；
   发送底层全部复用 `send-media.js` 的导出。
 - **`send-file.js`** — `qq_send_file`：**任意类型**文件上传（群文件/私聊文件），

@@ -67,6 +67,18 @@ export function resolveMediaLimits(deps) {
 }
 
 /**
+ * 出站文本的 CQ 码转义：`[CQ:` → `[CQ：`（全角冒号）。
+ *
+ * 上游所有文本发送都过 `escapeCqText()`（bridge.js:606）；ext 的三条发送路径
+ * （send-media 文案 / send-chain text 段 / send-file 文件名）此前**直接拼段**，
+ * 模型把 `[CQ:at,qq=all]` 写进 text 段就会被网关当成 CQ 码解析成 @全体成员 ——
+ * 那是「模型输出 = 可执行指令」的注入面。这里与上游同一份规则，不另立口径。
+ */
+export function escapeCqText(text) {
+  return String(text ?? "").replace(/\[CQ:/gi, "[CQ：");
+}
+
+/**
  * 分类一个媒体引用。返回：
  *   { kind: 'base64', data } — base64://、data: URL、纯 base64（启发式）
  *   { kind: 'url', url }     — http(s) URL（调用方必须走 safeFetchBuffer）
@@ -296,7 +308,7 @@ export async function buildMediaSegments(
   limits = resolveMediaLimits(deps),
 ) {
   const segments = [];
-  if (norm.text) segments.push({ type: "text", data: { text: norm.text } });
+  if (norm.text) segments.push({ type: "text", data: { text: escapeCqText(norm.text) } });
   for (const ref of norm.images) {
     const b64 = await resolveMediaBase64(deps, ref, "image", limits);
     segments.push({ type: "image", data: { file: "base64://" + b64 } });

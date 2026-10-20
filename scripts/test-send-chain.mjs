@@ -165,6 +165,24 @@ test("chainText 汇总 text 段 / chainSummaryLabel 按类型计数", () => {
   assert.equal(chainSummaryLabel(videoNorm), "[消息链 视频]");
 });
 
+test("buildChainSegments 的每个 text 段都过 CQ 转义（链内不出现可解析的 CQ 码）", async () => {
+  const deps = { safeFetchBuffer: async () => ({ buffer: PNG_BYTES }) };
+  const norm = normalizeChainPayload({
+    segments: [
+      { type: "text", text: "[CQ:at,qq=all]" },
+      { type: "text", text: "正常文本" },
+    ],
+  });
+  const segments = await buildChainSegments(deps, norm);
+  assert.equal(segments.length, 2);
+  for (const seg of segments) {
+    assert.equal(seg.type, "text");
+    assert.ok(!/\[CQ:/i.test(seg.data.text), "text 段里不能再出现可解析的 [CQ:");
+  }
+  assert.equal(segments[0].data.text, "[CQ：at,qq=all]");
+  assert.equal(segments[1].data.text, "正常文本");
+});
+
 test("buildChainSegments 保持段序，内联不走网络、URL 按类型上限下载", async () => {
   const downloads = [];
   const deps = {

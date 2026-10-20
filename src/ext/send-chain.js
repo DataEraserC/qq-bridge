@@ -24,6 +24,7 @@
 import {
   MEDIA_LIMITS,
   classifyMediaRef,
+  escapeCqText,
   resolveMediaBase64,
   resolveMediaLimits,
   buildReplyAtSegments,
@@ -149,7 +150,7 @@ export async function buildChainSegments(
   const out = [];
   for (const seg of norm.segments) {
     if (seg.type === "text") {
-      out.push({ type: "text", data: { text: seg.text } });
+      out.push({ type: "text", data: { text: escapeCqText(seg.text) } });
     } else if (seg.type === "face") {
       out.push({ type: "face", data: { id: Number(seg.id) } });
     } else if (seg.type === "at") {
