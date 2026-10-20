@@ -28,10 +28,18 @@
 // 序首个，同名替换即换内容，no-store 保证立即生效）。多文件/无文件都按既有规则
 // 取首个/404——目录不是 API，形态由投放方自律。
 //
+// 【投放靠本模块导出，不靠 HTTP】`publishHostedFile()` / `listHostedFiles()` /
+// `removeHostedFile()` 是**文件系统操作**（与桥接同 UID），由 `scripts/file-host.mjs`
+// 调用；桥接进程不暴露任何上传端点，写攻击面为零。publish 先写 `.part` 再 rename，
+// 半截文件不会出现在托管目录里。
+//
 // 不支持 Range（首版全量 200，浏览器可整段缓冲播放）；无过期时间（token 即门禁，
 // 清理 = 删目录）。
 import { createReadStream } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import {
+  copyFile, mkdir, readdir, rename, rm, stat, unlink,
+} from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 
 /** 精确匹配 /files/<32位小写hex>。多余段、大小写混用、编码绕过一律不认。 */
@@ -131,6 +139,90 @@ function fileHeaders(contentType, disposition, size) {
     "access-control-allow-origin": "*",
     "cross-origin-resource-policy": "cross-origin",
   };
+}
+
+/** 新 token：128-bit 随机小写 hex。 */
+export function newHostedToken() {
+  return randomBytes(16).toString("hex");
+}
+
+/** 文件名 → 安全基名：去目录段、消解分隔符/控制字符、限长。 */
+export function safeHostedName(name) {
+  const base = String(name ?? "").split(/[/\\]/).pop() ?? "";
+  const cleaned = base.replace(/[\r\n\t"\\:*?<>|]/g, "_").replace(/^\.+/, "").trim();
+  return (cleaned || "file").slice(0, 120);
+}
+
+/**
+ * 把本机文件投放为能力 URL（**文件系统操作**，不走 HTTP）。
+ *
+ * 与只读端点共用同一份目录约定：hosted/<token>/ 内恰好一个文件。先写
+ * `.<name>.part` 再 rename —— 半截文件不会出现在托管目录里被读出去。
+ * `token` 省略时新生成；重复投放同一 token 即换内容（同名替换语义）。
+ *
+ * @returns {Promise<{token: string, fileName: string, size: number}>}
+ */
+export async function publishHostedFile(hostedDir, sourcePath, { token, name } = {}) {
+  const from = path.resolve(String(sourcePath ?? ""));
+  let info;
+  try {
+    info = await stat(from);
+  } catch (error) {
+    throw new Error(
+      `源文件不可读（${error?.code === "ENOENT" ? "不存在" : error?.code || "未知错误"}）：${from}`,
+    );
+  }
+  if (!info.isFile()) throw new Error(`源路径不是普通文件：${from}`);
+  const fileName = safeHostedName(name ?? path.basename(from));
+  const finalToken = token === undefined ? newHostedToken() : String(token);
+  if (!/^[0-9a-f]{32}$/.test(finalToken)) {
+    throw new Error("token 必须是 32 位小写十六进制（省略则自动生成）");
+  }
+  const dir = path.join(hostedDir, finalToken);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const target = path.join(dir, fileName);
+  const staging = path.join(dir, `.${fileName}.${randomBytes(4).toString("hex")}.part`);
+  try {
+    await copyFile(from, staging);
+    await rename(staging, target);
+  } catch (error) {
+    await unlink(staging).catch(() => {});
+    throw new Error(`投放失败：${error?.message ?? error}`);
+  }
+  // 同名替换即换内容；其余旧文件（换名重投）会被"取字典序首个"读到旧的那份，
+  // 因此投放成功后清掉除目标之外的所有条目——一 token 一文件是硬约定。
+  for (const entry of await readdir(dir).catch(() => [])) {
+    if (entry !== fileName) await rm(path.join(dir, entry), { force: true, recursive: true }).catch(() => {});
+  }
+  return { token: finalToken, fileName, size: info.size };
+}
+
+/** 列出已投放的 token（按名字排序），供 CLI/排查用。 */
+export async function listHostedFiles(hostedDir) {
+  let entries;
+  try {
+    entries = await readdir(hostedDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[0-9a-f]{32}$/.test(entry.name)) continue;
+    const hit = await resolveHostedFile(hostedDir, entry.name);
+    if (hit) out.push({ token: entry.name, fileName: hit.fileName, size: hit.size });
+  }
+  return out.sort((a, b) => a.token.localeCompare(b.token));
+}
+
+/** 下线一个 token（删目录）；返回是否真的删掉了。 */
+export async function removeHostedFile(hostedDir, token) {
+  const t = String(token ?? "");
+  if (!/^[0-9a-f]{32}$/.test(t)) throw new Error("token 必须是 32 位小写十六进制");
+  const dir = path.join(hostedDir, t);
+  const exists = await stat(dir).then((s) => s.isDirectory()).catch(() => false);
+  if (!exists) return false;
+  await rm(dir, { recursive: true, force: true });
+  return true;
 }
 
 /**

@@ -75,6 +75,9 @@
   html/svg 等可执行文档强制 `attachment`（防托管页面在控制台同源执行）；
   CORS 按能力语义放行（ACAO:*，知道 URL 即有权取用）。
   符号链接/隐藏文件不下发，多文件取字典序首个。不支持 Range（首版全量 200）。
+  投放由本模块导出的 `publishHostedFile()` / `listHostedFiles()` / `removeHostedFile()`
+  完成（纯文件系统操作，先写 `.part` 再 rename，同名重投即换内容），CLI 入口
+  `node scripts/file-host.mjs publish|list|remove|url`——桥接进程仍**不暴露任何上传端点**。
   **非 MCP 工具、无四份开关面、不进 preset**；端点 `GET|HEAD /files/<32hex>`（其余 405）。
 
 ## 新增一个功能的最短路径（照抄 send-media 的接线）

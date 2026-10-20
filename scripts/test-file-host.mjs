@@ -1,14 +1,18 @@
-// file-host 回归（三面）：
+// file-host 回归（四面）：
 //   1. 纯函数 —— 能力路径解析（含大写/长度/尾段/编码变形全拒）、Content-Type 推导、
 //      Content-Disposition 注入消解（CRLF/引号）与 RFC 5987 非 ASCII 编码；
 //   2. 桥接端点 /files/<token> —— 真实 HTTP 处理器 + fixture：无任何令牌即 200（能力
 //      路径本身是门禁）、安全头齐全、Host 校验仍在其前、POST 405、未知 404、
 //      **其余路由的控制台令牌门禁一根手指都没松**；
-//   3. 文件系统语义 —— 符号链接跳过、隐藏文件跳过、多文件取字典序首个（确定性）。
+//   3. 文件系统语义 —— 符号链接跳过、隐藏文件跳过、多文件取字典序首个（确定性）；
+//   4. 投放侧（publishHostedFile / listHostedFiles / removeHostedFile）—— token 生成与
+//      校验、先写 .part 再 rename（半截文件不外泄）、同名替换换内容、换名重投清旧条目、
+//      投放→端点取回的端到端闭环、下线后 404。
 // 只用 fixture：不读生产配置、不连 QQ/DSH、不发送任何消息。
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -17,6 +21,10 @@ import {
   parseHostedPath,
   contentTypeFor,
   contentDispositionFor,
+  publishHostedFile,
+  listHostedFiles,
+  removeHostedFile,
+  safeHostedName,
 } from "../src/ext/file-host.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef"; // 32 位小写 hex
@@ -281,6 +289,110 @@ test("直调缺省 url 时兜底解析：合法走通、坏 URL 回 400 不抛",
     assert.equal(JSON.parse(badRes.body).ok, false);
   } finally {
     await h.close();
+  }
+});
+
+// ── 4. 投放侧（file-host 的生产者） ────────────────────────────────────────
+test("publishHostedFile：token 自动生成/校验、文件名净化、一 token 一文件", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qq-hosted-pub-"));
+  const hostedDir = path.join(tmp, "hosted");
+  const src = path.join(tmp, "src.bin");
+  try {
+    fs.writeFileSync(src, "payload-v1");
+    const first = await publishHostedFile(hostedDir, src);
+    assert.match(first.token, /^[0-9a-f]{32}$/, "省略 token 时自动生成 128-bit 随机 hex");
+    assert.equal(first.fileName, "src.bin");
+    assert.equal(first.size, 10);
+
+    // 同名重投 = 换内容（no-store 语义的另一半：磁盘上只留一份）
+    fs.writeFileSync(src, "payload-v2-longer");
+    await publishHostedFile(hostedDir, src, { token: first.token });
+    const entries = fs.readdirSync(path.join(hostedDir, first.token));
+    assert.deepEqual(entries, ["src.bin"], "同名替换后目录里仍只有一个文件");
+    assert.equal(
+      fs.readFileSync(path.join(hostedDir, first.token, "src.bin"), "utf8"),
+      "payload-v2-longer",
+    );
+
+    // 换名重投 = 清掉旧条目（一 token 一文件是硬约定，否则"取字典序首个"会读到旧内容）
+    await publishHostedFile(hostedDir, src, { token: first.token, name: "renamed.bin" });
+    assert.deepEqual(fs.readdirSync(path.join(hostedDir, first.token)), ["renamed.bin"]);
+
+    // 无残留 .part（先写 .part 再 rename）
+    const all = fs.readdirSync(path.join(hostedDir, first.token));
+    assert.ok(!all.some((n) => n.endsWith(".part")), "投放不留半截临时文件");
+
+    // token 形态与源文件校验
+    await assert.rejects(
+      publishHostedFile(hostedDir, src, { token: "NOTHEX" }),
+      /32 位小写十六进制/,
+    );
+    await assert.rejects(
+      publishHostedFile(hostedDir, path.join(tmp, "nope.bin")),
+      /源文件不可读（不存在）/,
+    );
+    await assert.rejects(
+      publishHostedFile(hostedDir, tmp),
+      /源路径不是普通文件/,
+    );
+
+    // 文件名净化：目录段剥离（反斜杠也算分隔符）、控制字符/引号消解、限长
+    assert.equal(safeHostedName("/etc/passwd"), "passwd");
+    assert.equal(safeHostedName("..\\..\\x\r\n.txt"), "x__.txt");
+    assert.equal(safeHostedName('a"b|c?.txt'), "a_b_c_.txt");
+    assert.ok(safeHostedName("a".repeat(400)).length <= 120);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("listHostedFiles / removeHostedFile：只认 32hex 目录、下线后查不到", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qq-hosted-list-"));
+  const hostedDir = path.join(tmp, "hosted");
+  const src = path.join(tmp, "a.txt");
+  try {
+    fs.writeFileSync(src, "abc");
+    const { token } = await publishHostedFile(hostedDir, src);
+    // 干扰项：非 32hex 目录、空 token 目录都不该出现在列表里
+    fs.mkdirSync(path.join(hostedDir, "not-a-token"), { recursive: true });
+    fs.mkdirSync(path.join(hostedDir, "f".repeat(32)), { recursive: true });
+
+    const items = await listHostedFiles(hostedDir);
+    assert.equal(items.length, 1);
+    assert.deepEqual(items[0], { token, fileName: "a.txt", size: 3 });
+
+    assert.equal(await removeHostedFile(hostedDir, token), true);
+    assert.equal(await removeHostedFile(hostedDir, token), false, "重复下线返回 false");
+    assert.deepEqual(await listHostedFiles(hostedDir), []);
+    await assert.rejects(removeHostedFile(hostedDir, "../etc"), /32 位小写十六进制/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("投放 → 端点取回 → 下线 404（端到端闭环）", async () => {
+  const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), "qq-hosted-e2e-"));
+  const payload = Buffer.from("published through publishHostedFile\n");
+  const src = path.join(srcDir, "note.txt");
+  fs.writeFileSync(src, payload);
+  const h = await bridgeHarness();
+  const server = h.startConsoleServer();
+  if (!server.listening) await new Promise((r) => server.once("listening", r));
+  const hostedDir = path.join(h.temp, "state", "hosted");
+  try {
+    const { token } = await publishHostedFile(hostedDir, src);
+    const ok = await request(server, { path: `/files/${token}` });
+    assert.equal(ok.status, 200, "投放后立即可取（无需重启桥接）");
+    assert.deepEqual(ok.body, payload);
+    assert.equal(ok.headers["content-type"], "text/plain; charset=utf-8");
+
+    assert.equal(await removeHostedFile(hostedDir, token), true);
+    const gone = await request(server, { path: `/files/${token}` });
+    assert.equal(gone.status, 404, "下线后端点立刻 404");
+  } finally {
+    await new Promise((r) => server.close(r));
+    await h.close();
+    fs.rmSync(srcDir, { recursive: true, force: true });
   }
 });
 
