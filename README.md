@@ -9,9 +9,26 @@ QSH 让 agent 以真实的 QQ 账号身份参与群聊。它由两个互不知�
 
 ## 当前状态
 
-**只有文档，没有代码。**
+**骨架已开始，QQ 侧尚未连通。**
 
-本仓库从空白重建。旧实现是一个 Node 单进程，把 QQ 语义与 DSH 协议混在约一万二千行里，已整体删除；新实现的架构在 [docs/architecture/](docs/architecture/README.md) 中定义，编码尚未开始。因此这套文档描述的是**将要建成的系统**，不是现有系统。
+本仓库从空白重建。旧实现是一个 Node 单进程，把 QQ 语义与 DSH 协议混在约一万二千行里，已整体删除。
+
+已实现的部分：
+
+| 位置 | 内容 |
+| --- | --- |
+| `crates/proto` | 协议帧、错误码、未知类型忽略 |
+| `crates/kernel/src/config.rs` | `config.toml` 解析与启动期校验（含 `(群, 账号)` 冲突检查） |
+| `crates/kernel/src/wake.rs` | 唤醒判定链，含忽略名单与休眠期 |
+
+尚未实现：OneBot 连接、归档、队列、投递、工具面、钩子宿主、笔记。
+
+```sh
+cargo test                      # 全部测试
+cargo clippy --all-targets -- -D warnings
+```
+
+`crates/kernel/tests/fixtures/documented.toml` 是文档里配置示例的合集，由测试直接解析——文档与实现漂移时这里会失败。
 
 ## 文档
 
