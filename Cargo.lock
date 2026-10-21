@@ -67,7 +67,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qsh-kernel"
+name = "qqab-kernel"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -78,7 +78,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qsh-proto"
+name = "qqab-proto"
 version = "0.1.0"
 dependencies = [
  "serde",

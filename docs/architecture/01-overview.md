@@ -27,7 +27,7 @@ flowchart LR
 
 四个进程角色，四条链路：
 
-1. **QQ 与 OneBot 实现之间**：由 OneBot 实现负责，QSH 不参与。
+1. **QQ 与 OneBot 实现之间**：由 OneBot 实现负责，qq-agent-bridge 不参与。
 2. **OneBot 实现与内核之间**：WebSocket，标准 OneBot 11 事件与动作。
 3. **内核与适配器之间**：本机 socket，见 [协议](05-protocol.md)。
 4. **适配器与 agent 运行时之间**：适配器是该运行时眼里的一个工具服务端。
@@ -90,6 +90,6 @@ sequenceDiagram
 
 ## 明确不做的事
 
-- **不做消息中转服务**：QSH 是单个部署者自用的桥，不是多租户网关。
+- **不做消息中转服务**：qq-agent-bridge 是单个部署者自用的桥，不是多租户网关。
 - **不替 OneBot 实现兜底**：登录、重连、协议兼容由 OneBot 实现负责。
-- **不接管 agent 运行时的会话存储**：记忆的载体是运行时的会话，QSH 只记住「记忆名与会话的映射。
+- **不接管 agent 运行时的会话存储**：记忆的载体是运行时的会话，qq-agent-bridge 只记住「记忆名与会话的映射。

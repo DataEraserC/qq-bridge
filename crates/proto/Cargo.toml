@@ -1,6 +1,6 @@
 [package]
-name = "qsh-proto"
-description = "QSH 内核与适配器之间的协议帧"
+name = "qqab-proto"
+description = "qq-agent-bridge 内核与适配器之间的协议帧"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

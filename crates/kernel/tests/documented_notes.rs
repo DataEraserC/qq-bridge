@@ -3,7 +3,7 @@
 //! 直接读 `docs/architecture/08-notes.md`，从代码块里抽出 JSON 来解析。测试里不复制
 //! 一份示例——复制的那份迟早和文档分叉，而这份测试的全部意义就是抓这个分叉。
 
-use qsh_kernel::notes::{NoteKind, NoteStore, TopicStatus};
+use qqab_kernel::notes::{NoteKind, NoteStore, TopicStatus};
 
 /// 从 Markdown 里取出第一个 ```json 代码块的内容。
 fn first_json_block(markdown: &str) -> String {
@@ -90,7 +90,7 @@ fn documented_digest_header_is_exactly_what_we_render() {
     store
         .write(
             "20002",
-            qsh_kernel::notes::NoteInput::new(
+            qqab_kernel::notes::NoteInput::new(
                 NoteKind::Term,
                 "67",
                 "短视频上火的梗，本身没有固定含义",
@@ -123,9 +123,9 @@ fn documented_digest_header_is_exactly_what_we_render() {
 fn documented_limits_match_implementation() {
     // 文档写「最多 3 条原文，每条最多 80 字」。实现若改了上限，这里失败。
     let mut store = NoteStore::new(2000);
-    let mut input = qsh_kernel::notes::NoteInput::new(NoteKind::Term, "k", "v");
+    let mut input = qqab_kernel::notes::NoteInput::new(NoteKind::Term, "k", "v");
     input.evidence = (0..5)
-        .map(|index| qsh_kernel::notes::Evidence {
+        .map(|index| qqab_kernel::notes::Evidence {
             text: "长".repeat(200),
             at: index,
         })

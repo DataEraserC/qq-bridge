@@ -128,7 +128,7 @@ memory = "alice"
 
 ```toml
 [adapter]
-socket = "/run/user/1000/qsh.sock"   # 内核监听，适配器连接
+socket = "/run/user/1000/qqab.sock"   # 内核监听，适配器连接
 turn_timeout_sec = 600               # 单回合上限，超时视为失败
 ```
 

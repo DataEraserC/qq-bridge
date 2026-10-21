@@ -4,7 +4,7 @@
 
 ## 依赖
 
-| 组件 | 作用 | 是否由 QSH 提供 |
+| 组件 | 作用 | 是否由 qq-agent-bridge 提供 |
 | --- | --- | --- |
 | OneBot 实现 | 登录 QQ，提供 WebSocket 事件与动作接口 | 否，自备（如 SnowLuma、Lagrange） |
 | 内核 | QQ 侧语义 | 是，单个二进制 |

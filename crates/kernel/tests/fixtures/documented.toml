@@ -54,7 +54,7 @@ accounts = ["backup"]
   send = ["backup"]
 
 [adapter]
-socket = "/run/user/1000/qsh.sock"
+socket = "/run/user/1000/qqab.sock"
 turn_timeout_sec = 600
 
 [notes]

@@ -402,7 +402,7 @@ pub struct AdapterConfig {
 impl Default for AdapterConfig {
     fn default() -> Self {
         Self {
-            socket: "/run/user/1000/qsh.sock".to_owned(),
+            socket: "/run/user/1000/qqab.sock".to_owned(),
             turn_timeout_sec: 600,
         }
     }

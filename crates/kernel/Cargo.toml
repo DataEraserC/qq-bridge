@@ -1,12 +1,12 @@
 [package]
-name = "qsh-kernel"
-description = "QSH 内核：QQ 侧语义"
+name = "qqab-kernel"
+description = "qq-agent-bridge 内核：QQ 侧语义"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "qsh"
+name = "qqab"
 path = "src/main.rs"
 
 [dependencies]

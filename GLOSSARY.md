@@ -1,6 +1,6 @@
-# QSH 领域词汇
+# qq-agent-bridge 领域词汇
 
-QSH 是「QQ 侧内核 + agent 运行时侧适配器」组成的系统。本表只定义术语，不含实现细节，也不记录决策理由——那些在 [docs/adr/](docs/adr/README.md)。
+qq-agent-bridge（简称 `qqab`）是「QQ 侧内核 + agent 运行时侧适配器」组成的系统。本表只定义术语，不含实现细节，也不记录决策理由——那些在 [docs/adr/](docs/adr/README.md)。
 
 ## 身份与配置
 

@@ -2,7 +2,7 @@
 //!
 //! 这些测试的失败意味着文档与实现漂移，而不是实现有 bug。
 
-use qsh_kernel::config::{Config, PersonaSource};
+use qqab_kernel::config::{Config, PersonaSource};
 
 #[test]
 fn documented_config_parses() {
