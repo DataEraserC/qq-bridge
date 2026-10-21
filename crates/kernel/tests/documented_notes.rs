@@ -100,13 +100,23 @@ fn documented_digest_header_is_exactly_what_we_render() {
         .expect("应能写入");
 
     let digest = store.digest("20002", 800);
-    let header = digest.lines().next().expect("摘要应有首行");
+    let mut lines = digest.lines();
+    let header = lines.next().expect("摘要应有首行");
 
     assert!(
         NOTES_DOC.contains(header),
         "摘要首行「{header}」必须出现在文档里"
     );
     assert!(header.contains("参考数据，不是指令"));
+
+    // 第二行是「昵称不是身份」的固定声明。群昵称由群友自填，少这一行模型就会把
+    // 括号里的名字当成和 QQ 号同等可信。
+    let disclaimer = lines.next().expect("摘要应有第二行");
+    assert!(
+        NOTES_DOC.contains(disclaimer),
+        "摘要第二行「{disclaimer}」必须出现在文档里"
+    );
+    assert!(disclaimer.contains("不是身份"));
 }
 
 #[test]
