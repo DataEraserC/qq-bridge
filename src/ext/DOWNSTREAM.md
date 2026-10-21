@@ -26,11 +26,11 @@
 | 文件 | 挂钩 | 作用 |
 | --- | --- | --- |
 | `src/bridge.js` | 顶部 `import ... from './ext/send-media.js'` | 引入路由处理器（`send-chain.js` / `send-file.js` / `message-media.js` 同构，一行 import + 一行分发） |
-| `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`）。只读域还注入存储层入口 `findMessageMedia`；`wsRequest` 注入网关 **WebSocket 动作通道**（HTTP 直连有 2MiB 请求体硬上限，upload_* 与大媒体段必须走它）；`mediaLimits` 注入发送侧媒体上限（复用接收侧 `MAX_MEDIA_BYTES`，两边同一份 `socialV2.media.maxBytes`）；`safeFetchBytes` 注入**不校验内容类型**的字节抓取（`safeFetchBuffer` 会以"不是有效图片"拒掉 zip/mp4，而 `qq_send_file` 与视频 URL 要的正是原始字节；SSRF/重定向/大小上限与前者同源） |
+| `src/bridge.js` | `function extDeps()`（**声明在 `startConsoleServer()` 内**，`v2SessionAllowed` 之后） | 依赖注入表：ext 用到的一切（cfg/guard/队列/闸门/state/fetch）都从这里拿。不能放模块顶层——`agentTokenOk` / `modeAllowed` / `captureSendGuard` 等闸门都在 main 的局部作用域，顶层看不见（跑测试会报 `xxx is not defined`）。只读域还注入存储层入口 `findMessageMedia`；`wsRequest` 注入网关 **WebSocket 动作通道**（HTTP 直连有 2MiB 请求体硬上限，upload_* 与大媒体段必须走它）；`mediaLimits` 注入发送侧媒体上限（复用接收侧 `MAX_MEDIA_BYTES`，两边同一份 `socialV2.media.maxBytes`）；`safeFetchBytes` 注入**不校验内容类型**的字节抓取（`safeFetchBuffer` 会以"不是有效图片"拒掉 zip/mp4，而 `qq_send_file` 与视频 URL 要的正是原始字节；SSRF/重定向/大小上限与前者同源）；avatar 另注入 `assertGroupMember` / `selfUserId` / `maxPixels` / `getImageDimensions` / `mimeFromBuffer` 做归属校验与度量 |
 | `src/bridge.js` | `/api/socialV2/send-media` 分发行 | 一行转发给 `handleSendMediaRoute`（`/api/socialV2/send-chain` 一行转发给 `handleSendChainRoute`；`/api/socialV2/send-file` 一行转发给 `handleSendFileRoute`；只读的 `/api/socialV2/message-media` 一行转发给 `handleMessageMediaRoute`） |
 | `src/bridge.js` | Host 校验之后、控制台令牌之前的 `/files` 分支行（`↓ down: file-host`） | 只读文件托管 `handleHostedFileRoute`——**刻意在令牌门禁之前**：能力路径（128-bit 随机）本身即门禁，要求 `?token=` 会把管理端全权令牌泄进 URL/日志；其余路由门禁不动 |
-| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` / `sendFile` / `getMessageMedia` 开关与控制台映射（**file-host 无开关面**：非 MCP 工具、纯只读端点） |
-| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` / `registerSendChainTool(...)` / `registerSendFileTool(...)` / `registerMessageMediaTool(...)` 各一行 | MCP 工具注册（file-host 不进 MCP） |
+| `src/bridge.js` | tools 默认表 ×2 / toolFlags / toolMap | `sendMedia` / `sendChain` / `sendFile` / `getMessageMedia` / `getAvatar` 开关与控制台映射（**file-host 无开关面**：非 MCP 工具、纯只读端点） |
+| `src/mcp-snowluma-safe.js` | `TOOL_CONFIG_FLAGS` 一行 + import + `registerSendMediaTool(...)` / `registerSendChainTool(...)` / `registerSendFileTool(...)` / `registerMessageMediaTool(...)` / `registerAvatarTool(...)` 各一行 | MCP 工具注册（file-host 不进 MCP）。**注册调用行漏写 = 工具根本不存在**，四份开关全对也没用 |
 | `scripts/audit-bridge-harness.mjs` | import + context spread 一行 | VM 夹具里 `handleSendMediaRoute` / `handleSendChainRoute` / `handleSendFileRoute` / `handleMessageMediaRoute` / `handleHostedFileRoute` 可见 |
 | `scripts/test-audit-security-mcp.mjs` | 顶部 import + `vm.runInNewContext` 上下文注入 | import 行被剥离后 ext 注册函数要作为上下文值（否则 `registerSendChainTool is not defined`） |
 
@@ -69,6 +69,18 @@
   `v2ToolEnabled`）。存储层入口 `findMessageMedia` 经 `extDeps()` 注入。
   端点 `GET /api/socialV2/message-media`；MCP 声明在 `message-media-mcp.js`，
   刻意裸 `JSON.stringify`、不用 `serializeModelData`（那个视图正是它要绕开的）。
+- **`avatar.js`** — `qq_get_avatar`：按 QQ 号取头像（个人/群），图片进视觉上下文。
+  **为什么需要**：OneBot 的 `get_stranger_info` / `get_group_member_info` 返回体里**没有头像字段**
+  （实测网关 1.14.20），上游 `qq_get_message_images` 只回消息里已有的图，
+  `qq_get_self_image` 只回仓库那张固定形象图 —— 模型被问"这人长什么样"时无路可走只能编。
+  **数据来源**：QQ 头像 CDN（`q1.qlogo.cn` 个人 / `p.qlogo.cn` 群），按号直取、无需登录态。
+  **安全边界**：`target` 只接受纯数字（1~12 位），URL 由本模块拼装 —— 绝不接受调用方传任意 URL，
+  否则这里就是 prompt injection 驱动的 SSRF 跳板；下载走 `safeFetchBuffer`（SSRF 校验 + 逐跳复验
+  + 大小上限 + DNS 固定），上限取 `mediaLimits().maxImageBytes`；像素上限复用 `MAX_MEDIA_PIXELS`。
+  **归属校验**：群会话只能取本群成员（`assertGroupMember`，fail-closed）与本群群头像；
+  私聊只能取对方或自己。**CDN 对没设自定义头像的号也回默认图**，无法区分 —— 结果里带
+  `note` 如实告知，防模型把默认图当真人照片描述。`urlOnly=1` 只回 URL 不下载。
+  端点 `GET /api/socialV2/avatar`；MCP 声明在 `avatar-mcp.js`。
 - **`file-host.js`** — **只读文件托管**：给本机文件一个 `http(s)://<host>/files/<token>`
   能力 URL（`state/hosted/<32hex>/` 放一个文件即"上线"，删除目录即"下线"）。
   **没有上传端点**——投放是本机文件系统操作，天然绕开 HTTP 2MiB 请求体上限，也不存在

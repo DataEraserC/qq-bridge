@@ -61,6 +61,7 @@ import { handleSendChainRoute } from './ext/send-chain.js';
 import { handleSendFileRoute } from './ext/send-file.js';
 import { handleMessageMediaRoute } from './ext/message-media.js';
 import { handleHostedFileRoute } from './ext/file-host.js';
+import { handleAvatarRoute } from './ext/avatar.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -790,7 +791,8 @@ function loadConfig() {
         setStickerRemark: false,
         stickerNote: true,
         collectSticker: true,
-        getSelfImage: true
+        getSelfImage: true,
+        getAvatar: true
       },
       wake: {
         defaultMode: 'diving',
@@ -920,6 +922,7 @@ function loadConfig() {
     stickerNote: true,
     collectSticker: true,
     getSelfImage: true,
+    getAvatar: true,
     sendVoice: false,
     ...(cfg.socialV2.tools ?? {})
   };
@@ -3197,7 +3200,16 @@ async function main() {
         mediaLimits: () => ({ maxImageBytes: MAX_MEDIA_BYTES }),
         // ↓ down (ext): 网关 WebSocket 动作通道（复用主链路 bot，token/重连/echo 都归它管）。
         // HTTP 直连有 2MiB 请求体硬上限；upload_* 与大媒体段走这里才装得下（见 ext/send-file.js）。
-        wsRequest: (action, params, options) => bot.request(action, params, options)
+        wsRequest: (action, params, options) => bot.request(action, params, options),
+        // ↓ down (ext): qq_get_avatar 的归属校验与图像度量。OneBot 的 get_stranger_info /
+        // get_group_member_info 都没有头像字段（实测 1.14.20），所以头像只能从 QQ CDN 按号取；
+        // 正因如此必须限制「只能取本会话看得见的号」——assertGroupMember 是现成的群成员校验
+        // （fail-closed：拿不到成员列表就拒绝），selfUserId 用来放行"取自己头像"。
+        assertGroupMember,
+        selfUserId: () => selfUserId,
+        maxPixels: () => MAX_MEDIA_PIXELS,
+        getImageDimensions,
+        mimeFromBuffer
       };
     }
 
@@ -4469,7 +4481,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendMedia', 'sendChain', 'sendFile', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'sendMedia', 'sendChain', 'sendFile', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getMessageMedia', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'getAvatar', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4735,6 +4747,7 @@ async function main() {
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
+            getAvatar: 'qq_get_avatar',
             sendVoice: 'qq_send_voice / qq_list_voices'
           };
           const tools = cfg.socialV2?.tools ?? {};
@@ -6461,6 +6474,13 @@ async function main() {
         // 这里只留一行转发（同 send-media / send-chain 的挂钩形态）。
         if (req.method === 'GET' && url.pathname === '/api/socialV2/message-media') {
           await handleMessageMediaRoute(extDeps(), { req, sendJson });
+          return;
+        }
+        // ↓ down (ext): qq_get_avatar（按 QQ 号取头像），实现见 src/ext/avatar.js。
+        // OneBot 的 get_stranger_info / get_group_member_info 都不回头像字段，
+        // 头像只能从 QQ CDN 按号取；归属校验（本群成员/本群群头像）在 ext 侧。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/avatar') {
+          await handleAvatarRoute(extDeps(), { req, sendJson });
           return;
         }
         // ── 合并转发消息查询端点（MCP qq_get_forward_msg 走这里） ────────────

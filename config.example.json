@@ -144,6 +144,7 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
+      "getAvatar": true,
       "sendVoice": false
     },
     "wake": {

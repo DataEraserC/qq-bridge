@@ -9,6 +9,7 @@ import { registerSendMediaTool } from '../src/ext/send-media-mcp.js';
 import { registerSendChainTool } from '../src/ext/send-chain-mcp.js';
 import { registerSendFileTool } from '../src/ext/send-file-mcp.js';
 import { registerMessageMediaTool } from '../src/ext/message-media-mcp.js';
+import { registerAvatarTool } from '../src/ext/avatar-mcp.js';
 
 function loadWebTools({ safeFetch, webSearch }) {
   const tools = new Map();
@@ -122,6 +123,7 @@ function loadSnowlumaTools(fetchImpl, fixtureConfig = null, httpImpl = null) {
     registerSendChainTool,
     registerSendFileTool,
     registerMessageMediaTool,
+    registerAvatarTool,
   });
   return async (name, arguments_ = {}) => {
     const tool = tools.get(name);

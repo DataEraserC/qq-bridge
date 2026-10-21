@@ -21,11 +21,12 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
 // ↓ down (ext): 下游扩展的 MCP 注册（src/ext/DOWNSTREAM.md），官方文件只留 import
 // + TOOL_CONFIG_FLAGS 一行 + 下方 registerSendMediaTool / registerSendChainTool /
-// registerSendFileTool / registerMessageMediaTool 调用。
+// registerSendFileTool / registerMessageMediaTool / registerAvatarTool 调用。
 import { registerSendMediaTool } from './ext/send-media-mcp.js';
 import { registerSendChainTool } from './ext/send-chain-mcp.js';
 import { registerSendFileTool } from './ext/send-file-mcp.js';
 import { registerMessageMediaTool } from './ext/message-media-mcp.js';
+import { registerAvatarTool } from './ext/avatar-mcp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -353,6 +354,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_send_sticker: 'sendSticker',
   qq_collect_sticker: 'collectSticker',
   qq_get_self_image: 'getSelfImage',
+  qq_get_avatar: 'getAvatar',
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
 };
@@ -1156,6 +1158,9 @@ registerSendChainTool({ server, z, agentApi, serializeModelData, cfg });
 
 // ↓ down (ext): qq_send_file（任意类型文件上传），实现见 src/ext/send-file-mcp.js。
 registerSendFileTool({ server, z, agentApi, serializeModelData, cfg });
+
+// ↓ down (ext): qq_get_avatar（按 QQ 号取头像），实现见 src/ext/avatar-mcp.js。
+registerAvatarTool({ server, z, agentApi, cfg });
 
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
   server.tool(

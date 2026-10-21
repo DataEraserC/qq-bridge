@@ -31,6 +31,7 @@
     "test-send-chain": "node scripts/test-send-chain.mjs",
     "test-send-file": "node scripts/test-send-file.mjs",
     "test-file-host": "node scripts/test-file-host.mjs",
+    "test-avatar": "node scripts/test-avatar.mjs",
     "file-host": "node scripts/file-host.mjs",
     "test-voice": "node scripts/test-voice.mjs",
     "test-voice:gui": "node scripts/test-voice-gui.mjs",

@@ -27,6 +27,7 @@ import * as sendChainExt from '../src/ext/send-chain.js';
 import * as sendFileExt from '../src/ext/send-file.js';
 import * as messageMediaExt from '../src/ext/message-media.js';
 import * as fileHostExt from '../src/ext/file-host.js';
+import * as avatarExt from '../src/ext/avatar.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -47,7 +48,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     fs.writeFileSync(target, typeof content === 'string' ? content : JSON.stringify(content));
   }
   // faces：上游 r4 的表情实体查询；ws：下游 ext 的 WebSocket 动作通道。
-  const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], faces: [], http: [], ws: [] };
+  const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], faces: [], http: [], ws: [], members: [] };
   // 语音发送在桥接里是**直接 fetch 网关**（与文本/表情共用 sendChain，但要自己带 record 段），
   // 所以这里给 VM 注入一个记录型 fetch：既不让测试真的发 QQ 消息，又能断言发出的段内容。
   const fakeFetch = async (url, init = {}) => {
@@ -102,6 +103,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
       return { base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=' };
     }
     async fetchFaceEntity(id) { calls.faces.push(id); return null; }
+    // 群成员列表：qq_get_avatar 的归属校验（assertGroupMember）要用。
+    // 夹具成员固定为 '789'（appendSocialV2Message 里的发言者）与 '10001'。
+    async getGroupMemberList(id) {
+      calls.members.push(id);
+      return [{ user_id: 789 }, { user_id: 10001 }];
+    }
     // WebSocket 动作通道（ext 的 deps.wsRequest → bot.request）：记录 action/params，
     // 发送与上传类动作按真实网关同形回执，其余保持旧的数组形态（表情细节查询等依赖它）。
     async request(action, params) {
@@ -180,7 +187,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
-    ...sendMediaExt, ...sendChainExt, ...sendFileExt, ...messageMediaExt, ...fileHostExt,
+    ...sendMediaExt, ...sendChainExt, ...sendFileExt, ...messageMediaExt, ...fileHostExt, ...avatarExt,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

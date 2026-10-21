@@ -25,6 +25,9 @@ const tests = [
   // file-host（只读文件托管 /files/<能力token>）：纯函数 + 桥接端点安全头/门禁 + FS 语义
   // （非 MCP 工具，无四份开关面）
   'test-file-host.mjs',
+  // qq_get_avatar（按 QQ 号取头像）：纯函数（URL 拼装/ID 归一）+ 桥接端点归属校验与闸门
+  // + MCP 图像块 + 四份开关一致
+  'test-avatar.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',
   // 体检修复回归：无令牌智能体调用面、send-burst 失败回滚、唤醒限频重试、
   // 定时器类暂存唤醒补发、collector 生命周期、ownerQQ 覆盖语义、预设名校验、
