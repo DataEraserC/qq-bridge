@@ -1,0 +1,177 @@
+# 钩子脚本
+
+钩子是写在配置里的 Lua 脚本，可以改变唤醒判定与消息处理。设计说明见 [架构：钩子](../architecture/06-hooks.md)，本文只讲怎么写。
+
+## 启用
+
+```toml
+[[devices]]
+id = "alice-phone"
+# ...
+hooks = "hooks/alice.lua"
+```
+
+脚本在启动时加载。语法错误会导致启动失败，不会运行期才暴露。修改后需要重启内核。
+
+## 可用的东西
+
+三个钩子函数、三个宿主函数、若干只读数据。
+
+### 宿主函数
+
+| 函数 | 说明 |
+| --- | --- |
+| `log(level, msg)` | 写日志，`level` 取 `"debug"`/`"info"`/`"warn"`/`"error"` |
+| `now()` | 当前 Unix 毫秒时间戳 |
+| `random()` | `[0, 1)` 随机数 |
+
+没有 `io`、`os.execute`、`require`、`load`、`dofile`、`debug`。钩子只做判定与过滤，不做动作——需要发消息的场合是工具，不是钩子。
+
+## preReceive：消息进归档之前
+
+```lua
+function preReceive(ev)
+  -- ev.sender_id  string   发言者 QQ 号
+  -- ev.group_id   string   群号
+  -- ev.text       string   纯文本
+  -- ev.time       number   Unix 毫秒
+  -- ev.is_self    boolean  是否为设备自己账号发出
+  -- ev.tags       table    可变，附加标签
+  return ev        -- 返回 nil 表示丢弃
+end
+```
+
+### 丢弃空消息与纯表情
+
+```lua
+function preReceive(ev)
+  if ev.text == "" then return nil end
+  return ev
+end
+```
+
+### 给消息打标签，供后续判定使用
+
+```lua
+function preReceive(ev)
+  if ev.text:find("^/") then
+    ev.tags = { "command" }
+  end
+  return ev
+end
+```
+
+`is_self` 在钩子执行前就已确定，**不能改写**。这是身份识别，不是规则。
+
+## postReceive：归档之后
+
+```lua
+function postReceive(ev, batch)
+  -- batch.count     number  本批消息条数
+  -- batch.oldest_at number
+  -- batch.newest_at number
+end
+```
+
+返回值被忽略。用于维护跨事件状态或记录统计：
+
+```lua
+local seen = {}
+
+function postReceive(ev, batch)
+  local key = ev.sender_id
+  seen[key] = (seen[key] or 0) + 1
+  if seen[key] == 20 then
+    log("info", "这个人在本进程内已发 20 条")
+  end
+end
+```
+
+## shouldWake：唤醒判定
+
+```lua
+function shouldWake(ev, reason)
+  -- reason  string|nil  配置规则算出的结果
+  return reason           -- 返回 nil 否决；返回字符串则作为原因
+end
+```
+
+### 除某人外都唤醒
+
+配置里的 `ignore_speakers` 覆盖常见情况。需要更复杂的条件时：
+
+```lua
+function shouldWake(ev, reason)
+  -- 深夜只响应 @
+  local hour = tonumber(os.date("%H", ev.time / 1000))
+  if hour >= 2 and hour < 8 and reason ~= "at_mention" then
+    return nil
+  end
+  return reason
+end
+```
+
+### 按内容否决
+
+```lua
+function shouldWake(ev, reason)
+  -- 刷屏的单字回复不唤醒
+  if #ev.text <= 2 and reason == "any_message" then
+    return nil
+  end
+  return reason
+end
+```
+
+### 改写原因
+
+```lua
+function shouldWake(ev, reason)
+  if ev.text:find("上线") then
+    return "keyword:上线"
+  end
+  return reason
+end
+```
+
+原因字符串会传给适配器，可用于在提示里区分「被叫到」和「随机冒泡」。
+
+## 失败处理
+
+| 情况 | 行为 |
+| --- | --- |
+| `preReceive` 抛错 | 事件**保留**，记错误日志 |
+| `shouldWake` 抛错 | **不否决**，按配置规则的结果继续 |
+| 单次调用超时（100ms） | 按抛错处理 |
+
+方向是「宁可多处理一次，不要静默丢弃」。脚本 bug 的代价应该是噪音，不是失联。
+
+## 完整示例
+
+```lua
+-- 白天宽松，深夜只认 @；刷屏短句不唤醒
+function preReceive(ev)
+  if ev.text == "" then return nil end
+  return ev
+end
+
+function postReceive(ev, batch)
+  log("debug", string.format("批 %d 条，来自 %s", batch.count, ev.sender_id))
+end
+
+function shouldWake(ev, reason)
+  if reason == nil then return nil end
+
+  local hour = tonumber(os.date("%H", ev.time / 1000))
+  if hour >= 2 and hour < 8 then
+    if reason == "at_mention" then return reason end
+    return nil
+  end
+
+  if #ev.text <= 2 and reason ~= "at_mention" then
+    return nil
+  end
+
+  return reason
+end
+```
