@@ -22,15 +22,16 @@ qq-agent-bridge 让 agent 以真实的 QQ 账号身份参与群聊。它由两�
 | `crates/kernel/src/wake.rs` | 唤醒判定链，含忽略名单与休眠期 |
 | `crates/kernel/src/turn.rs` | 按记忆名的串行队列、回合票签发与作废、积压合并、超时清扫 |
 | `crates/kernel/src/notes.rs` | 笔记存储（三类记录、覆盖写、淘汰、摘要渲染、JSON 往返） |
+| `crates/kernel/src/archive.rs` | 按记忆名分片的归档（按群的未读水位、去重、条数与字节双限、投递文本渲染、JSON 往返） |
 
-尚未实现：OneBot 连接、归档、投递、工具面、钩子宿主。
+尚未实现：OneBot 连接、投递、工具面、钩子宿主。
 
 ```sh
 cargo test                      # 全部测试
 cargo clippy --all-targets -- -D warnings
 ```
 
-`crates/kernel/tests/fixtures/documented.toml` 是文档里配置示例的合集，由测试直接解析；`crates/kernel/tests/documented_notes.rs` 直接读 `docs/architecture/08-notes.md` 抽代码块——文档与实现漂移时这两处会失败。
+`crates/kernel/tests/fixtures/documented.toml` 是文档里配置示例的合集，由测试直接解析；`crates/kernel/tests/documented_notes.rs` 与 `crates/kernel/tests/documented_archive.rs` 分别直接读 `docs/architecture/08-notes.md` 和 `docs/architecture/03-kernel.md` 抽代码块与上限表——文档与实现漂移时这几处会失败。
 
 ## 文档
 

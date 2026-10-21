@@ -2,6 +2,7 @@
 //!
 //! 内核不知道运行时的存在。它只认识「记忆名」和「一个可以投递内容的通道」。
 
+pub mod archive;
 pub mod config;
 pub mod notes;
 pub mod turn;
