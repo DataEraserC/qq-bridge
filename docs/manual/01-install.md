@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | OneBot 实现 | 登录 QQ，提供 WebSocket 事件与动作接口 | 否，自备（如 SnowLuma、Lagrange） |
 | 内核 | QQ 侧语义 | 是，单个二进制 |
-| 适配器 | 对接 agent 运行时 | 是，Node 包 |
+| 适配器 | 对接 agent 运行时 | 是，按运行时的生态分发；DSH 适配器是 Node 包 |
 | agent 运行时 | 提供模型与工具调用 | 否，自备 |
 
 ## 启动顺序

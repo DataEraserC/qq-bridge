@@ -15,17 +15,17 @@ flowchart LR
     subgraph host[本机]
         CFG["config.toml"]
         K["内核<br/>Rust"]
-        A["适配器<br/>TypeScript"]
+        A["适配器<br/>语言随运行时"]
         RT["agent 运行时<br/>（如 DSH）"]
     end
     QQ --- SN
     SN -- "OneBot WebSocket" --> K
     CFG --> K
     K -- "Unix socket<br/>JSON 行" --> A
-    A -- "MCP / stdio" --> RT
+    A -- "运行时自己的工具协议" --> RT
 ```
 
-四个进程角色，三条链路：
+四个进程角色，四条链路：
 
 1. **QQ 与 OneBot 实现之间**：由 OneBot 实现负责，QSH 不参与。
 2. **OneBot 实现与内核之间**：WebSocket，标准 OneBot 11 事件与动作。
