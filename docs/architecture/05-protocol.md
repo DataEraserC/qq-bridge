@@ -16,7 +16,7 @@
 每行一个 JSON 对象，必须有 `type` 字段。未知 `type` 必须被忽略而不是断连——这是向前兼容的唯一手段。
 
 ```json
-{"type": "deliver", "id": "d-1", "memory": "alice", "persona": "...", "blocks": [...], "scope": {...}}
+{"type": "deliver", "id": "d-1", "memory": "alice", "persona": "...", "blocks": [...], "scope": {...}, "notes": "..."}
 ```
 
 所有请求带 `id`，响应带相同的 `id`。`id` 由发起方生成，只需在单条连接内唯一。
@@ -35,6 +35,7 @@
 | `blocks` | array | 内容块，见下 |
 | `scope` | object | 本次投递涉及的群与可用发送账号 |
 | `wake_reason` | string | 唤醒原因标签，供运行时展示 |
+| `notes` | string | 已渲染的笔记摘要，可为空字符串 |
 
 `blocks` 是渲染好的内容块，不是 QQ 消息段：
 
@@ -53,6 +54,8 @@
 ```
 
 `send_accounts` 是账号的**标识**，不是 QQ 号。适配器把它们当作不透明字符串，工具调用时原样回传。
+
+`notes` 是内核渲染好的纯文本，适配器原样拼进提示词，不解析、不裁剪、不排序。预算与选取规则在内核——见[笔记](08-notes.md)。
 
 ### `cancel`
 

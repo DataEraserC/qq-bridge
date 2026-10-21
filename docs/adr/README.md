@@ -8,6 +8,7 @@
 | [0002](0002-rust-kernel-typescript-adapter.md) | 内核用 Rust，适配器用 TypeScript | 已采纳 |
 | [0003](0003-embed-lua-natively.md) | 钩子用内嵌 Lua，不用 WebAssembly | 已采纳 |
 | [0004](0004-memory-name-as-queue-key.md) | 配置写记忆名，队列键也用记忆名 | 已采纳 |
+| [0005](0005-notes-as-keyed-records.md) | 笔记是带主键的结构化记录，不用检索系统 | 已采纳 |
 
 ## 格式
 

@@ -1,6 +1,6 @@
 # 配置
 
-唯一配置文件是 `config.toml`。四类顶层表：账号、人格、设备、适配器。
+唯一配置文件是 `config.toml`。五类顶层表：账号、人格、设备、适配器、笔记。
 
 ## 账号
 
@@ -131,6 +131,16 @@ memory = "alice"
 socket = "/run/user/1000/qsh.sock"   # 内核监听，适配器连接
 turn_timeout_sec = 600               # 单回合上限，超时视为失败
 ```
+
+## 笔记
+
+```toml
+[notes]
+max_entries = 2000                   # 每记忆的笔记条数上限
+digest_budget_tokens = 800           # 每回合注入的摘要预算，0 表示不注入
+```
+
+整节可省略，用上面的默认值。细节见 [笔记](05-notes.md)。
 
 ## 校验
 
