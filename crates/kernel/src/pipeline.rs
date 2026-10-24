@@ -1,8 +1,7 @@
 //! 事件管线：把归档、唤醒判定与串行队列串成一次事件的处理顺序。
 //!
-//! 这里落地 `docs/architecture/03-kernel.md#一次事件的处理顺序` 的第 4 到第 7 步——
-//! 第 2 步（身份过滤）由调用方在此之前完成，第 3、5、6 步的钩子尚未实现，第 8 步发出帧
-//! 属于传输层。
+//! 这里落地 `docs/architecture/03-kernel.md#一次事件的处理顺序` 的第 3 到第 7 步——
+//! 第 2 步（身份过滤）由调用方在此之前完成，第 8 步发出帧属于传输层。
 //!
 //! 顺序不可重排，其中两条是硬约束：
 //!
@@ -10,6 +9,10 @@
 //!   必须在归档之后。
 //! - **判定针对增量，投递针对全部未读。** 一条消息叫醒设备，投递出去的是自上次投递以来
 //!   的所有未读——否则队列忙时积压的消息会一条一条地被投成十个回合。
+//!
+//! 三个钩子各自只在自己那一段有效：`preReceive` 能丢弃或改写，改后的正文**向下**传播给
+//! 判定；`postReceive` 只看增量、返回值被忽略；`shouldWake` 是判定的最终决定，脚本给的
+//! 原因替换规则的原因。
 //!
 //! 积压期间的唤醒原因要留。队列只记「有没有积压」这个布尔值，而积压合并后的那一次投递
 //! 仍然需要一个原因标签；原因取积压期间**最强**的那个，与批量判定同一把尺子。
@@ -21,6 +24,7 @@ use time::{Duration, OffsetDateTime};
 use crate::archive::{Archive, ArchiveError, Limits, Message, WatermarkError};
 use crate::config::{Device, ScopeConfig};
 use crate::deliver::{Delivery, assemble, judge_poke};
+use crate::hooks::{Hooks, Ruling, Snapshot};
 use crate::notes::NoteStore;
 use crate::turn::{Arrival, Finished, Ticket, TicketError, TurnContext, TurnTable};
 use crate::wake::WakeReason;
@@ -48,6 +52,8 @@ pub struct Pipeline {
     note_budget: usize,
     /// 积压期间的唤醒原因，键是记忆名。合并投递时取最强的一个。
     pending: BTreeMap<String, WakeReason>,
+    /// 各设备的钩子环境，键是设备 id。没有声明 `hooks` 的设备不在其中。
+    hooks: BTreeMap<String, Hooks>,
 }
 
 impl Pipeline {
@@ -59,7 +65,22 @@ impl Pipeline {
             context_messages: archive_limits.context_messages,
             note_budget: 0,
             pending: BTreeMap::new(),
+            hooks: BTreeMap::new(),
         }
+    }
+
+    /// 装上钩子。逐设备的环境由 [`Hooks::load_all`] 建好。
+    pub fn with_hooks(mut self, hooks: BTreeMap<String, Hooks>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    pub fn hooks(&self) -> &BTreeMap<String, Hooks> {
+        &self.hooks
+    }
+
+    pub fn hooks_mut(&mut self) -> &mut BTreeMap<String, Hooks> {
+        &mut self.hooks
     }
 
     /// 设置每回合注入笔记摘要的预算。
@@ -84,16 +105,38 @@ impl Pipeline {
     ///
     /// `message.own` 必须由调用方按设备的账号集合标好——那是第 2 步的事，管线不重复判断，
     /// 但要按它分岔：自己发的消息照样归档，不判定、不唤醒。
+    ///
+    /// 这里落地第 3、5、6 步：`preReceive` 在归档之前（可以丢弃或改写），`postReceive` 在
+    /// 归档之后、判定之前，`shouldWake` 是判定的最终决定。
     pub fn ingest(
         &mut self,
         device: &Device,
         scope: &ScopeConfig,
         persona: &str,
-        message: Message,
+        mut message: Message,
         now: OffsetDateTime,
         roll: f64,
     ) -> Action {
         let own = message.own;
+
+        // 第 3 步：preReceive。丢弃则到此为止——不归档、不判定、不唤醒。
+        // 快照在改写之前取：脚本看到的是原始事件。
+        let snapshot = Snapshot::of_message(&message, true);
+        let ruling = match self.hooks.get_mut(&device.id) {
+            Some(hooks) => hooks.pre_receive(&snapshot.view()),
+            None => Ruling::keep(),
+        };
+        if ruling.dropped {
+            return Action::Stay;
+        }
+        if let Some(text) = ruling.text {
+            message.text = text;
+        }
+        let tags = ruling.tags;
+        // 改写后的正文要留给 shouldWake；快照本身仍是改写前的原始事件。
+        let message_text = message.text.clone();
+        let snapshot_before_rewrite = snapshot;
+
         // 判定需要消息的字段，但 `append` 要拿走所有权——先判定，再追加。顺序不影响结论：
         // 判定只看这一条，不看归档。
         let reason = {
@@ -113,6 +156,19 @@ impl Pipeline {
 
         let appended = self.archive.append(&device.memory, message);
 
+        // 第 5 步：postReceive。归档之后、判定之前，只看增量。
+        // 快照取自归档里的那条：钩子看见的是别人读时会看见的同一份。
+        if let Some(hooks) = self.hooks.get_mut(&device.id) {
+            let archived = self
+                .archive
+                .unread(&device.memory, &scope.group)
+                .last()
+                .map(|message| Snapshot::of_message(message, appended.fresh));
+            if let Some(archived) = archived {
+                hooks.post_receive(&archived.view());
+            }
+        }
+
         // 自己发的消息照样归档，但不叫醒自己。
         if own {
             return Action::Stay;
@@ -123,6 +179,26 @@ impl Pipeline {
             return Action::Stay;
         }
 
+        // 第 6 步：shouldWake。脚本否决即不唤醒；未命中时也能自行判定为唤醒。
+        //
+        // 事件用**改写之后**的那份：`preReceive` 改文本的目的就是让后续判定看到新文本，
+        // 否则那次改写只是改归档、不改行为。
+        let judged = Snapshot {
+            text: message_text,
+            ..snapshot_before_rewrite
+        };
+        let ruling = reason.as_ref().map(WakeReason::label);
+        let reason = match self.hooks.get_mut(&device.id) {
+            Some(hooks) => match hooks.should_wake(&judged.view(), &tags, ruling.as_deref()) {
+                // 脚本原样返回规则的原因：保留规则身份，别把它变成脚本原因。
+                Ok(Some(label)) if ruling.as_deref() == Some(label.as_str()) => reason,
+                Ok(Some(label)) => Some(WakeReason::Hook(label)),
+                Ok(None) => None,
+                // 脚本抛错时不否决：按规则结论继续（不变量八）。
+                Err(_) => reason,
+            },
+            None => reason,
+        };
         let Some(reason) = reason else {
             return Action::Stay;
         };
@@ -140,7 +216,29 @@ impl Pipeline {
         now: OffsetDateTime,
         roll: f64,
     ) -> Action {
-        let Some(reason) = judge_poke(&device.wake, from, now, roll) else {
+        let Some(sender) = from else {
+            return Action::Stay;
+        };
+        let rule = judge_poke(&device.wake, from, now, roll);
+
+        // 拍一拍没有归档内容，`batch` 为 0；它照样要过 shouldWake。
+        let snapshot = Snapshot::of_poke(&scope.group, sender, now.unix_timestamp() * 1000);
+        let reason = match self.hooks.get_mut(&device.id) {
+            Some(hooks) => match hooks.should_wake(
+                &snapshot.view(),
+                &[],
+                rule.as_ref().map(WakeReason::label).as_deref(),
+            ) {
+                Ok(Some(label)) => Some(WakeReason::Hook(label)),
+                // 脚本否决：不唤醒。
+                Ok(None) => None,
+                // 脚本抛错时不否决，按规则结论继续（不变量八）。
+                Err(_) => rule,
+            },
+            None => rule,
+        };
+
+        let Some(reason) = reason else {
             return Action::Stay;
         };
         self.start_or_defer(device, scope, persona, reason, now)
@@ -320,7 +418,14 @@ impl Pipeline {
     }
 
     /// 积压期间保留最强的那个原因。
+    ///
+    /// 脚本给的原因总是替换：它是判定的最终决定，与规则在 `rank` 上并列时不该被先到的那条
+    /// 规则压住。
     fn remember_reason(&mut self, memory: &str, reason: WakeReason) {
+        if matches!(reason, WakeReason::Hook(_)) {
+            self.pending.insert(memory.to_owned(), reason);
+            return;
+        }
         match self.pending.get(memory) {
             Some(current) if current.rank() <= reason.rank() => {}
             _ => {
@@ -415,6 +520,18 @@ mod tests {
         Pipeline::new(Limits::default(), 100, Duration::minutes(10))
     }
 
+    /// 装上脚本的管线。脚本与设备 id 对得上。
+    fn hooked(source: &str) -> Pipeline {
+        let hooks = crate::hooks::Hooks::from_source(
+            "alice-phone",
+            source,
+            "test.lua",
+            crate::hooks::HookLimits::default(),
+        )
+        .expect("脚本应能加载");
+        pipeline().with_hooks(BTreeMap::from([("alice-phone".to_owned(), hooks)]))
+    }
+
     fn message(id: &str, sender: &str, text: &str) -> Message {
         Message {
             account: "main".to_owned(),
@@ -452,6 +569,199 @@ mod tests {
         assert_eq!(delivery.wake_reason, "at_mention");
         assert_eq!(delivery.watermark, 1);
         assert_eq!(pipeline.archive().retained("alice"), 1, "先归档后判定");
+    }
+
+    #[test]
+    fn hook_can_drop_a_message_before_it_is_archived() {
+        // 空正文的 @ 消息：规则上该唤醒，脚本把它丢掉。
+        let mut pipeline =
+            hooked("function preReceive(ev) if ev.text == \"\" then return nil end return ev end");
+        assert_eq!(
+            pipeline.ingest(
+                &device(),
+                &scope(),
+                "你是……",
+                mentioned("1", "30002", ""),
+                now(),
+                0.0
+            ),
+            Action::Stay
+        );
+        assert_eq!(
+            pipeline.archive().retained("alice"),
+            0,
+            "丢弃的消息不该归档"
+        );
+
+        // 非空消息照常进入归档并唤醒。
+        assert!(matches!(
+            pipeline.ingest(
+                &device(),
+                &scope(),
+                "你是……",
+                mentioned("2", "30002", "在"),
+                now(),
+                0.0
+            ),
+            Action::Deliver(_)
+        ));
+    }
+
+    #[test]
+    fn hook_rewrite_changes_what_should_wake_sees() {
+        // 脚本把正文改写成带关键词的样子，再在 shouldWake 里按新文本判定。
+        let mut pipeline = hooked(
+            r#"function preReceive(ev)
+                 ev.text = ev.text .. " 上线"
+                 return ev
+               end
+               function shouldWake(ev, reason)
+                 if ev.text:find("上线") then return "keyword:上线" end
+                 return reason
+               end"#,
+        );
+        let Action::Deliver(delivery) = pipeline.ingest(
+            &device(),
+            &scope(),
+            "你是……",
+            message("1", "30002", "我回来了"),
+            now(),
+            0.0,
+        ) else {
+            panic!("改写后的文本应触发唤醒");
+        };
+        assert_eq!(delivery.wake_reason, "keyword:上线");
+    }
+
+    #[test]
+    fn hook_can_veto_a_rule_hit() {
+        let mut pipeline = hooked("function shouldWake(ev, reason) return nil end");
+        assert_eq!(
+            pipeline.ingest(
+                &device(),
+                &scope(),
+                "你是……",
+                mentioned("1", "30002", "在吗"),
+                now(),
+                0.0
+            ),
+            Action::Stay,
+            "脚本否决后不该唤醒"
+        );
+        // 归档仍然发生：否决唤醒不等于丢消息。
+        assert_eq!(pipeline.archive().retained("alice"), 1);
+    }
+
+    #[test]
+    fn hook_can_wake_when_rules_stayed() {
+        let mut pipeline = hooked(
+            r#"function shouldWake(ev, reason)
+                 if reason == nil and ev.text:find("上线") then return "keyword:上线" end
+                 return reason
+               end"#,
+        );
+        let Action::Deliver(delivery) = pipeline.ingest(
+            &device(),
+            &scope(),
+            "你是……",
+            message("1", "30002", "我上线了"),
+            now(),
+            0.0,
+        ) else {
+            panic!("规则未命中时脚本应能自行判定");
+        };
+        assert_eq!(delivery.wake_reason, "keyword:上线");
+    }
+
+    #[test]
+    fn unchanged_reason_keeps_its_rule_identity() {
+        // 脚本原样返回规则原因时不该被标成脚本原因：否则「为什么醒」的归因就变了。
+        let mut pipeline = hooked("function shouldWake(ev, reason) return reason end");
+        let Action::Deliver(delivery) = pipeline.ingest(
+            &device(),
+            &scope(),
+            "你是……",
+            mentioned("1", "30002", "在吗"),
+            now(),
+            0.0,
+        ) else {
+            panic!("应能唤醒");
+        };
+        assert_eq!(delivery.wake_reason, "at_mention");
+    }
+
+    #[test]
+    fn broken_hook_does_not_lose_the_message() {
+        let mut pipeline = hooked("function preReceive(ev) error('boom') end");
+        // 抛错按保留处理：消息照样归档、照样唤醒。
+        assert!(matches!(
+            pipeline.ingest(
+                &device(),
+                &scope(),
+                "你是……",
+                mentioned("1", "30002", "在吗"),
+                now(),
+                0.0
+            ),
+            Action::Deliver(_)
+        ));
+        assert_eq!(pipeline.archive().retained("alice"), 1);
+        let logs = pipeline
+            .hooks_mut()
+            .get_mut("alice-phone")
+            .expect("应有环境")
+            .drain_logs();
+        assert!(logs.iter().any(|log| log.message.contains("boom")));
+    }
+
+    #[test]
+    fn broken_should_wake_does_not_veto() {
+        let mut pipeline = hooked("function shouldWake(ev, reason) error('boom') end");
+        let Action::Deliver(delivery) = pipeline.ingest(
+            &device(),
+            &scope(),
+            "你是……",
+            mentioned("1", "30002", "在吗"),
+            now(),
+            0.0,
+        ) else {
+            panic!("脚本 bug 不该导致永眠");
+        };
+        assert_eq!(delivery.wake_reason, "at_mention");
+    }
+
+    #[test]
+    fn hook_reason_survives_backlog_merge() {
+        let mut pipeline = hooked(
+            r#"function shouldWake(ev, reason)
+                 if ev.text:find("急") then return "custom:urgent" end
+                 return reason
+               end"#,
+        );
+        let Action::Deliver(first) = pipeline.ingest(
+            &device(),
+            &scope(),
+            "你是……",
+            mentioned("1", "30002", "在吗"),
+            now(),
+            0.0,
+        ) else {
+            panic!("第一轮应能开始");
+        };
+
+        let mut urgent = message("2", "30002", "急事");
+        urgent.at_self = false;
+        assert_eq!(
+            pipeline.ingest(&device(), &scope(), "你是……", urgent, now(), 0.0),
+            Action::Defer,
+            "队列忙应积压"
+        );
+
+        let merged = pipeline
+            .finish(&device(), &scope(), "你是……", &first.ticket, now())
+            .expect("应能收尾")
+            .expect("有积压就该再投");
+        assert_eq!(merged.wake_reason, "custom:urgent", "脚本给的原因应保留");
     }
 
     #[test]

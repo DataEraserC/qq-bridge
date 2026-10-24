@@ -48,6 +48,8 @@ pub enum WakeReason {
     AnyMessage,
     Probability,
     IdlePrompt,
+    /// 脚本在 `shouldWake` 里自己给出的原因，或改写后的原因。标签原样传出。
+    Hook(String),
 }
 
 impl WakeReason {
@@ -62,6 +64,8 @@ impl WakeReason {
             Self::AnyMessage => "any_message".to_owned(),
             Self::Probability => "probability".to_owned(),
             Self::IdlePrompt => "idle_prompt".to_owned(),
+            // 脚本给的就是标签：加前缀会篡改它的语义。
+            Self::Hook(label) => label.clone(),
         }
     }
 
@@ -79,6 +83,8 @@ impl WakeReason {
             Self::AnyMessage => 5,
             Self::Probability => 6,
             Self::IdlePrompt => 7,
+            // 脚本是判定的最终决定者，它给出的原因优先于任何规则命中的结果。
+            Self::Hook(_) => 0,
         }
     }
 }

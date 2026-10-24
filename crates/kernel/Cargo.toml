@@ -29,3 +29,4 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 interprocess = "2.4"
 subtle = "2.6"
+mlua = { version = "0.12", features = ["lua54", "vendored"] }

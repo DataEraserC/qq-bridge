@@ -25,6 +25,7 @@ use qqab_kernel::adapter::Server;
 use qqab_kernel::archive::Limits;
 use qqab_kernel::config::{Account, Config};
 use qqab_kernel::conn::Pool;
+use qqab_kernel::hooks::Hooks;
 use qqab_kernel::persona::{Personas, base_dir};
 use qqab_kernel::pipeline::Pipeline;
 use qqab_kernel::runtime::{Inbound, Kernel, Outbound};
@@ -68,15 +69,23 @@ fn run(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("读不到配置 {}（{error}）", config_path.display()))?;
 
     let config = Config::parse(&text).map_err(|error| format!("配置不合法：{error}"))?;
-    let personas = Personas::load(&config, &base_dir(&config_path))
-        .map_err(|error| format!("人格加载失败：{error}"))?;
+    let base = base_dir(&config_path);
+    let personas =
+        Personas::load(&config, &base).map_err(|error| format!("人格加载失败：{error}"))?;
+
+    // 钩子在启动时一次性加载：语法错当场失败，不留到运行期（见 06-hooks.md#加载时机）。
+    let hooks: BTreeMap<String, Hooks> = Hooks::load_all(&config, &base)
+        .map_err(|error| format!("钩子加载失败：{error}"))?
+        .into_iter()
+        .collect();
 
     let pipeline = Pipeline::new(
         Limits::default(),
         config.notes.max_entries,
         time::Duration::seconds(config.adapter.turn_timeout_sec as i64),
     )
-    .with_note_budget(config.notes.digest_budget_tokens);
+    .with_note_budget(config.notes.digest_budget_tokens)
+    .with_hooks(hooks);
 
     let pool = Pool::new(&config.accounts);
     let mut kernel = Kernel::new(config.clone(), personas, pipeline, pool);

@@ -159,7 +159,7 @@ impl Kernel {
     ///
     /// 时间由调用方传入：同一条事件流在不同时刻重放会得到同一份结论。
     pub fn handle(&mut self, inbound: Inbound, now: OffsetDateTime) -> Vec<Outbound> {
-        match inbound {
+        let mut out = match inbound {
             Inbound::Qq { account, incoming } => self.on_qq(&account, incoming, now),
             Inbound::LinkUp { account, actions } => {
                 self.actions.insert(account.clone(), actions);
@@ -171,7 +171,10 @@ impl Kernel {
             }
             Inbound::Adapter(event) => self.on_adapter(event, now),
             Inbound::Tick => self.on_tick(now),
-        }
+        };
+        // 处理一条输入后统一收钩子日志：脚本的 `log()` 与内核日志走同一条出口。
+        out.extend(self.drain_hook_logs());
+        out
     }
 
     /// 执行内核自己能做的出站动作：写适配器、断开连接。
@@ -212,6 +215,23 @@ impl Kernel {
     /// 供测试与诊断读取。
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
+    }
+
+    /// 把钩子攒下的日志变成出站日志。
+    ///
+    /// 钩子在里面没有日志出口——它们只写进缓冲区，由这里统一交给主循环写 stderr。
+    /// 这样脚本的 `log()` 与内核对日志的口径一致，也不必让 Lua 环境握住一个 IO 句柄。
+    pub fn drain_hook_logs(&mut self) -> Vec<Outbound> {
+        let mut out = Vec::new();
+        for (device, hooks) in self.pipeline.hooks_mut() {
+            for log in hooks.drain_logs() {
+                out.push(Outbound::Log {
+                    level: hook_level(&log.level),
+                    message: format!("钩子[{device}]：{}", log.message),
+                });
+            }
+        }
+        out
     }
 
     pub fn pool(&self) -> &Pool {
@@ -855,6 +875,19 @@ impl Kernel {
 ///
 /// 长度不同也走完整比较：提前返回会让攻击者按用时逐字节猜。令牌是内网里的一个共享
 /// 字符串，长度差异本身不敏感，但用统一的比较路径省得每次都要论证一遍。
+/// 脚本给的级别名映射到出站日志的那几个静态名。
+///
+/// `Outbound::Log` 的 `level` 是 `&'static str`——主循环只做一次 `eprintln!`，不值得为它
+/// 引入分配。未知级别降到 `info`：脚本写错级别不该让日志丢掉。
+fn hook_level(level: &str) -> &'static str {
+    match level {
+        "debug" => "debug",
+        "warn" | "warning" => "warn",
+        "error" => "error",
+        _ => "info",
+    }
+}
+
 fn ct_eq(expected: &Secret, presented: &str) -> bool {
     let expected = match expected {
         Secret::Literal(value) => value.as_str(),

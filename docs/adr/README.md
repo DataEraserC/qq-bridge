@@ -11,6 +11,7 @@
 | [0005](0005-notes-as-keyed-records.md) | 笔记是带主键的结构化记录，不用检索系统 | 已采纳 |
 | [0006](0006-blocking-websocket-per-thread.md) | 连接用阻塞 WebSocket 与每连接一线程，不引入 async runtime | 已采纳 |
 | [0007](0007-adapter-endpoint-and-transport.md) | 适配器接入点跨平台、可跨机器，跨机必须配令牌 | 已采纳 |
+| [0008](0008-hook-sandbox-and-limits.md) | 钩子宿主用 mlua vendored；沙箱靠不给，资源上限靠 VM 指令钩子 | 已采纳 |
 
 ## 格式
 

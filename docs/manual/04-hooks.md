@@ -15,7 +15,7 @@ hooks = "hooks/alice.lua"
 
 ## 可用的东西
 
-三个钩子函数、三个宿主函数、若干只读数据。
+三个钩子函数、三个宿主函数、一份只读配置快照。
 
 ### 宿主函数
 
@@ -23,9 +23,27 @@ hooks = "hooks/alice.lua"
 | --- | --- |
 | `log(level, msg)` | 写日志，`level` 取 `"debug"`/`"info"`/`"warn"`/`"error"` |
 | `now()` | 当前 Unix 毫秒时间戳 |
-| `random()` | `[0, 1)` 随机数 |
+| `random()` | `[0, 1)` 随机数，种子来自设备 id，故跨启动可重放 |
 
-没有 `io`、`os.execute`、`require`、`load`、`dofile`、`debug`。钩子只做判定与过滤，不做动作——需要发消息的场合是工具，不是钩子。
+没有 `io`、`os.execute`、`require`、`load`、`loadfile`、`dofile`、`debug`、`collectgarbage`。钩子只做判定与过滤，不做动作——需要发消息的场合是工具，不是钩子。
+
+### 配置快照
+
+`config` 是这台设备的只读副本：
+
+| 字段 | 说明 |
+| --- | --- |
+| `config.id` | 设备 id |
+| `config.memory` | 记忆名 |
+| `config.persona` | 人格 id |
+| `config.accounts` | 可用账号 id 数组 |
+| `config.scopes` | 数组，每项含 `group`、`receive`、`send` |
+
+改它当场抛错。`rawset` 仍能绕过——目标是防误改，不是防恶意脚本。
+
+### 资源上限
+
+每次调用最多 100ms 墙钟、两万条 VM 指令、4 MiB 内存。超限按抛错处理，方向见 [架构：钩子](../architecture/06-hooks.md#超时与资源上限)。
 
 ## preReceive：消息进归档之前
 
@@ -115,8 +133,10 @@ end
 
 ```lua
 function shouldWake(ev, reason)
-  -- 刷屏的单字回复不唤醒
-  if #ev.text <= 2 and reason == "any_message" then
+  -- 刷屏的单字回复不唤醒。按**字符数**而不是字节数：
+  -- Lua 的 # 返回字节数，一个汉字占 3 字节，用 # 永远判不到中文短句。
+  local chars = utf8.len(ev.text) or #ev.text
+  if chars <= 2 and reason == "any_message" then
     return nil
   end
   return reason
@@ -168,7 +188,9 @@ function shouldWake(ev, reason)
     return nil
   end
 
-  if #ev.text <= 2 and reason ~= "at_mention" then
+  -- 同样是字符数：`#` 数的是字节，中文按字节算永远过不了这个阈值。
+  local chars = utf8.len(ev.text) or #ev.text
+  if chars <= 2 and reason ~= "at_mention" then
     return nil
   end
 
