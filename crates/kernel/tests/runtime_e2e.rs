@@ -50,8 +50,12 @@ fn now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_792_561_540).expect("合法时间戳")
 }
 
+fn config_text() -> String {
+    CONFIG.to_owned()
+}
+
 fn config() -> Config {
-    Config::parse(CONFIG).expect("配置应能解析")
+    Config::parse(&config_text()).expect("配置应能解析")
 }
 
 /// 建一个已连上适配器与 QQ 账号的运行时。
@@ -430,6 +434,115 @@ fn no_adapter_means_the_turn_is_abandoned_and_retried_not_lost() {
     );
 }
 
+/// 一个配了接入令牌的内核，其余与 [`kernel`] 相同。
+fn kernel_with_token(token: &str) -> (Kernel, std::sync::mpsc::Receiver<String>) {
+    let mut text = config_text();
+    text.push_str(&format!("\n[adapter]\ntoken = \"{token}\"\n"));
+    let config = Config::parse(&text).expect("应能解析");
+    let personas = Personas::load(&config, std::path::Path::new(".")).expect("应能加载人格");
+    let pool = Pool::new(&config.accounts);
+    let pipeline = Pipeline::new(Limits::default(), 100, Duration::minutes(10));
+    let mut kernel = Kernel::new(config, personas, pipeline, pool);
+
+    let (action_tx, _action_rx) = channel();
+    kernel.handle(
+        Inbound::LinkUp {
+            account: "main".to_owned(),
+            actions: action_tx,
+        },
+        now(),
+    );
+
+    let (out_tx, out_rx) = channel();
+    kernel.handle(
+        Inbound::Adapter(AdapterEvent::Connected {
+            conn: 1,
+            out: out_tx,
+            peer: "test".to_owned(),
+        }),
+        now(),
+    );
+    (kernel, out_rx)
+}
+
+#[test]
+fn hello_with_matching_token_is_accepted() {
+    let (mut kernel, _rx) = kernel_with_token("s3cret");
+    let out = kernel.handle(
+        Inbound::Adapter(AdapterEvent::Frame {
+            conn: 1,
+            frame: Frame::Hello(qqab_proto::Hello {
+                id: "h-1".to_owned(),
+                version: qqab_proto::PROTOCOL_VERSION,
+                adapter: "remote".to_owned(),
+                token: Some("s3cret".to_owned()),
+            }),
+        }),
+        now(),
+    );
+    assert!(
+        frames(&out)
+            .iter()
+            .any(|frame| matches!(frame, Frame::HelloOk(_))),
+        "令牌正确应通过"
+    );
+}
+
+#[test]
+fn hello_with_wrong_or_missing_token_is_rejected_and_closed() {
+    // 跨机器形态下，令牌是唯一的身份来源：错的和没给的一样拒绝。
+    for presented in [Some("wrong"), None] {
+        let (mut kernel, _rx) = kernel_with_token("s3cret");
+        let out = kernel.handle(
+            Inbound::Adapter(AdapterEvent::Frame {
+                conn: 1,
+                frame: Frame::Hello(qqab_proto::Hello {
+                    id: "h-1".to_owned(),
+                    version: qqab_proto::PROTOCOL_VERSION,
+                    adapter: "remote".to_owned(),
+                    token: presented.map(|value| value.to_owned()),
+                }),
+            }),
+            now(),
+        );
+        assert!(
+            frames(&out)
+                .iter()
+                .any(|frame| matches!(frame, Frame::HelloReject(_))),
+            "令牌 {presented:?} 应被拒绝"
+        );
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Outbound::CloseAdapter { conn: 1 })),
+            "拒绝之后要断开"
+        );
+    }
+}
+
+#[test]
+fn hello_without_token_is_fine_when_none_configured() {
+    // 本机形态不配令牌：不给令牌照样通过。
+    let (mut kernel, _rx) = kernel();
+    let out = kernel.handle(
+        Inbound::Adapter(AdapterEvent::Frame {
+            conn: 1,
+            frame: Frame::Hello(qqab_proto::Hello {
+                id: "h-1".to_owned(),
+                version: qqab_proto::PROTOCOL_VERSION,
+                adapter: "local".to_owned(),
+                token: None,
+            }),
+        }),
+        now(),
+    );
+    assert!(
+        frames(&out)
+            .iter()
+            .any(|frame| matches!(frame, Frame::HelloOk(_))),
+        "没配令牌时缺省字段不影响握手"
+    );
+}
+
 #[test]
 fn hello_version_mismatch_is_rejected_and_closed() {
     let (mut kernel, _rx) = kernel();
@@ -440,6 +553,7 @@ fn hello_version_mismatch_is_rejected_and_closed() {
                 id: "h-1".to_owned(),
                 version: 99,
                 adapter: "future".to_owned(),
+                token: None,
             }),
         }),
         now(),
@@ -469,6 +583,7 @@ fn same_version_hello_is_accepted() {
                 id: "h-1".to_owned(),
                 version: qqab_proto::PROTOCOL_VERSION,
                 adapter: "dsh".to_owned(),
+                token: None,
             }),
         }),
         now(),

@@ -128,9 +128,25 @@ memory = "alice"
 
 ```toml
 [adapter]
-socket = "/run/user/1000/qqab.sock"   # 内核监听，适配器连接
+socket = "/run/user/1000/qqab.sock"   # 内核监听的接入点
 turn_timeout_sec = 600               # 单回合上限，超时视为失败
+token = "env:QQAB_ADAPTER_TOKEN"     # 跨机器时必填
 ```
+
+`socket` 有三种写法，帧格式完全相同：
+
+| 写法 | 形态 | 跨机器 |
+| --- | --- | --- |
+| `/run/user/1000/qqab.sock` | Unix 域套接字 | 否 |
+| `\\.\pipe\qqab` | Windows 命名管道 | 否 |
+| `local:qqab` | 平台命名空间（Linux 抽象命名空间 / Windows 管道） | 否 |
+| `tcp://0.0.0.0:7000` | TCP | **是** |
+
+Windows 部署必须显式写 `\\.\pipe\qqab` 或 `local:qqab`——缺省值是一个 Unix 路径，在 Windows 上不存在。
+
+**跨机器必须配 `token`。** 监听非回环地址时，同网段任何人都能冒充适配器接管投递，所以内核在启动期就拒绝「TCP 监听非回环地址但没配 token」的组合。本机形态不强制：文件权限或命名空间隔离已经是边界。
+
+令牌在 `hello` 帧里核对，配了就必须一致，否则连接被拒绝并断开。
 
 ## 笔记
 

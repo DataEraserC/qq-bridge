@@ -1,6 +1,6 @@
 # 连接用阻塞 WebSocket 与每连接一线程
 
-OneBot 实现只提供 WebSocket。内核要同时持有 N 条长连接（每账号一条）和一份本机 socket 服务端，决定用 `tungstenite` 的**阻塞** API，每条连接一个线程，不引入 async runtime。
+OneBot 实现只提供 WebSocket。内核要同时持有 N 条长连接（每账号一条）和一份适配器接入服务端，决定用 `tungstenite` 的**阻塞** API，每条连接一个线程，不引入 async runtime。
 
 ## 理由
 
@@ -19,5 +19,5 @@ OneBot 实现只提供 WebSocket。内核要同时持有 N 条长连接（每账
 ## 后果
 
 - 连接数上限由线程数决定。几百个账号时会开始吃栈，届时换 tokio 是局部替换（只改 `transport`），管线与归档不受影响。
-- `tungstenite` 的 TLS 特性不启用：OneBot 实现按配置跑在本机或内网，`ws://` 即可。将来需要 `wss://` 时开 `__rustls-tls` 特性，仍不改上层。
+- `tungstenite` 的 TLS 特性**开启**（rustls + ring）：`ws://` 与 `wss://` 共用同一条读取循环，只是底层是 `MaybeTlsStream<TcpStream>`。选 ring 而不是 rustls 缺省的 aws-lc-rs，是因为后者要 cmake——交叉编译时多一层工具链依赖，而 ring 只要 C 编译器。
 - 线程间共享的状态（连接池、管线）用一把 `Mutex` 串起来。争用点在事件处理与回合收尾，都是短临界区——不是热点路径。

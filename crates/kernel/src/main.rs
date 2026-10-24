@@ -85,8 +85,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let (bus_tx, bus_rx) = channel::<Inbound>();
 
     // 适配器接入：内核监听，适配器连上来。
-    let server = Server::bind(std::path::Path::new(&config.adapter.socket))
-        .map_err(|error| error.to_string())?;
+    let server = Server::bind(&config.adapter.endpoint).map_err(|error| error.to_string())?;
     let bus_for_adapter = bus_tx.clone();
     let (adapter_tx, adapter_rx) = channel::<qqab_kernel::adapter::AdapterEvent>();
     Server::spawn(server, adapter_tx);
@@ -129,7 +128,10 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     });
 
-    eprintln!("qqab：已启动（socket {}）", config.adapter.socket);
+    eprintln!(
+        "qqab：已启动（适配器接入点 {}）",
+        config.adapter.endpoint.describe()
+    );
     main_loop(&mut kernel, &bus_rx, &config, &bus_tx, &mut links);
     Ok(())
 }

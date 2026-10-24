@@ -4,17 +4,24 @@
 //! 序列化结果比对。这张表是适配器作者唯一会读的东西——它写少了字段，适配器就少实现一条；
 //! 写多了字段，适配器就实现一个内核不发的字段。
 
-use qqab_proto::{Block, Deliver, Frame, Scope, decode, encode};
+use qqab_proto::{Block, Deliver, Frame, PROTOCOL_VERSION, Scope, decode, encode};
 
 const PROTOCOL_DOC: &str = include_str!("../../../docs/architecture/05-protocol.md");
 
 /// 取 `### deliver` 小节里那张字段表的字段名，按文档顺序。
 fn documented_deliver_fields() -> Vec<String> {
+    documented_fields("### `deliver`", "deliver")
+}
+
+/// 取某个 `### ` 小节里第一张字段表的字段名。
+fn documented_fields(heading: &str, what: &str) -> Vec<String> {
     let start = PROTOCOL_DOC
-        .find("### `deliver`")
-        .expect("文档里应有 deliver 小节");
+        .find(heading)
+        .unwrap_or_else(|| panic!("文档里应有 {what} 小节"));
     let body = &PROTOCOL_DOC[start..];
-    let table_start = body.find("| 字段 |").expect("应有字段表");
+    let table_start = body
+        .find("| 字段 |")
+        .unwrap_or_else(|| panic!("{what} 小节应有字段表"));
     let table = &body[table_start..];
     let table_end = table[2..]
         .find("\n\n")
@@ -90,6 +97,54 @@ fn documented_example_line_decodes() {
 
     assert!(
         matches!(decode(&line), Ok(Frame::Deliver(_))),
+        "文档示例行必须能解码：{line}"
+    );
+}
+
+#[test]
+fn hello_table_lists_every_field() {
+    // 跨机器时 `token` 是唯一身份来源；这张表写少了它，适配器就不会带令牌。
+    let documented = documented_fields("## 版本协商", "版本协商");
+    assert!(!documented.is_empty(), "字段表不该是空的");
+
+    let line = encode(&Frame::Hello(qqab_proto::Hello {
+        id: "h-1".into(),
+        version: PROTOCOL_VERSION,
+        adapter: "dsh".into(),
+        token: Some("s3cret".into()),
+    }))
+    .expect("应能编码");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("应是 JSON");
+    let object = value.as_object().expect("应是对象");
+
+    let mut actual: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| *key != "type")
+        .collect();
+    actual.sort_unstable();
+
+    let mut expected: Vec<&str> = documented.iter().map(String::as_str).collect();
+    expected.sort_unstable();
+
+    assert_eq!(
+        actual, expected,
+        "协议文档的 hello 字段表与帧定义漂移了：文档 {documented:?}"
+    );
+}
+
+#[test]
+fn documented_hello_line_decodes() {
+    // 版本协商小节里的那行示例必须能解成 Hello。
+    let start = PROTOCOL_DOC.find("## 版本协商").expect("应有版本协商小节");
+    let rest = &PROTOCOL_DOC[start..];
+    let fence = rest.find("```json").expect("应有 json 代码块") + "```json".len();
+    let rest = &rest[fence..];
+    let block = &rest[..rest.find("```").expect("代码块应闭合")];
+    let line = block.trim().replace('\n', " ");
+
+    assert!(
+        matches!(decode(&line), Ok(Frame::Hello(_))),
         "文档示例行必须能解码：{line}"
     );
 }

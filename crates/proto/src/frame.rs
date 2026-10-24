@@ -95,12 +95,17 @@ pub struct HelloReject {
     pub reason: String,
 }
 
-/// 连接建立后适配器发 `hello`，带协议版本。
+/// 连接建立后适配器发 `hello`，带协议版本与接入令牌。
+///
+/// `token` 只在跨机器形态下必需——本机套接字靠文件权限隔离。缺省时字段不出现，
+/// 所以本机适配器不需要关心它。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub id: String,
     pub version: u32,
     pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// 对 `deliver` 的成功响应。

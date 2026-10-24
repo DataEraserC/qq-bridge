@@ -4,9 +4,8 @@
 //! [`Server`] 绑出来的 socket，QQ 一侧是 `transport::Connection` 连到一个回环 WebSocket
 //! 服务端。只缺 `main` 自己的主循环，其余接线全是生产代码。
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
-use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::Duration;
@@ -100,8 +99,68 @@ fn onebot_server() -> (String, thread::JoinHandle<Vec<u8>>) {
     (format!("ws://127.0.0.1:{port}"), handle)
 }
 
-fn temp_socket() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("qqab-wiring-{}.sock", std::process::id()))
+fn temp_endpoint() -> qqab_kernel::endpoint::Endpoint {
+    let unique = format!("qqab-wiring-{}", std::process::id());
+    if cfg!(windows) {
+        qqab_kernel::endpoint::Endpoint::Namespaced(unique)
+    } else {
+        qqab_kernel::endpoint::Endpoint::Path(std::env::temp_dir().join(unique))
+    }
+}
+
+/// 测试当适配器：连到内核绑的接入点上。
+fn connect(endpoint: &qqab_kernel::endpoint::Endpoint) -> qqab_kernel::adapter::Conn {
+    use interprocess::local_socket::traits::Stream as _;
+    use interprocess::local_socket::{
+        GenericFilePath, GenericNamespaced, Stream, ToFsName, ToNsName,
+    };
+
+    let stream = match endpoint {
+        qqab_kernel::endpoint::Endpoint::Path(path) => {
+            let name = path
+                .as_path()
+                .to_fs_name::<GenericFilePath>()
+                .expect("路径应可用");
+            Stream::connect(name).expect("应能连上内核")
+        }
+        qqab_kernel::endpoint::Endpoint::Namespaced(name) => {
+            let name = name
+                .as_str()
+                .to_ns_name::<GenericNamespaced>()
+                .expect("名字应可用");
+            Stream::connect(name).expect("应能连上内核")
+        }
+        other => panic!("接线测试不走 TCP 形态，实际 {other:?}"),
+    };
+    stream.set_nonblocking(true).expect("应能设非阻塞");
+    qqab_kernel::adapter::Conn::Local(stream)
+}
+
+/// 非阻塞读到一个完整行为止。
+fn read_line(client: &mut qqab_kernel::adapter::Conn) -> String {
+    use std::io::Read as _;
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut chunk = [0u8; 4096];
+    while std::time::Instant::now() < deadline {
+        match client.read(&mut chunk) {
+            Ok(0) => panic!("连接被关闭了"),
+            Ok(count) => {
+                got.extend_from_slice(&chunk[..count]);
+                if got.contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("读失败：{error}"),
+        }
+    }
+    String::from_utf8_lossy(&got).trim_end().to_owned()
 }
 
 /// 等待适配器连上来。
@@ -127,7 +186,7 @@ fn frames(out: &[Outbound]) -> Vec<Frame> {
 #[test]
 fn full_loop_from_qq_message_to_delivered_frame_and_back() {
     let (ws_url, onebot) = onebot_server();
-    let socket_path = temp_socket();
+    let endpoint = temp_endpoint();
 
     let config =
         Config::parse(&CONFIG.replace("WS_URL_PLACEHOLDER", &ws_url)).expect("配置应能解析");
@@ -141,14 +200,11 @@ fn full_loop_from_qq_message_to_delivered_frame_and_back() {
     );
 
     // 真 socket：内核监听，测试当适配器连上去。
-    let server = qqab_kernel::adapter::Server::bind(&socket_path).expect("应能绑定");
+    let server = qqab_kernel::adapter::Server::bind(&endpoint).expect("应能绑定");
     let (adapter_tx, adapter_rx) = channel();
     qqab_kernel::adapter::Server::spawn(server, adapter_tx);
 
-    let mut client = UnixStream::connect(&socket_path).expect("应能连上内核");
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("应能设超时");
+    let mut client = connect(&endpoint);
     let (conn, out) = await_connected(&adapter_rx);
     // 先登记连接：不登记的话内核没有写出通道，回不了 hello_ok。
     kernel.handle(
@@ -287,15 +343,4 @@ fn full_loop_from_qq_message_to_delivered_frame_and_back() {
     assert_eq!(value["action"], "send_group_msg");
     assert_eq!(value["params"]["group_id"], "20001");
     assert_eq!(value["params"]["message"], "在");
-
-    let _ = std::fs::remove_file(&socket_path);
-}
-
-/// 从 socket 读一整行。
-fn read_line(client: &mut UnixStream) -> String {
-    let mut buffer = [0u8; 8192];
-    let count = client.read(&mut buffer).expect("应能读到一行");
-    String::from_utf8_lossy(&buffer[..count])
-        .trim_end()
-        .to_owned()
 }

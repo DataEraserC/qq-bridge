@@ -5,10 +5,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+use crate::endpoint::Endpoint;
 
 /// 已校验的配置模型。
 #[derive(Debug, Clone)]
@@ -393,25 +396,35 @@ impl TryFrom<RawWake> for WakeConfig {
 
 #[derive(Debug, Clone)]
 pub struct AdapterConfig {
-    /// 内核监听，适配器连接。
-    pub socket: String,
+    /// 内核监听的接入点。三种形态见 [`Endpoint`](crate::endpoint::Endpoint)：
+    /// 文件路径、命名空间、`tcp://主机:端口`。
+    pub endpoint: Endpoint,
     /// 单回合上限，超时视为失败。
     pub turn_timeout_sec: u64,
+    /// 适配器接入令牌。跨机器时必须配，本机形态可以省略。
+    pub token: Option<Secret>,
 }
 
 impl Default for AdapterConfig {
     fn default() -> Self {
+        // 缺省是本机文件路径。Windows 上同一行配置会被 `Endpoint::parse` 读成路径，但那个
+        // 路径在 Windows 上不存在——部署者必须显式写 `\\.\pipe\qqab` 或 `local:qqab`。
+        // 之所以不做平台分支：配置是部署者写的，猜平台比让他写清楚更危险。
         Self {
-            socket: "/run/user/1000/qqab.sock".to_owned(),
+            endpoint: Endpoint::Path(PathBuf::from("/run/user/1000/qqab.sock")),
             turn_timeout_sec: 600,
+            token: None,
         }
     }
 }
 
 impl AdapterConfig {
     fn validated(self) -> Result<Self, ConfigError> {
-        if self.socket.trim().is_empty() {
-            return Err(ConfigError::EmptySocket);
+        // 跨机器的接入点必须配令牌：同网段任何人都能冒充适配器接管投递。
+        if self.endpoint.reaches_other_machines() && self.token.is_none() {
+            return Err(ConfigError::CrossMachineWithoutToken {
+                endpoint: self.endpoint.describe(),
+            });
         }
         if self.turn_timeout_sec == 0 {
             return Err(ConfigError::ZeroTimeout);
@@ -516,16 +529,26 @@ struct RawWake {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawAdapter {
+    /// 接入点。保留 `socket` 这个名字——它描述的就是这条通道，换传输形态不改语义。
     socket: Option<String>,
     turn_timeout_sec: Option<u64>,
+    token: Option<String>,
 }
 
 impl RawAdapter {
     fn validated(self) -> Result<AdapterConfig, ConfigError> {
         let default = AdapterConfig::default();
+        let endpoint = match self.socket {
+            Some(text) => Endpoint::parse(&text).map_err(|error| ConfigError::BadEndpoint {
+                value: text,
+                detail: error.to_string(),
+            })?,
+            None => default.endpoint,
+        };
         AdapterConfig {
-            socket: self.socket.unwrap_or(default.socket),
+            endpoint,
             turn_timeout_sec: self.turn_timeout_sec.unwrap_or(default.turn_timeout_sec),
+            token: self.token.map(Secret::parse),
         }
         .validated()
     }
@@ -619,8 +642,10 @@ pub enum ConfigError {
     ProbabilityOutOfRange { probability: f64 },
     #[error("wake.sleep_until 不是合法 RFC 3339 时间：{value}")]
     BadSleepUntil { value: String },
-    #[error("adapter.socket 不能为空")]
-    EmptySocket,
+    #[error("adapter.socket {value:?} 不是一个可用的接入点：{detail}")]
+    BadEndpoint { value: String, detail: String },
+    #[error("接入点 {endpoint} 可被其它机器连上，必须配 adapter.token")]
+    CrossMachineWithoutToken { endpoint: String },
     #[error("adapter.turn_timeout_sec 不能为 0")]
     ZeroTimeout,
     #[error("notes.max_entries 不能为 0")]
@@ -904,6 +929,71 @@ accounts = ["main"]
         let from_env = Secret::parse("env:QQ_TOKEN".to_owned());
         assert_eq!(from_env, Secret::Env("QQ_TOKEN".to_owned()));
         assert!(format!("{from_env:?}").contains("QQ_TOKEN"));
+    }
+
+    #[test]
+    fn adapter_endpoint_defaults_to_local_path() {
+        let config = Config::parse(MINIMAL).expect("应能解析");
+        assert_eq!(
+            config.adapter.endpoint,
+            Endpoint::Path(PathBuf::from("/run/user/1000/qqab.sock"))
+        );
+        assert!(config.adapter.token.is_none());
+    }
+
+    #[test]
+    fn adapter_accepts_every_endpoint_form() {
+        for (text, expected) in [
+            (
+                "/run/user/1000/qqab.sock",
+                Endpoint::Path(PathBuf::from("/run/user/1000/qqab.sock")),
+            ),
+            ("local:qqab", Endpoint::Namespaced("qqab".to_owned())),
+            (
+                "tcp://127.0.0.1:7000",
+                Endpoint::Tcp {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7000,
+                },
+            ),
+        ] {
+            let with_token = if matches!(expected, Endpoint::Tcp { .. }) {
+                "\n[adapter]\nsocket = \"".to_owned() + text + "\"\ntoken = \"s3cret\"\n"
+            } else {
+                "\n[adapter]\nsocket = \"".to_owned() + text + "\"\n"
+            };
+            let config = Config::parse(&format!("{MINIMAL}{with_token}")).expect("应能解析");
+            assert_eq!(config.adapter.endpoint, expected, "{text} 应解析成该形态");
+        }
+    }
+
+    #[test]
+    fn cross_machine_endpoint_requires_token() {
+        // 监听非回环地址 = 同网段任何人都能冒充适配器。
+        let text = format!("{MINIMAL}\n[adapter]\nsocket = \"tcp://0.0.0.0:7000\"\n");
+        assert!(matches!(
+            Config::parse(&text).expect_err("跨机器必须配令牌"),
+            ConfigError::CrossMachineWithoutToken { .. }
+        ));
+
+        // 配了令牌就通过。
+        let ok =
+            format!("{MINIMAL}\n[adapter]\nsocket = \"tcp://0.0.0.0:7000\"\ntoken = \"s3cret\"\n");
+        let config = Config::parse(&ok).expect("应能解析");
+        assert!(config.adapter.token.is_some());
+
+        // 本机形态不强制：文件权限已经是隔离手段。
+        let local = format!("{MINIMAL}\n[adapter]\nsocket = \"tcp://127.0.0.1:7000\"\n");
+        assert!(Config::parse(&local).is_ok());
+    }
+
+    #[test]
+    fn bad_endpoint_is_rejected() {
+        let text = format!("{MINIMAL}\n[adapter]\nsocket = \"tcp://127.0.0.1\"\n");
+        assert!(matches!(
+            Config::parse(&text).expect_err("缺端口应失败"),
+            ConfigError::BadEndpoint { .. }
+        ));
     }
 
     #[test]

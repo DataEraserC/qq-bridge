@@ -5,7 +5,7 @@ qq-agent-bridge 让 agent 以真实的 QQ 账号身份参与群聊。它由两�
 - **内核**（Rust）—— QQ 侧语义：账号、群、订阅范围、唤醒判定、消息归档、工具执行。
 - **适配器**（语言随运行时）—— agent 运行时侧语义：会话、回合、工具声明。当前只有 DSH 适配器，用 TypeScript。
 
-内核不知道会话标识是什么，适配器不知道群号是什么。两者唯一的接触面是本机 Unix socket 上的一份 JSON 协议，见 [协议](docs/architecture/05-protocol.md)。
+内核不知道会话标识是什么，适配器不知道群号是什么。两者唯一的接触面是一份 JSON 协议，跑在本机套接字或 TCP 上（跨机器），见 [协议](docs/architecture/05-protocol.md)。
 
 ## 当前状态
 
@@ -27,9 +27,13 @@ qq-agent-bridge 让 agent 以真实的 QQ 账号身份参与群聊。它由两�
 | `crates/kernel/src/pipeline.rs` | 事件管线：归档 → 判定 → 入队 → 投递，积压合并与唤醒原因保留 |
 | `crates/kernel/src/onebot.rs` | OneBot 11 事件解码与动作编码（消息、拍一拍、生命周期、心跳） |
 | `crates/kernel/src/conn.rs` | 连接池状态机（退避、就绪、轮换）与事件到设备的范围路由 |
-| `crates/kernel/src/transport.rs` | WebSocket 传输：建连、令牌、读循环、动作与响应配对 |
+| `crates/kernel/src/transport.rs` | WebSocket 传输：建连（含 `wss://`）、令牌、读循环、动作与响应配对 |
+| `crates/kernel/src/endpoint.rs` | 适配器接入点：文件路径 / 命名空间 / TCP 三种形态，跨平台判定 |
+| `crates/kernel/src/adapter.rs` | 适配器接入服务端：跨平台监听、非阻塞连接循环、接入令牌校验 |
+| `crates/kernel/src/runtime.rs` | 运行时状态机：握手、投递、工具调用、回合收尾、重投 |
+| `crates/kernel/src/main.rs` | 可执行入口：连接池、适配器接入、时钟与主循环 |
 
-尚未实现：内核与适配器之间的 socket 服务端、工具面、钩子宿主。
+尚未实现：工具面、钩子宿主。
 
 ```sh
 cargo test                      # 全部测试

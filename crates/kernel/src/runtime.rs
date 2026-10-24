@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
 
 use qqab_proto::{
@@ -28,7 +29,7 @@ use qqab_proto::{
 };
 
 use crate::adapter::AdapterEvent;
-use crate::config::{Config, Device, ScopeConfig};
+use crate::config::{Config, Device, ScopeConfig, Secret};
 use crate::conn::{Pool, route};
 use crate::deliver::Delivery;
 use crate::onebot::{Action, Event as QqEvent, MessageEvent, PokeEvent};
@@ -470,6 +471,26 @@ impl Kernel {
     }
 
     fn on_hello(&mut self, conn: u64, hello: Hello) -> Vec<Outbound> {
+        // 跨机器形态必须验令牌：接入点在网络上，文件权限保护不了它。本机形态（路径 /
+        // 命名空间）由操作系统的套接字权限隔离，没有令牌就是没有令牌——不在这里再加一层
+        // 「本机也算可信」的判断，因为内核不掌握对端地址，判断就得靠调用方补信息。
+        if let Some(expected) = &self.config.adapter.token {
+            let presented = hello.token.as_deref().unwrap_or_default();
+            if !ct_eq(expected, presented) {
+                return vec![
+                    self.frame_out(
+                        conn,
+                        Frame::HelloReject(HelloReject {
+                            id: hello.id,
+                            version: PROTOCOL_VERSION,
+                            reason: "接入令牌不匹配".to_owned(),
+                        }),
+                    ),
+                    Outbound::CloseAdapter { conn },
+                ];
+            }
+        }
+
         if hello.version != PROTOCOL_VERSION {
             return vec![
                 self.frame_out(
@@ -828,6 +849,24 @@ impl Kernel {
         let value = self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
         (value >> 11) as f64 / (1_u64 << 53) as f64
     }
+}
+
+/// 常量时间比较令牌。
+///
+/// 长度不同也走完整比较：提前返回会让攻击者按用时逐字节猜。令牌是内网里的一个共享
+/// 字符串，长度差异本身不敏感，但用统一的比较路径省得每次都要论证一遍。
+fn ct_eq(expected: &Secret, presented: &str) -> bool {
+    let expected = match expected {
+        Secret::Literal(value) => value.as_str(),
+        // 环境变量形式在启动期就该读出来；这里读不到就当不匹配，不 panic。
+        Secret::Env(name) => return std::env::var(name).is_ok_and(|value| value == presented),
+    };
+    let left = expected.as_bytes();
+    let right = presented.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    left.ct_eq(right).into()
 }
 
 /// 一次工具调用的失败回执。自由函数：调用方常处在对 `self` 的可变借用里。

@@ -18,9 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use tungstenite::WebSocket;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::Message as WsMessage;
-use tungstenite::{WebSocket, client};
+use tungstenite::stream::MaybeTlsStream;
 
 use crate::config::{Account, Secret};
 use crate::conn::Pool;
@@ -81,11 +82,14 @@ impl Connection {
             detail: error.to_string(),
         })?;
 
-        let (socket, _response) = client::client_with_config(request, stream, Some(build_config()))
-            .map_err(|error| ConnectError::Handshake {
-                url: account.ws_url.clone(),
-                detail: error.to_string(),
-            })?;
+        // `wss://` 由 `tungstenite` 的 TLS 支持处理：请求里是 `wss` 就套一层 rustls，是
+        // `ws` 就原样走明文。两个分支在同一个调用里，上层不必判断。
+        let (socket, _response) =
+            tungstenite::client_tls_with_config(request, stream, Some(build_config()), None)
+                .map_err(|error| ConnectError::Handshake {
+                    url: account.ws_url.clone(),
+                    detail: error.to_string(),
+                })?;
 
         set_read_timeout(&socket);
 
@@ -283,7 +287,14 @@ fn build_config() -> WebSocketConfig {
 /// `tungstenite` 把 IO 错误原样透出，所以超时表现为 `WouldBlock`/`TimedOut`——读循环
 /// 据此回头检查动作队列。没有这个超时，一个空闲群会让发送动作永远等不到执行。
 fn set_read_timeout(socket: &Sock) {
-    let _ = socket.get_ref().set_read_timeout(Some(READ_TIMEOUT));
+    // TLS 之下仍是一条 TCP：读超时必须设在它上面。漏掉 `wss` 这一支的后果不是「读得慢」，
+    // 是读永久阻塞——空闲群上永远等不到字节，动作队列就再也不被检查，发送全部卡死。
+    let _ = match socket.get_ref() {
+        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(Some(READ_TIMEOUT)),
+        MaybeTlsStream::Rustls(stream) => stream.sock.set_read_timeout(Some(READ_TIMEOUT)),
+        // `non_exhaustive`：将来若再加一个 TLS 后端，这里必须回来补上分支。
+        _ => Ok(()),
+    };
 }
 
 fn closed_reason(error: tungstenite::Error) -> String {
@@ -303,8 +314,9 @@ fn describe_decode_error(error: &DecodeError) -> String {
     }
 }
 
-/// 连接类型：本决策不启用 TLS，所以底层就是一条 TCP（见 ADR-0006）。
-type Sock = WebSocket<TcpStream>;
+/// 连接类型。底层是「可能套了 TLS 的 TCP」——`ws://` 与 `wss://` 共用这一种类型，
+/// 由 `tungstenite` 在握手里选分支（见 ADR-0006 的后果一节）。
+type Sock = WebSocket<MaybeTlsStream<TcpStream>>;
 type WebSocketConfig = tungstenite::protocol::WebSocketConfig;
 
 /// 建一个解析到 `ws_url` 的 TCP 连接，超时由 [`CONNECT_TIMEOUT`] 管。

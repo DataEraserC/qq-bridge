@@ -214,6 +214,18 @@ mod tests {
         };
         assert_eq!(hello.version, PROTOCOL_VERSION);
         assert_eq!(hello.adapter, "dsh");
+        // 本机形态不写令牌：字段缺省不出现，也不影响解码。
+        assert_eq!(hello.token, None);
+    }
+
+    #[test]
+    fn hello_carries_token_across_machines() {
+        // 跨机器形态必须带令牌；字段在同一帧里，不另开一帧。
+        let line = r#"{"type":"hello","id":"h-1","version":1,"adapter":"dsh","token":"s3cret"}"#;
+        let Frame::Hello(hello) = decode(line).expect("应能解码") else {
+            panic!("期望 hello");
+        };
+        assert_eq!(hello.token.as_deref(), Some("s3cret"));
     }
 
     #[test]

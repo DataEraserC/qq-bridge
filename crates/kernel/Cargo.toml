@@ -16,4 +16,16 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 toml.workspace = true
-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30", default-features = false, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+# 只开 ring：`rustls` 的默认 crypto provider 是 aws-lc-rs，它要 cmake，交叉编译时是额外的
+# 工具链负担。ring 在各平台上的构建要求都只是 C 编译器。
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+interprocess = "2.4"
+subtle = "2.6"

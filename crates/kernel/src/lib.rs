@@ -7,6 +7,7 @@ pub mod archive;
 pub mod config;
 pub mod conn;
 pub mod deliver;
+pub mod endpoint;
 pub mod notes;
 pub mod onebot;
 pub mod persona;

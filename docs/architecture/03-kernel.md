@@ -24,7 +24,7 @@ flowchart TB
         WAKE["唤醒判定"]
         QUEUE["串行队列<br/>按记忆名"]
         TURN["回合票<br/>签发 + 作废"]
-        PROTO["协议端<br/>Unix socket"]
+        PROTO["协议端<br/>本机套接字 / TCP"]
         TOOL["工具面<br/>qq_*"]
     end
     CFG --> CONN

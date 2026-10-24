@@ -3,6 +3,7 @@
 //! 这些测试的失败意味着文档与实现漂移，而不是实现有 bug。
 
 use qqab_kernel::config::{Config, PersonaSource};
+use qqab_kernel::endpoint::Endpoint;
 
 #[test]
 fn documented_config_parses() {
@@ -44,6 +45,19 @@ fn documented_config_parses() {
     assert!(pc.wake.name_mention);
     assert!(!pc.wake.question);
     assert_eq!(pc.wake.probability, 0.0);
+}
+
+#[test]
+fn documented_adapter_endpoint_parses() {
+    let text = include_str!("fixtures/documented.toml");
+    let config = Config::parse(text).expect("应能解析");
+
+    assert_eq!(
+        config.adapter.endpoint,
+        Endpoint::Path("/run/user/1000/qqab.sock".into()),
+        "文档里的接入点应解析成本机路径"
+    );
+    assert!(config.adapter.token.is_none(), "本机形态不必配令牌");
 }
 
 #[test]

@@ -21,7 +21,7 @@ flowchart LR
     QQ --- SN
     SN -- "OneBot WebSocket" --> K
     CFG --> K
-    K -- "Unix socket<br/>JSON 行" --> A
+    K -- "本机套接字或 TCP<br/>JSON 行" --> A
     A -- "运行时自己的工具协议" --> RT
 ```
 
@@ -29,7 +29,7 @@ flowchart LR
 
 1. **QQ 与 OneBot 实现之间**：由 OneBot 实现负责，qq-agent-bridge 不参与。
 2. **OneBot 实现与内核之间**：WebSocket，标准 OneBot 11 事件与动作。
-3. **内核与适配器之间**：本机 socket，见 [协议](05-protocol.md)。
+3. **内核与适配器之间**：本机套接字，或 TCP（跨机器），见 [协议](05-protocol.md)。
 4. **适配器与 agent 运行时之间**：适配器是该运行时眼里的一个工具服务端。
 
 内核与适配器的生命周期互相独立。内核可以比运行时活得久：运行时重启，内核不必重连 QQ；内核重启，适配器会重连。
