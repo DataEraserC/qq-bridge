@@ -24,6 +24,14 @@ impl Ticket {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// 把适配器原样回传的字符串还原成票。
+    ///
+    /// 不做格式校验：票的内容由签发侧决定，校验它等于把内部格式变成协议的一部分。
+    /// 「这是不是一张有效的票」由 [`TurnTable::authorize`] 判断。
+    pub fn from_wire(text: &str) -> Self {
+        Self(text.to_owned())
+    }
 }
 
 impl fmt::Display for Ticket {

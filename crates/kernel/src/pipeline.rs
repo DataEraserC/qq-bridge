@@ -214,6 +214,69 @@ impl Pipeline {
         Ok(())
     }
 
+    /// 校验一次工具调用的票，取回本回合的身份。
+    pub fn authorize(
+        &self,
+        memory: &str,
+        ticket: &Ticket,
+        now: OffsetDateTime,
+    ) -> Result<&TurnContext, TicketError> {
+        self.turns.authorize(memory, ticket, now)
+    }
+
+    /// 丢掉一个回合而不重投：票作废，积压与原因一并清掉。
+    ///
+    /// 用于「投递送不出去」这一类——送不出去不是消息没了，是这一轮不值得再试；未读留在
+    /// 归档里，下一次新消息到达时自然带上。与 [`Pipeline::finish`] 的区别是它不接受
+    /// 积压重投：那个语义属于「回合跑完了还想接着说」，不属于「根本没送出去」。
+    pub fn abandon(&mut self, memory: &str, ticket: &Ticket, now: OffsetDateTime) {
+        let _ = self.turns.finish(memory, ticket, now);
+        self.pending.remove(memory);
+    }
+
+    /// 队列空闲时按当前未读重新组装一次投递。
+    ///
+    /// 重投用：回合因适配器不在线而被放弃后，过一会儿再来一次，内容按那时的归档重新算。
+    pub fn rearrive(
+        &mut self,
+        device: &Device,
+        scope: &ScopeConfig,
+        persona: &str,
+        now: OffsetDateTime,
+    ) -> Action {
+        let reason = self
+            .pending
+            .remove(&device.memory)
+            .unwrap_or(WakeReason::AnyMessage);
+
+        match self.turns.arrive(self.context_of(device, scope), now) {
+            Arrival::Start(ticket) => {
+                match assemble(
+                    device,
+                    scope,
+                    None,
+                    persona,
+                    &self.archive,
+                    &self.notes,
+                    &ticket,
+                    &reason,
+                    self.context_messages,
+                    self.note_budget,
+                ) {
+                    Some(delivery) => Action::Deliver(Box::new(delivery)),
+                    None => {
+                        let _ = self.turns.finish(&device.memory, &ticket, now);
+                        Action::Stay
+                    }
+                }
+            }
+            Arrival::Defer => {
+                self.remember_reason(&device.memory, reason);
+                Action::Defer
+            }
+        }
+    }
+
     /// 清扫超时的回合。与 [`TurnTable::sweep`] 同义，积压与原因保留。
     pub fn sweep(&mut self, now: OffsetDateTime) -> Vec<(String, Ticket)> {
         self.turns.sweep(now)
