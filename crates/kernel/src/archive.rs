@@ -138,6 +138,15 @@ impl Message {
     }
 }
 
+/// 一次追加的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Appended {
+    /// 这条消息在分片里的序号。
+    pub seq: u64,
+    /// 是否新分配了序号。`false` 表示它已在保留窗口里，这次只是合并视角。
+    pub fresh: bool,
+}
+
 /// 按记忆名分片的归档。
 #[derive(Debug)]
 pub struct Archive {
@@ -153,21 +162,27 @@ impl Archive {
         }
     }
 
-    /// 追加一条消息，返回它在分片里的序号。
+    /// 追加一条消息，返回它在分片里的序号与「是否新分配」。
     ///
     /// 同一个 `(群, 消息 ID)` 还在保留窗口里时不重复追加，返回原序号——上游重连后重发
     /// 同一条消息不该变成两条，轮换交接期间两个账号各看到一次也一样。重复到达时合并视角
     /// （`own` / `at_self` 取或）：同一个群的另一个账号看到的是同一条消息，只是「自己发的」
     /// 判定不同，合并后任一视角说是自己发的就算。被上限淘汰过的消息认不出来，会被当成新
     /// 消息，这是有界的代价。
-    pub fn append(&mut self, memory: &str, mut message: Message) -> u64 {
+    ///
+    /// 第二个返回值是 `true` 表示这条是新消息。唤醒判定用它分岔：重复到达不该再判一次，
+    /// 否则一次轮换交接会唤醒两次。
+    pub fn append(&mut self, memory: &str, mut message: Message) -> Appended {
         let limits = self.limits;
         let shard = self.shards.entry(memory.to_owned()).or_default();
 
         if let Some(existing) = shard.find_mut(&message) {
             existing.own |= message.own;
             existing.at_self |= message.at_self;
-            return existing.seq;
+            return Appended {
+                seq: existing.seq,
+                fresh: false,
+            };
         }
 
         shard.next_seq += 1;
@@ -176,7 +191,7 @@ impl Archive {
         shard.bytes += message.size();
         shard.messages.push_back(message);
         shard.enforce(&limits);
-        seq
+        Appended { seq, fresh: true }
     }
 
     /// 某群自上次投递以来的未读。
@@ -544,10 +559,10 @@ mod tests {
     #[test]
     fn append_assigns_increasing_seq_per_shard() {
         let mut archive = archive();
-        assert_eq!(archive.append("alice", message("1", "30002", "一")), 1);
-        assert_eq!(archive.append("alice", message("2", "30002", "二")), 2);
+        assert_eq!(archive.append("alice", message("1", "30002", "一")).seq, 1);
+        assert_eq!(archive.append("alice", message("2", "30002", "二")).seq, 2);
         // 另一个记忆名从自己的 1 开始：序号是分片内的。
-        assert_eq!(archive.append("bob", message("1", "30002", "一")), 1);
+        assert_eq!(archive.append("bob", message("1", "30002", "一")).seq, 1);
         assert_eq!(archive.latest_seq("alice"), 2);
         assert_eq!(archive.retained("alice"), 2);
     }
@@ -587,7 +602,8 @@ mod tests {
         let mut from_relay = message("1", "10001", "我用发送号说的");
         from_relay.account = "relay".to_owned();
         from_relay.own = true;
-        let seq = archive.append("alice", from_relay);
+        let Appended { seq, fresh } = archive.append("alice", from_relay);
+        assert!(fresh, "发送号独占看到的消息是新消息");
 
         assert_eq!(archive.retained("alice"), 1, "发送号独占看到的消息也归档");
         assert!(
@@ -598,7 +614,9 @@ mod tests {
         // 接收号也看到了这一句：合并且仍算自己发的。
         let mut from_main = message("1", "10001", "我用发送号说的");
         from_main.own = true;
-        assert_eq!(archive.append("alice", from_main), seq, "同一句只归档一份");
+        let again = archive.append("alice", from_main);
+        assert_eq!(again.seq, seq, "同一句只归档一份");
+        assert!(!again.fresh, "重复到达不是新消息");
         assert_eq!(archive.retained("alice"), 1);
         assert!(archive.unread("alice", "20001").is_empty());
         assert_eq!(seqs(archive.context("alice", "20001", 10)), vec![seq]);
@@ -664,7 +682,8 @@ mod tests {
         let first = archive.append("alice", message("1", "30002", "一"));
         // 上游重连后重发同一条：标识相同，不该变成两条。
         let again = archive.append("alice", message("1", "30002", "一"));
-        assert_eq!(first, again);
+        assert_eq!(first.seq, again.seq);
+        assert!(first.fresh && !again.fresh);
         assert_eq!(archive.retained("alice"), 1);
     }
 
@@ -683,7 +702,7 @@ mod tests {
         rotated.account = "backup".to_owned();
         rotated.own = true;
 
-        assert_eq!(archive.append("alice", rotated), first);
+        assert_eq!(archive.append("alice", rotated).seq, first.seq);
         assert_eq!(archive.retained("alice"), 1, "轮换看到同一条，只归档一份");
         assert!(
             archive.unread("alice", "20001").is_empty(),

@@ -64,6 +64,23 @@ impl WakeReason {
             Self::IdlePrompt => "idle_prompt".to_owned(),
         }
     }
+
+    /// 判定链里的位置：数字小的先胜出。
+    ///
+    /// 逐条判定时每条只给出自己最强的那个原因；一批消息要合成**一个**原因，靠这个顺序
+    /// 取最小的。批量语义因此与 [`judge`] 的链条顺序一致，不必写第二份链条。
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::AtMention => 0,
+            Self::NameMention => 1,
+            Self::Question => 2,
+            Self::Keyword(_) => 3,
+            Self::Poke => 4,
+            Self::AnyMessage => 5,
+            Self::Probability => 6,
+            Self::IdlePrompt => 7,
+        }
+    }
 }
 
 /// 判定一条消息是否唤醒。

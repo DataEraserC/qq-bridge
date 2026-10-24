@@ -4,6 +4,8 @@
 
 pub mod archive;
 pub mod config;
+pub mod deliver;
 pub mod notes;
+pub mod pipeline;
 pub mod turn;
 pub mod wake;

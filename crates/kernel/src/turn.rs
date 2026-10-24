@@ -84,6 +84,17 @@ impl TicketError {
     }
 }
 
+impl fmt::Display for TicketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Expired => f.write_str("票已作废或过期"),
+            Self::Mismatch => f.write_str("票与记忆名不匹配"),
+        }
+    }
+}
+
+impl std::error::Error for TicketError {}
+
 /// 按记忆名的串行队列 + 进行中回合的票表。
 #[derive(Debug)]
 pub struct TurnTable {

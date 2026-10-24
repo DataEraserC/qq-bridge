@@ -155,6 +155,7 @@ mod tests {
     fn deliver_round_trip() {
         let frame = Frame::Deliver(Deliver {
             id: "d-1".into(),
+            ticket: "t1-1792561540309".into(),
             memory: "alice".into(),
             persona: "你是……".into(),
             blocks: vec![
@@ -188,12 +189,20 @@ mod tests {
 
     #[test]
     fn missing_optional_fields_use_defaults() {
-        let line = r#"{"type":"deliver","id":"d-1","memory":"alice","persona":"p","blocks":[],"scope":{"group":"1"},"wake_reason":"any_message"}"#;
+        let line = r#"{"type":"deliver","id":"d-1","ticket":"t1-1","memory":"alice","persona":"p","blocks":[],"scope":{"group":"1"},"wake_reason":"any_message"}"#;
         let Frame::Deliver(deliver) = decode(line).expect("可解码") else {
             panic!("期望 deliver");
         };
         assert_eq!(deliver.notes, "");
+        assert_eq!(deliver.ticket, "t1-1");
         assert!(deliver.scope.send_accounts.is_empty());
+    }
+
+    #[test]
+    fn deliver_without_ticket_is_rejected() {
+        // 票是工具调用的唯一身份来源；缺了它这一帧结构非法，不能当成「无票回合」放行。
+        let line = r#"{"type":"deliver","id":"d-1","memory":"alice","persona":"p","blocks":[],"scope":{"group":"1"},"wake_reason":"any_message"}"#;
+        assert!(matches!(decode(line), Err(DecodeError::BadShape { .. })));
     }
 
     #[test]

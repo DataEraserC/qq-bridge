@@ -16,7 +16,9 @@
 每行一个 JSON 对象，必须有 `type` 字段。未知 `type` 必须被忽略而不是断连——这是向前兼容的唯一手段。
 
 ```json
-{"type": "deliver", "id": "d-1", "memory": "alice", "persona": "...", "blocks": [...], "scope": {...}, "notes": "..."}
+{"type": "deliver", "id": "d-1", "ticket": "t1-1792561540309", "memory": "alice",
+ "persona": "你是……", "blocks": [{"kind": "text", "text": "在吗"}],
+ "scope": {"group": "20001", "send_accounts": ["main"]}, "wake_reason": "at_mention", "notes": ""}
 ```
 
 所有请求带 `id`，响应带相同的 `id`。`id` 由发起方生成，只需在单条连接内唯一。
@@ -30,6 +32,7 @@
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `id` | string | 请求标识 |
+| `ticket` | string | 本回合的票。适配器不解析，只在本回合的 `tool_call` 里原样回传 |
 | `memory` | string | 记忆名 |
 | `persona` | string | 已渲染的人格文本 |
 | `blocks` | array | 内容块，见下 |

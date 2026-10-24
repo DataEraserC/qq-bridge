@@ -30,7 +30,7 @@ sequenceDiagram
     participant K as 内核
     participant A as 适配器
     participant RT as agent 运行时
-    K->>A: deliver(记忆名, 内容块, 人格)
+    K->>A: deliver(记忆名, 回合票, 内容块, 人格)
     A->>RT: 启动/续用会话，投递内容
     RT->>A: 工具调用（带回合票）
     A->>K: tool_call(回合票, 工具名, 参数)
@@ -59,7 +59,7 @@ stateDiagram-v2
 
 ## 回合与回合票
 
-一个回合开始于一次 `deliver`，结束于运行时的回合结束事件。适配器为每个进行中的回合持有内核签发的回合票。
+一个回合开始于一次 `deliver`，结束于运行时的回合结束事件。回合票随 `deliver` 一起来——内核签发，适配器只保存与回传，不解析。
 
 回合票的作用是让工具调用能被归因：内核收到 `tool_call` 时，靠票确定这是哪个设备、哪个范围、哪些可用账号。
 

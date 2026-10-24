@@ -43,6 +43,8 @@ pub enum Frame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliver {
     pub id: String,
+    /// 本次回合的票。适配器不解析它，只在本回合的 `tool_call` 里原样回传。
+    pub ticket: String,
     pub memory: String,
     /// 已渲染的人格文本。
     pub persona: String,
