@@ -23,12 +23,15 @@ use time::OffsetDateTime;
 
 use qqab_kernel::adapter::Server;
 use qqab_kernel::archive::Limits;
+use qqab_kernel::chat::Transport;
 use qqab_kernel::config::{Account, Config};
 use qqab_kernel::conn::Pool;
-use qqab_kernel::hooks::Hooks;
+use qqab_kernel::hooks::{HookRuntime, Hooks};
+use qqab_kernel::onebot::OneBot;
 use qqab_kernel::persona::{Personas, base_dir};
 use qqab_kernel::pipeline::Pipeline;
 use qqab_kernel::runtime::{Inbound, Kernel, Outbound};
+use qqab_kernel::satori::SatoriTransport;
 use qqab_kernel::transport::{ActionRequest, ConnectError, Connection, Handle, spawn};
 
 /// 时钟节拍。与传输层的读超时同量级：再快只是空转。
@@ -74,9 +77,11 @@ fn run(args: &[String]) -> Result<(), String> {
         Personas::load(&config, &base).map_err(|error| format!("人格加载失败：{error}"))?;
 
     // 钩子在启动时一次性加载：语法错当场失败，不留到运行期（见 06-hooks.md#加载时机）。
-    let hooks: BTreeMap<String, Hooks> = Hooks::load_all(&config, &base)
+    // 现在只有 Lua 一种运行时。换实现要动的就是这里的一行——见 ADR-0010。
+    let hooks: BTreeMap<String, Box<dyn HookRuntime>> = Hooks::load_all(&config, &base)
         .map_err(|error| format!("钩子加载失败：{error}"))?
         .into_iter()
+        .map(|(device, hooks)| (device, Box::new(hooks) as Box<dyn HookRuntime>))
         .collect();
 
     let pipeline = Pipeline::new(
@@ -109,7 +114,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // QQ 连接。
     let mut links: BTreeMap<String, Handle> = BTreeMap::new();
     for account in &config.accounts {
-        match Connection::open(account) {
+        match Connection::open(account, transport_for(account)) {
             Ok(connection) => {
                 let handle = start_link(&bus_tx, account, connection);
                 let _ = bus_tx.send(Inbound::LinkUp {
@@ -192,7 +197,7 @@ fn main_loop(
             else {
                 continue;
             };
-            match Connection::open(account) {
+            match Connection::open(account, transport_for(account)) {
                 Ok(connection) => {
                     let handle = start_link(bus_tx, account, connection);
                     let _ = bus_tx.send(Inbound::LinkUp {
@@ -207,6 +212,18 @@ fn main_loop(
                 ),
             }
         }
+    }
+}
+
+/// 按配置里的协议名挑一份 [`Transport`] 实现。
+///
+/// 配置校验期已经拒掉未知名字，所以这里不需要 `Result`——走到这一步只可能是已知协议。
+/// 新增一个协议要动的就是这里加一个分支，内核别处一行不改。
+fn transport_for(account: &Account) -> Box<dyn Transport> {
+    match account.protocol.as_str() {
+        "satori" => Box::new(SatoriTransport::new()),
+        // 校验期保证只有已知协议；OneBot 是缺省。
+        _ => Box::new(OneBot::new()),
     }
 }
 

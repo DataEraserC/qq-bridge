@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 
 use qqab_kernel::archive::{Limits, Message};
 use qqab_kernel::config::{Config, Device, ScopeConfig};
-use qqab_kernel::hooks::{HookError, Hooks};
+use qqab_kernel::hooks::{HookError, HookRuntime, Hooks};
 use qqab_kernel::pipeline::{Action, Pipeline};
 
 const CONFIG: &str = r#"
@@ -72,9 +72,10 @@ fn fixture(tag: &str, script: &str) -> PathBuf {
 
 fn pipeline_with(dir: &Path) -> (Pipeline, Config) {
     let config = Config::parse(CONFIG).expect("配置应能解析");
-    let hooks: BTreeMap<String, Hooks> = Hooks::load_all(&config, dir)
+    let hooks: BTreeMap<String, Box<dyn HookRuntime>> = Hooks::load_all(&config, dir)
         .expect("应能加载脚本")
         .into_iter()
+        .map(|(device, hooks)| (device, Box::new(hooks) as Box<dyn HookRuntime>))
         .collect();
     let pipeline =
         Pipeline::new(Limits::default(), 100, time::Duration::minutes(10)).with_hooks(hooks);

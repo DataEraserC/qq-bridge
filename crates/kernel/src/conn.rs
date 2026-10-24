@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use time::{Duration, OffsetDateTime};
 
 use crate::config::{Account, Config, Device, ScopeConfig};
-use crate::onebot::MessageEvent;
 
 /// 退避的起点与上限。上限固定，否则一次长时间断网会让下一次重连等到天荒地老。
 pub const BACKOFF_BASE: Duration = Duration::seconds(1);
@@ -175,14 +174,18 @@ pub struct Route<'a> {
 ///
 /// 只返回 `receive` 里含这条连接所属账号、且群号匹配的范围。没被任何范围收下的群消息
 /// 直接丢弃——它不在这个部署的管理范围内。
-pub fn route<'a>(config: &'a Config, event: &MessageEvent, account: &str) -> Vec<Route<'a>> {
+pub fn route<'a>(
+    config: &'a Config,
+    event: &crate::chat::ChatMessage,
+    account: &str,
+) -> Vec<Route<'a>> {
     let mut routes = Vec::new();
 
     for device in &config.devices {
-        let own = device_is_sender(config, device, &event.user_id);
+        let own = device_is_sender(config, device, &event.sender_id);
 
         for scope in &device.scopes {
-            if scope.group != event.group_id {
+            if scope.group != event.group {
                 continue;
             }
             // 收到这条事件的连接，是否在这个范围的接收列表里。
@@ -225,12 +228,14 @@ mod tests {
             Account {
                 id: "main".to_owned(),
                 self_id: "10001".to_owned(),
+                protocol: "onebot11".to_owned(),
                 ws_url: "ws://127.0.0.1:6700".to_owned(),
                 token: None,
             },
             Account {
                 id: "backup".to_owned(),
                 self_id: "10002".to_owned(),
+                protocol: "onebot11".to_owned(),
                 ws_url: "ws://127.0.0.1:6701".to_owned(),
                 token: None,
             },
@@ -323,12 +328,12 @@ mod tests {
         );
     }
 
-    fn message(group: &str, sender: &str) -> MessageEvent {
-        MessageEvent {
+    fn message(group: &str, sender: &str) -> crate::chat::ChatMessage {
+        crate::chat::ChatMessage {
             self_id: "10001".to_owned(),
-            group_id: group.to_owned(),
+            group: group.to_owned(),
             message_id: "7451".to_owned(),
-            user_id: sender.to_owned(),
+            sender_id: sender.to_owned(),
             sender_name: None,
             text: "在吗".to_owned(),
             at_self: false,

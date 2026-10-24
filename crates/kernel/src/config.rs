@@ -57,9 +57,17 @@ pub struct Account {
     pub id: String,
     /// 这个账号的 QQ 号。
     pub self_id: String,
+    /// 聊天协议名。决定用哪个 [`Transport`](crate::chat::Transport) 实现解码与编码。
+    pub protocol: String,
     pub ws_url: String,
     pub token: Option<Secret>,
 }
+
+/// 已知的协议名。
+///
+/// 校验期就拒绝未知名字：`protocol = "onebot1l"` 这样的笔误在运行期表现为「连上了但没有
+/// 事件」，比启动失败难查得多。
+pub const KNOWN_PROTOCOLS: &[&str] = &["onebot11", "satori"];
 
 fn validate_accounts(raw: Vec<RawAccount>) -> Result<Vec<Account>, ConfigError> {
     if raw.is_empty() {
@@ -74,6 +82,16 @@ fn validate_accounts(raw: Vec<RawAccount>) -> Result<Vec<Account>, ConfigError> 
         let id = require_non_empty(account.id, "accounts[].id", index)?;
         let self_id = require_non_empty(account.self_id, "accounts[].self_id", index)?;
         let ws_url = require_non_empty(account.ws_url, "accounts[].ws_url", index)?;
+        let protocol = account
+            .protocol
+            .unwrap_or_else(|| KNOWN_PROTOCOLS[0].to_owned());
+        if !KNOWN_PROTOCOLS.contains(&protocol.as_str()) {
+            return Err(ConfigError::UnknownProtocol {
+                account: id,
+                protocol,
+                known: KNOWN_PROTOCOLS.join("、"),
+            });
+        }
 
         if !seen_ids.insert(id.clone()) {
             return Err(ConfigError::DuplicateAccountId { id });
@@ -91,6 +109,7 @@ fn validate_accounts(raw: Vec<RawAccount>) -> Result<Vec<Account>, ConfigError> 
         accounts.push(Account {
             id,
             self_id,
+            protocol,
             ws_url,
             token: account.token.map(Secret::parse),
         });
@@ -479,6 +498,8 @@ struct RawConfig {
 struct RawAccount {
     id: String,
     self_id: String,
+    /// 省略时默认 `onebot11`——现有配置不必改。
+    protocol: Option<String>,
     ws_url: String,
     token: Option<String>,
 }
@@ -592,6 +613,12 @@ pub enum ConfigError {
     EmptyField { field: &'static str, index: usize },
     #[error("账号 id {id} 重复")]
     DuplicateAccountId { id: String },
+    #[error("账号 {account} 的协议 {protocol} 不认识（已知：{known}）")]
+    UnknownProtocol {
+        account: String,
+        protocol: String,
+        known: String,
+    },
     #[error("QQ 号 {self_id} 被两个账号使用：{first}、{second}")]
     DuplicateSelfId {
         self_id: String,

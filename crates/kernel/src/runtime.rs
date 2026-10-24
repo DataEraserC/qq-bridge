@@ -29,10 +29,10 @@ use qqab_proto::{
 };
 
 use crate::adapter::AdapterEvent;
+use crate::chat::{ChatAction, ChatEvent, ChatMessage, ChatPoke, ChatStatus};
 use crate::config::{Config, Device, ScopeConfig, Secret};
 use crate::conn::{Pool, route};
 use crate::deliver::Delivery;
-use crate::onebot::{Action, Event as QqEvent, MessageEvent, PokeEvent};
 use crate::persona::Personas;
 use crate::pipeline::{Action as PipelineAction, Pipeline};
 use crate::transport::{ActionOutcome, ActionRequest, Incoming, WriteError};
@@ -260,32 +260,28 @@ impl Kernel {
         }
     }
 
-    fn on_event(&mut self, account: &str, event: QqEvent, now: OffsetDateTime) -> Vec<Outbound> {
+    fn on_event(&mut self, account: &str, event: ChatEvent, now: OffsetDateTime) -> Vec<Outbound> {
         match event {
-            QqEvent::Message(message) => self.on_message(account, &message, now),
-            QqEvent::Poke(poke) => self.on_poke(account, &poke, now),
-            QqEvent::Lifecycle(lifecycle) => {
-                if lifecycle.is_ready() {
-                    self.pool.ready(account);
-                }
+            ChatEvent::Message(message) => self.on_message(account, &message, now),
+            ChatEvent::Poke(poke) => self.on_poke(account, &poke, now),
+            ChatEvent::Status(ChatStatus::Ready) => {
+                self.pool.ready(account);
                 Vec::new()
             }
-            QqEvent::Heartbeat(heartbeat) => {
-                // 心跳说不在线，就当这次连接没成：交给退避重连。
-                if !heartbeat.online {
-                    self.pool.failed(account, now);
-                }
+            // 平台说本账号不在线：就当这次连接没成，交给退避重连。
+            ChatEvent::Status(ChatStatus::Offline) => {
+                self.pool.failed(account, now);
                 Vec::new()
             }
-            // 上游扩展事件：不是错误，什么都不用做。
-            QqEvent::Ignored { .. } => Vec::new(),
+            // 平台扩展事件：不是错误，什么都不用做。
+            ChatEvent::Ignored { .. } => Vec::new(),
         }
     }
 
     fn on_message(
         &mut self,
         account: &str,
-        message: &MessageEvent,
+        message: &ChatMessage,
         now: OffsetDateTime,
     ) -> Vec<Outbound> {
         // 先把路由结果取成自有数据，再动管线：借用 `self.config` 的同时不能改管线。
@@ -317,12 +313,12 @@ impl Kernel {
         out
     }
 
-    fn on_poke(&mut self, account: &str, poke: &PokeEvent, now: OffsetDateTime) -> Vec<Outbound> {
+    fn on_poke(&mut self, account: &str, poke: &ChatPoke, now: OffsetDateTime) -> Vec<Outbound> {
         // 只有拍自己的那些是给这台设备的信号。
         if !poke.targets_self() {
             return Vec::new();
         }
-        let Some(group) = poke.group_id.as_deref() else {
+        let Some(group) = poke.group.as_deref() else {
             return Vec::new();
         };
 
@@ -338,7 +334,7 @@ impl Kernel {
                     continue;
                 }
                 // 自己拍自己不算信号。
-                if self.device_owns(device, &poke.user_id) {
+                if self.device_owns(device, &poke.sender_id) {
                     continue;
                 }
                 let persona = self.persona_of(&device.persona);
@@ -346,7 +342,7 @@ impl Kernel {
                     device,
                     scope,
                     &persona,
-                    Some(poke.user_id.as_str()),
+                    Some(poke.sender_id.as_str()),
                     now,
                     roll,
                 );
@@ -682,8 +678,8 @@ impl Kernel {
         vec![Outbound::Act {
             account,
             request: ActionRequest {
-                action: Action::SendGroupMsg {
-                    group_id: context.group.clone(),
+                action: ChatAction::SendGroupMessage {
+                    group: context.group.clone(),
                     text: text.to_owned(),
                 },
                 echo,

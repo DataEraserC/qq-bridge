@@ -2,7 +2,7 @@
 //!
 //! 这些测试的失败意味着文档与实现漂移，而不是实现有 bug。
 
-use qqab_kernel::config::{Config, PersonaSource};
+use qqab_kernel::config::{Config, KNOWN_PROTOCOLS, PersonaSource};
 use qqab_kernel::endpoint::Endpoint;
 
 #[test]
@@ -83,4 +83,55 @@ fn env_prefixed_token_is_not_inlined() {
     // token 写成 env: 前缀时不进内存明文，只记变量名。
     let token = main.token.as_ref().expect("main 应有 token");
     assert!(format!("{token:?}").contains("QQ_TOKEN"));
+}
+
+/// 配置手册里列的协议名必须与实现接受的完全一致。
+///
+/// 少写一个：部署者照文档写却被拒。多写一个：部署者照文档写却在启动期失败。
+/// 两种都是「文档与实现漂移」，而这类漂移在运行期表现为「连上了但没有事件」。
+const CONFIG_MANUAL: &str = include_str!("../../../docs/manual/02-config.md");
+
+#[test]
+fn documented_protocols_match_the_known_list() {
+    for protocol in KNOWN_PROTOCOLS {
+        assert!(
+            CONFIG_MANUAL.contains(&format!("`{protocol}`")),
+            "文档应列出协议 {protocol}"
+        );
+    }
+
+    // 反向：文档表格里的每一个协议名，实现都得认。
+    let documented: Vec<&str> = CONFIG_MANUAL
+        .lines()
+        .filter(|line| line.starts_with("| `onebot") || line.starts_with("| `satori"))
+        .filter_map(|line| line.split('`').nth(1))
+        .collect();
+    assert!(!documented.is_empty(), "文档里应有协议表");
+    for protocol in documented {
+        assert!(
+            KNOWN_PROTOCOLS.contains(&protocol),
+            "文档列了实现不认识的协议 {protocol}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_protocol_fails_at_parse_time_with_the_known_list() {
+    let text = include_str!("fixtures/documented.toml").replace(
+        "self_id = \"10001\"",
+        "self_id = \"10001\"\nprotocol = \"irc\"",
+    );
+
+    let error = Config::parse(&text).expect_err("未知协议应被拒");
+    let message = error.to_string();
+    assert!(
+        message.contains("irc"),
+        "错误里应指出写错的那个名字：{message}"
+    );
+    for protocol in KNOWN_PROTOCOLS {
+        assert!(
+            message.contains(protocol),
+            "错误里应列出已知协议 {protocol}：{message}"
+        );
+    }
 }

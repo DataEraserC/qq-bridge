@@ -4,16 +4,19 @@
 
 pub mod adapter;
 pub mod archive;
+pub mod chat;
 pub mod config;
 pub mod conn;
 pub mod deliver;
 pub mod endpoint;
+pub mod hook_process;
 pub mod hooks;
 pub mod notes;
 pub mod onebot;
 pub mod persona;
 pub mod pipeline;
 pub mod runtime;
+pub mod satori;
 pub mod transport;
 pub mod turn;
 pub mod wake;

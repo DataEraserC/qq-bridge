@@ -6,8 +6,9 @@
 use std::net::TcpListener;
 use std::thread;
 
+use qqab_kernel::chat::{ChatAction, ChatEvent, ChatMessage};
 use qqab_kernel::config::{Account, Secret};
-use qqab_kernel::onebot::{Action, Event, MessageEvent};
+use qqab_kernel::onebot::OneBot;
 use qqab_kernel::transport::{ActionOutcome, ConnectError, Connection, Incoming};
 
 use tungstenite::Message as WsMessage;
@@ -33,6 +34,7 @@ fn account(url: &str) -> Account {
     Account {
         id: "main".to_owned(),
         self_id: "10001".to_owned(),
+        protocol: "onebot11".to_owned(),
         ws_url: url.to_owned(),
         token: None,
     }
@@ -51,16 +53,17 @@ fn connects_and_reads_an_event() {
             .expect("应能发出事件");
     });
 
-    let mut connection = Connection::open(&account(&url)).expect("应能建连");
+    let mut connection =
+        Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
     assert_eq!(connection.account(), "main");
     assert_eq!(connection.self_id(), "10001");
 
     match connection.read_event() {
         Incoming::Event(event) => {
-            let Event::Message(message) = *event else {
+            let ChatEvent::Message(message) = *event else {
                 panic!("期望群消息");
             };
-            assert_eq!(message.group_id, "20001");
+            assert_eq!(message.group, "20001");
             assert_eq!(message.text, "在吗");
         }
         other => panic!("期望事件，得到 {other:?}"),
@@ -81,7 +84,8 @@ fn undecodable_frame_does_not_kill_the_connection() {
             .expect("应能发出事件");
     });
 
-    let mut connection = Connection::open(&account(&url)).expect("应能建连");
+    let mut connection =
+        Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
 
     assert!(matches!(
         connection.read_event(),
@@ -119,11 +123,12 @@ fn sends_action_and_matches_response_by_echo() {
             .expect("应能发出对应响应");
     });
 
-    let mut connection = Connection::open(&account(&url)).expect("应能建连");
+    let mut connection =
+        Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
 
     let (outcome, carried) = connection.act(
-        &Action::SendGroupMsg {
-            group_id: "20001".to_owned(),
+        &ChatAction::SendGroupMessage {
+            group: "20001".to_owned(),
             text: "在".to_owned(),
         },
         "a-1",
@@ -150,10 +155,11 @@ fn rejected_action_reports_reason_without_retry() {
             .expect("应能发出拒绝响应");
     });
 
-    let mut connection = Connection::open(&account(&url)).expect("应能建连");
+    let mut connection =
+        Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
     let (outcome, _) = connection.act(
-        &Action::SendGroupMsg {
-            group_id: "0".to_owned(),
+        &ChatAction::SendGroupMessage {
+            group: "0".to_owned(),
             text: "x".to_owned(),
         },
         "a-1",
@@ -183,10 +189,11 @@ fn events_arriving_while_waiting_for_an_action_are_carried_back() {
             .expect("应能发出响应");
     });
 
-    let mut connection = Connection::open(&account(&url)).expect("应能建连");
+    let mut connection =
+        Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
     let (outcome, carried) = connection.act(
-        &Action::SendGroupMsg {
-            group_id: "20001".to_owned(),
+        &ChatAction::SendGroupMessage {
+            group: "20001".to_owned(),
             text: "在".to_owned(),
         },
         "a-1",
@@ -194,7 +201,7 @@ fn events_arriving_while_waiting_for_an_action_are_carried_back() {
 
     assert!(matches!(outcome, Ok(ActionOutcome::Ok { .. })));
     assert_eq!(carried.len(), 1, "等响应期间的事件必须带回来");
-    assert!(matches!(carried[0], Event::Message(MessageEvent { .. })));
+    assert!(matches!(carried[0], ChatEvent::Message(ChatMessage { .. })));
 
     let _ = server.join();
 }
@@ -209,7 +216,10 @@ fn unauthorized_handshake_is_reported_not_silently_successful() {
         // 不发握手响应直接关：客户端应报错而不是挂起。
     });
 
-    let result = Connection::open(&account(&format!("ws://127.0.0.1:{port}")));
+    let result = Connection::open(
+        &account(&format!("ws://127.0.0.1:{port}")),
+        Box::new(OneBot::new()),
+    );
     assert!(
         matches!(
             result,
@@ -233,7 +243,7 @@ fn literal_token_is_sent_as_authorization_header() {
     let mut with_token = account(&url);
     with_token.token = Some(Secret::Literal("Bearer s3cret".to_owned()));
 
-    let mut connection = Connection::open(&with_token).expect("应能建连");
+    let mut connection = Connection::open(&with_token, Box::new(OneBot::new())).expect("应能建连");
     assert!(matches!(connection.read_event(), Incoming::Event(_)));
 
     let _ = server.join();
@@ -244,12 +254,13 @@ fn missing_token_env_fails_before_connecting() {
     let account = Account {
         id: "main".to_owned(),
         self_id: "10001".to_owned(),
+        protocol: "onebot11".to_owned(),
         ws_url: "ws://127.0.0.1:1".to_owned(),
         token: Some(Secret::Env("QQAB_TEST_TOKEN_NOT_SET".to_owned())),
     };
 
     // 环境变量缺失应在建连之前就被发现：不是「连不上」，是「配置不全」。
-    match Connection::open(&account) {
+    match Connection::open(&account, Box::new(OneBot::new())) {
         Err(ConnectError::TokenEnv(name)) => assert_eq!(name, "QQAB_TEST_TOKEN_NOT_SET"),
         other => panic!("期望令牌缺失错误，得到 {other:?}"),
     }

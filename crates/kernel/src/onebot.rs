@@ -379,6 +379,102 @@ pub enum DecodeError {
     MissingField(&'static str),
 }
 
+/// OneBot 11 的 [`Transport`] 实现。
+///
+/// 这是第一个实现，也是抽象的验证对象：如果它对内核的接口要求不止
+/// [`ChatEvent`](crate::chat::ChatEvent) 那几个分支，抽象就是错的。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OneBot;
+
+impl OneBot {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::chat::Transport for OneBot {
+    fn name(&self) -> &'static str {
+        "onebot11"
+    }
+
+    fn decode(&self, line: &str) -> Result<crate::chat::ChatEvent, crate::chat::TransportError> {
+        Ok(match decode(line)? {
+            Event::Message(message) => crate::chat::ChatEvent::Message(crate::chat::ChatMessage {
+                self_id: message.self_id,
+                group: message.group_id,
+                message_id: message.message_id,
+                sender_id: message.user_id,
+                sender_name: message.sender_name,
+                text: message.text,
+                at_self: message.at_self,
+                time: message.time,
+            }),
+            Event::Poke(poke) => crate::chat::ChatEvent::Poke(crate::chat::ChatPoke {
+                group: poke.group_id,
+                sender_id: poke.user_id,
+                target_id: poke.target_id,
+                self_id: poke.self_id,
+            }),
+            Event::Lifecycle(lifecycle) => {
+                // `enable`/`connect` 都算就绪；其他子类型（比如 `disable`）不是内核要的状态。
+                if lifecycle.is_ready() {
+                    crate::chat::ChatEvent::Status(crate::chat::ChatStatus::Ready)
+                } else {
+                    crate::chat::ChatEvent::Ignored {
+                        kind: format!("lifecycle:{}", lifecycle.sub_type),
+                    }
+                }
+            }
+            Event::Heartbeat(heartbeat) => {
+                if heartbeat.online {
+                    // 在线心跳不改变状态：就绪由 lifecycle 给，心跳只是确认。
+                    crate::chat::ChatEvent::Ignored {
+                        kind: "heartbeat:online".to_owned(),
+                    }
+                } else {
+                    crate::chat::ChatEvent::Status(crate::chat::ChatStatus::Offline)
+                }
+            }
+            Event::Ignored { kind } => crate::chat::ChatEvent::Ignored { kind },
+        })
+    }
+
+    fn encode(&self, action: &crate::chat::ChatAction, id: &str) -> String {
+        let mapped = match action {
+            crate::chat::ChatAction::SendGroupMessage { group, text } => Action::SendGroupMsg {
+                group_id: group.clone(),
+                text: text.clone(),
+            },
+        };
+        mapped.encode(id)
+    }
+
+    fn response(&self, line: &str) -> Option<(Option<String>, crate::chat::ChatOutcome)> {
+        let response = ActionResponse::decode(line).ok()?;
+        let outcome = if response.is_ok() {
+            crate::chat::ChatOutcome::Ok
+        } else {
+            crate::chat::ChatOutcome::Rejected {
+                reason: response.reason(),
+            }
+        };
+        Some((response.echo, outcome))
+    }
+}
+
+impl From<DecodeError> for crate::chat::TransportError {
+    fn from(source: DecodeError) -> Self {
+        match source {
+            DecodeError::NotJson { source } => Self::NotJson {
+                detail: source.to_string(),
+            },
+            DecodeError::NotObject => Self::NotObject,
+            DecodeError::MissingPostType => Self::MissingField("post_type"),
+            DecodeError::MissingField(field) => Self::MissingField(field),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

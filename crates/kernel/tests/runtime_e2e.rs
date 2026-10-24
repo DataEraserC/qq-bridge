@@ -11,9 +11,9 @@ use time::{Duration, OffsetDateTime};
 
 use qqab_kernel::adapter::AdapterEvent;
 use qqab_kernel::archive::Limits;
+use qqab_kernel::chat::{ChatEvent, ChatMessage};
 use qqab_kernel::config::Config;
 use qqab_kernel::conn::Pool;
-use qqab_kernel::onebot::{Event as QqEvent, MessageEvent};
 use qqab_kernel::persona::Personas;
 use qqab_kernel::pipeline::Pipeline;
 use qqab_kernel::runtime::{Inbound, Kernel, Outbound};
@@ -90,12 +90,12 @@ fn kernel() -> (Kernel, std::sync::mpsc::Receiver<String>) {
     (kernel, out_rx)
 }
 
-fn group_message(id: &str, sender: &str, text: &str, at_self: bool) -> QqEvent {
-    QqEvent::Message(MessageEvent {
+fn group_message(id: &str, sender: &str, text: &str, at_self: bool) -> ChatEvent {
+    ChatEvent::Message(ChatMessage {
         self_id: "10001".to_owned(),
-        group_id: "20001".to_owned(),
+        group: "20001".to_owned(),
         message_id: id.to_owned(),
-        user_id: sender.to_owned(),
+        sender_id: sender.to_owned(),
         sender_name: Some("小明".to_owned()),
         text: text.to_owned(),
         at_self,
@@ -272,8 +272,8 @@ fn tool_call_with_a_valid_ticket_becomes_a_qq_action() {
     assert_eq!(act.0, "main", "只能用这一轮 send 列表里的账号");
     assert_eq!(
         act.1.action,
-        qqab_kernel::onebot::Action::SendGroupMsg {
-            group_id: "20001".to_owned(),
+        qqab_kernel::chat::ChatAction::SendGroupMessage {
+            group: "20001".to_owned(),
             text: "在".to_owned(),
         },
         "群号来自回合上下文，不是模型给的参数"

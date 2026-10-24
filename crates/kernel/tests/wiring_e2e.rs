@@ -16,6 +16,7 @@ use qqab_kernel::adapter::AdapterEvent;
 use qqab_kernel::archive::Limits;
 use qqab_kernel::config::Config;
 use qqab_kernel::conn::Pool;
+use qqab_kernel::onebot::OneBot;
 use qqab_kernel::persona::Personas;
 use qqab_kernel::pipeline::Pipeline;
 use qqab_kernel::runtime::{Inbound, Kernel, Outbound};
@@ -244,7 +245,8 @@ fn full_loop_from_qq_message_to_delivered_frame_and_back() {
     );
 
     // 真 WebSocket：连上去拿事件。
-    let mut connection = Connection::open(&config.accounts[0]).expect("应能连上假 OneBot");
+    let mut connection =
+        Connection::open(&config.accounts[0], Box::new(OneBot::new())).expect("应能连上假 OneBot");
     let incoming = connection.read_event();
     assert!(
         matches!(incoming, Incoming::Event(_)),

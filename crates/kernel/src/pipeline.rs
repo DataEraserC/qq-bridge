@@ -24,7 +24,7 @@ use time::{Duration, OffsetDateTime};
 use crate::archive::{Archive, ArchiveError, Limits, Message, WatermarkError};
 use crate::config::{Device, ScopeConfig};
 use crate::deliver::{Delivery, assemble, judge_poke};
-use crate::hooks::{Hooks, Ruling, Snapshot};
+use crate::hooks::{HookRuntime, Ruling, Snapshot};
 use crate::notes::NoteStore;
 use crate::turn::{Arrival, Finished, Ticket, TicketError, TurnContext, TurnTable};
 use crate::wake::WakeReason;
@@ -41,7 +41,6 @@ pub enum Action {
 }
 
 /// 管线状态。归档、笔记与队列各一份，均在内存里。
-#[derive(Debug)]
 pub struct Pipeline {
     archive: Archive,
     notes: NoteStore,
@@ -52,8 +51,22 @@ pub struct Pipeline {
     note_budget: usize,
     /// 积压期间的唤醒原因，键是记忆名。合并投递时取最强的一个。
     pending: BTreeMap<String, WakeReason>,
-    /// 各设备的钩子环境，键是设备 id。没有声明 `hooks` 的设备不在其中。
-    hooks: BTreeMap<String, Hooks>,
+    /// 各设备的钩子运行时，键是设备 id。没有声明 `hooks` 的设备不在其中。
+    ///
+    /// 存 `dyn` 而不是具体类型：Lua、子进程、WASM 三种实现，内核这一侧不该知道是哪一种。
+    hooks: BTreeMap<String, Box<dyn HookRuntime>>,
+}
+
+impl std::fmt::Debug for Pipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn HookRuntime` 不是 `Debug`；打印钩子的设备名足够定位。
+        f.debug_struct("Pipeline")
+            .field("archive", &self.archive)
+            .field("notes", &self.notes)
+            .field("turns", &self.turns)
+            .field("hooks", &self.hooks.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Pipeline {
@@ -70,16 +83,16 @@ impl Pipeline {
     }
 
     /// 装上钩子。逐设备的环境由 [`Hooks::load_all`] 建好。
-    pub fn with_hooks(mut self, hooks: BTreeMap<String, Hooks>) -> Self {
+    pub fn with_hooks(mut self, hooks: BTreeMap<String, Box<dyn HookRuntime>>) -> Self {
         self.hooks = hooks;
         self
     }
 
-    pub fn hooks(&self) -> &BTreeMap<String, Hooks> {
+    pub fn hooks(&self) -> &BTreeMap<String, Box<dyn HookRuntime>> {
         &self.hooks
     }
 
-    pub fn hooks_mut(&mut self) -> &mut BTreeMap<String, Hooks> {
+    pub fn hooks_mut(&mut self) -> &mut BTreeMap<String, Box<dyn HookRuntime>> {
         &mut self.hooks
     }
 
@@ -123,7 +136,7 @@ impl Pipeline {
         // 快照在改写之前取：脚本看到的是原始事件。
         let snapshot = Snapshot::of_message(&message, true);
         let ruling = match self.hooks.get_mut(&device.id) {
-            Some(hooks) => hooks.pre_receive(&snapshot.view()),
+            Some(hooks) => HookRuntime::pre_receive(hooks.as_mut(), &snapshot.view()),
             None => Ruling::keep(),
         };
         if ruling.dropped {
@@ -165,7 +178,7 @@ impl Pipeline {
                 .last()
                 .map(|message| Snapshot::of_message(message, appended.fresh));
             if let Some(archived) = archived {
-                hooks.post_receive(&archived.view());
+                HookRuntime::post_receive(hooks.as_mut(), &archived.view());
             }
         }
 
@@ -189,7 +202,12 @@ impl Pipeline {
         };
         let ruling = reason.as_ref().map(WakeReason::label);
         let reason = match self.hooks.get_mut(&device.id) {
-            Some(hooks) => match hooks.should_wake(&judged.view(), &tags, ruling.as_deref()) {
+            Some(hooks) => match HookRuntime::should_wake(
+                hooks.as_mut(),
+                &judged.view(),
+                &tags,
+                ruling.as_deref(),
+            ) {
                 // 脚本原样返回规则的原因：保留规则身份，别把它变成脚本原因。
                 Ok(Some(label)) if ruling.as_deref() == Some(label.as_str()) => reason,
                 Ok(Some(label)) => Some(WakeReason::Hook(label)),
@@ -224,7 +242,8 @@ impl Pipeline {
         // 拍一拍没有归档内容，`batch` 为 0；它照样要过 shouldWake。
         let snapshot = Snapshot::of_poke(&scope.group, sender, now.unix_timestamp() * 1000);
         let reason = match self.hooks.get_mut(&device.id) {
-            Some(hooks) => match hooks.should_wake(
+            Some(hooks) => match HookRuntime::should_wake(
+                hooks.as_mut(),
                 &snapshot.view(),
                 &[],
                 rule.as_ref().map(WakeReason::label).as_deref(),
@@ -529,7 +548,10 @@ mod tests {
             crate::hooks::HookLimits::default(),
         )
         .expect("脚本应能加载");
-        pipeline().with_hooks(BTreeMap::from([("alice-phone".to_owned(), hooks)]))
+        pipeline().with_hooks(BTreeMap::from([(
+            "alice-phone".to_owned(),
+            Box::new(hooks) as Box<dyn HookRuntime>,
+        )]))
     }
 
     fn message(id: &str, sender: &str, text: &str) -> Message {

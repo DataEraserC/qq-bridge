@@ -23,9 +23,9 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::Message as WsMessage;
 use tungstenite::stream::MaybeTlsStream;
 
+use crate::chat::{ChatAction, ChatEvent, ChatOutcome, Transport};
 use crate::config::{Account, Secret};
 use crate::conn::Pool;
-use crate::onebot::{Action, DecodeError, Event};
 
 /// 建连与握手的上限。超过就当作一次失败，交给连接池的退避。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -37,7 +37,7 @@ pub const READ_TIMEOUT: Duration = Duration::from_millis(200);
 #[derive(Debug)]
 pub enum Incoming {
     /// 解码成功的事件。
-    Event(Box<Event>),
+    Event(Box<ChatEvent>),
     /// 收到了但解不出来。`kind` 是给日志用的粗分类。
     Undecodable { reason: String },
     /// 读超时：这一段时间没有帧。调用方应回头检查是否要发动作。
@@ -47,10 +47,11 @@ pub enum Incoming {
 }
 
 /// 一条已建立的连接。
-#[derive(Debug)]
 pub struct Connection {
     socket: Sock,
-    /// 已分配的号码，用于 `ActionResponse` 与 `deliver` 的请求标识。
+    /// 这条连接说的是哪种聊天协议。解码/编码全部经它，传输层不认识任何具体协议。
+    protocol: Box<dyn Transport>,
+    /// 已分配的号码，用于动作响应的配对。
     self_id: String,
     account: String,
 }
@@ -59,7 +60,7 @@ impl Connection {
     /// 按配置建连。
     ///
     /// 失败即返回错误，由调用方记一次失败并交给退避——这一层不重试。
-    pub fn open(account: &Account) -> Result<Self, ConnectError> {
+    pub fn open(account: &Account, protocol: Box<dyn Transport>) -> Result<Self, ConnectError> {
         let mut request = account
             .ws_url
             .clone()
@@ -95,6 +96,7 @@ impl Connection {
 
         Ok(Self {
             socket,
+            protocol,
             self_id: account.self_id.clone(),
             account: account.id.clone(),
         })
@@ -122,10 +124,10 @@ impl Connection {
 
             match frame {
                 WsMessage::Text(text) => {
-                    return match crate::onebot::decode(&text) {
+                    return match self.protocol.decode(&text) {
                         Ok(event) => Incoming::Event(Box::new(event)),
                         Err(error) => Incoming::Undecodable {
-                            reason: describe_decode_error(&error),
+                            reason: error.to_string(),
                         },
                     };
                 }
@@ -155,9 +157,9 @@ impl Connection {
     /// **不能丢**，所以随结果一并交出，由调用方补投给上层。
     pub fn act(
         &mut self,
-        action: &Action,
+        action: &ChatAction,
         echo: &str,
-    ) -> (Result<ActionOutcome, WriteError>, Vec<Event>) {
+    ) -> (Result<ActionOutcome, WriteError>, Vec<ChatEvent>) {
         let mut carried = Vec::new();
         match self.act_inner(action, echo, &mut carried) {
             Ok(outcome) => (Ok(outcome), carried),
@@ -167,11 +169,11 @@ impl Connection {
 
     fn act_inner(
         &mut self,
-        action: &Action,
+        action: &ChatAction,
         echo: &str,
-        carried: &mut Vec<Event>,
+        carried: &mut Vec<ChatEvent>,
     ) -> Result<ActionOutcome, WriteError> {
-        let line = action.encode(echo);
+        let line = self.protocol.encode(action, echo);
         self.socket
             .send(WsMessage::Text(line.into()))
             .map_err(|source| WriteError {
@@ -187,28 +189,24 @@ impl Connection {
                 continue;
             };
 
-            let Ok(response) = crate::onebot::ActionResponse::decode(&text) else {
+            let Some((echo_in_frame, outcome)) = self.protocol.response(&text) else {
                 // 不是动作响应，是一条事件：留着，别丢。
-                match crate::onebot::decode(&text) {
+                match self.protocol.decode(&text) {
                     Ok(event) => carried.push(event),
-                    Err(_) => carried.push(Event::Ignored {
+                    Err(_) => carried.push(ChatEvent::Ignored {
                         kind: "undecodable".to_owned(),
                     }),
                 }
                 continue;
             };
-            if response.echo.as_deref() != Some(echo) {
+            if echo_in_frame.as_deref() != Some(echo) {
                 continue;
             }
 
-            return Ok(if response.is_ok() {
-                ActionOutcome::Ok {
-                    data: response.data.clone(),
-                }
-            } else {
-                ActionOutcome::Rejected {
-                    reason: response.reason(),
-                }
+            // 响应的 `data` 只有 OneBot 一类协议才有；中立层不承诺它。
+            return Ok(match outcome {
+                ChatOutcome::Ok => ActionOutcome::Ok { data: None },
+                ChatOutcome::Rejected { reason } => ActionOutcome::Rejected { reason },
             });
         }
     }
@@ -219,6 +217,17 @@ impl Connection {
 
     pub fn self_id(&self) -> &str {
         &self.self_id
+    }
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn Transport` 不是 `Debug`；打印身份与协议名足够定位。
+        f.debug_struct("Connection")
+            .field("account", &self.account)
+            .field("self_id", &self.self_id)
+            .field("protocol", &self.protocol.name())
+            .finish_non_exhaustive()
     }
 }
 
@@ -233,7 +242,7 @@ pub enum ActionOutcome {
 
 /// 发起一次动作的请求。传输线程持有一条连接，动作经这个通道排进去。
 pub struct ActionRequest {
-    pub action: Action,
+    pub action: ChatAction,
     pub echo: String,
     pub reply: Sender<Result<ActionOutcome, WriteError>>,
 }
@@ -302,15 +311,6 @@ fn closed_reason(error: tungstenite::Error) -> String {
         tungstenite::Error::ConnectionClosed => "连接已关闭".to_owned(),
         tungstenite::Error::AlreadyClosed => "连接已关闭".to_owned(),
         other => other.to_string(),
-    }
-}
-
-fn describe_decode_error(error: &DecodeError) -> String {
-    match error {
-        DecodeError::NotJson { .. } => "不是合法 JSON".to_owned(),
-        DecodeError::NotObject => "不是 JSON 对象".to_owned(),
-        DecodeError::MissingPostType => "缺少 post_type".to_owned(),
-        DecodeError::MissingField(field) => format!("缺少 {field}"),
     }
 }
 

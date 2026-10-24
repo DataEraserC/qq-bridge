@@ -12,6 +12,8 @@
 | [0006](0006-blocking-websocket-per-thread.md) | 连接用阻塞 WebSocket 与每连接一线程，不引入 async runtime | 已采纳 |
 | [0007](0007-adapter-endpoint-and-transport.md) | 适配器接入点跨平台、可跨机器，跨机必须配令牌 | 已采纳 |
 | [0008](0008-hook-sandbox-and-limits.md) | 钩子宿主用 mlua vendored；沙箱靠不给，资源上限靠 VM 指令钩子 | 已采纳 |
+| [0009](0009-chat-transport-boundary.md) | 内核与聊天协议之间有 Transport 边界，OneBot 只是一个实现 | 已采纳 |
+| [0010](0010-hook-runtime-is-an-interface.md) | 钩子运行时是接口，Lua 与外进程都是一种实现 | 已采纳 |
 
 ## 格式
 

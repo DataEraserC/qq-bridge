@@ -8,11 +8,21 @@
 [[accounts]]
 id = "main"                      # 本文件内唯一的标识，不是 QQ 号
 self_id = "10001"                # 这个账号的 QQ 号
+protocol = "onebot11"            # 省略时默认 onebot11
 ws_url = "ws://127.0.0.1:6700"
 token = "env:QQ_TOKEN"           # 支持 env: 前缀，避免明文入库
 ```
 
-`id` 是你起的名字，工具调用和日志里都用它。`self_id` 必须与 OneBot 实现实际登录的号一致——不一致时内核无法正确判断「自己的消息」。
+`id` 是你起的名字，工具调用和日志里都用它。`self_id` 必须与实现实际登录的号一致——不一致时内核无法正确判断「自己的消息」。
+
+`protocol` 决定用哪份 [`Transport`](../architecture/03-kernel.md#聊天传输) 实现解码与编码：
+
+| 值 | 说明 |
+| --- | --- |
+| `onebot11` | OneBot 11；动作与事件走同一条 WS |
+| `satori` | Satori；事件走 WS，动作走 HTTP `message.create` |
+
+写错协议名会在**启动期**失败并列出已知值——运行期才发现的表现是「连上了但没有事件」，那比启动报错难查得多。
 
 ## 人格
 

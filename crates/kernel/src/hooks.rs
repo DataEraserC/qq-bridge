@@ -189,6 +189,48 @@ pub struct HookLog {
     pub message: String,
 }
 
+/// 钩子运行时。
+///
+/// 内核只认识这三个挂载点与它们的输入输出；**怎么执行**是运行时的事。
+///
+/// - 解释器内（现在的 [`Hooks`]）：Lua，隔离靠不加载 IO 库，超时靠 VM 指令钩子。
+/// - 子进程：任何语言，隔离靠进程边界，超时靠 kill。测得常驻子进程逐行 IPC 约
+///   0.031 ms，每次重起进程约 12.4 ms——所以子进程实现必须常驻，不能一调用一起。
+/// - WASM：隔离靠虚拟机，超时靠燃料计量。
+///
+/// 这三种的隔离模型完全不同，所以抽象只放**接口**，不放实现策略。见
+/// [ADR-0010](../../../docs/adr/0010-hook-runtime-is-an-interface.md)。
+///
+/// **不要求 `Send`。** 钩子全部在主循环线程上同步执行——[ADR-0006] 的阻塞模型决定了
+/// 没有第二个线程会碰它。要求 `Send` 会立刻把 `mlua::Lua` 排除在外（它不是 `Send`），
+/// 而那是个假的约束：真要有线程要碰钩子，问题就不在 trait 上。
+///
+/// [ADR-0006]: ../../docs/adr/0006-blocking-websocket-per-thread.md
+pub trait HookRuntime {
+    /// 设备 id。日志与诊断要用。
+    fn device(&self) -> &str;
+
+    /// `preReceive`：身份过滤之后、归档之前。
+    fn pre_receive(&mut self, event: &HookEvent<'_>) -> Ruling;
+
+    /// `postReceive`：归档之后、判定之前。返回值被忽略。
+    fn post_receive(&mut self, event: &HookEvent<'_>);
+
+    /// `shouldWake`：判定的最终决定。
+    ///
+    /// `Ok(None)` 是「否决」，`Ok(Some(reason))` 是「唤醒并给出原因」，`Err` 是脚本失败——
+    /// 调用方据此按「失败偏向保留」的方向退回规则结论（不变量八）。
+    fn should_wake(
+        &mut self,
+        event: &HookEvent<'_>,
+        tags: &[String],
+        reason: Option<&str>,
+    ) -> Result<Option<String>, HookError>;
+
+    /// 取走攒下的日志。
+    fn drain_logs(&self) -> Vec<HookLog>;
+}
+
 /// 一个设备的钩子环境。
 pub struct Hooks {
     lua: Lua,
@@ -579,6 +621,33 @@ impl Hooks {
             device: self.device.clone(),
             detail: source.to_string(),
         }
+    }
+}
+
+impl HookRuntime for Hooks {
+    fn device(&self) -> &str {
+        &self.device
+    }
+
+    fn pre_receive(&mut self, event: &HookEvent<'_>) -> Ruling {
+        Hooks::pre_receive(self, event)
+    }
+
+    fn post_receive(&mut self, event: &HookEvent<'_>) {
+        Hooks::post_receive(self, event)
+    }
+
+    fn should_wake(
+        &mut self,
+        event: &HookEvent<'_>,
+        tags: &[String],
+        reason: Option<&str>,
+    ) -> Result<Option<String>, HookError> {
+        Hooks::should_wake(self, event, tags, reason)
+    }
+
+    fn drain_logs(&self) -> Vec<HookLog> {
+        Hooks::drain_logs(self)
     }
 }
 
