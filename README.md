@@ -25,8 +25,11 @@ qq-agent-bridge 让 agent 以真实的 QQ 账号身份参与群聊。它由两�
 | `crates/kernel/src/archive.rs` | 按记忆名分片的归档（按群的未读水位、去重、条数与字节双限、投递文本渲染、JSON 往返） |
 | `crates/kernel/src/deliver.rs` | 投递组装：未读 + 上下文渲染成内容块、拍一拍判定、人格与笔记摘要、水位建议 |
 | `crates/kernel/src/pipeline.rs` | 事件管线：归档 → 判定 → 入队 → 投递，积压合并与唤醒原因保留 |
+| `crates/kernel/src/onebot.rs` | OneBot 11 事件解码与动作编码（消息、拍一拍、生命周期、心跳） |
+| `crates/kernel/src/conn.rs` | 连接池状态机（退避、就绪、轮换）与事件到设备的范围路由 |
+| `crates/kernel/src/transport.rs` | WebSocket 传输：建连、令牌、读循环、动作与响应配对 |
 
-尚未实现：OneBot 连接、socket 传输与重试、工具面、钩子宿主。
+尚未实现：内核与适配器之间的 socket 服务端、工具面、钩子宿主。
 
 ```sh
 cargo test                      # 全部测试

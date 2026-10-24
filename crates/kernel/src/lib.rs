@@ -4,8 +4,11 @@
 
 pub mod archive;
 pub mod config;
+pub mod conn;
 pub mod deliver;
 pub mod notes;
+pub mod onebot;
 pub mod pipeline;
+pub mod transport;
 pub mod turn;
 pub mod wake;

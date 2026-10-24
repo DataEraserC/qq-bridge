@@ -9,13 +9,22 @@ use qqab_kernel::archive::{
 
 const KERNEL_DOC: &str = include_str!("../../../docs/architecture/03-kernel.md");
 
-/// 从 Markdown 里取出第一个 ```json 代码块的内容。
-fn first_json_block(markdown: &str) -> String {
-    let fence = "```json";
-    let start = markdown.find(fence).expect("文档里应有 json 代码块") + fence.len();
-    let rest = &markdown[start..];
-    let end = rest.find("```").expect("代码块应闭合");
-    rest[..end].trim().to_owned()
+/// 取出归档分片那个 `json` 代码块。
+///
+/// 按内容特征找而不是「第一个」：同一份文档里还有 OneBot 事件示例，靠位置取会让两份
+/// 测试互相挤掉对方。归档分片的特征是最外层是 `shards`。
+fn shard_json_block(markdown: &str) -> String {
+    let mut rest = markdown;
+    while let Some(start) = rest.find("```json") {
+        let after = &rest[start + "```json".len()..];
+        let end = after.find("```").expect("代码块应闭合");
+        let body = after[..end].trim();
+        if body.contains("\"shards\"") {
+            return body.to_owned();
+        }
+        rest = &after[end..];
+    }
+    panic!("文档里应有一个归档分片示例");
 }
 
 /// 取上限表格里某一行的「默认」单元格。
@@ -55,7 +64,7 @@ fn documented_defaults_match_implementation() {
 
 #[test]
 fn documented_shard_parses() {
-    let json = first_json_block(KERNEL_DOC);
+    let json = shard_json_block(KERNEL_DOC);
     let archive = Archive::from_json(&json, Limits::default()).expect("文档里的分片示例必须能解析");
 
     assert_eq!(archive.watermark("alice", "20001"), 34);
@@ -74,7 +83,7 @@ fn documented_shard_parses() {
 
 #[test]
 fn documented_render_matches_implementation() {
-    let json = first_json_block(KERNEL_DOC);
+    let json = shard_json_block(KERNEL_DOC);
     let archive = Archive::from_json(&json, Limits::default()).expect("应能解析");
 
     // 号码是身份，括号里是显示名；被点到的消息带 @你 前缀。
@@ -86,7 +95,7 @@ fn documented_render_matches_implementation() {
 
 #[test]
 fn documented_shard_round_trips() {
-    let json = first_json_block(KERNEL_DOC);
+    let json = shard_json_block(KERNEL_DOC);
     let archive = Archive::from_json(&json, Limits::default()).expect("应能解析");
 
     let written = archive.to_json().expect("应能序列化");
