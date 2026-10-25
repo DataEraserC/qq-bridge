@@ -14,6 +14,7 @@
 | [0008](0008-hook-sandbox-and-limits.md) | 钩子宿主用 mlua vendored；沙箱靠不给，资源上限靠 VM 指令钩子 | 已采纳 |
 | [0009](0009-chat-transport-boundary.md) | 内核与聊天协议之间有 Transport 边界，OneBot 只是一个实现 | 已采纳 |
 | [0010](0010-hook-runtime-is-an-interface.md) | 钩子运行时是接口，Lua 与外进程都是一种实现 | 已采纳 |
+| [0011](0011-conversation-identity.md) | 会话身份是平台 + 会话，回复目标与会话分开；`protocol` 改名 `adapter` | 已采纳 |
 
 ## 格式
 
