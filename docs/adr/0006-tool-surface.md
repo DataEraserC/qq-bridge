@@ -14,11 +14,14 @@ agent 在一轮里可以调用的工具：
 | `list_rooms` | — | 列出本设备订阅的房间 |
 | `get_notes` / `set_note` / `del_note` | room, key, value | 笔记读写 |
 | `get_platform_events` | room, limit | 查最近的平台事件 |
+| `wait_message` | room, timeout | **阻塞**等该房间来新未读，等到就作为工具结果返回（自动确认）；超时返回空。上限受配置约束 |
+| `ack_messages` | ids | 确认这批消息已处理完；水位只前进地推到连续位置，未确认的下一轮重投（见 [0010](0010-ack-watermark.md)） |
 
 铁律：
 
 - 两个发送工具参数形状一致，降低使用成本；
 - 没有任何工具能发到订阅之外的房间；不给 `send_message` 加自由 `to` 的变体；
+- 没有自由设定水位的工具——水位只经 `ack_messages` 前进；
 - 每次工具调用必须携带回合票，票在开轮次时签发、收工时作废——不认票不认调用。
 
 ## 不这样会怎样
