@@ -7,6 +7,7 @@ node_modules/
 # 运行时状态与本机配置（永不入库）
 /state/
 config.toml
+.workbuddy/
 *.log
 *.bak
 *.bak-*
