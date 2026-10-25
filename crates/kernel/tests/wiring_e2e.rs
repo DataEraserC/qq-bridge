@@ -3,6 +3,7 @@
 //! 与 `runtime_e2e.rs` 的区别是那里用通道模拟两端，这里两端都是真的：适配器一侧是
 //! [`Server`] 绑出来的 socket，QQ 一侧是 `transport::Connection` 连到一个回环 WebSocket
 //! 服务端。只缺 `main` 自己的主循环，其余接线全是生产代码。
+use qqab_kernel::chat::ConversationKey;
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -42,7 +43,7 @@ memory = "alice"
 accounts = ["main"]
 
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 
@@ -55,6 +56,11 @@ const AT_ME: &str = r#"{"post_type":"message","message_type":"group","self_id":1
 "group_id":20001,"message_id":"7451","user_id":30002,"sender":{"nickname":"小明"},
 "time":1792561540,"message":[{"type":"at","data":{"qq":"10001"}},
 {"type":"text","data":{"text":" 在吗"}}]}"#;
+
+/// 测试里的会话键：这些用例只有 QQ 一个平台。
+fn qq(conversation: &str) -> ConversationKey {
+    ConversationKey::new("qq", conversation)
+}
 
 fn now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_792_561_540).expect("合法时间戳")
@@ -219,7 +225,7 @@ fn full_loop_from_qq_message_to_delivered_frame_and_back() {
 
     // 握手。
     client
-        .write_all(b"{\"type\":\"hello\",\"id\":\"h-1\",\"version\":1,\"adapter\":\"wiring\"}\n")
+        .write_all(b"{\"type\":\"hello\",\"id\":\"h-1\",\"version\":2,\"adapter\":\"wiring\"}\n")
         .expect("应能发 hello");
     let event = adapter_rx
         .recv_timeout(Duration::from_secs(5))
@@ -305,7 +311,7 @@ fn full_loop_from_qq_message_to_delivered_frame_and_back() {
     };
     kernel.handle(Inbound::Adapter(AdapterEvent::Frame { conn, frame }), now());
     assert_eq!(
-        kernel.pipeline().archive().watermark("alice", "20001"),
+        kernel.pipeline().archive().watermark("alice", &qq("20001")),
         1,
         "确认之后水位推进"
     );

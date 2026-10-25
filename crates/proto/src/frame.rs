@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ErrorBody;
-use crate::{Block, Scope};
+use crate::{Block, ReplyTo, Scope};
 
 /// 一帧协议消息。
 ///
@@ -50,6 +50,10 @@ pub struct Deliver {
     pub persona: String,
     pub blocks: Vec<Block>,
     pub scope: Scope,
+    /// 本回合的回复目标。适配器发消息时用它而不是 `scope.conversation`——
+    /// 有的平台上两者不同（Satori 的 guild 与 channel）。
+    #[serde(default)]
+    pub reply: Option<ReplyTo>,
     /// 唤醒原因标签，供运行时展示。
     pub wake_reason: String,
     /// 已渲染的笔记摘要，可为空字符串。适配器原样拼进提示词，不解析、不裁剪、不排序。

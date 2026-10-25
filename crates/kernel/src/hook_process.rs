@@ -366,7 +366,8 @@ impl Drop for ProcessHooks {
 fn event_json(event: &HookEvent<'_>) -> Value {
     json!({
         "sender_id": event.sender_id,
-        "group_id": event.group_id,
+        "platform": event.platform,
+        "conversation": event.conversation,
         "text": event.text,
         "time": event.time_ms,
         "is_self": event.is_self,
@@ -394,7 +395,8 @@ mod tests {
     fn event<'a>(text: &'a str, sender: &'a str) -> HookEvent<'a> {
         HookEvent {
             sender_id: sender,
-            group_id: "20001",
+            platform: "qq",
+            conversation: "20001",
             text,
             time_ms: 1_792_561_540_000,
             is_self: false,

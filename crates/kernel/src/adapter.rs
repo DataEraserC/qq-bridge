@@ -67,7 +67,10 @@ pub enum AdapterEvent {
         peer: String,
     },
     /// 收到一帧。
-    Frame { conn: u64, frame: Frame },
+    ///
+    /// `frame` 装箱：`Frame` 因为 `deliver` 一族字段而很大，不装箱会让整个
+    /// 枚举按最大的变体分配，每条拍一拍、每次时钟推进都跟着付这份内存。
+    Frame { conn: u64, frame: Box<Frame> },
     /// 收到一行但解不出来。内核丢弃它，连接继续。
     Undecodable { conn: u64, reason: String },
     /// 连接结束。
@@ -452,7 +455,10 @@ fn deliver_line(id: u64, line: &[u8], tx: &Sender<AdapterEvent>) {
     }
     match decode(&text) {
         Ok(frame) => {
-            let _ = tx.send(AdapterEvent::Frame { conn: id, frame });
+            let _ = tx.send(AdapterEvent::Frame {
+                conn: id,
+                frame: Box::new(frame),
+            });
         }
         Err(error) => {
             let _ = tx.send(AdapterEvent::Undecodable {
@@ -598,14 +604,14 @@ mod tests {
         let _keep = out;
 
         client
-            .write_all(b"{\"type\":\"hello\",\"id\":\"h-1\",\"version\":1,\"adapter\":\"test\"}\n")
+            .write_all(b"{\"type\":\"hello\",\"id\":\"h-1\",\"version\":2,\"adapter\":\"test\"}\n")
             .expect("应能写出");
 
         let AdapterEvent::Frame { conn: id, frame } = recv(&rx) else {
             panic!("应收到一枚帧");
         };
         assert_eq!(id, conn);
-        assert!(matches!(frame, Frame::Hello(_)));
+        assert!(matches!(*frame, Frame::Hello(_)));
     }
 
     #[test]
@@ -629,7 +635,7 @@ mod tests {
             let AdapterEvent::Frame { frame, .. } = recv(&rx) else {
                 panic!("应收到两枚帧");
             };
-            match frame {
+            match *frame {
                 Frame::Ping(ping) => ids.push(ping.id),
                 other => panic!("期望 ping，得到 {other:?}"),
             }
@@ -750,12 +756,12 @@ mod tests {
         let _connected = recv(&rx);
 
         client
-            .write_all(b"{\"type\":\"hello\",\"id\":\"h-9\",\"version\":1,\"adapter\":\"tcp\"}\n")
+            .write_all(b"{\"type\":\"hello\",\"id\":\"h-9\",\"version\":2,\"adapter\":\"tcp\"}\n")
             .expect("应能写出");
         let AdapterEvent::Frame { frame, .. } = recv(&rx) else {
             panic!("应收到一枚帧");
         };
-        assert!(matches!(frame, Frame::Hello(_)));
+        assert!(matches!(*frame, Frame::Hello(_)));
     }
 
     #[test]
@@ -778,6 +784,6 @@ mod tests {
         let AdapterEvent::Frame { frame, .. } = recv(&rx) else {
             panic!("应收到一枚帧");
         };
-        assert!(matches!(frame, Frame::Ping(_)));
+        assert!(matches!(*frame, Frame::Ping(_)));
     }
 }

@@ -26,7 +26,7 @@ memory = "alice"
 accounts = ["main", "backup"]
 
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main", "backup"]
 
@@ -49,7 +49,7 @@ memory = "alice"
 accounts = ["backup"]
 
   [[devices.scopes]]
-  group = "20003"
+  conversation = "20003"
   receive = ["backup"]
   send = ["backup"]
 

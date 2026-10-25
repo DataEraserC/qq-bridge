@@ -18,7 +18,7 @@
 
 - 纯 Lua 标准库中无副作用的部分：`string`、`table`、`math`、`utf8`、部分 `os.time`/`os.date`。
 - 注入的宿主函数（见下）。
-- 该设备的只读配置快照：`config.id`、`config.memory`、`config.persona`、`config.accounts`、`config.scopes`（每项含 `group`/`receive`/`send`）。
+- 该设备的只读配置快照：`config.id`、`config.memory`、`config.persona`、`config.accounts`、`config.scopes`（每项含 `platform`/`conversation`/`receive`/`send`）。
 
 **不加载**：`io`、`os.execute`、`os.remove`、`package`、`require`、`load`、`loadfile`、`dofile`、`debug`、`collectgarbage`。
 
@@ -53,7 +53,7 @@ flowchart LR
 
 ```lua
 function preReceive(ev)
-  -- ev.sender_id, ev.group_id, ev.text, ev.is_self, ev.tags
+  -- ev.sender_id, ev.platform, ev.conversation, ev.text, ev.is_self, ev.tags
   if ev.text == "" then return nil end        -- 丢弃
   ev.tags = { "noisy" }
   return ev

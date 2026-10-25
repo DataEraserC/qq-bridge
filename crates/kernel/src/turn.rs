@@ -9,12 +9,18 @@
 //! 由调用方重新 `arrive` 一次，把积压合并成**一次**投递。这避免「群里刷屏后连续
 //! 回复十条」。
 //!
+//! **积压记的是「哪些范围」，不是一个布尔值。** 一个记忆名可以订阅多个会话，两边的
+//! 未读互不相干；只记「有积压」会在收尾时把另一个会话的未读永久落下——那一批消息要等到
+//! 该会话的下一条新消息才会再被看见。
+//!
 //! 时间由调用方传入，不在这里读时钟——判定可测、可重放。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use time::{Duration, OffsetDateTime};
+
+use crate::chat::ConversationKey;
 
 /// 回合票。不透明字符串，只在协议里原样传递。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,8 +55,8 @@ pub struct TurnContext {
     pub memory: String,
     /// 设备标识。同一个记忆名可能被多个设备投递，这里记下本次是哪一个。
     pub device: String,
-    /// 本次投递涉及的群。
-    pub group: String,
+    /// 本次投递涉及的会话。
+    pub conversation: ConversationKey,
     /// 允许用于发送的账号标识。
     pub send_accounts: Vec<String>,
 }
@@ -65,12 +71,15 @@ pub enum Arrival {
 }
 
 /// 一次回合结束的判定结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finished {
     /// 没有积压，队列回到空闲。
     Idle,
-    /// 有积压，调用方应立即再次 `arrive` 把积压合并成一次投递。
-    Backlog,
+    /// 有积压，调用方应逐个 `arrive` 把积压合并成投递。
+    ///
+    /// 带着**还有未读的范围**，不是一个布尔值：一个记忆名可以订阅多个会话，只有一个
+    /// 范围值得重投时，另一个的未读不能跟着这个结论一起被丢掉。
+    Backlog(BTreeSet<ConversationKey>),
 }
 
 /// 票被拒绝的原因。三个变体对应协议里的两个错误码。
@@ -116,8 +125,9 @@ pub struct TurnTable {
 #[derive(Debug, Default)]
 struct MemoryState {
     active: Option<Active>,
-    /// 回合忙时是否有新消息到达。只记布尔值，不记条数——积压合并只需要知道「有」。
-    backlog: bool,
+    /// 回合忙时有哪些范围到达过消息。只记范围名，不记条数——积压合并只需要知道
+    /// 「哪些会话还有未读」，条数由归档在收尾时重新清点。
+    backlog: BTreeSet<ConversationKey>,
 }
 
 #[derive(Debug)]
@@ -143,13 +153,17 @@ impl TurnTable {
     /// 队列空闲则签票开始回合；忙则只记积压水位并返回 [`Arrival::Defer`]。
     pub fn arrive(&mut self, context: TurnContext, now: OffsetDateTime) -> Arrival {
         if self.is_busy(&context.memory) {
-            self.memories.entry(context.memory).or_default().backlog = true;
+            self.memories
+                .entry(context.memory)
+                .or_default()
+                .backlog
+                .insert(context.conversation);
             return Arrival::Defer;
         }
 
         let ticket = self.issue(now);
         let state = self.memories.entry(context.memory.clone()).or_default();
-        state.backlog = false;
+        state.backlog.remove(&context.conversation);
         state.active = Some(Active {
             ticket: ticket.clone(),
             context,
@@ -181,10 +195,13 @@ impl TurnTable {
         }
 
         state.active = None;
-        Ok(if state.backlog {
-            Finished::Backlog
-        } else {
+        // 积压清单交给调用方：它会逐个范围重新 `arrive`，重新记账。这里清掉是为了让
+        // 「谁还需要投一次」只有一个来源——返回值。
+        let backlog = std::mem::take(&mut state.backlog);
+        Ok(if backlog.is_empty() {
             Finished::Idle
+        } else {
+            Finished::Backlog(backlog)
         })
     }
 
@@ -236,7 +253,29 @@ impl TurnTable {
 
     /// 某记忆名是否有未投递的积压。
     pub fn has_backlog(&self, memory: &str) -> bool {
-        self.memories.get(memory).is_some_and(|state| state.backlog)
+        self.memories
+            .get(memory)
+            .is_some_and(|state| !state.backlog.is_empty())
+    }
+
+    /// 某记忆名上还有未读的那些范围。诊断与测试用。
+    pub fn backlog(&self, memory: &str) -> BTreeSet<ConversationKey> {
+        self.memories
+            .get(memory)
+            .map(|state| state.backlog.clone())
+            .unwrap_or_default()
+    }
+
+    /// 把一个范围重新记进积压。
+    ///
+    /// 收尾时 [`Finished::Backlog`] 会带走整份清单——调用方一次只服务一个范围，其余的
+    /// 必须原样交回来，否则它们在下一个回合结束前就没人再提起了。
+    pub fn remember_backlog(&mut self, memory: &str, conversation: &ConversationKey) {
+        self.memories
+            .entry(memory.to_owned())
+            .or_default()
+            .backlog
+            .insert(conversation.clone());
     }
 
     /// 签发过的票总数。诊断用。
@@ -273,7 +312,7 @@ mod tests {
         TurnContext {
             memory: memory.to_owned(),
             device: format!("{memory}-phone"),
-            group: "20001".to_owned(),
+            conversation: ConversationKey::new("qq", "20001"),
             send_accounts: vec!["main".to_owned()],
         }
     }
@@ -325,7 +364,12 @@ mod tests {
         let ticket = start(&mut table, "alice");
         assert_eq!(table.arrive(ctx("alice"), now()), Arrival::Defer);
 
-        assert_eq!(table.finish("alice", &ticket, now()), Ok(Finished::Backlog));
+        assert_eq!(
+            table.finish("alice", &ticket, now()),
+            Ok(Finished::Backlog(BTreeSet::from([ConversationKey::new(
+                "qq", "20001"
+            )])))
+        );
         assert!(!table.is_busy("alice"));
 
         // 积压合并成一次投递，不是每来一条一个回合。
@@ -377,7 +421,7 @@ mod tests {
 
         let context = table.authorize("alice", &ticket, now()).expect("票应有效");
         assert_eq!(context.device, "alice-phone");
-        assert_eq!(context.group, "20001");
+        assert_eq!(context.conversation, ConversationKey::new("qq", "20001"));
         assert_eq!(context.send_accounts, vec!["main".to_owned()]);
     }
 
@@ -393,7 +437,12 @@ mod tests {
         assert_eq!(table.arrive(ctx("bob"), now()), Arrival::Defer);
 
         // bob 的积压只影响 bob；bob 先结束，alice 不受影响。
-        assert_eq!(table.finish("bob", &bob, now()), Ok(Finished::Backlog));
+        assert_eq!(
+            table.finish("bob", &bob, now()),
+            Ok(Finished::Backlog(BTreeSet::from([ConversationKey::new(
+                "qq", "20001"
+            )])))
+        );
         assert!(!table.has_backlog("alice"));
         assert!(table.is_busy("alice"));
         assert_eq!(

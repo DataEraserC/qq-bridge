@@ -6,7 +6,7 @@
 use std::net::TcpListener;
 use std::thread;
 
-use qqab_kernel::chat::{ChatAction, ChatEvent, ChatMessage};
+use qqab_kernel::chat::{ChatAction, ChatEvent, ChatMessage, ReplyAddress};
 use qqab_kernel::config::{Account, Secret};
 use qqab_kernel::onebot::OneBot;
 use qqab_kernel::transport::{ActionOutcome, ConnectError, Connection, Incoming};
@@ -34,7 +34,8 @@ fn account(url: &str) -> Account {
     Account {
         id: "main".to_owned(),
         self_id: "10001".to_owned(),
-        protocol: "onebot11".to_owned(),
+        adapter: "onebot11".to_owned(),
+        platform: Some("qq".to_owned()),
         ws_url: url.to_owned(),
         token: None,
     }
@@ -63,7 +64,8 @@ fn connects_and_reads_an_event() {
             let ChatEvent::Message(message) = *event else {
                 panic!("期望群消息");
             };
-            assert_eq!(message.group, "20001");
+            assert_eq!(message.conversation.conversation, "20001");
+            assert_eq!(message.conversation.platform, "qq");
             assert_eq!(message.text, "在吗");
         }
         other => panic!("期望事件，得到 {other:?}"),
@@ -127,8 +129,11 @@ fn sends_action_and_matches_response_by_echo() {
         Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
 
     let (outcome, carried) = connection.act(
-        &ChatAction::SendGroupMessage {
-            group: "20001".to_owned(),
+        &ChatAction::Send {
+            to: ReplyAddress {
+                platform: "qq".to_owned(),
+                address: "20001".to_owned(),
+            },
             text: "在".to_owned(),
         },
         "a-1",
@@ -158,8 +163,11 @@ fn rejected_action_reports_reason_without_retry() {
     let mut connection =
         Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
     let (outcome, _) = connection.act(
-        &ChatAction::SendGroupMessage {
-            group: "0".to_owned(),
+        &ChatAction::Send {
+            to: ReplyAddress {
+                platform: "qq".to_owned(),
+                address: "0".to_owned(),
+            },
             text: "x".to_owned(),
         },
         "a-1",
@@ -192,8 +200,11 @@ fn events_arriving_while_waiting_for_an_action_are_carried_back() {
     let mut connection =
         Connection::open(&account(&url), Box::new(OneBot::new())).expect("应能建连");
     let (outcome, carried) = connection.act(
-        &ChatAction::SendGroupMessage {
-            group: "20001".to_owned(),
+        &ChatAction::Send {
+            to: ReplyAddress {
+                platform: "qq".to_owned(),
+                address: "20001".to_owned(),
+            },
             text: "在".to_owned(),
         },
         "a-1",
@@ -254,7 +265,8 @@ fn missing_token_env_fails_before_connecting() {
     let account = Account {
         id: "main".to_owned(),
         self_id: "10001".to_owned(),
-        protocol: "onebot11".to_owned(),
+        adapter: "onebot11".to_owned(),
+        platform: Some("qq".to_owned()),
         ws_url: "ws://127.0.0.1:1".to_owned(),
         token: Some(Secret::Env("QQAB_TEST_TOKEN_NOT_SET".to_owned())),
     };
@@ -264,4 +276,80 @@ fn missing_token_env_fails_before_connecting() {
         Err(ConnectError::TokenEnv(name)) => assert_eq!(name, "QQAB_TEST_TOKEN_NOT_SET"),
         other => panic!("期望令牌缺失错误，得到 {other:?}"),
     }
+}
+
+/// Satori 走同一条阻塞传输，但两件事不同：平台来自 `READY`，动作发到频道不是 guild。
+///
+/// 这条测试验证「平台由传输层透传」的落地形态：内核一行不改，而会话键与会话名在
+/// Satori 上分别是 `guild.id` 与 `channel.id`。
+#[test]
+fn satori_learns_the_platform_from_ready_and_tracks_the_channel() {
+    let (url, server) = serve(|socket| {
+        socket
+        .send(WsMessage::Text(
+            r#"{"op":4,"body":{"login":{"status":1,"platform":"qqguild","user":{"id":"90001","name":"bot"}}}}"#
+                .into(),
+        ))
+        .expect("应能发出 READY");
+        socket
+        .send(WsMessage::Text(
+            r#"{"op":0,"body":{"type":"message-created","message":{"id":"m-1","content":"在吗","created_at":1792561540000,"channel":{"id":"ch-9","type":0},"guild":{"id":"g-1"},"user":{"id":"30002","nick":"小明"}}}}"#
+                .into(),
+        ))
+        .expect("应能发出事件");
+    });
+
+    let account = Account {
+        id: "guild-main".to_owned(),
+        self_id: "90001".to_owned(),
+        adapter: "satori".to_owned(),
+        // 平台留空：由 READY 给。
+        platform: None,
+        ws_url: url.clone(),
+        token: None,
+    };
+
+    let transport = qqab_kernel::satori::SatoriTransport::new();
+    let mut connection = Connection::open(&account, Box::new(transport)).expect("应能建连");
+
+    let mut events = Vec::new();
+    for _ in 0..8 {
+        match connection.read_event() {
+            Incoming::Event(event) => {
+                events.push(*event);
+                if events.len() == 2 {
+                    break;
+                }
+            }
+            Incoming::Timeout => continue,
+            other => panic!("不该发生：{other:?}"),
+        }
+    }
+
+    assert_eq!(
+        events.first().expect("应有 READY"),
+        &ChatEvent::Status(qqab_kernel::chat::ChatStatus::Ready {
+            platform: Some("qqguild".to_owned())
+        }),
+        "平台由 READY 的 login.platform 透传，不是配置给的"
+    );
+
+    let Some(ChatEvent::Message(message)) = events.get(1) else {
+        panic!("期望消息，得到 {:?}", events.get(1));
+    };
+    assert_eq!(
+        message.conversation,
+        qqab_kernel::chat::ConversationKey::new("qqguild", "g-1"),
+        "会话是 guild —— 内核的范围模型是一个群一个订阅"
+    );
+    assert_eq!(
+        message.reply_to,
+        Some(ReplyAddress {
+            platform: "qqguild".to_owned(),
+            address: "ch-9".to_owned(),
+        }),
+        "回复目标是 channel —— 一个群有多条文本频道"
+    );
+
+    let _ = server.join();
 }

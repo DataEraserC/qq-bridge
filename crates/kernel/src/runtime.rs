@@ -85,13 +85,16 @@ struct PendingAction {
 
 /// 待重投。
 ///
-/// 记住目标设备与群，而不是到重投时再去配置里找一个——一台设备可以订阅多个群，按「第一个
-/// scope」猜会把消息投到错误的群里。
+/// 记住目标设备与会话，而不是到重投时再去配置里找一个——一台设备可以订阅多个会话，
+/// 按「第一个 scope」猜会把消息投到错误的会话里。
+///
+/// 键是 `(记忆名, 会话)` 而不是记忆名：一个记忆名可以同时有多个会话等着投递，按记忆名记
+/// 只会留下最后一个，先失败的那个会话的重投点就被覆盖掉，它的未读要等到下一条新消息。
 struct Retry {
     attempts: u32,
     due: OffsetDateTime,
     device: String,
-    group: String,
+    conversation: crate::chat::ConversationKey,
 }
 
 /// 回合身份：从票里取回来的那几项。
@@ -99,16 +102,25 @@ struct Retry {
 pub struct TurnContext {
     pub memory: String,
     pub device: String,
-    pub group: String,
+    /// 本回合的会话。
+    pub conversation: crate::chat::ConversationKey,
+    /// 本回合的回信目标。**可以与会话不同**：Satori 上收信是 guild，回信是 channel。
+    pub reply: crate::chat::ReplyAddress,
     pub send_accounts: Vec<String>,
 }
 
 impl From<crate::turn::TurnContext> for TurnContext {
     fn from(context: crate::turn::TurnContext) -> Self {
+        // 回信目标默认等于会话；`send_delivery` 若拿到更精确的地址会覆盖它。
+        let reply = crate::chat::ReplyAddress {
+            platform: context.conversation.platform.clone(),
+            address: context.conversation.conversation.clone(),
+        };
         Self {
             memory: context.memory,
             device: context.device,
-            group: context.group,
+            conversation: context.conversation,
+            reply,
             send_accounts: context.send_accounts,
         }
     }
@@ -129,7 +141,7 @@ pub struct Kernel {
     /// 进行中的回合身份。键是记忆名——一个记忆名同时只有一个回合。
     contexts: BTreeMap<String, TurnContext>,
     pending_actions: Vec<PendingAction>,
-    retries: BTreeMap<String, Retry>,
+    retries: BTreeMap<(String, crate::chat::ConversationKey), Retry>,
     frame_seq: u64,
     echo_seq: u64,
     /// 概率唤醒的确定性随机源。可重放比真随机重要——排查「它为什么说话」时能复现。
@@ -264,9 +276,18 @@ impl Kernel {
         match event {
             ChatEvent::Message(message) => self.on_message(account, &message, now),
             ChatEvent::Poke(poke) => self.on_poke(account, &poke, now),
-            ChatEvent::Status(ChatStatus::Ready) => {
+            ChatEvent::Status(ChatStatus::Ready { platform }) => {
                 self.pool.ready(account);
-                Vec::new()
+                // 平台是会话命名空间的一部分，学到就打一条——部署者要能从日志看出
+                // 这条连接到底把自己算成了哪个平台。
+                let learned = match platform {
+                    Some(platform) => format!("平台 {platform}"),
+                    None => "平台未知".to_owned(),
+                };
+                vec![Outbound::Log {
+                    level: "info",
+                    message: format!("账号 {account} 就绪：{learned}"),
+                }]
             }
             // 平台说本账号不在线：就当这次连接没成，交给退避重连。
             ChatEvent::Status(ChatStatus::Offline) => {
@@ -308,7 +329,7 @@ impl Kernel {
             let action = self
                 .pipeline
                 .ingest(&device, &scope, &persona, archived, now, roll);
-            out.extend(self.after_action(&device, &scope, action, now));
+            out.extend(self.after_action(&device, action, now));
         }
         out
     }
@@ -318,7 +339,7 @@ impl Kernel {
         if !poke.targets_self() {
             return Vec::new();
         }
-        let Some(group) = poke.group.as_deref() else {
+        let Some(conversation) = poke.conversation.as_ref() else {
             return Vec::new();
         };
 
@@ -327,7 +348,7 @@ impl Kernel {
         let roll = self.next_roll();
         for device in &devices {
             for scope in &device.scopes {
-                if scope.group != group {
+                if scope.key() != *conversation {
                     continue;
                 }
                 if !scope.receive.iter().any(|candidate| candidate == account) {
@@ -346,40 +367,51 @@ impl Kernel {
                     now,
                     roll,
                 );
-                out.extend(self.after_action(device, scope, action, now));
+                out.extend(self.after_action(device, action, now));
             }
         }
         out
     }
 
     /// 管线给出结论后，把结论变成出站动作。
+    ///
+    /// 不带范围参数：投递自带目标，而 `Defer`/`Stay` 不需要目标。收尾时管线会在多个
+    /// 积压范围之间轮转，调用方手里的那个范围不一定是被投出去的那个。
     fn after_action(
         &mut self,
         device: &Device,
-        scope: &ScopeConfig,
         action: PipelineAction,
         now: OffsetDateTime,
     ) -> Vec<Outbound> {
         match action {
-            PipelineAction::Deliver(delivery) => self.send_delivery(*delivery, device, scope, now),
+            PipelineAction::Deliver(delivery) => self.send_delivery(*delivery, device, now),
             // 积压已记在管线里，回合结束后合并投递。
             PipelineAction::Defer | PipelineAction::Stay => Vec::new(),
         }
     }
 
+    /// 把一批投递发出去。
+    ///
+    /// **目标群与发送账号取自投递自己，不取自调用方的参数。** 积压收尾时管线会从刚结束
+    /// 的范围轮转到另一个范围，调用方手里那个 `scope` 已经是上一场对话的了；用它填回合
+    /// 上下文，模型这条回合里的 `qq_send_message` 就会发进错误的群。
     fn send_delivery(
         &mut self,
         delivery: Delivery,
         device: &Device,
-        scope: &ScopeConfig,
         now: OffsetDateTime,
     ) -> Vec<Outbound> {
+        let conversation = crate::chat::ConversationKey::new(
+            delivery.scope.platform.clone(),
+            delivery.scope.conversation.clone(),
+        );
+        let reply = delivery.reply.clone();
         let Some(conn) = self.adapters.keys().next().copied() else {
             // 没有适配器：作废这一轮的票、留重试点。消息留在归档里，什么都不丢。
             self.pipeline
                 .abandon(&delivery.memory, &delivery.ticket, now);
             let seconds = REDELIVER_AFTER.whole_seconds();
-            self.schedule_retry(&delivery.memory, &device.id, &scope.group, now);
+            self.schedule_retry(&delivery.memory, &device.id, &conversation, now);
             return vec![Outbound::Log {
                 level: "warn",
                 message: format!(
@@ -396,8 +428,9 @@ impl Kernel {
             TurnContext {
                 memory: delivery.memory.clone(),
                 device: device.id.clone(),
-                group: scope.group.clone(),
-                send_accounts: scope.send.clone(),
+                conversation,
+                reply,
+                send_accounts: delivery.scope.send_accounts.clone(),
             },
         );
 
@@ -423,17 +456,18 @@ impl Kernel {
             AdapterEvent::Connected { conn, out, peer } => {
                 self.adapters.insert(conn, out);
                 // 适配器回来了：把刚才投不出去的那些立刻重投一遍。
-                let due: Vec<String> = self.retries.keys().cloned().collect();
+                let due: Vec<(String, crate::chat::ConversationKey)> =
+                    self.retries.keys().cloned().collect();
                 let mut actions = vec![Outbound::Log {
                     level: "info",
                     message: format!("适配器已连接（{peer}）"),
                 }];
-                for memory in due {
-                    actions.extend(self.redeliver(&memory, now));
+                for (memory, conversation) in due {
+                    actions.extend(self.redeliver(&memory, &conversation, now));
                 }
                 actions
             }
-            AdapterEvent::Frame { conn, frame } => self.on_frame(conn, frame, now),
+            AdapterEvent::Frame { conn, frame } => self.on_frame(conn, *frame, now),
             AdapterEvent::Undecodable { conn, reason } => vec![Outbound::Log {
                 level: "warn",
                 message: format!("适配器连接 {conn}：丢弃无法解码的帧（{reason}）"),
@@ -537,14 +571,19 @@ impl Kernel {
             return Vec::new();
         };
         let memory = delivery.memory.clone();
-        let group = self
-            .contexts
-            .get(&memory)
-            .map_or_else(String::new, |context| context.group.clone());
+        // 会话取自这一批投递自己，而不是去上下文表里回查：上下文在收尾时就被清掉，
+        // 一个迟到的 `deliver_ok` 回查到的是空的会话名，水位推进就会打到空键上。
+        let conversation = crate::chat::ConversationKey::new(
+            delivery.scope.platform.clone(),
+            delivery.scope.conversation.clone(),
+        );
 
-        match self.pipeline.confirm(&memory, &group, delivery.watermark) {
+        match self
+            .pipeline
+            .confirm(&memory, &conversation, delivery.watermark)
+        {
             Ok(()) => {
-                self.retries.remove(&memory);
+                self.retries.remove(&(memory, conversation));
                 Vec::new()
             }
             Err(error) => vec![Outbound::Log {
@@ -564,11 +603,11 @@ impl Kernel {
             .contexts
             .get(&memory)
             .cloned()
-            .map(|c| (c.device, c.group));
+            .map(|c| (c.device, c.conversation));
         self.pipeline.abandon(&memory, &delivery.ticket, now);
         self.contexts.remove(&memory);
-        if let Some((device, group)) = target {
-            self.schedule_retry(&memory, &device, &group, now);
+        if let Some((device, conversation)) = target {
+            self.schedule_retry(&memory, &device, &conversation, now);
         }
 
         let seconds = REDELIVER_AFTER.whole_seconds();
@@ -607,7 +646,7 @@ impl Kernel {
                     level: "info",
                     message: format!("记忆 {memory} 有积压，合并投递"),
                 }];
-                out.extend(self.send_delivery(delivery, &device, &scope, now));
+                out.extend(self.send_delivery(delivery, &device, now));
                 out
             }
             Ok(None) => Vec::new(),
@@ -678,8 +717,8 @@ impl Kernel {
         vec![Outbound::Act {
             account,
             request: ActionRequest {
-                action: ChatAction::SendGroupMessage {
-                    group: context.group.clone(),
+                action: ChatAction::Send {
+                    to: context.reply.clone(),
                     text: text.to_owned(),
                 },
                 echo,
@@ -748,25 +787,40 @@ impl Kernel {
         }
 
         // 到点的重投。
-        let due: Vec<String> = self
+        let due: Vec<(String, crate::chat::ConversationKey)> = self
             .retries
             .iter()
             .filter(|(_, retry)| now >= retry.due)
-            .map(|(memory, _)| memory.clone())
+            .map(|(key, _)| key.clone())
             .collect();
-        for memory in due {
-            out.extend(self.redeliver(&memory, now));
+        for (memory, conversation) in due {
+            out.extend(self.redeliver(&memory, &conversation, now));
         }
 
         out
     }
 
-    fn redeliver(&mut self, memory: &str, now: OffsetDateTime) -> Vec<Outbound> {
-        let Some(retry) = self.retries.get(memory) else {
+    fn redeliver(
+        &mut self,
+        memory: &str,
+        conversation: &crate::chat::ConversationKey,
+        now: OffsetDateTime,
+    ) -> Vec<Outbound> {
+        let key = (memory.to_owned(), conversation.clone());
+        let Some(retry) = self.retries.get(&key) else {
             return Vec::new();
         };
-        let (device_id, group) = (retry.device.clone(), retry.group.clone());
-        self.retries.remove(memory);
+
+        // 这个记忆名已经有回合在跑：现在投就只会变成积压，而重投点是「还没投出去」的
+        // 记账，用掉就不再回来。留着它，等这一回合收尾后由积压轮转带出去。
+        if self.pipeline.is_busy(memory) {
+            let entry = self.retries.get_mut(&key).expect("刚取过");
+            entry.due = now + REDELIVER_AFTER;
+            return Vec::new();
+        }
+
+        let device_id = retry.device.clone();
+        self.retries.remove(&key);
 
         let Some(device) = self
             .config
@@ -780,7 +834,7 @@ impl Kernel {
         let Some(scope) = device
             .scopes
             .iter()
-            .find(|scope| scope.group == group)
+            .find(|scope| scope.key() == *conversation)
             .cloned()
         else {
             return Vec::new();
@@ -788,20 +842,29 @@ impl Kernel {
 
         let persona = self.persona_of(&device.persona);
         let action = self.pipeline.rearrive(&device, &scope, &persona, now);
-        self.after_action(&device, &scope, action, now)
+        self.after_action(&device, action, now)
     }
 
-    fn schedule_retry(&mut self, memory: &str, device: &str, group: &str, now: OffsetDateTime) {
-        let entry = self.retries.entry(memory.to_owned()).or_insert(Retry {
-            attempts: 0,
-            due: now,
-            device: device.to_owned(),
-            group: group.to_owned(),
-        });
+    fn schedule_retry(
+        &mut self,
+        memory: &str,
+        device: &str,
+        conversation: &crate::chat::ConversationKey,
+        now: OffsetDateTime,
+    ) {
+        let entry = self
+            .retries
+            .entry((memory.to_owned(), conversation.clone()))
+            .or_insert(Retry {
+                attempts: 0,
+                due: now,
+                device: device.to_owned(),
+                conversation: conversation.clone(),
+            });
         entry.attempts = entry.attempts.saturating_add(1);
         entry.due = now + REDELIVER_AFTER;
         entry.device = device.to_owned();
-        entry.group = group.to_owned();
+        entry.conversation = conversation.clone();
     }
 
     // ---- 小工具 ----
@@ -839,7 +902,7 @@ impl Kernel {
         let scope = device
             .scopes
             .iter()
-            .find(|scope| scope.group == context.group)?;
+            .find(|scope| scope.key() == context.conversation)?;
         Some((device.clone(), scope.clone()))
     }
 

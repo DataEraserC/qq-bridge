@@ -7,7 +7,7 @@
 协议必须让两侧都保持无知：
 
 - 内核不知道会话、回合、工具调用的运行时形态——所以协议里不出现这些词。
-- 适配器不知道群号、账号、消息段——所以协议里的消息内容已经是渲染好的块。
+- 适配器不知道账号、消息段——所以协议里的消息内容已经是渲染好的块。
 
 协议是**有状态的**：一次连接承载多个记忆名的会话，靠 `memory` 字段区分。
 
@@ -18,7 +18,8 @@
 ```json
 {"type": "deliver", "id": "d-1", "ticket": "t1-1792561540309", "memory": "alice",
  "persona": "你是……", "blocks": [{"kind": "text", "text": "在吗"}],
- "scope": {"group": "20001", "send_accounts": ["main"]}, "wake_reason": "at_mention", "notes": ""}
+ "scope": {"platform": "qq", "conversation": "20001", "send_accounts": ["main"]},
+ "reply": {"platform": "qq", "address": "20001"}, "wake_reason": "at_mention", "notes": ""}
 ```
 
 所有请求带 `id`，响应带相同的 `id`。`id` 由发起方生成，只需在单条连接内唯一。
@@ -36,7 +37,8 @@
 | `memory` | string | 记忆名 |
 | `persona` | string | 已渲染的人格文本 |
 | `blocks` | array | 内容块，见下 |
-| `scope` | object | 本次投递涉及的群与可用发送账号 |
+| `scope` | object | 本次投递涉及的会话与可用发送账号 |
+| `reply` | object | 本回合的回复目标。可省略，省略即等于 `scope` 的会话 |
 | `wake_reason` | string | 唤醒原因标签，供运行时展示 |
 | `notes` | string | 已渲染的笔记摘要，可为空字符串 |
 
@@ -53,8 +55,12 @@
 `scope` 只含适配器需要转述给模型的部分：
 
 ```json
-{"group": "20001", "group_name": "...", "send_accounts": ["main", "backup"]}
+{"platform": "qq", "conversation": "20001", "conversation_name": "...", "send_accounts": ["main", "backup"]}
 ```
+
+`platform` 是会话的命名空间，`conversation` 是它里面的会话标识。两者分开而不是拼成一个字符串：拼接会引入分隔符撞车的歧义，而且相等判断必须逐段比——`qq` 群 `123` 与 `discord` 频道 `123` 是两个会话。
+
+`reply` 是**回复目标**，与 `scope` 分开：有的平台上「收消息的会话」和「发消息的目标」不是同一个对象。Satori 一个 guild 可以有多条文本频道，消息从频道来、回复也要回频道去；多数平台两者相同，那时 `address` 等于 `conversation`。适配器发消息时用 `reply`，不用 `scope.conversation`。
 
 `send_accounts` 是账号的**标识**，不是 QQ 号。适配器把它们当作不透明字符串，工具调用时原样回传。
 

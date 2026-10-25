@@ -25,6 +25,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::chat::{ConversationKey, ReplyAddress};
+
 /// 每片保留的消息条数上限。
 pub const DEFAULT_MAX_MESSAGES: usize = 500;
 /// 每片保留的负载字节上限。
@@ -97,7 +99,17 @@ pub struct Message {
     #[serde(default)]
     pub seq: u64,
     pub account: String,
+    /// 会话的命名空间。旧数据没有这个字段时视为空——那时只有 QQ 一个平台。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform: String,
+    /// 命名空间内的会话标识。对群聊平台就是群号。
     pub group: String,
+    /// 回复该发到哪儿。`None` 表示就是本会话——多数平台如此。
+    ///
+    /// 它是**每条消息**的属性而不是会话的属性：Satori 上一个 guild 有多个文本频道，
+    /// 回哪一条取决于这条消息从哪个频道来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
     pub message_id: String,
     pub sender_id: String,
     /// 群昵称。显示数据，不参与任何判定。
@@ -121,6 +133,7 @@ impl Message {
     /// 负载字节数。用于分片的内存预算，不是精确分配量。
     pub fn size(&self) -> usize {
         self.account.len()
+            + self.platform.len()
             + self.group.len()
             + self.message_id.len()
             + self.sender_id.len()
@@ -129,12 +142,33 @@ impl Message {
             + self.media.iter().map(Media::size).sum::<usize>()
     }
 
-    /// 消息的稳定标识是 `(群, 消息 ID)`——同一条消息只按这两项认。
+    /// 这条消息属于哪个会话。
+    pub fn conversation(&self) -> ConversationKey {
+        ConversationKey::new(self.platform.clone(), self.group.clone())
+    }
+
+    /// 回复这条消息该用的地址。
+    ///
+    /// 优先用消息自己记的 `reply`（Satori 的频道号），没有就是会话本身。回退到会话是
+    /// 安全的：群聊平台上两者本来就相等。
+    pub fn reply_address(&self) -> ReplyAddress {
+        ReplyAddress {
+            platform: self.platform.clone(),
+            address: self.reply.clone().unwrap_or_else(|| self.group.clone()),
+        }
+    }
+
+    /// 消息的稳定标识是 `(会话, 消息 ID)`——同一条消息只按这两项认。
     ///
     /// 账号**不**参与。一个群里轮换的多个接收账号看到的是同一条消息；按账号分别归档，
     /// 一次轮换交接就会在未读里留下两条副本。账号只记录「哪条连接先看到」。
+    ///
+    /// 会话要连**平台**一起比：`qq` 群 `123` 与 `discord` 频道 `123` 是同名的两个会话，
+    /// 只按群号认会把它们当成同一条消息。
     fn same_origin(&self, other: &Self) -> bool {
-        self.group == other.group && self.message_id == other.message_id
+        self.platform == other.platform
+            && self.group == other.group
+            && self.message_id == other.message_id
     }
 }
 
@@ -194,35 +228,40 @@ impl Archive {
         Appended { seq, fresh: true }
     }
 
-    /// 某群自上次投递以来的未读。
+    /// 某个会话自上次投递以来的未读。
     ///
     /// 自己发的消息不在其中。同一条消息在一个分片里只有一条——见 `Message::same_origin`。
-    pub fn unread(&self, memory: &str, group: &str) -> Vec<&Message> {
+    pub fn unread(&self, memory: &str, conversation: &ConversationKey) -> Vec<&Message> {
         let Some(shard) = self.shards.get(memory) else {
             return Vec::new();
         };
-        shard.unread(group).collect()
+        shard.unread(conversation).collect()
     }
 
-    /// 某群最近 `limit` 条**已消费**的消息，供投递时补上下文。
-    pub fn context(&self, memory: &str, group: &str, limit: usize) -> Vec<&Message> {
+    /// 某个会话最近 `limit` 条**已消费**的消息，供投递时补上下文。
+    pub fn context(
+        &self,
+        memory: &str,
+        conversation: &ConversationKey,
+        limit: usize,
+    ) -> Vec<&Message> {
         let Some(shard) = self.shards.get(memory) else {
             return Vec::new();
         };
-        let mut out: Vec<&Message> = shard.seen(group).collect();
+        let mut out: Vec<&Message> = shard.seen(conversation).collect();
         let start = out.len().saturating_sub(limit);
         out.drain(..start);
         out
     }
 
-    /// 把某群的水位推到 `through`：这之前的消息算被某个回合消费过。
+    /// 把某个会话的水位推到 `through`：这之前的消息算被某个回合消费过。
     ///
     /// 水位只前进。回退等于把已消费的消息再投递一次，所以回退是调用方的错误，不是可忽略
     /// 的输入。
     pub fn consume(
         &mut self,
         memory: &str,
-        group: &str,
+        conversation: &ConversationKey,
         through: u64,
     ) -> Result<(), WatermarkError> {
         let limits = self.limits;
@@ -230,25 +269,25 @@ impl Archive {
             return Err(WatermarkError::UnknownMemory);
         };
 
-        let current = shard.watermark(group);
+        let current = shard.watermark(conversation);
         if through <= current {
             return Err(WatermarkError::Backwards { current });
         }
-        let latest = shard.latest_seq(group);
+        let latest = shard.latest_seq(conversation);
         if through > latest {
             return Err(WatermarkError::Ahead { latest });
         }
 
-        shard.watermarks.insert(group.to_owned(), through);
+        shard.watermarks.insert(conversation.clone(), through);
         shard.enforce(&limits);
         Ok(())
     }
 
-    /// 某群的水位。没有投递过就是 0。
-    pub fn watermark(&self, memory: &str, group: &str) -> u64 {
+    /// 某个会话的水位。没有投递过就是 0。
+    pub fn watermark(&self, memory: &str, conversation: &ConversationKey) -> u64 {
         self.shards
             .get(memory)
-            .map_or(0, |shard| shard.watermark(group))
+            .map_or(0, |shard| shard.watermark(conversation))
     }
 
     /// 某分片里因上限被丢弃的条数。诊断用，投递时据此说明有缺。
@@ -350,13 +389,16 @@ impl std::fmt::Display for ArchiveError {
 
 impl std::error::Error for ArchiveError {}
 
-/// 一个记忆名的全部消息，以及每个群的未读水位。
+/// 一个记忆名的全部消息，以及每个会话的未读水位。
 #[derive(Debug, Default)]
 struct Shard {
     messages: VecDeque<Message>,
     bytes: usize,
-    /// 群 → 水位。消息的群没有水位时视为 0。
-    watermarks: BTreeMap<String, u64>,
+    /// 会话 → 水位。消息的会话没有水位时视为 0。
+    ///
+    /// 键是 [`ConversationKey`] 而不是群号：`qq` 群 `123` 与 `discord` 频道 `123` 在同
+    /// 一个记忆名下是两个会话，各有一条水位，否则一边投递就会把另一边的未读一起划掉。
+    watermarks: BTreeMap<ConversationKey, u64>,
     dropped: u64,
     next_seq: u64,
 }
@@ -368,31 +410,31 @@ impl Shard {
             .find(|existing| existing.same_origin(message))
     }
 
-    fn watermark(&self, group: &str) -> u64 {
-        self.watermarks.get(group).copied().unwrap_or(0)
+    fn watermark(&self, conversation: &ConversationKey) -> u64 {
+        self.watermarks.get(conversation).copied().unwrap_or(0)
     }
 
-    fn latest_seq(&self, group: &str) -> u64 {
+    fn latest_seq(&self, conversation: &ConversationKey) -> u64 {
         self.messages
             .iter()
-            .filter(|message| message.group == group)
+            .filter(|message| &message.conversation() == conversation)
             .map(|message| message.seq)
             .max()
             .unwrap_or(0)
     }
 
-    fn unread(&self, group: &str) -> impl Iterator<Item = &Message> {
-        let through = self.watermark(group);
-        self.messages
-            .iter()
-            .filter(move |message| message.group == group && is_unread(message, through))
+    fn unread(&self, conversation: &ConversationKey) -> impl Iterator<Item = &Message> {
+        let through = self.watermark(conversation);
+        self.messages.iter().filter(move |message| {
+            &message.conversation() == conversation && is_unread(message, through)
+        })
     }
 
-    fn seen(&self, group: &str) -> impl Iterator<Item = &Message> {
-        let through = self.watermark(group);
-        self.messages
-            .iter()
-            .filter(move |message| message.group == group && !is_unread(message, through))
+    fn seen(&self, conversation: &ConversationKey) -> impl Iterator<Item = &Message> {
+        let through = self.watermark(conversation);
+        self.messages.iter().filter(move |message| {
+            &message.conversation() == conversation && !is_unread(message, through)
+        })
     }
 
     /// 回收与收口。先丢已消费的上下文，再谈硬上限——顺序决定「先保未读」。
@@ -400,13 +442,13 @@ impl Shard {
         let mut seen = self
             .messages
             .iter()
-            .filter(|message| !is_unread(message, self.watermark(&message.group)))
+            .filter(|message| !is_unread(message, self.watermark(&message.conversation())))
             .count();
         while seen > limits.context_messages {
             let Some(front) = self.messages.front() else {
                 break;
             };
-            if is_unread(front, self.watermark(&front.group)) {
+            if is_unread(front, self.watermark(&front.conversation())) {
                 // 最旧的还没被投递过，不能为了上下文丢掉它。
                 break;
             }
@@ -427,7 +469,7 @@ impl Shard {
             return;
         };
         self.bytes = self.bytes.saturating_sub(message.size());
-        if is_unread(&message, self.watermark(&message.group)) {
+        if is_unread(&message, self.watermark(&message.conversation())) {
             self.dropped += 1;
         }
     }
@@ -436,7 +478,17 @@ impl Shard {
         let mut shard = Self {
             messages: VecDeque::with_capacity(wire.messages.len()),
             bytes: 0,
-            watermarks: wire.watermarks,
+            // 线上形态是数组：JSON 的 map 键只能是字符串，而会话键有两段。
+            watermarks: wire
+                .watermarks
+                .into_iter()
+                .map(|entry| {
+                    (
+                        ConversationKey::new(entry.platform, entry.conversation),
+                        entry.through,
+                    )
+                })
+                .collect(),
             dropped: wire.dropped,
             next_seq: 0,
         };
@@ -456,11 +508,12 @@ impl Shard {
         }
 
         // 水位指向已被淘汰的序号是合法的（那条消息被上限丢过）；指向未来不是。
-        for (group, watermark) in &shard.watermarks {
-            let latest = shard.latest_seq(group);
+        for (conversation, watermark) in &shard.watermarks {
+            let latest = shard.latest_seq(conversation);
             if *watermark > latest && latest != 0 {
                 return Err(ArchiveError::Corrupt(format!(
-                    "群 {group} 的水位 {watermark} 超过最大序号 {latest}"
+                    "会话 {} 的水位 {watermark} 超过最大序号 {latest}",
+                    conversation.conversation
                 )));
             }
         }
@@ -483,17 +536,37 @@ struct ArchiveWire {
 #[derive(Serialize, Deserialize)]
 struct ShardWire {
     #[serde(default)]
-    watermarks: BTreeMap<String, u64>,
+    watermarks: Vec<WatermarkWire>,
     #[serde(default)]
     dropped: u64,
     #[serde(default)]
     messages: Vec<Message>,
 }
 
+/// 一条水位记录。
+///
+/// 不用 `{"qq/20001": 34}` 那种单键 map：JSON 的对象键只能是字符串，而会话键有两段，
+/// 拼成字符串就退回到「分隔符会撞车」的老问题。数组形式两个字段各自独立，也没有歧义。
+#[derive(Serialize, Deserialize)]
+struct WatermarkWire {
+    #[serde(default)]
+    platform: String,
+    conversation: String,
+    through: u64,
+}
+
 impl From<&Shard> for ShardWire {
     fn from(shard: &Shard) -> Self {
         Self {
-            watermarks: shard.watermarks.clone(),
+            watermarks: shard
+                .watermarks
+                .iter()
+                .map(|(conversation, through)| WatermarkWire {
+                    platform: conversation.platform.clone(),
+                    conversation: conversation.conversation.clone(),
+                    through: *through,
+                })
+                .collect(),
             dropped: shard.dropped,
             messages: shard.messages.iter().cloned().collect(),
         }
@@ -540,9 +613,15 @@ mod tests {
         Archive::new(Limits::default())
     }
 
+    /// 测试里的会话键。多数用例只有 QQ 一个平台，写成短形式省得每处都铺开。
+    fn qq(conversation: &str) -> ConversationKey {
+        ConversationKey::new("qq", conversation)
+    }
+
     fn message(id: &str, sender: &str, text: &str) -> Message {
         Message {
             account: "main".to_owned(),
+            platform: "qq".to_owned(),
             group: "20001".to_owned(),
             message_id: id.to_owned(),
             sender_id: sender.to_owned(),
@@ -573,11 +652,13 @@ mod tests {
         for (id, text) in [("1", "一"), ("2", "二"), ("3", "三")] {
             archive.append("alice", message(id, "30002", text));
         }
-        assert_eq!(seqs(archive.unread("alice", "20001")), vec![1, 2, 3]);
+        assert_eq!(seqs(archive.unread("alice", &qq("20001"))), vec![1, 2, 3]);
 
-        archive.consume("alice", "20001", 2).expect("应能推进水位");
-        assert_eq!(seqs(archive.unread("alice", "20001")), vec![3]);
-        assert_eq!(archive.watermark("alice", "20001"), 2);
+        archive
+            .consume("alice", &qq("20001"), 2)
+            .expect("应能推进水位");
+        assert_eq!(seqs(archive.unread("alice", &qq("20001"))), vec![3]);
+        assert_eq!(archive.watermark("alice", &qq("20001")), 2);
     }
 
     #[test]
@@ -588,10 +669,10 @@ mod tests {
         own.own = true;
         archive.append("alice", own);
 
-        assert!(archive.unread("alice", "20001").is_empty());
+        assert!(archive.unread("alice", &qq("20001")).is_empty());
         assert_eq!(archive.retained("alice"), 1, "它仍然在归档里");
         // 上下文里要有它，否则模型看不到自己刚说过什么。
-        assert_eq!(seqs(archive.context("alice", "20001", 10)), vec![1]);
+        assert_eq!(seqs(archive.context("alice", &qq("20001"), 10)), vec![1]);
     }
 
     #[test]
@@ -607,7 +688,7 @@ mod tests {
 
         assert_eq!(archive.retained("alice"), 1, "发送号独占看到的消息也归档");
         assert!(
-            archive.unread("alice", "20001").is_empty(),
+            archive.unread("alice", &qq("20001")).is_empty(),
             "own 不进未读，也就不触发唤醒"
         );
 
@@ -618,8 +699,8 @@ mod tests {
         assert_eq!(again.seq, seq, "同一句只归档一份");
         assert!(!again.fresh, "重复到达不是新消息");
         assert_eq!(archive.retained("alice"), 1);
-        assert!(archive.unread("alice", "20001").is_empty());
-        assert_eq!(seqs(archive.context("alice", "20001", 10)), vec![seq]);
+        assert!(archive.unread("alice", &qq("20001")).is_empty());
+        assert_eq!(seqs(archive.context("alice", &qq("20001"), 10)), vec![seq]);
     }
 
     #[test]
@@ -631,12 +712,12 @@ mod tests {
         archive.append("alice", elsewhere);
 
         archive
-            .consume("alice", "20001", 1)
+            .consume("alice", &qq("20001"), 1)
             .expect("应能推进 A 群水位");
         // 推进 A 群不能划掉 B 群的未读。
-        assert_eq!(seqs(archive.unread("alice", "20003")), vec![2]);
-        assert_eq!(archive.watermark("alice", "20001"), 1);
-        assert_eq!(archive.watermark("alice", "20003"), 0);
+        assert_eq!(seqs(archive.unread("alice", &qq("20003"))), vec![2]);
+        assert_eq!(archive.watermark("alice", &qq("20001")), 1);
+        assert_eq!(archive.watermark("alice", &qq("20003")), 0);
     }
 
     #[test]
@@ -644,10 +725,10 @@ mod tests {
         let mut archive = archive();
         archive.append("alice", message("1", "30002", "一"));
         archive.append("alice", message("2", "30002", "二"));
-        archive.consume("alice", "20001", 2).expect("应能推进");
+        archive.consume("alice", &qq("20001"), 2).expect("应能推进");
 
         assert_eq!(
-            archive.consume("alice", "20001", 1),
+            archive.consume("alice", &qq("20001"), 1),
             Err(WatermarkError::Backwards { current: 2 })
         );
     }
@@ -657,12 +738,12 @@ mod tests {
         let mut archive = archive();
         archive.append("alice", message("1", "30002", "一"));
         assert_eq!(
-            archive.consume("alice", "20001", 2),
+            archive.consume("alice", &qq("20001"), 2),
             Err(WatermarkError::Ahead { latest: 1 })
         );
         // 群还没收到消息时推向未来同样非法。
         assert_eq!(
-            archive.consume("alice", "20003", 1),
+            archive.consume("alice", &qq("20003"), 1),
             Err(WatermarkError::Ahead { latest: 0 })
         );
     }
@@ -671,7 +752,7 @@ mod tests {
     fn consume_unknown_memory_is_rejected() {
         let mut archive = archive();
         assert_eq!(
-            archive.consume("nobody", "20001", 1),
+            archive.consume("nobody", &qq("20001"), 1),
             Err(WatermarkError::UnknownMemory)
         );
     }
@@ -693,7 +774,7 @@ mod tests {
         let mut archive = archive();
         let first = archive.append("alice", message("1", "30002", "一"));
         assert_eq!(
-            archive.unread("alice", "20001").len(),
+            archive.unread("alice", &qq("20001")).len(),
             1,
             "先到的那份不是自己发的"
         );
@@ -705,7 +786,7 @@ mod tests {
         assert_eq!(archive.append("alice", rotated).seq, first.seq);
         assert_eq!(archive.retained("alice"), 1, "轮换看到同一条，只归档一份");
         assert!(
-            archive.unread("alice", "20001").is_empty(),
+            archive.unread("alice", &qq("20001")).is_empty(),
             "own 取或：另一个账号视角认作自己发的，合并后不再进未读"
         );
     }
@@ -716,9 +797,9 @@ mod tests {
         archive.append("alice", message("1", "30002", "给爱丽丝"));
         archive.append("bob", message("2", "30002", "给鲍勃"));
 
-        archive.consume("alice", "20001", 1).expect("应能推进");
-        assert!(archive.unread("alice", "20001").is_empty());
-        assert_eq!(seqs(archive.unread("bob", "20001")), vec![1]);
+        archive.consume("alice", &qq("20001"), 1).expect("应能推进");
+        assert!(archive.unread("alice", &qq("20001")).is_empty());
+        assert_eq!(seqs(archive.unread("bob", &qq("20001"))), vec![1]);
         assert_eq!(archive.memories().collect::<Vec<_>>(), vec!["alice", "bob"]);
     }
 
@@ -731,10 +812,10 @@ mod tests {
         for id in ["1", "2", "3", "4", "5"] {
             archive.append("alice", message(id, "30002", "x"));
         }
-        archive.consume("alice", "20001", 5).expect("应能推进");
+        archive.consume("alice", &qq("20001"), 5).expect("应能推进");
 
         // 已消费的只留最近两条。
-        assert_eq!(seqs(archive.context("alice", "20001", 10)), vec![4, 5]);
+        assert_eq!(seqs(archive.context("alice", &qq("20001"), 10)), vec![4, 5]);
         assert_eq!(archive.retained("alice"), 2);
     }
 
@@ -751,7 +832,7 @@ mod tests {
         // 一条都没投递过，硬上限还是生效——但丢弃要留痕。
         assert_eq!(archive.retained("alice"), 3);
         assert_eq!(archive.dropped("alice"), 2);
-        assert_eq!(seqs(archive.unread("alice", "20001")), vec![3, 4, 5]);
+        assert_eq!(seqs(archive.unread("alice", &qq("20001"))), vec![3, 4, 5]);
     }
 
     #[test]
@@ -782,12 +863,12 @@ mod tests {
             archive.append("alice", message(id, "30002", "x"));
         }
         archive.append("bob", message("9", "30002", "y"));
-        archive.consume("alice", "20001", 6).expect("应能推进");
+        archive.consume("alice", &qq("20001"), 6).expect("应能推进");
 
         let json = archive.to_json().expect("应能序列化");
         let restored = Archive::from_json(&json, Limits::default()).expect("应能再解析");
 
-        assert_eq!(restored.watermark("alice", "20001"), 6);
+        assert_eq!(restored.watermark("alice", &qq("20001")), 6);
         assert_eq!(restored.dropped("alice"), archive.dropped("alice"));
         assert_eq!(restored.latest_seq("alice"), archive.latest_seq("alice"));
         assert_eq!(restored.retained("bob"), 1);
@@ -836,5 +917,85 @@ mod tests {
     #[test]
     fn render_of_empty_batch_is_empty() {
         assert_eq!(render(&[]), "");
+    }
+
+    #[test]
+    fn same_conversation_id_on_two_platforms_has_two_watermarks() {
+        // `qq` 群 123 与 `discord` 频道 123 同名而不同。只按群号做水位键，
+        // 推进一边就会把另一边的未读一起划掉——静默丢消息。
+        let mut archive = archive();
+        let mut qq_message = message("1", "30002", "QQ 群里的");
+        qq_message.group = "123".to_owned();
+        let mut discord_message = message("1", "30002", "Discord 频道里的");
+        discord_message.platform = "discord".to_owned();
+        discord_message.group = "123".to_owned();
+
+        let qq = archive.append("alice", qq_message);
+        let discord = archive.append("alice", discord_message);
+
+        let qq_key = ConversationKey::new("qq", "123");
+        let discord_key = ConversationKey::new("discord", "123");
+
+        assert_eq!(archive.unread("alice", &qq_key).len(), 1);
+        assert_eq!(archive.unread("alice", &discord_key).len(), 1);
+
+        // 推进 QQ 的水位。
+        archive.consume("alice", &qq_key, qq.seq).expect("应能推进");
+
+        assert!(archive.unread("alice", &qq_key).is_empty(), "QQ 已消费");
+        assert_eq!(
+            archive.unread("alice", &discord_key).len(),
+            1,
+            "Discord 的未读不能被 QQ 的水位划掉"
+        );
+        assert_eq!(archive.watermark("alice", &discord_key), 0);
+        assert_eq!(discord.seq, 2, "两条都在同一个分片里，序号各自分配");
+    }
+
+    #[test]
+    fn the_same_message_id_on_two_platforms_is_two_messages() {
+        // 消息标识按 (会话, 消息 ID) 认，会话含平台。若只按消息 ID 合并，
+        // 两条不同平台的消息会被当成同一条，其中一条永远进不了未读。
+        let mut archive = archive();
+        let mut qq_message = message("same-id", "30002", "QQ 的");
+        qq_message.group = "123".to_owned();
+        let mut discord_message = message("same-id", "30002", "Discord 的");
+        discord_message.platform = "discord".to_owned();
+        discord_message.group = "123".to_owned();
+
+        let first = archive.append("alice", qq_message);
+        let second = archive.append("alice", discord_message);
+
+        assert!(first.fresh, "第一条是新的");
+        assert!(second.fresh, "不同平台的同号消息也是新的，不是重复");
+        assert_ne!(first.seq, second.seq);
+    }
+
+    #[test]
+    fn reply_address_falls_back_to_the_conversation() {
+        let mut plain = message("1", "30002", "x");
+        plain.platform = "qq".to_owned();
+        plain.group = "123".to_owned();
+        assert_eq!(
+            plain.reply_address(),
+            ReplyAddress {
+                platform: "qq".to_owned(),
+                address: "123".to_owned(),
+            },
+            "多数平台上回信目标就是会话本身"
+        );
+
+        let mut satori = message("2", "30002", "y");
+        satori.platform = "satori".to_owned();
+        satori.group = "guild-1".to_owned();
+        satori.reply = Some("channel-9".to_owned());
+        assert_eq!(
+            satori.reply_address(),
+            ReplyAddress {
+                platform: "satori".to_owned(),
+                address: "channel-9".to_owned(),
+            },
+            "Satori 上回信道频道，不是 guild"
+        );
     }
 }

@@ -55,19 +55,29 @@ impl Config {
 pub struct Account {
     /// 本文件内唯一的标识，不是 QQ 号。
     pub id: String,
-    /// 这个账号的 QQ 号。
+    /// 这个账号在这个平台里的号码。
     pub self_id: String,
-    /// 聊天协议名。决定用哪个 [`Transport`](crate::chat::Transport) 实现解码与编码。
-    pub protocol: String,
+    /// 用哪个 [`Transport`](crate::chat::Transport) 实现解码与编码。这是**实现名**，
+    /// 不是平台名——同一个实现可以服务多个平台。
+    pub adapter: String,
+    /// 会话命名空间。`None` 表示由传输层在运行期给出（Satori 的 `login.platform`）。
+    ///
+    /// 能给就给：写死之后启动期就能校验 `[[devices.scopes]] conversation` 是否指向一个
+    /// 存在的会话。不给就只能等连上之后再知道，配置错误要等发现「这个群没反应」才查得到。
+    pub platform: Option<String>,
     pub ws_url: String,
     pub token: Option<Secret>,
 }
 
-/// 已知的协议名。
+/// 已知的传输实现名。
 ///
-/// 校验期就拒绝未知名字：`protocol = "onebot1l"` 这样的笔误在运行期表现为「连上了但没有
+/// 校验期就拒绝未知名字：`adapter = "onebot1l"` 这样的笔误在运行期表现为「连上了但没有
 /// 事件」，比启动失败难查得多。
-pub const KNOWN_PROTOCOLS: &[&str] = &["onebot11", "satori"];
+pub const KNOWN_ADAPTERS: &[&str] = &["onebot11", "satori"];
+
+/// OneBot 的帧里没有平台字段，所以它的平台必须是配置声明的。缺省 `qq`——最常见的部署，
+/// 且旧配置不必改。
+pub const DEFAULT_ONEBOT_PLATFORM: &str = "qq";
 
 fn validate_accounts(raw: Vec<RawAccount>) -> Result<Vec<Account>, ConfigError> {
     if raw.is_empty() {
@@ -75,31 +85,50 @@ fn validate_accounts(raw: Vec<RawAccount>) -> Result<Vec<Account>, ConfigError> 
     }
 
     let mut seen_ids = BTreeSet::new();
-    let mut seen_self = BTreeMap::new();
+    // 键是 `(平台, self_id)`：号码只在同一平台内唯一，两个平台可以有同一个号。
+    let mut seen_self: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut accounts = Vec::with_capacity(raw.len());
 
     for (index, account) in raw.into_iter().enumerate() {
         let id = require_non_empty(account.id, "accounts[].id", index)?;
         let self_id = require_non_empty(account.self_id, "accounts[].self_id", index)?;
         let ws_url = require_non_empty(account.ws_url, "accounts[].ws_url", index)?;
-        let protocol = account
-            .protocol
-            .unwrap_or_else(|| KNOWN_PROTOCOLS[0].to_owned());
-        if !KNOWN_PROTOCOLS.contains(&protocol.as_str()) {
-            return Err(ConfigError::UnknownProtocol {
+        let adapter = account
+            .adapter
+            .unwrap_or_else(|| KNOWN_ADAPTERS[0].to_owned());
+        if !KNOWN_ADAPTERS.contains(&adapter.as_str()) {
+            return Err(ConfigError::UnknownAdapter {
                 account: id,
-                protocol,
-                known: KNOWN_PROTOCOLS.join("、"),
+                adapter,
+                known: KNOWN_ADAPTERS.join("、"),
+            });
+        }
+
+        let declared = account
+            .platform
+            .map(|platform| require_non_empty(platform, "accounts[].platform", index))
+            .transpose()?;
+        // OneBot 的平台上不了线，所以必须有；Satori 可以留给 READY。
+        let platform = match (adapter.as_str(), declared) {
+            ("onebot11", None) => Some(DEFAULT_ONEBOT_PLATFORM.to_owned()),
+            (_, declared) => declared,
+        };
+        if platform.is_none() && adapter != "satori" {
+            return Err(ConfigError::PlatformUnknown {
+                account: id,
+                adapter,
             });
         }
 
         if !seen_ids.insert(id.clone()) {
             return Err(ConfigError::DuplicateAccountId { id });
         }
-        // 同一个 QQ 号挂两条连接没有意义：身份过滤会重复计一次，发送侧也会出现
-        // 两个「可用账号」其实是同一个人。
-        if let Some(previous) = seen_self.insert(self_id.clone(), id.clone()) {
+        // 同一个平台上的同一个号挂两条连接没有意义：身份过滤会重复计一次，发送侧也会
+        // 出现两个「可用账号」其实是同一个人。跨平台同号是合法的。
+        let key = (platform.clone().unwrap_or_default(), self_id.clone());
+        if let Some(previous) = seen_self.insert(key, id.clone()) {
             return Err(ConfigError::DuplicateSelfId {
+                platform: platform.unwrap_or_default(),
                 self_id,
                 first: previous,
                 second: id,
@@ -109,7 +138,8 @@ fn validate_accounts(raw: Vec<RawAccount>) -> Result<Vec<Account>, ConfigError> 
         accounts.push(Account {
             id,
             self_id,
-            protocol,
+            adapter,
+            platform,
             ws_url,
             token: account.token.map(Secret::parse),
         });
@@ -205,11 +235,24 @@ pub struct Device {
 
 #[derive(Debug, Clone)]
 pub struct ScopeConfig {
-    pub group: String,
-    /// 从哪些账号的连接上收这个群。决定订阅关系。
+    /// 会话命名空间。与 `conversation` 一起构成会话键。
+    ///
+    /// 由该范围 `receive` 里的账号推出并校验一致：一个范围只属于一个平台，否则
+    /// 「收 QQ 的消息、发到 Discord」这种配置会被当成合法。
+    pub platform: String,
+    /// 该平台内的会话标识。对群聊平台就是群号。
+    pub conversation: String,
+    /// 从哪些账号的连接上收这个会话。决定订阅关系。
     pub receive: Vec<String>,
     /// 回复时允许用哪些账号发。决定发送侧的故障轮换。
     pub send: Vec<String>,
+}
+
+impl ScopeConfig {
+    /// 这个范围的会话键。
+    pub fn key(&self) -> crate::chat::ConversationKey {
+        crate::chat::ConversationKey::new(self.platform.clone(), self.conversation.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -263,8 +306,8 @@ fn validate_devices(
     let persona_ids: BTreeSet<&str> = personas.iter().map(|p| p.id.as_str()).collect();
 
     let mut seen_device_ids = BTreeSet::new();
-    // (群, 账号) → 声明它的设备。冲突即启动失败，不降级。
-    let mut claimed: BTreeMap<(String, String), String> = BTreeMap::new();
+    // (平台, 会话, 账号) → 声明它的设备。冲突即启动失败，不降级。
+    let mut claimed: BTreeMap<(String, String, String), String> = BTreeMap::new();
     let mut devices = Vec::with_capacity(raw.len());
 
     for (index, device) in raw.into_iter().enumerate() {
@@ -308,36 +351,70 @@ fn validate_devices(
         }
 
         let mut scopes = Vec::with_capacity(device.scopes.len());
-        let mut seen_groups = BTreeSet::new();
+        // 按会话键去重：`(平台, 会话)` 才是会话的身份。只按群号去重会让
+        // 「QQ 群 123 + Discord 频道 123」这种合法配置写不出来。
+        let mut seen_conversations = BTreeSet::new();
         for scope in device.scopes {
-            let group = require_non_empty(scope.group, "devices[].scopes[].group", index)?;
-            if !seen_groups.insert(group.clone()) {
-                return Err(ConfigError::DuplicateScopeGroup { device: id, group });
-            }
+            let conversation =
+                require_non_empty(scope.conversation, "devices[].scopes[].conversation", index)?;
 
             if scope.receive.is_empty() {
-                return Err(ConfigError::ScopeWithoutReceive { device: id, group });
+                return Err(ConfigError::ScopeWithoutReceive {
+                    device: id,
+                    conversation: conversation.clone(),
+                });
             }
             if scope.send.is_empty() {
-                return Err(ConfigError::ScopeWithoutSend { device: id, group });
+                return Err(ConfigError::ScopeWithoutSend {
+                    device: id,
+                    conversation: conversation.clone(),
+                });
+            }
+
+            // 平台由 receive 的账号推出。同一个范围里混两个平台是没有意义的：
+            // 收信的地方和发信的地方必须是同一个命名空间。
+            let platform = platform_of_scope(&id, &conversation, &scope.receive, accounts)?;
+
+            if !seen_conversations.insert((platform.clone(), conversation.clone())) {
+                return Err(ConfigError::DuplicateScopeConversation {
+                    device: id,
+                    platform,
+                    conversation,
+                });
             }
 
             for account in scope.receive.iter().chain(scope.send.iter()) {
                 if !device_accounts.contains(account) {
                     return Err(ConfigError::ScopeAccountNotInDevice {
                         device: id,
-                        group: group.clone(),
+                        conversation: conversation.clone(),
                         account: account.clone(),
+                    });
+                }
+                // `send` 的账号也必须在这个平台上：否则一条 QQ 群的消息会被拿
+                // Discord 账号发出去。
+                let sender = accounts
+                    .iter()
+                    .find(|known| &known.id == account)
+                    .expect("账号已在上面校验过存在");
+                if sender.platform.as_deref() != Some(platform.as_str()) {
+                    return Err(ConfigError::ScopeSenderWrongPlatform {
+                        device: id,
+                        conversation: conversation.clone(),
+                        account: account.clone(),
+                        platform: sender.platform.clone().unwrap_or_default(),
+                        expected: platform.clone(),
                     });
                 }
             }
 
-            // 同一个 (群, 账号) 只能被一个设备声明。
+            // 同一个 (会话, 账号) 只能被一个设备声明。
             for account in &scope.receive {
-                let key = (group.clone(), account.clone());
+                let key = (platform.clone(), conversation.clone(), account.clone());
                 if let Some(previous) = claimed.insert(key, id.clone()) {
                     return Err(ConfigError::ScopeClaimConflict {
-                        group,
+                        platform,
+                        conversation,
                         account: account.clone(),
                         first: previous,
                         second: id,
@@ -346,7 +423,8 @@ fn validate_devices(
             }
 
             scopes.push(ScopeConfig {
-                group,
+                platform,
+                conversation,
                 receive: scope.receive,
                 send: scope.send,
             });
@@ -498,8 +576,10 @@ struct RawConfig {
 struct RawAccount {
     id: String,
     self_id: String,
-    /// 省略时默认 `onebot11`——现有配置不必改。
-    protocol: Option<String>,
+    /// 传输实现名。省略时默认 `onebot11`——现有配置不必改。
+    adapter: Option<String>,
+    /// 会话命名空间。OneBot 省略即 `qq`；Satori 可省略（READY 时才知道）。
+    platform: Option<String>,
     ws_url: String,
     token: Option<String>,
 }
@@ -526,7 +606,7 @@ struct RawDevice {
 
 #[derive(Debug, Deserialize)]
 struct RawScope {
-    group: String,
+    conversation: String,
     #[serde(default)]
     receive: Vec<String>,
     #[serde(default)]
@@ -613,14 +693,17 @@ pub enum ConfigError {
     EmptyField { field: &'static str, index: usize },
     #[error("账号 id {id} 重复")]
     DuplicateAccountId { id: String },
-    #[error("账号 {account} 的协议 {protocol} 不认识（已知：{known}）")]
-    UnknownProtocol {
+    #[error("账号 {account} 的适配器 {adapter} 不认识（已知：{known}）")]
+    UnknownAdapter {
         account: String,
-        protocol: String,
+        adapter: String,
         known: String,
     },
-    #[error("QQ 号 {self_id} 被两个账号使用：{first}、{second}")]
+    #[error("账号 {account} 用的适配器 {adapter} 需要声明 platform：它的协议不告诉你平台名")]
+    PlatformUnknown { account: String, adapter: String },
+    #[error("平台 {platform} 上的号码 {self_id} 被两个账号使用：{first}、{second}")]
     DuplicateSelfId {
+        platform: String,
         self_id: String,
         first: String,
         second: String,
@@ -643,24 +726,65 @@ pub enum ConfigError {
     DeviceWithoutAccounts { device: String },
     #[error("设备 {device} 没有任何范围")]
     DeviceWithoutScopes { device: String },
-    #[error("设备 {device} 重复声明了群 {group}")]
-    DuplicateScopeGroup { device: String, group: String },
-    #[error("设备 {device} 的群 {group} 没有 receive 列表")]
-    ScopeWithoutReceive { device: String, group: String },
-    #[error("设备 {device} 的群 {group} 没有 send 列表")]
-    ScopeWithoutSend { device: String, group: String },
-    #[error("设备 {device} 的群 {group} 用了不在该设备 accounts 里的账号 {account}")]
+    #[error("设备 {device} 在平台 {platform} 上重复声明了会话 {conversation}")]
+    DuplicateScopeConversation {
+        device: String,
+        platform: String,
+        conversation: String,
+    },
+    #[error("设备 {device} 的会话 {conversation} 没有 receive 列表")]
+    ScopeWithoutReceive {
+        device: String,
+        conversation: String,
+    },
+    #[error("设备 {device} 的会话 {conversation} 没有 send 列表")]
+    ScopeWithoutSend {
+        device: String,
+        conversation: String,
+    },
+    #[error("设备 {device} 的会话 {conversation} 用了不在该设备 accounts 里的账号 {account}")]
     ScopeAccountNotInDevice {
         device: String,
-        group: String,
+        conversation: String,
         account: String,
     },
     #[error(
-        "账号 {account} 在群 {group} 上被两个设备声明：{first}、{second}。\
+        "设备 {device} 的会话 {conversation} 混用了两个平台的账号：{first}、{second}。\
+         一个范围只能属于一个平台"
+    )]
+    ScopeMixedPlatform {
+        device: String,
+        conversation: String,
+        first: String,
+        second: String,
+    },
+    #[error(
+        "设备 {device} 的会话 {conversation} 用了账号 {account}，而它的平台要等连接建立才知道。\
+         请在该账号上写 platform = \"...\""
+    )]
+    ScopePlatformUnknown {
+        device: String,
+        conversation: String,
+        account: String,
+    },
+    #[error(
+        "设备 {device} 的会话 {conversation} 用账号 {account} 发送，但该账号属于平台 {platform}，\
+         而范围的平台是 {expected}"
+    )]
+    ScopeSenderWrongPlatform {
+        device: String,
+        conversation: String,
+        account: String,
+        platform: String,
+        expected: String,
+    },
+    #[error(
+        "平台 {platform} 上的会话 {conversation} 被两个设备用同一个账号声明：{first}、{second}。\
          请删掉其中一个设备的该范围，或改用不同账号"
     )]
     ScopeClaimConflict {
-        group: String,
+        platform: String,
+        conversation: String,
         account: String,
         first: String,
         second: String,
@@ -690,6 +814,49 @@ fn require_non_empty(
     Ok(value)
 }
 
+/// 一个范围的平台，由它的收信账号推出。
+///
+/// 不单独写 `platform` 字段：收信的账号已经决定了是哪个平台，再写一个字段就有两个来源，
+/// 它们能互相矛盾。混用平台直接报错——那不是一个能运行的部署。
+fn platform_of_scope(
+    device: &str,
+    conversation: &str,
+    receive: &[String],
+    accounts: &[Account],
+) -> Result<String, ConfigError> {
+    let mut found: Option<String> = None;
+    for account in receive {
+        let Some(known) = accounts.iter().find(|known| &known.id == account) else {
+            // 账号是否存在在别处校验；这里只跳过，不重复报错。
+            continue;
+        };
+        let Some(platform) = known.platform.clone() else {
+            // 平台要等运行期才知道（Satori）：这个范围暂时无平台可推。
+            return Err(ConfigError::ScopePlatformUnknown {
+                device: device.to_owned(),
+                conversation: conversation.to_owned(),
+                account: account.clone(),
+            });
+        };
+        match &found {
+            None => found = Some(platform),
+            Some(existing) if existing == &platform => {}
+            Some(existing) => {
+                return Err(ConfigError::ScopeMixedPlatform {
+                    device: device.to_owned(),
+                    conversation: conversation.to_owned(),
+                    first: existing.clone(),
+                    second: platform,
+                });
+            }
+        }
+    }
+    found.ok_or(ConfigError::ScopeWithoutReceive {
+        device: device.to_owned(),
+        conversation: conversation.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,7 +878,7 @@ memory = "alice"
 accounts = ["main"]
 
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 "#;
@@ -753,7 +920,7 @@ persona = "whale"
 memory = "alice"
 accounts = ["main"]
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 
@@ -763,7 +930,7 @@ persona = "whale"
 memory = "bob"
 accounts = ["main"]
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 "#;
@@ -797,7 +964,7 @@ persona = "whale"
 memory = "alice"
 accounts = ["main"]
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 
@@ -807,7 +974,7 @@ persona = "whale"
 memory = "alice"
 accounts = ["backup"]
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["backup"]
   send = ["backup"]
 "#;
@@ -840,13 +1007,160 @@ persona = "p"
 memory = "m"
 accounts = ["a"]
   [[devices.scopes]]
-  group = "1"
+  conversation = "1"
   receive = ["a"]
   send = ["a"]
 "#;
         assert!(matches!(
             Config::parse(text).expect_err("应拒绝"),
             ConfigError::DuplicateSelfId { .. }
+        ));
+    }
+
+    #[test]
+    fn same_numeric_id_on_two_platforms_is_allowed() {
+        // 号码只在平台内唯一。两个平台恰好有同一个号不是配置错误——
+        // 按号码去重会让「QQ 与 Discord 都用 1 号」这种部署起不来。
+        let text = r#"
+[[accounts]]
+id = "qq-main"
+self_id = "1"
+adapter = "onebot11"
+platform = "qq"
+ws_url = "ws://x"
+
+[[accounts]]
+id = "discord-main"
+self_id = "1"
+adapter = "satori"
+platform = "discord"
+ws_url = "ws://y"
+
+[[personas]]
+id = "p"
+text = "p"
+
+[[devices]]
+id = "d"
+persona = "p"
+memory = "m"
+accounts = ["qq-main", "discord-main"]
+  [[devices.scopes]]
+  conversation = "1"
+  receive = ["qq-main"]
+  send = ["qq-main"]
+  [[devices.scopes]]
+  conversation = "1"
+  receive = ["discord-main"]
+  send = ["discord-main"]
+"#;
+        let config = Config::parse(text).expect("跨平台同号应能解析");
+        assert_eq!(config.accounts.len(), 2);
+        assert_eq!(config.devices[0].scopes.len(), 2, "两个会话都保留");
+        assert_eq!(config.devices[0].scopes[0].platform, "qq");
+        assert_eq!(config.devices[0].scopes[1].platform, "discord");
+    }
+
+    #[test]
+    fn scope_platform_comes_from_the_receiving_account() {
+        // 范围不单独写 platform：收信账号已经决定了平台，再写一个字段就有两个
+        // 会互相矛盾的来源。
+        let text = r#"
+[[accounts]]
+id = "a"
+self_id = "1"
+adapter = "satori"
+platform = "qqguild"
+ws_url = "ws://x"
+
+[[personas]]
+id = "p"
+text = "p"
+
+[[devices]]
+id = "d"
+persona = "p"
+memory = "m"
+accounts = ["a"]
+  [[devices.scopes]]
+  conversation = "ch-1"
+  receive = ["a"]
+  send = ["a"]
+"#;
+        let config = Config::parse(text).expect("应能解析");
+        assert_eq!(config.devices[0].scopes[0].platform, "qqguild");
+    }
+
+    #[test]
+    fn a_scope_mixing_two_platforms_is_rejected() {
+        let text = r#"
+[[accounts]]
+id = "qq-main"
+self_id = "1"
+adapter = "onebot11"
+ws_url = "ws://x"
+
+[[accounts]]
+id = "discord-main"
+self_id = "2"
+adapter = "satori"
+platform = "discord"
+ws_url = "ws://y"
+
+[[personas]]
+id = "p"
+text = "p"
+
+[[devices]]
+id = "d"
+persona = "p"
+memory = "m"
+accounts = ["qq-main", "discord-main"]
+  [[devices.scopes]]
+  conversation = "1"
+  receive = ["qq-main", "discord-main"]
+  send = ["qq-main"]
+"#;
+        assert!(matches!(
+            Config::parse(text).expect_err("混平台应被拒"),
+            ConfigError::ScopeMixedPlatform { .. }
+        ));
+    }
+
+    #[test]
+    fn a_scope_cannot_send_through_another_platforms_account() {
+        // 收 QQ 的消息、用 Discord 账号发出去，是最坏的一种「能跑但发错地方」。
+        let text = r#"
+[[accounts]]
+id = "qq-main"
+self_id = "1"
+adapter = "onebot11"
+ws_url = "ws://x"
+
+[[accounts]]
+id = "discord-main"
+self_id = "1"
+adapter = "satori"
+platform = "discord"
+ws_url = "ws://y"
+
+[[personas]]
+id = "p"
+text = "p"
+
+[[devices]]
+id = "d"
+persona = "p"
+memory = "m"
+accounts = ["qq-main", "discord-main"]
+  [[devices.scopes]]
+  conversation = "1"
+  receive = ["qq-main"]
+  send = ["discord-main"]
+"#;
+        assert!(matches!(
+            Config::parse(text).expect_err("跨平台发送应被拒"),
+            ConfigError::ScopeSenderWrongPlatform { .. }
         ));
     }
 
@@ -894,7 +1208,7 @@ persona = "p"
 memory = "m"
 accounts = ["main"]
   [[devices.scopes]]
-  group = "1"
+  conversation = "1"
   receive = ["other"]
   send = ["main"]
 "#;

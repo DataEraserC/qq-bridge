@@ -172,7 +172,7 @@ pub struct Route<'a> {
 
 /// 按配置把一条群消息路由到各设备。
 ///
-/// 只返回 `receive` 里含这条连接所属账号、且群号匹配的范围。没被任何范围收下的群消息
+/// 只返回 `receive` 里含这条连接所属账号、且会话匹配的范围。没被任何范围收下的群消息
 /// 直接丢弃——它不在这个部署的管理范围内。
 pub fn route<'a>(
     config: &'a Config,
@@ -182,10 +182,18 @@ pub fn route<'a>(
     let mut routes = Vec::new();
 
     for device in &config.devices {
-        let own = device_is_sender(config, device, &event.sender_id);
+        let own = device_is_sender(
+            config,
+            device,
+            &event.conversation.platform,
+            &event.sender_id,
+        );
 
         for scope in &device.scopes {
-            if scope.group != event.group {
+            // 会话匹配要**平台 + 会话**一起比：QQ 群 123 与 Discord 频道 123 同名而不同。
+            if scope.conversation != event.conversation.conversation
+                || scope.platform != event.conversation.platform
+            {
                 continue;
             }
             // 收到这条事件的连接，是否在这个范围的接收列表里。
@@ -206,13 +214,17 @@ pub fn route<'a>(
 
 /// 发言者是否属于这台设备的账号集合。
 ///
-/// 设备声明的是账号**标识**，事件里给的是 QQ 号，所以要先翻一次。
-fn device_is_sender(config: &Config, device: &Device, sender_id: &str) -> bool {
+/// 设备声明的是账号**标识**，事件里给的是平台侧号码，所以要先翻一次。
+///
+/// 平台必须参与比较：账号 `self_id` 是**平台内**唯一的，两个平台可以有同一个号。只比
+/// 号码会让 Discord 上某个用户恰好等于我们 QQ 账号的号码，于是他被当成「自己发的」——
+/// 消息不进未读、不触发唤醒，而且是静默的。
+fn device_is_sender(config: &Config, device: &Device, platform: &str, sender_id: &str) -> bool {
     device
         .accounts
         .iter()
         .filter_map(|account| config.accounts.iter().find(|known| &known.id == account))
-        .any(|known| known.self_id == sender_id)
+        .any(|known| known.platform.as_deref() == Some(platform) && known.self_id == sender_id)
 }
 
 #[cfg(test)]
@@ -228,14 +240,16 @@ mod tests {
             Account {
                 id: "main".to_owned(),
                 self_id: "10001".to_owned(),
-                protocol: "onebot11".to_owned(),
+                adapter: "onebot11".to_owned(),
+                platform: Some("qq".to_owned()),
                 ws_url: "ws://127.0.0.1:6700".to_owned(),
                 token: None,
             },
             Account {
                 id: "backup".to_owned(),
                 self_id: "10002".to_owned(),
-                protocol: "onebot11".to_owned(),
+                adapter: "onebot11".to_owned(),
+                platform: Some("qq".to_owned()),
                 ws_url: "ws://127.0.0.1:6701".to_owned(),
                 token: None,
             },
@@ -331,7 +345,8 @@ mod tests {
     fn message(group: &str, sender: &str) -> crate::chat::ChatMessage {
         crate::chat::ChatMessage {
             self_id: "10001".to_owned(),
-            group: group.to_owned(),
+            conversation: crate::chat::ConversationKey::new("qq", group),
+            reply_to: None,
             message_id: "7451".to_owned(),
             sender_id: sender.to_owned(),
             sender_name: None,
@@ -353,7 +368,7 @@ mod tests {
         let routes = route(&config, &message("20001", "30002"), "main");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].device.id, "alice-phone");
-        assert_eq!(routes[0].scope.group, "20001");
+        assert_eq!(routes[0].scope.conversation, "20001");
         assert_eq!(routes[0].account, "main");
         assert!(!routes[0].own, "群友不是设备账号");
 
@@ -406,7 +421,7 @@ persona = "p"
 memory = "alice"
 accounts = ["main"]
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 
@@ -416,7 +431,7 @@ persona = "p"
 memory = "bob"
 accounts = ["backup"]
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["backup"]
   send = ["backup"]
 "#;
@@ -429,5 +444,91 @@ accounts = ["backup"]
         let from_backup = route(&config, &message("20001", "30002"), "backup");
         assert_eq!(from_backup.len(), 1);
         assert_eq!(from_backup[0].device.memory, "bob");
+    }
+
+    /// 一台设备、两个平台，号码不同。注意：**不是**「两个平台号码相同」——
+    /// 同号在两个平台上本来就是两个不同的人，那是缺陷的来源，不是配置形态。
+    fn cross_platform_config() -> Config {
+        let text = r#"
+[[accounts]]
+id = "qq-main"
+self_id = "10001"
+adapter = "onebot11"
+platform = "qq"
+ws_url = "ws://127.0.0.1:6700"
+
+[[accounts]]
+id = "discord-main"
+self_id = "20002"
+adapter = "satori"
+platform = "discord"
+ws_url = "ws://127.0.0.1:6701"
+
+[[personas]]
+id = "p"
+text = "x"
+
+[[devices]]
+id = "d"
+persona = "p"
+memory = "alice"
+accounts = ["qq-main", "discord-main"]
+  [[devices.scopes]]
+  conversation = "123"
+  receive = ["qq-main"]
+  send = ["qq-main"]
+  [[devices.scopes]]
+  conversation = "123"
+  receive = ["discord-main"]
+  send = ["discord-main"]
+"#;
+        Config::parse(text).expect("跨平台同号应能解析")
+    }
+
+    fn chat(platform: &str, group: &str, sender: &str) -> crate::chat::ChatMessage {
+        crate::chat::ChatMessage {
+            self_id: "10001".to_owned(),
+            conversation: crate::chat::ConversationKey::new(platform, group),
+            reply_to: None,
+            message_id: "1".to_owned(),
+            sender_id: sender.to_owned(),
+            sender_name: None,
+            text: "x".to_owned(),
+            at_self: false,
+            time: 0,
+        }
+    }
+
+    #[test]
+    fn a_stranger_on_one_platform_is_not_mistaken_for_our_own_account() {
+        // 关键的一条：Discord 上有个用户恰好叫 10001，而我们 QQ 账号也是 10001。
+        // 只比号码会把他当成「自己发的」——消息不进未读、不唤醒，且是静默的。
+        let config = cross_platform_config();
+        let routes = route(&config, &chat("discord", "123", "10001"), "discord-main");
+        assert_eq!(routes.len(), 1);
+        assert!(!routes[0].own, "他是 Discord 用户，不是我们的 QQ 账号");
+    }
+
+    #[test]
+    fn our_own_account_is_recognized_on_its_own_platform() {
+        let config = cross_platform_config();
+        let routes = route(&config, &chat("qq", "123", "10001"), "qq-main");
+        assert_eq!(routes.len(), 1);
+        assert!(routes[0].own, "QQ 上 10001 就是我们自己");
+    }
+
+    #[test]
+    fn the_same_conversation_id_routes_to_the_right_platform_scope() {
+        // 两个平台都有会话 123。按群号匹配会按配置顺序命中 qq 那个，
+        // 于是 Discord 的消息进了 QQ 的归档，回复也发到 QQ。
+        let config = cross_platform_config();
+
+        let qq = route(&config, &chat("qq", "123", "30002"), "qq-main");
+        assert_eq!(qq.len(), 1);
+        assert_eq!(qq[0].scope.platform, "qq");
+
+        let discord = route(&config, &chat("discord", "123", "30002"), "discord-main");
+        assert_eq!(discord.len(), 1);
+        assert_eq!(discord[0].scope.platform, "discord");
     }
 }

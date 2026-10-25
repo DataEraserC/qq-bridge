@@ -24,7 +24,8 @@
 use serde_json::{Value, json};
 
 use crate::chat::{
-    ChatAction, ChatEvent, ChatMessage, ChatOutcome, ChatStatus, Transport, TransportError,
+    ChatAction, ChatEvent, ChatMessage, ChatOutcome, ChatStatus, ConversationKey, ReplyAddress,
+    Transport, TransportError,
 };
 
 /// Satori 的信令 op 码。
@@ -42,6 +43,11 @@ pub struct SatoriTransport {
     /// 它是 `&self` 之外的可变状态，所以用 `Mutex` 而不是 `&mut self`：`decode` 的签名
     /// 是共享借用——传输层在读循环里同时持着它对解码调用。
     login: std::sync::Mutex<Option<String>>,
+    /// 当前平台名。`READY` 的 `login.platform` 填上，之前为空。
+    ///
+    /// 会话命名空间的一部分：Satori 一个服务器可以同时挂 Discord、KOOK、Telegram，
+    /// 所以「频道 123」在不同 platform 下是不同会话。
+    platform: std::sync::Mutex<Option<String>>,
     /// 只处理文本频道。私聊频道没有群号，不在内核的范围模型里。
     ///
     /// 固定为真，不做成配置：内核只处理群，这是不变量而不是偏好。
@@ -58,11 +64,21 @@ impl SatoriTransport {
         self.login.lock().ok()?.clone()
     }
 
-    fn remember_login(&self, user_id: Option<String>) {
+    /// 当前平台名。`READY` 之前是 `None`。
+    pub fn known_platform(&self) -> Option<String> {
+        self.platform.lock().ok()?.clone()
+    }
+
+    fn remember_login(&self, user_id: Option<String>, platform: Option<String>) {
         if let Some(user_id) = user_id
             && let Ok(mut guard) = self.login.lock()
         {
             *guard = Some(user_id);
+        }
+        if let Some(platform) = platform.filter(|platform| !platform.is_empty())
+            && let Ok(mut guard) = self.platform.lock()
+        {
+            *guard = Some(platform);
         }
     }
 }
@@ -70,6 +86,12 @@ impl SatoriTransport {
 impl Transport for SatoriTransport {
     fn name(&self) -> &'static str {
         "satori"
+    }
+
+    /// `READY` 之前是 `None`。协议没给 `login.platform` 也留 `None`——不拿 adapter 名
+    /// 顶替，也不猜 `qq`。
+    fn platform(&self) -> Option<String> {
+        self.known_platform()
     }
 
     fn decode(&self, line: &str) -> Result<ChatEvent, TransportError> {
@@ -84,15 +106,20 @@ impl Transport for SatoriTransport {
         match opcode {
             op::EVENT => self.decode_event(object),
             op::READY => {
+                let login_body = object.get("body").and_then(|body| body.get("login"));
                 // `login.user.id` 是本连接的身份。没有它就没法判断「是不是自己发的」。
-                let login = object
-                    .get("body")
-                    .and_then(|body| body.get("login"))
+                let login = login_body
                     .and_then(|login| login.get("user"))
                     .and_then(|user| user.get("id"))
                     .and_then(string_of);
-                self.remember_login(login);
-                Ok(ChatEvent::Status(ChatStatus::Ready))
+                // `login.platform` 是会话命名空间。协议没给就留空，不猜。
+                let platform = login_body
+                    .and_then(|login| login.get("platform"))
+                    .and_then(string_of);
+                self.remember_login(login, platform);
+                Ok(ChatEvent::Status(ChatStatus::Ready {
+                    platform: self.known_platform(),
+                }))
             }
             op::PONG => Ok(ChatEvent::Ignored {
                 kind: "pong".to_owned(),
@@ -109,10 +136,10 @@ impl Transport for SatoriTransport {
         //
         // 用同一条 WS 发是不可能的——Satori 的 WS 是单向的事件流。这条差异是抽象必须
         // 容纳的唯一一处非对称，所以它显式地落在这里。
-        let ChatAction::SendGroupMessage { group, text } = action;
+        let ChatAction::Send { to, text } = action;
         json!({
             "path": "/message.create",
-            "body": { "channel_id": group, "content": text },
+            "body": { "channel_id": to.address, "content": text },
             "id": id,
         })
         .to_string()
@@ -175,17 +202,25 @@ impl SatoriTransport {
             });
         }
 
+        // 平台名是会话命名空间的一部分。`READY` 之前不知道——这时**丢弃**而不是猜：
+        // 猜一个平台名会把消息归进错误的命名空间，比丢一条更难查。
+        let Some(platform) = self.known_platform() else {
+            return Ok(ChatEvent::Ignored {
+                kind: "message:platform_unknown".to_owned(),
+            });
+        };
+
+        let channel_id = channel
+            .and_then(|channel| channel.get("id"))
+            .and_then(string_of);
+
         // 群号优先取 `guild.id`：Satori 里一个群可以有多个文本频道，而内核的范围模型
         // 是「一个群一个订阅」。退到 `channel.id` 只在没有 guild 时才发生。
-        let group = message
+        let conversation = message
             .get("guild")
             .and_then(|guild| guild.get("id"))
             .and_then(string_of)
-            .or_else(|| {
-                channel
-                    .and_then(|channel| channel.get("id"))
-                    .and_then(string_of)
-            })
+            .or_else(|| channel_id.clone())
             .ok_or(TransportError::MissingField("channel.id"))?;
 
         let user = message.get("user").and_then(Value::as_object);
@@ -221,7 +256,12 @@ impl SatoriTransport {
 
         Ok(ChatEvent::Message(ChatMessage {
             self_id,
-            group,
+            conversation: ConversationKey::new(platform, conversation),
+            // 发回去要打到**频道**，不是 guild——一个群可以有多个文本频道。
+            reply_to: channel_id.map(|address| ReplyAddress {
+                platform: self.known_platform().unwrap_or_default(),
+                address,
+            }),
             message_id,
             sender_id,
             sender_name,
@@ -292,6 +332,13 @@ mod tests {
 
     fn ready(user: &str) -> String {
         format!(
+            r#"{{"op":4,"body":{{"login":{{"status":1,"platform":"qqguild","user":{{"id":"{user}","name":"bot"}}}}}}}}"#
+        )
+    }
+
+    /// 没有 `login.platform` 的 READY：平台学不到，消息只能丢弃。
+    fn ready_without_platform(user: &str) -> String {
+        format!(
             r#"{{"op":4,"body":{{"login":{{"status":1,"user":{{"id":"{user}","name":"bot"}}}}}}}}"#
         )
     }
@@ -318,8 +365,14 @@ mod tests {
         assert_eq!(transport.login(), None);
 
         let event = transport.decode(&ready("10001")).expect("应能解码");
-        assert_eq!(event, ChatEvent::Status(ChatStatus::Ready));
+        assert_eq!(
+            event,
+            ChatEvent::Status(ChatStatus::Ready {
+                platform: Some("qqguild".to_owned())
+            })
+        );
         assert_eq!(transport.login().as_deref(), Some("10001"));
+        assert_eq!(transport.known_platform().as_deref(), Some("qqguild"));
     }
 
     #[test]
@@ -333,7 +386,19 @@ mod tests {
             panic!("期望消息，得到 {event:?}");
         };
         // 这条是抽象的核心断言：Satori 的 channel/guild/user 全部落成内核的中立字段。
-        assert_eq!(message.group, "20001", "群号取 guild.id");
+        assert_eq!(
+            message.conversation,
+            ConversationKey::new("qqguild", "20001"),
+            "会话取 guild.id，平台取 READY 的 login.platform"
+        );
+        assert_eq!(
+            message.reply_to,
+            Some(ReplyAddress {
+                platform: "qqguild".to_owned(),
+                address: "c-1".to_owned(),
+            }),
+            "guild 是会话，channel 是回复目标"
+        );
         assert_eq!(message.sender_id, "30002");
         assert_eq!(message.sender_name.as_deref(), Some("小明"), "nick 优先");
         assert_eq!(message.text, "在吗");
@@ -394,8 +459,11 @@ mod tests {
     fn send_action_is_encoded_as_a_http_request_not_a_ws_frame() {
         let transport = transport();
         let line = transport.encode(
-            &ChatAction::SendGroupMessage {
-                group: "20001".to_owned(),
+            &ChatAction::Send {
+                to: ReplyAddress {
+                    platform: "qqguild".to_owned(),
+                    address: "c-1".to_owned(),
+                },
                 text: "在".to_owned(),
             },
             "a-1",
@@ -403,7 +471,7 @@ mod tests {
 
         let value: Value = serde_json::from_str(&line).expect("应是 JSON");
         assert_eq!(value["path"], "/message.create");
-        assert_eq!(value["body"]["channel_id"], "20001");
+        assert_eq!(value["body"]["channel_id"], "c-1", "动作打到频道");
         assert_eq!(value["body"]["content"], "在");
         assert_eq!(value["id"], "a-1");
     }
@@ -444,5 +512,34 @@ mod tests {
         assert_eq!(flatten_mentions("你好 <at id=\"1\""), "你好 <at id=\"1\"");
         assert_eq!(flatten_mentions("没有元素"), "没有元素");
         assert_eq!(flatten_mentions(""), "");
+    }
+
+    #[test]
+    fn message_before_ready_is_dropped_not_guessed() {
+        // READY 之前不知道平台。猜一个平台名会把消息归进错误的命名空间，
+        // 比丢一条更难查——所以显式丢弃并留下日志可读的原因。
+        let transport = SatoriTransport::new();
+        let event = transport
+            .decode(&text_event("在吗", "30002", "20001", 0))
+            .expect("应能解码");
+        assert!(
+            matches!(event, ChatEvent::Ignored { ref kind } if kind == "message:platform_unknown"),
+            "得到 {event:?}"
+        );
+    }
+
+    #[test]
+    fn ready_without_platform_still_ignores_messages() {
+        // 协议没给 `login.platform` 是不猜，不是编一个。没有平台就没有会话命名空间。
+        let transport = SatoriTransport::new();
+        transport
+            .decode(&ready_without_platform("10001"))
+            .expect("READY 应能解码");
+        assert_eq!(transport.known_platform(), None, "协议没给就是不猜");
+
+        let event = transport
+            .decode(&text_event("在吗", "30002", "20001", 0))
+            .expect("应能解码");
+        assert!(matches!(event, ChatEvent::Ignored { .. }));
     }
 }

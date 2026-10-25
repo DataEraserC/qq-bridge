@@ -55,13 +55,19 @@ pub struct MessageEvent {
 impl MessageEvent {
     /// 转成归档消息。`account` 是配置里的账号标识，不是 QQ 号。
     ///
+    /// `platform` 由调用方给：OneBot 的帧里没有平台字段，它是什么平台由**部署**决定
+    /// （同一个 OneBot 实现可以接 QQ，也可以接别的平台）。
+    ///
     /// `own` 不在这里判定：它是**设备**的属性（设备声明的账号集合），同一个事件进入两台
-    /// 设备时结论可能不同，所以由 [`crate::conn::Router`] 在路由时按设备填。
-    pub fn into_archive(&self, account: &str) -> Message {
+    /// 设备时结论可能不同，所以由 [`crate::conn::route`] 在路由时按设备填。
+    pub fn into_archive(&self, account: &str, platform: &str) -> Message {
         Message {
             seq: 0,
             account: account.to_owned(),
+            platform: platform.to_owned(),
             group: self.group_id.clone(),
+            // OneBot 上群号既是会话也是目标：没有「一个群多个频道」这回事。
+            reply: None,
             message_id: self.message_id.clone(),
             sender_id: self.user_id.clone(),
             sender_name: self.sender_name.clone(),
@@ -383,12 +389,33 @@ pub enum DecodeError {
 ///
 /// 这是第一个实现，也是抽象的验证对象：如果它对内核的接口要求不止
 /// [`ChatEvent`](crate::chat::ChatEvent) 那几个分支，抽象就是错的。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OneBot;
+///
+/// **平台名由配置给。** OneBot 的帧里没有平台字段——`self_id` 是 QQ 号、`group_id` 是
+/// 群号，但没有一个字说这是哪个平台。所以平台是部署者的事实，不是协议的事实。
+#[derive(Debug, Clone)]
+pub struct OneBot {
+    /// 会话命名空间。缺省 `qq`：最常见的部署是 QQ，且旧配置不必改。
+    platform: String,
+}
 
 impl OneBot {
     pub fn new() -> Self {
-        Self
+        Self {
+            platform: "qq".to_owned(),
+        }
+    }
+
+    /// 指定平台名。
+    pub fn with_platform(platform: impl Into<String>) -> Self {
+        Self {
+            platform: platform.into(),
+        }
+    }
+}
+
+impl Default for OneBot {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -397,11 +424,18 @@ impl crate::chat::Transport for OneBot {
         "onebot11"
     }
 
+    /// OneBot 的平台名是配置声明的，所以连接一建立就知道。
+    fn platform(&self) -> Option<String> {
+        Some(self.platform.clone())
+    }
+
     fn decode(&self, line: &str) -> Result<crate::chat::ChatEvent, crate::chat::TransportError> {
         Ok(match decode(line)? {
             Event::Message(message) => crate::chat::ChatEvent::Message(crate::chat::ChatMessage {
                 self_id: message.self_id,
-                group: message.group_id,
+                conversation: crate::chat::ConversationKey::new(&self.platform, message.group_id),
+                // OneBot 上会话就是目标：群号既是收信的地方也是发信的地方。
+                reply_to: None,
                 message_id: message.message_id,
                 sender_id: message.user_id,
                 sender_name: message.sender_name,
@@ -410,7 +444,9 @@ impl crate::chat::Transport for OneBot {
                 time: message.time,
             }),
             Event::Poke(poke) => crate::chat::ChatEvent::Poke(crate::chat::ChatPoke {
-                group: poke.group_id,
+                conversation: poke
+                    .group_id
+                    .map(|group| crate::chat::ConversationKey::new(&self.platform, group)),
                 sender_id: poke.user_id,
                 target_id: poke.target_id,
                 self_id: poke.self_id,
@@ -418,7 +454,9 @@ impl crate::chat::Transport for OneBot {
             Event::Lifecycle(lifecycle) => {
                 // `enable`/`connect` 都算就绪；其他子类型（比如 `disable`）不是内核要的状态。
                 if lifecycle.is_ready() {
-                    crate::chat::ChatEvent::Status(crate::chat::ChatStatus::Ready)
+                    crate::chat::ChatEvent::Status(crate::chat::ChatStatus::Ready {
+                        platform: Some(self.platform.clone()),
+                    })
                 } else {
                     crate::chat::ChatEvent::Ignored {
                         kind: format!("lifecycle:{}", lifecycle.sub_type),
@@ -441,8 +479,8 @@ impl crate::chat::Transport for OneBot {
 
     fn encode(&self, action: &crate::chat::ChatAction, id: &str) -> String {
         let mapped = match action {
-            crate::chat::ChatAction::SendGroupMessage { group, text } => Action::SendGroupMsg {
-                group_id: group.clone(),
+            crate::chat::ChatAction::Send { to, text } => Action::SendGroupMsg {
+                group_id: to.address.clone(),
                 text: text.clone(),
             },
         };
@@ -701,8 +739,9 @@ mod tests {
         let Event::Message(message) = decode(&group_message("")).expect("应能解码") else {
             panic!("期望群消息");
         };
-        let archived = message.into_archive("main");
+        let archived = message.into_archive("main", "qq");
         assert_eq!(archived.account, "main");
+        assert_eq!(archived.platform, "qq", "平台由配置给，协议里没有");
         assert_eq!(archived.group, "20001");
         assert_eq!(archived.message_id, "7451");
         assert_eq!(archived.sender_id, "30002");

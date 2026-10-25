@@ -42,7 +42,8 @@ fn load(block: &str) -> Hooks {
 fn at(text: &str) -> Snapshot {
     Snapshot {
         sender_id: "30002".to_owned(),
-        group_id: "20001".to_owned(),
+        platform: "qq".to_owned(),
+        conversation: "20001".to_owned(),
         text: text.to_owned(),
         time_ms: 1_792_561_540_000,
         is_self: false,

@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 use qqab_kernel::adapter::Server;
 use qqab_kernel::archive::Limits;
 use qqab_kernel::chat::Transport;
+use qqab_kernel::config::DEFAULT_ONEBOT_PLATFORM;
 use qqab_kernel::config::{Account, Config};
 use qqab_kernel::conn::Pool;
 use qqab_kernel::hooks::{HookRuntime, Hooks};
@@ -215,15 +216,23 @@ fn main_loop(
     }
 }
 
-/// 按配置里的协议名挑一份 [`Transport`] 实现。
+/// 按配置里的适配器名挑一份 [`Transport`] 实现。
 ///
-/// 配置校验期已经拒掉未知名字，所以这里不需要 `Result`——走到这一步只可能是已知协议。
-/// 新增一个协议要动的就是这里加一个分支，内核别处一行不改。
+/// 配置校验期已经拒掉未知名字，所以这里不需要 `Result`——走到这一步只可能是已知实现。
+/// 新增一个实现要动的就是这里加一个分支，内核别处一行不改。
+///
+/// **平台名传给 OneBot。** 它的帧里没有平台字段，所以平台只能来自配置；Satori 自己会
+/// 在 READY 里告诉我们，不需要也不应该从配置里塞。
 fn transport_for(account: &Account) -> Box<dyn Transport> {
-    match account.protocol.as_str() {
+    match account.adapter.as_str() {
         "satori" => Box::new(SatoriTransport::new()),
-        // 校验期保证只有已知协议；OneBot 是缺省。
-        _ => Box::new(OneBot::new()),
+        // 校验期保证只有已知实现；OneBot 是缺省。
+        _ => Box::new(OneBot::with_platform(
+            account
+                .platform
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ONEBOT_PLATFORM.to_owned()),
+        )),
     }
 }
 

@@ -2,6 +2,7 @@
 //!
 //! 直接读 `docs/architecture/03-kernel.md`，从代码块里抽出 JSON 来解析，从表格里抽出上限
 //! 来比对。测试里不复制一份——复制的那份迟早和文档分叉，而这份测试的全部意义就是抓分叉。
+use qqab_kernel::chat::ConversationKey;
 
 use qqab_kernel::archive::{
     Archive, DEFAULT_CONTEXT_MESSAGES, DEFAULT_MAX_BYTES, DEFAULT_MAX_MESSAGES, Limits, render,
@@ -13,6 +14,11 @@ const KERNEL_DOC: &str = include_str!("../../../docs/architecture/03-kernel.md")
 ///
 /// 按内容特征找而不是「第一个」：同一份文档里还有 OneBot 事件示例，靠位置取会让两份
 /// 测试互相挤掉对方。归档分片的特征是最外层是 `shards`。
+/// 测试里的会话键：这些用例只有 QQ 一个平台。
+fn qq(conversation: &str) -> ConversationKey {
+    ConversationKey::new("qq", conversation)
+}
+
 fn shard_json_block(markdown: &str) -> String {
     let mut rest = markdown;
     while let Some(start) = rest.find("```json") {
@@ -67,12 +73,12 @@ fn documented_shard_parses() {
     let json = shard_json_block(KERNEL_DOC);
     let archive = Archive::from_json(&json, Limits::default()).expect("文档里的分片示例必须能解析");
 
-    assert_eq!(archive.watermark("alice", "20001"), 34);
+    assert_eq!(archive.watermark("alice", &qq("20001")), 34);
     assert_eq!(archive.retained("alice"), 2);
     // 序号 33 在水位之前，34 是自己发的——两条都不是未读。
-    assert!(archive.unread("alice", "20001").is_empty());
+    assert!(archive.unread("alice", &qq("20001")).is_empty());
 
-    let context = archive.context("alice", "20001", 10);
+    let context = archive.context("alice", &qq("20001"), 10);
     assert_eq!(context.len(), 2);
     assert_eq!(context[0].message_id, "7451");
     assert!(context[0].at_self, "示例标了 @");
@@ -88,7 +94,7 @@ fn documented_render_matches_implementation() {
 
     // 号码是身份，括号里是显示名；被点到的消息带 @你 前缀。
     assert_eq!(
-        render(&archive.context("alice", "20001", 10)),
+        render(&archive.context("alice", &qq("20001"), 10)),
         "30002（小明）：@你 在吗\n我：在"
     );
 }

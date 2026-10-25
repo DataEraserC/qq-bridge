@@ -49,10 +49,15 @@ fn sample_deliver() -> Deliver {
             text: "在吗".into(),
         }],
         scope: Scope {
-            group: "20001".into(),
-            group_name: None,
+            platform: "qq".into(),
+            conversation: "20001".into(),
+            conversation_name: None,
             send_accounts: vec!["main".into()],
         },
+        reply: Some(qqab_proto::ReplyTo {
+            platform: "qq".into(),
+            address: "20001".into(),
+        }),
         wake_reason: "at_mention".into(),
         notes: String::new(),
     }

@@ -61,9 +61,15 @@ impl HookLimits {
 }
 
 /// 传给钩子的事件视图。字段与文档里的 `ev.sender_id` 等一一对应。
+///
+/// 会话是**两段**：`platform` 是命名空间，`conversation` 是里面的标识。合成一个字符串
+/// 会让脚本自己去拆，而分隔符在 id 里出现时拆错——那时它改的是一个不存在的会话。
 pub struct HookEvent<'a> {
     pub sender_id: &'a str,
-    pub group_id: &'a str,
+    /// 会话的命名空间，如 `qq`、`discord`。
+    pub platform: &'a str,
+    /// 该平台内的会话标识。对群聊平台就是群号。
+    pub conversation: &'a str,
     pub text: &'a str,
     /// Unix 毫秒。
     pub time_ms: i64,
@@ -80,7 +86,8 @@ impl<'a> HookEvent<'a> {
     pub fn of_message(message: &'a Message, fresh: bool) -> Self {
         Self {
             sender_id: &message.sender_id,
-            group_id: &message.group,
+            platform: &message.platform,
+            conversation: &message.group,
             text: &message.text,
             time_ms: message.at,
             is_self: message.own,
@@ -91,10 +98,16 @@ impl<'a> HookEvent<'a> {
     }
 
     /// 一次拍一拍。它没有正文也没有归档增量。
-    pub fn of_poke(group: &'a str, sender_id: &'a str, time_ms: i64) -> Self {
+    pub fn of_poke(
+        platform: &'a str,
+        conversation: &'a str,
+        sender_id: &'a str,
+        time_ms: i64,
+    ) -> Self {
         Self {
             sender_id,
-            group_id: group,
+            platform,
+            conversation,
             text: "",
             time_ms,
             is_self: false,
@@ -112,7 +125,8 @@ impl<'a> HookEvent<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub sender_id: String,
-    pub group_id: String,
+    pub platform: String,
+    pub conversation: String,
     pub text: String,
     pub time_ms: i64,
     pub is_self: bool,
@@ -125,7 +139,8 @@ impl Snapshot {
     pub fn of_message(message: &Message, fresh: bool) -> Self {
         Self {
             sender_id: message.sender_id.clone(),
-            group_id: message.group.clone(),
+            platform: message.platform.clone(),
+            conversation: message.group.clone(),
             text: message.text.clone(),
             time_ms: message.at,
             is_self: message.own,
@@ -135,10 +150,11 @@ impl Snapshot {
         }
     }
 
-    pub fn of_poke(group: &str, sender_id: &str, time_ms: i64) -> Self {
+    pub fn of_poke(platform: &str, conversation: &str, sender_id: &str, time_ms: i64) -> Self {
         Self {
             sender_id: sender_id.to_owned(),
-            group_id: group.to_owned(),
+            platform: platform.to_owned(),
+            conversation: conversation.to_owned(),
             text: String::new(),
             time_ms,
             is_self: false,
@@ -152,7 +168,8 @@ impl Snapshot {
     pub fn view(&self) -> HookEvent<'_> {
         HookEvent {
             sender_id: &self.sender_id,
-            group_id: &self.group_id,
+            platform: &self.platform,
+            conversation: &self.conversation,
             text: &self.text,
             time_ms: self.time_ms,
             is_self: self.is_self,
@@ -525,11 +542,20 @@ impl Hooks {
                     .map_err(|e| self.runtime(e))?,
             )
             .map_err(|e| self.runtime(e))?;
+        // 会话是两段：脚本要按平台区分两个同名的会话时不必自己拆字符串。
         table
             .set(
-                "group_id",
+                "platform",
                 self.lua
-                    .create_string(event.group_id)
+                    .create_string(event.platform)
+                    .map_err(|e| self.runtime(e))?,
+            )
+            .map_err(|e| self.runtime(e))?;
+        table
+            .set(
+                "conversation",
+                self.lua
+                    .create_string(event.conversation)
                     .map_err(|e| self.runtime(e))?,
             )
             .map_err(|e| self.runtime(e))?;
@@ -820,10 +846,19 @@ fn install_config(lua: &Lua, config: &Config, device_id: &str) -> Result<(), Hoo
     let scopes = lua.create_table().map_err(|e| env_error(device_id, e))?;
     for (index, scope) in device.scopes.iter().enumerate() {
         let entry = lua.create_table().map_err(|e| env_error(device_id, e))?;
+        // 会话是两段：平台与它里面的会话标识分开给。合成一个字符串会让钩子自己
+        // 去拆，而分隔符会撞车。
         entry
             .set(
-                "group",
-                lua.create_string(&scope.group)
+                "platform",
+                lua.create_string(&scope.platform)
+                    .map_err(|e| env_error(device_id, e))?,
+            )
+            .map_err(|e| env_error(device_id, e))?;
+        entry
+            .set(
+                "conversation",
+                lua.create_string(&scope.conversation)
                     .map_err(|e| env_error(device_id, e))?,
             )
             .map_err(|e| env_error(device_id, e))?;
@@ -867,7 +902,7 @@ fn install_config(lua: &Lua, config: &Config, device_id: &str) -> Result<(), Hoo
 /// `__index` 转发读、`__newindex` 拒绝写、`__pairs` 转发遍历。`rawset` 能绕过它，但脚本
 /// 作者是部署者本人，目标是防止误改而不是防恶意——见 ADR-0003 的威胁模型。
 const READONLY_WRAPPER: &str = r#"
--- 每一层都必须是代理：只在顶层拦截时，`config.scopes[1].group = "9"` 改的是影子副本。
+-- 每一层都必须是代理：只在顶层拦截时，`config.scopes[1].conversation = "9"` 改的是影子副本。
 -- 影子表本身不保护任何东西；protected 的是外面这层代理。
 local function readonly(t)
   local shadow = {}
@@ -963,7 +998,8 @@ mod tests {
     fn event<'a>(text: &'a str, sender: &'a str) -> HookEvent<'a> {
         HookEvent {
             sender_id: sender,
-            group_id: "20001",
+            platform: "qq",
+            conversation: "20001",
             text,
             time_ms: 1_792_561_540_000,
             is_self: false,
@@ -1242,7 +1278,7 @@ memory = "alice"
 accounts = ["main"]
 
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 "#,
@@ -1253,7 +1289,7 @@ accounts = ["main"]
             "alice-phone",
             r#"function shouldWake(ev, reason)
                  return string.format("%s/%s/%s/%s",
-                   config.memory, config.scopes[1].group, config.accounts[1], config.id)
+                   config.memory, config.scopes[1].conversation, config.accounts[1], config.id)
                end"#,
             "config.lua",
             HookLimits::default(),
@@ -1287,7 +1323,7 @@ memory = "alice"
 accounts = ["main"]
 
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 "#,
@@ -1297,7 +1333,7 @@ accounts = ["main"]
         // 改顶层、改嵌套表、改数组元素都该抛错——否则「只读快照」只是口头承诺。
         for attempt in [
             r#"config.memory = "hacked""#,
-            r#"config.scopes[1].group = "9""#,
+            r#"config.scopes[1].conversation = "9""#,
             r#"config.accounts[1] = "9""#,
         ] {
             let source = format!("function shouldWake(ev, reason) {attempt} return reason end");

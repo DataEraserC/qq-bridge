@@ -2,7 +2,7 @@
 //!
 //! 这些测试的失败意味着文档与实现漂移，而不是实现有 bug。
 
-use qqab_kernel::config::{Config, KNOWN_PROTOCOLS, PersonaSource};
+use qqab_kernel::config::{Config, KNOWN_ADAPTERS, PersonaSource};
 use qqab_kernel::endpoint::Endpoint;
 
 #[test]
@@ -93,7 +93,7 @@ const CONFIG_MANUAL: &str = include_str!("../../../docs/manual/02-config.md");
 
 #[test]
 fn documented_protocols_match_the_known_list() {
-    for protocol in KNOWN_PROTOCOLS {
+    for protocol in KNOWN_ADAPTERS {
         assert!(
             CONFIG_MANUAL.contains(&format!("`{protocol}`")),
             "文档应列出协议 {protocol}"
@@ -109,26 +109,26 @@ fn documented_protocols_match_the_known_list() {
     assert!(!documented.is_empty(), "文档里应有协议表");
     for protocol in documented {
         assert!(
-            KNOWN_PROTOCOLS.contains(&protocol),
+            KNOWN_ADAPTERS.contains(&protocol),
             "文档列了实现不认识的协议 {protocol}"
         );
     }
 }
 
 #[test]
-fn an_unknown_protocol_fails_at_parse_time_with_the_known_list() {
+fn an_unknown_adapter_fails_at_parse_time_with_the_known_list() {
     let text = include_str!("fixtures/documented.toml").replace(
         "self_id = \"10001\"",
-        "self_id = \"10001\"\nprotocol = \"irc\"",
+        "self_id = \"10001\"\nadapter = \"irc\"",
     );
 
-    let error = Config::parse(&text).expect_err("未知协议应被拒");
+    let error = Config::parse(&text).expect_err("未知适配器应被拒");
     let message = error.to_string();
     assert!(
         message.contains("irc"),
         "错误里应指出写错的那个名字：{message}"
     );
-    for protocol in KNOWN_PROTOCOLS {
+    for protocol in KNOWN_ADAPTERS {
         assert!(
             message.contains(protocol),
             "错误里应列出已知协议 {protocol}：{message}"

@@ -16,6 +16,7 @@
 use qqab_proto::{Block, Deliver, Scope};
 
 use crate::archive::{Archive, Message, render};
+use crate::chat::ReplyAddress;
 use crate::config::{Device, ScopeConfig, WakeConfig};
 use crate::notes::NoteStore;
 use crate::turn::Ticket;
@@ -30,6 +31,8 @@ pub struct Delivery {
     pub persona: String,
     pub blocks: Vec<Block>,
     pub scope: Scope,
+    /// 这一回合的回复该发到哪儿。工具调用用它，而不是会话号。
+    pub reply: ReplyAddress,
     pub wake_reason: String,
     pub notes: String,
     /// 投递成功后可推进到的水位（这批未读的最大序号）。0 表示没有未读。
@@ -46,6 +49,10 @@ impl Delivery {
             persona: self.persona,
             blocks: self.blocks,
             scope: self.scope,
+            reply: Some(qqab_proto::ReplyTo {
+                platform: self.reply.platform,
+                address: self.reply.address,
+            }),
             wake_reason: self.wake_reason,
             notes: self.notes,
         }
@@ -91,15 +98,26 @@ pub fn assemble(
     context_messages: usize,
     note_budget: usize,
 ) -> Option<Delivery> {
-    let unread = archive.unread(&device.memory, &scope.group);
+    let conversation = scope.key();
+    let unread = archive.unread(&device.memory, &conversation);
     if unread.is_empty() {
         return None;
     }
 
     let watermark = unread.iter().map(|message| message.seq).max().unwrap_or(0);
-    let context = archive.context(&device.memory, &scope.group, context_messages);
+    let context = archive.context(&device.memory, &conversation, context_messages);
 
     let blocks = render_blocks(&context, &unread, archive.dropped(&device.memory));
+
+    // 回信要打到这批未读**实际来的那个地方**。Satori 上一个 guild 有多个文本频道，
+    // 拿会话号发回去会打到 guild 而不是频道。取最近一条的地址：这一回合就是在回它。
+    let reply = unread
+        .last()
+        .map(|message| message.reply_address())
+        .unwrap_or_else(|| ReplyAddress {
+            platform: scope.platform.clone(),
+            address: scope.conversation.clone(),
+        });
 
     Some(Delivery {
         ticket: ticket.clone(),
@@ -107,12 +125,14 @@ pub fn assemble(
         persona: persona.to_owned(),
         blocks,
         scope: Scope {
-            group: scope.group.clone(),
-            group_name: group_name.map(str::to_owned),
+            platform: scope.platform.clone(),
+            conversation: scope.conversation.clone(),
+            conversation_name: group_name.map(str::to_owned),
             send_accounts: scope.send.clone(),
         },
+        reply,
         wake_reason: reason.label(),
-        notes: notes.digest(&scope.group, note_budget),
+        notes: notes.digest(&scope.conversation, note_budget),
         watermark,
     })
 }
@@ -184,6 +204,7 @@ mod tests {
     fn message(seq_group: &str, id: &str, sender: &str, text: &str) -> Message {
         Message {
             account: "main".to_owned(),
+            platform: "qq".to_owned(),
             group: seq_group.to_owned(),
             message_id: id.to_owned(),
             sender_id: sender.to_owned(),
@@ -208,7 +229,8 @@ mod tests {
             memory: "alice".to_owned(),
             accounts: vec!["main".to_owned(), "backup".to_owned()],
             scopes: vec![ScopeConfig {
-                group: "20001".to_owned(),
+                platform: "qq".to_owned(),
+                conversation: "20001".to_owned(),
                 receive: vec!["main".to_owned()],
                 send: vec!["main".to_owned(), "backup".to_owned()],
             }],
@@ -221,6 +243,11 @@ mod tests {
         device().scopes[0].clone()
     }
 
+    /// 测试里的会话键，与 `device()` 的范围一致。
+    fn conversation() -> crate::chat::ConversationKey {
+        crate::chat::ConversationKey::new("qq", "20001")
+    }
+
     /// 真签一张票：票的构造器只有队列有，测试也不该绕过它。
     fn ticket() -> Ticket {
         let mut table = TurnTable::new(time::Duration::minutes(10));
@@ -228,7 +255,7 @@ mod tests {
             TurnContext {
                 memory: "alice".to_owned(),
                 device: "alice-phone".to_owned(),
-                group: "20001".to_owned(),
+                conversation: crate::chat::ConversationKey::new("qq", "20001"),
                 send_accounts: vec!["main".to_owned()],
             },
             now(),
@@ -250,7 +277,7 @@ mod tests {
         mention.at_self = true;
 
         let incoming = crate::wake::Incoming {
-            group: &mention.group,
+            group: "20001",
             sender_id: &mention.sender_id,
             text: &mention.text,
             at_mention: mention.at_self,
@@ -271,7 +298,9 @@ mod tests {
         let archive = archive_with(vec![own]);
 
         assert!(
-            archive.unread("alice", "20001").is_empty(),
+            archive
+                .unread("alice", &crate::chat::ConversationKey::new("qq", "20001"))
+                .is_empty(),
             "own 本来就不进未读，判定层的输入里没有它"
         );
     }
@@ -315,7 +344,9 @@ mod tests {
         ]);
         // 前两条已被消费。
         let mut archive = archive;
-        archive.consume("alice", "20001", 2).expect("应能推进");
+        archive
+            .consume("alice", &conversation(), 2)
+            .expect("应能推进");
 
         let notes = NoteStore::new(100);
         let delivery = assemble(
@@ -334,8 +365,8 @@ mod tests {
 
         assert_eq!(delivery.memory, "alice");
         assert_eq!(delivery.watermark, 3, "水位指向这批最大的序号");
-        assert_eq!(delivery.scope.group, "20001");
-        assert_eq!(delivery.scope.group_name.as_deref(), Some("测试群"));
+        assert_eq!(delivery.scope.conversation, "20001");
+        assert_eq!(delivery.scope.conversation_name.as_deref(), Some("测试群"));
         assert_eq!(delivery.scope.send_accounts, vec!["main", "backup"]);
         assert_eq!(delivery.wake_reason, "any_message");
 
@@ -351,7 +382,9 @@ mod tests {
     fn assemble_without_unread_is_none() {
         let archive = archive_with(vec![message("20001", "1", "30002", "一")]);
         let mut archive = archive;
-        archive.consume("alice", "20001", 1).expect("应能推进");
+        archive
+            .consume("alice", &conversation(), 1)
+            .expect("应能推进");
 
         assert!(
             assemble(

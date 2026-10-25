@@ -106,7 +106,7 @@ memory = "alice"
 accounts = ["main"]
 
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 "#;

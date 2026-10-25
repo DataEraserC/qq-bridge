@@ -13,7 +13,11 @@ pub use error::{ErrorBody, ErrorCode};
 pub use frame::*;
 
 /// 协议主版本。主版本不同即拒绝，不尝试兼容。
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 起 `scope` 用 `conversation` 而不是 `group`，并新增 `reply`：会话名与回复目标
+/// 在有的平台上是两个不同的东西（Satori 的 guild 与 channel）。见
+/// `docs/adr/0011-conversation-identity.md`。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 解码一行协议文本。
 ///
@@ -110,15 +114,34 @@ pub enum Block {
     },
 }
 
-/// 本次投递涉及的群与可用发送账号。
+/// 本次投递涉及的会话与可用发送账号。
+///
+/// 字段是 `conversation` 而不是 `group`：内核处理的不再只是 QQ 群，而「群号」这个词在
+/// Discord、KOOK 上不成立。`platform` 另给，因为同一个会话号在不同平台上是不同会话。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
-    pub group: String,
+    /// 会话命名空间，如 `qq`、`discord`。
+    #[serde(default)]
+    pub platform: String,
+    /// 该平台内的会话标识。对群聊平台就是群号。
+    pub conversation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_name: Option<String>,
+    pub conversation_name: Option<String>,
     /// 账号的**标识**，不是 QQ 号。适配器当作不透明字符串原样回传。
     #[serde(default)]
     pub send_accounts: Vec<String>,
+}
+
+/// 一次回复要发到哪儿。
+///
+/// 与会话分开：有的平台上「收消息的会话」和「发消息的目标」不是同一个对象。Satori 一个
+/// guild 可以有多条文本频道，消息从频道来、回复也要回频道去。多数平台两者相同，那时
+/// `address` 等于会话号。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyTo {
+    #[serde(default)]
+    pub platform: String,
+    pub address: String,
 }
 
 #[cfg(test)]
@@ -168,10 +191,15 @@ mod tests {
                 },
             ],
             scope: Scope {
-                group: "20001".into(),
-                group_name: Some("测试群".into()),
+                platform: "qq".into(),
+                conversation: "20001".into(),
+                conversation_name: Some("测试群".into()),
                 send_accounts: vec!["main".into()],
             },
+            reply: Some(ReplyTo {
+                platform: "qq".into(),
+                address: "20001".into(),
+            }),
             wake_reason: "at_mention".into(),
             notes: String::new(),
         });
@@ -189,7 +217,7 @@ mod tests {
 
     #[test]
     fn missing_optional_fields_use_defaults() {
-        let line = r#"{"type":"deliver","id":"d-1","ticket":"t1-1","memory":"alice","persona":"p","blocks":[],"scope":{"group":"1"},"wake_reason":"any_message"}"#;
+        let line = r#"{"type":"deliver","id":"d-1","ticket":"t1-1","memory":"alice","persona":"p","blocks":[],"scope":{"conversation":"1"},"wake_reason":"any_message"}"#;
         let Frame::Deliver(deliver) = decode(line).expect("可解码") else {
             panic!("期望 deliver");
         };
@@ -208,7 +236,7 @@ mod tests {
     #[test]
     fn hello_carries_version() {
         let Frame::Hello(hello) =
-            decode(r#"{"type":"hello","id":"h-1","version":1,"adapter":"dsh"}"#).unwrap()
+            decode(r#"{"type":"hello","id":"h-1","version":2,"adapter":"dsh"}"#).unwrap()
         else {
             panic!("期望 hello");
         };
@@ -221,7 +249,7 @@ mod tests {
     #[test]
     fn hello_carries_token_across_machines() {
         // 跨机器形态必须带令牌；字段在同一帧里，不另开一帧。
-        let line = r#"{"type":"hello","id":"h-1","version":1,"adapter":"dsh","token":"s3cret"}"#;
+        let line = r#"{"type":"hello","id":"h-1","version":2,"adapter":"dsh","token":"s3cret"}"#;
         let Frame::Hello(hello) = decode(line).expect("应能解码") else {
             panic!("期望 hello");
         };

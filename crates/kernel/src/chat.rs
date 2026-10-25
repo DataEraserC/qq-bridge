@@ -17,6 +17,47 @@
 
 use crate::archive::Message;
 
+/// 一个会话的身份：**命名空间 + 会话标识**。
+///
+/// 两段分开而不是拼成一个字符串，因为分隔符会带来歧义（群号里出现分隔符就撞车），
+/// 而且相等判断必须逐段比较——这也是 Satori 文档对 `platform` 的定义：它「同时是一个
+/// 命名空间，`user.id`/`guild.id` 在同一 `platform` 内才保证唯一」。
+///
+/// **不含实现名。** 同一 platform 上可以有两个 adapter 指向同一个会话（OneBot 的
+/// SnowLuma 与 Satori 指向同一个 QQ 群），它们必须算作**同一个**会话；把 adapter 放进键
+/// 会让同一个会话被拆成两份记忆。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ConversationKey {
+    /// 命名空间，如 `qq`、`qqguild`、`discord`、`kook`。
+    ///
+    /// 对一条已解码的消息它**永远非空**：拿不到平台的消息不会被当成消息，见
+    /// [`ChatEvent::Ignored`]。
+    pub platform: String,
+    /// 该命名空间内的会话标识。对群聊平台就是群号。
+    pub conversation: String,
+}
+
+impl ConversationKey {
+    pub fn new(platform: impl Into<String>, conversation: impl Into<String>) -> Self {
+        Self {
+            platform: platform.into(),
+            conversation: conversation.into(),
+        }
+    }
+}
+
+/// 一次回复要发到哪里。
+///
+/// 与 [`ConversationKey`] 同形却是独立类型：它们回答两个不同的问题，且在 Satori 上
+/// **不一定取值相同**——收消息的会话是 `guild.id`（一个群可以有多个文本频道），发消息的
+/// 目标是 `channel.id`。混用一个类型会让那处差异无处安放。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ReplyAddress {
+    pub platform: String,
+    /// 真正收动作的那个对象。群聊平台是群号；Satori 上是频道号。
+    pub address: String,
+}
+
 /// 一条已拍平的消息。
 ///
 /// 字段就是内核真正读的那些。媒体只带**已落地**的路径——下载属于传输层，不属于内核。
@@ -24,8 +65,12 @@ use crate::archive::Message;
 pub struct ChatMessage {
     /// 收到它的连接所属账号的**平台侧**身份。内核用它判断「是不是自己发的」。
     pub self_id: String,
-    /// 会话标识。对群聊平台就是群号。
-    pub group: String,
+    /// 这条消息属于哪个会话。平台由传输层填：OneBot 用自己的平台名，Satori 用 READY
+    /// 里的 `login.platform`。
+    pub conversation: ConversationKey,
+    /// 回复该发到哪儿。**可以与会话不同**：Satori 上收消息的会话是 `guild.id`，回消息的
+    /// 目标是 `channel.id`。`None` 表示传输层没给出差异，回复等于会话本身。
+    pub reply_to: Option<ReplyAddress>,
     /// 平台侧的消息标识。用于跨连接去重。
     pub message_id: String,
     /// 发言者的平台侧身份。
@@ -49,7 +94,13 @@ impl ChatMessage {
         Message {
             seq: 0,
             account: account.to_owned(),
-            group: self.group.clone(),
+            platform: self.conversation.platform.clone(),
+            group: self.conversation.conversation.clone(),
+            reply: self
+                .reply_to
+                .as_ref()
+                .map(|to| to.address.clone())
+                .filter(|address| *address != self.conversation.conversation),
             message_id: self.message_id.clone(),
             sender_id: self.sender_id.clone(),
             sender_name: self.sender_name.clone(),
@@ -66,7 +117,7 @@ impl ChatMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatPoke {
     /// 拍一拍只发生在会话里。没有会话的拍一拍（好友私拍）不进判定。
-    pub group: Option<String>,
+    pub conversation: Option<ConversationKey>,
     /// 谁拍的。
     pub sender_id: String,
     /// 拍了谁。
@@ -86,10 +137,14 @@ impl ChatPoke {
 ///
 /// 两种就够了：能收发，以及「我不确定」。后者不是「断线」——`Incoming::Closed` 才是断线，
 /// 由传输层的读循环给出。心跳说「我不在线」属于这里。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatStatus {
-    /// 连接已可收发。
-    Ready,
+    /// 连接已可收发。带上平台名：有的协议（Satori）在握手里才告诉我们是哪个平台，
+    /// 而平台是会话命名空间的一部分，内核要能记下来做校验与日志。
+    Ready {
+        /// 平台名。协议没给就是 `None`——那不是错误，只是没学到。
+        platform: Option<String>,
+    },
     /// 平台说本账号不在线。交给连接池退避。
     Offline,
 }
@@ -119,7 +174,9 @@ pub enum ChatEvent {
 /// 并各自配一个测试——先留一个开放形状会让「哪些动作被支持」变得没法回答。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatAction {
-    SendGroupMessage { group: String, text: String },
+    /// 发一条文本到 [`ReplyAddress`]。目标自带平台，所以「发到哪个平台」不是一个
+    /// 需要调用方另行决定的参数。
+    Send { to: ReplyAddress, text: String },
 }
 
 /// 平台对一次动作的回应。
@@ -162,8 +219,15 @@ impl From<serde_json::Error> for TransportError {
 /// **要求同步**：整条传输是与 [ADR-0006](../../../docs/adr/0006-blocking-websocket-per-thread.md)
 /// 一致的阻塞模型，协议实现不该引入自己的执行器。
 pub trait Transport: Send + 'static {
-    /// 协议名，用于配置校验与日志。
+    /// 协议名（实现名），用于配置校验与日志。**不是平台名**：同一个协议可以服务多个平台。
     fn name(&self) -> &'static str;
+
+    /// 这条连接服务的平台名，即会话命名空间。
+    ///
+    /// `None` 表示还不知道。Satori 在 `READY` 之前不知道（要读 `login.platform`），
+    /// 所以那之前它解出消息也只能丢弃——猜一个平台名会把消息归进错误的命名空间，
+    /// 比丢一条更糟。OneBot 的平台上不了线，构造时由配置给出。
+    fn platform(&self) -> Option<String>;
 
     /// 把一行入站帧解成事件。
     ///
@@ -201,7 +265,8 @@ mod tests {
     fn message_becomes_an_archive_entry_without_deciding_ownership() {
         let message = ChatMessage {
             self_id: "10001".to_owned(),
-            group: "20001".to_owned(),
+            conversation: ConversationKey::new("qq", "20001"),
+            reply_to: None,
             message_id: "7451".to_owned(),
             sender_id: "30002".to_owned(),
             sender_name: Some("小明".to_owned()),
@@ -212,6 +277,7 @@ mod tests {
 
         let archived = message.into_archive("main");
         assert_eq!(archived.account, "main");
+        assert_eq!(archived.platform, "qq", "平台要跟着消息进归档");
         assert_eq!(archived.group, "20001");
         assert_eq!(archived.sender_id, "30002");
         assert!(archived.at_self);
@@ -223,9 +289,33 @@ mod tests {
     }
 
     #[test]
+    fn same_conversation_id_on_two_platforms_is_two_conversations() {
+        // 整个会话键存在的理由：QQ 群 123 与 Discord 频道 123 不是同一个会话。
+        let qq = ConversationKey::new("qq", "123");
+        let discord = ConversationKey::new("discord", "123");
+        assert_ne!(qq, discord);
+        assert_eq!(qq, ConversationKey::new("qq", "123"));
+        // 顺序是确定的，才能做 BTreeMap 的键。
+        assert!(discord < qq, "BTreeMap 需要全序");
+    }
+
+    #[test]
+    fn reply_address_is_not_the_same_type_as_the_conversation() {
+        // 两个类型分开的理由：Satori 上收消息的会话是 guild.id，发消息的目标是
+        // channel.id，两者不同。混用一个类型就没有地方表达这件事。
+        let conversation = ConversationKey::new("satori", "guild-1");
+        let address = ReplyAddress {
+            platform: "satori".to_owned(),
+            address: "channel-9".to_owned(),
+        };
+        assert_ne!(conversation.conversation, address.address);
+        assert_eq!(conversation.platform, address.platform);
+    }
+
+    #[test]
     fn poke_targets_self_only_when_the_target_matches() {
         let mut poke = ChatPoke {
-            group: Some("20001".to_owned()),
+            conversation: Some(ConversationKey::new("qq", "20001")),
             sender_id: "30002".to_owned(),
             target_id: "10001".to_owned(),
             self_id: "10001".to_owned(),

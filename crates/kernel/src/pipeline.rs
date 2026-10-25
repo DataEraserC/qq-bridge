@@ -14,14 +14,19 @@
 //! 判定；`postReceive` 只看增量、返回值被忽略；`shouldWake` 是判定的最终决定，脚本给的
 //! 原因替换规则的原因。
 //!
-//! 积压期间的唤醒原因要留。队列只记「有没有积压」这个布尔值，而积压合并后的那一次投递
+//! 积压期间的唤醒原因要留。队列记的是「哪些范围还有积压」，而积压合并后的那一次投递
 //! 仍然需要一个原因标签；原因取积压期间**最强**的那个，与批量判定同一把尺子。
+//!
+//! **原因与积压都按范围分开记。** 一个记忆名可以订阅多个会话，chat1 忙时 chat2 的消息
+//! 也要在收尾后拿到自己那一批——把两者都记成「这个记忆名的」，chat2 的未读就会等到它
+//! 的下一条新消息才被看见。
 
 use std::collections::BTreeMap;
 
 use time::{Duration, OffsetDateTime};
 
 use crate::archive::{Archive, ArchiveError, Limits, Message, WatermarkError};
+use crate::chat::ConversationKey;
 use crate::config::{Device, ScopeConfig};
 use crate::deliver::{Delivery, assemble, judge_poke};
 use crate::hooks::{HookRuntime, Ruling, Snapshot};
@@ -49,8 +54,12 @@ pub struct Pipeline {
     context_messages: usize,
     /// 每回合注入笔记摘要的预算，0 表示不注入。
     note_budget: usize,
-    /// 积压期间的唤醒原因，键是记忆名。合并投递时取最强的一个。
-    pending: BTreeMap<String, WakeReason>,
+    /// 积压期间的唤醒原因，键是 `(记忆名, 会话)`。合并投递时按会话取最强的一个。
+    ///
+    /// 键里必须有会话：一个记忆名可以同时有多个会话积压，共用一个原因槽会让先到的
+    /// 那条规则决定另一个会话的唤醒标签。会话用完整的键而不是群号——同名不同平台
+    /// 的会话是两场对话。
+    pending: BTreeMap<(String, ConversationKey), WakeReason>,
     /// 各设备的钩子运行时，键是设备 id。没有声明 `hooks` 的设备不在其中。
     ///
     /// 存 `dyn` 而不是具体类型：Lua、子进程、WASM 三种实现，内核这一侧不该知道是哪一种。
@@ -174,7 +183,7 @@ impl Pipeline {
         if let Some(hooks) = self.hooks.get_mut(&device.id) {
             let archived = self
                 .archive
-                .unread(&device.memory, &scope.group)
+                .unread(&device.memory, &scope.key())
                 .last()
                 .map(|message| Snapshot::of_message(message, appended.fresh));
             if let Some(archived) = archived {
@@ -240,7 +249,12 @@ impl Pipeline {
         let rule = judge_poke(&device.wake, from, now, roll);
 
         // 拍一拍没有归档内容，`batch` 为 0；它照样要过 shouldWake。
-        let snapshot = Snapshot::of_poke(&scope.group, sender, now.unix_timestamp() * 1000);
+        let snapshot = Snapshot::of_poke(
+            &scope.platform,
+            &scope.conversation,
+            sender,
+            now.unix_timestamp() * 1000,
+        );
         let reason = match self.hooks.get_mut(&device.id) {
             Some(hooks) => match HookRuntime::should_wake(
                 hooks.as_mut(),
@@ -265,8 +279,12 @@ impl Pipeline {
 
     /// 回合结束。
     ///
-    /// 返回 `Some(delivery)` 表示有积压，已合并成**一次**投递并签好了新票；`None` 表示队列
-    /// 回到空闲。
+    /// 返回 `Some(delivery)` 表示还有积压，已合并成**一次**投递并签好了新票；`None` 表示
+    /// 队列回到空闲，或积压里已经没有未读。
+    ///
+    /// 队列按记忆名串行，所以一次收尾最多只起一个回合：有多个范围积压时，先服务刚结束的
+    /// 那个（同一场对话续话最自然），其余留在积压里，等这一次回合结束时再轮转。跨范围
+    /// 并发不在这一层出现——那会需要运行时能同时吃两个回合。
     pub fn finish(
         &mut self,
         device: &Device,
@@ -275,45 +293,92 @@ impl Pipeline {
         ticket: &Ticket,
         now: OffsetDateTime,
     ) -> Result<Option<Delivery>, PipelineError> {
-        match self.turns.finish(&device.memory, ticket, now)? {
-            Finished::Idle => Ok(None),
-            Finished::Backlog => {
-                // 积压期间一定有原因——只有判定命中才会走 Defer。万一没有，退回「任意消息」
-                // 也比把这批未读永远压在归档里好。
-                let reason = self
-                    .pending
-                    .remove(&device.memory)
-                    .unwrap_or(WakeReason::AnyMessage);
-                match self.turns.arrive(self.context_of(device, scope), now) {
-                    Arrival::Start(ticket) => {
-                        match assemble(
-                            device,
-                            scope,
-                            None,
-                            persona,
-                            &self.archive,
-                            &self.notes,
-                            &ticket,
-                            &reason,
-                            self.context_messages,
-                            self.note_budget,
-                        ) {
-                            Some(delivery) => Ok(Some(delivery)),
-                            // 有积压却没有未读：票已签出，必须收回，否则队列永远忙。
-                            // 原因也一并清掉——它对应的未读已经不在归档里了。
-                            None => {
-                                let _ = self.turns.finish(&device.memory, &ticket, now);
-                                Err(PipelineError::NoUnread)
-                            }
+        let backlog = match self.turns.finish(&device.memory, ticket, now)? {
+            Finished::Idle => return Ok(None),
+            Finished::Backlog(backlog) => backlog,
+        };
+
+        // 刚结束的会话优先，其余按键排序：同一批积压每次都以同一顺序轮转，行为可复现。
+        let ending = scope.key();
+        let mut order: Vec<ConversationKey> = Vec::with_capacity(backlog.len());
+        if backlog.contains(&ending) {
+            order.push(ending.clone());
+        }
+        order.extend(backlog.iter().filter(|key| **key != ending).cloned());
+
+        let mut remaining: std::collections::BTreeSet<ConversationKey> =
+            backlog.into_iter().collect();
+
+        for conversation in order {
+            let Some(target) = device
+                .scopes
+                .iter()
+                .find(|scope| scope.key() == conversation)
+            else {
+                // 配置里已经没有这个会话（设备被改过）：它的积压无处可投，就地丢掉。
+                // 继续找下一个，别让一个失效会话挡住别的会话。
+                remaining.remove(&conversation);
+                continue;
+            };
+
+            // 积压期间一定有原因——只有判定命中才会走 Defer。万一没有，退回「任意消息」
+            // 也比把这批未读永远压在归档里好。
+            let reason = self
+                .pending
+                .remove(&(device.memory.clone(), target.key()))
+                .unwrap_or(WakeReason::AnyMessage);
+
+            match self.turns.arrive(self.context_of(device, target), now) {
+                Arrival::Start(ticket) => {
+                    remaining.remove(&conversation);
+                    match assemble(
+                        device,
+                        target,
+                        None,
+                        persona,
+                        &self.archive,
+                        &self.notes,
+                        &ticket,
+                        &reason,
+                        self.context_messages,
+                        self.note_budget,
+                    ) {
+                        Some(delivery) => {
+                            self.carry_backlog(&device.memory, &remaining);
+                            return Ok(Some(delivery));
+                        }
+                        // 有积压却没有未读：票已签出，必须收回，否则队列永远忙。这个范围
+                        // 的积压到此为止，接着看下一个——不能让一条空的积压挡住别的会话。
+                        None => {
+                            let _ = self.turns.finish(&device.memory, &ticket, now);
                         }
                     }
-                    // 刚收尾又变成忙，说明这期间起了另一个回合；积压留着，原因也留着。
-                    Arrival::Defer => {
-                        self.pending.insert(device.memory.clone(), reason);
-                        Ok(None)
-                    }
+                }
+                // 刚收尾又变成忙，说明这期间起了另一个回合；积压留着，原因也留着。
+                Arrival::Defer => {
+                    self.pending
+                        .insert((device.memory.clone(), target.key()), reason);
+                    self.carry_backlog(&device.memory, &remaining);
+                    return Ok(None);
                 }
             }
+        }
+
+        self.carry_backlog(&device.memory, &remaining);
+        Ok(None)
+    }
+
+    /// 把这一轮没服务到的范围交回积压表。
+    ///
+    /// `Finished::Backlog` 已经把整份清单交给了我们，一次收尾只服务其中一个；其余的必须
+    /// 原样还回去，否则它们要等到各自范围的下一条新消息才会再被看见。
+    fn carry_backlog(
+        &mut self,
+        memory: &str,
+        remaining: &std::collections::BTreeSet<ConversationKey>,
+    ) {
+        for conversation in remaining {
+            self.turns.remember_backlog(memory, conversation);
         }
     }
 
@@ -321,13 +386,13 @@ impl Pipeline {
     pub fn confirm(
         &mut self,
         memory: &str,
-        group: &str,
+        conversation: &ConversationKey,
         through: u64,
     ) -> Result<(), PipelineError> {
         if through == 0 {
             return Ok(());
         }
-        self.archive.consume(memory, group, through)?;
+        self.archive.consume(memory, conversation, through)?;
         Ok(())
     }
 
@@ -348,7 +413,7 @@ impl Pipeline {
     /// 积压重投：那个语义属于「回合跑完了还想接着说」，不属于「根本没送出去」。
     pub fn abandon(&mut self, memory: &str, ticket: &Ticket, now: OffsetDateTime) {
         let _ = self.turns.finish(memory, ticket, now);
-        self.pending.remove(memory);
+        self.pending.retain(|(owner, _), _| owner != memory);
     }
 
     /// 队列空闲时按当前未读重新组装一次投递。
@@ -363,7 +428,7 @@ impl Pipeline {
     ) -> Action {
         let reason = self
             .pending
-            .remove(&device.memory)
+            .remove(&(device.memory.clone(), scope.key()))
             .unwrap_or(WakeReason::AnyMessage);
 
         match self.turns.arrive(self.context_of(device, scope), now) {
@@ -388,10 +453,18 @@ impl Pipeline {
                 }
             }
             Arrival::Defer => {
-                self.remember_reason(&device.memory, reason);
+                self.remember_reason(&device.memory, &scope.key(), reason);
                 Action::Defer
             }
         }
+    }
+
+    /// 某记忆名是否有进行中的回合。
+    ///
+    /// 重投要问它：一个记忆名可以同时有多批待重投的会话，但一次只能服务一个——
+    /// 抢着投第二次会把后一批变成积压，重投点就被用掉了。
+    pub fn is_busy(&self, memory: &str) -> bool {
+        self.turns.is_busy(memory)
     }
 
     /// 清扫超时的回合。与 [`TurnTable::sweep`] 同义，积压与原因保留。
@@ -430,7 +503,7 @@ impl Pipeline {
                 }
             }
             Arrival::Defer => {
-                self.remember_reason(&device.memory, reason);
+                self.remember_reason(&device.memory, &scope.key(), reason);
                 Action::Defer
             }
         }
@@ -440,15 +513,22 @@ impl Pipeline {
     ///
     /// 脚本给的原因总是替换：它是判定的最终决定，与规则在 `rank` 上并列时不该被先到的那条
     /// 规则压住。
-    fn remember_reason(&mut self, memory: &str, reason: WakeReason) {
+    fn remember_reason(
+        &mut self,
+        memory: &str,
+        conversation: &ConversationKey,
+        reason: WakeReason,
+    ) {
         if matches!(reason, WakeReason::Hook(_)) {
-            self.pending.insert(memory.to_owned(), reason);
+            self.pending
+                .insert((memory.to_owned(), conversation.clone()), reason);
             return;
         }
-        match self.pending.get(memory) {
+        match self.pending.get(&(memory.to_owned(), conversation.clone())) {
             Some(current) if current.rank() <= reason.rank() => {}
             _ => {
-                self.pending.insert(memory.to_owned(), reason);
+                self.pending
+                    .insert((memory.to_owned(), conversation.clone()), reason);
             }
         }
     }
@@ -457,7 +537,7 @@ impl Pipeline {
         TurnContext {
             memory: device.memory.clone(),
             device: device.id.clone(),
-            group: scope.group.clone(),
+            conversation: scope.key(),
             send_accounts: scope.send.clone(),
         }
     }
@@ -469,8 +549,6 @@ pub enum PipelineError {
     Ticket(TicketError),
     Watermark(WatermarkError),
     Archive(ArchiveError),
-    /// 该有未读却没有——投递无内容可发。
-    NoUnread,
 }
 
 impl From<TicketError> for PipelineError {
@@ -497,7 +575,6 @@ impl std::fmt::Display for PipelineError {
             Self::Ticket(error) => write!(f, "回合票被拒绝：{error}"),
             Self::Watermark(error) => write!(f, "水位被拒绝：{error}"),
             Self::Archive(error) => write!(f, "{error}"),
-            Self::NoUnread => f.write_str("判定命中但没有未读，不需要投递"),
         }
     }
 }
@@ -522,7 +599,8 @@ mod tests {
             memory: "alice".to_owned(),
             accounts: vec!["main".to_owned()],
             scopes: vec![ScopeConfig {
-                group: "20001".to_owned(),
+                platform: "qq".to_owned(),
+                conversation: "20001".to_owned(),
                 receive: vec!["main".to_owned()],
                 send: vec!["main".to_owned()],
             }],
@@ -533,6 +611,11 @@ mod tests {
 
     fn scope() -> ScopeConfig {
         device().scopes[0].clone()
+    }
+
+    /// 测试里的会话键。
+    fn key(conversation: &str) -> ConversationKey {
+        ConversationKey::new("qq", conversation)
     }
 
     fn pipeline() -> Pipeline {
@@ -557,6 +640,7 @@ mod tests {
     fn message(id: &str, sender: &str, text: &str) -> Message {
         Message {
             account: "main".to_owned(),
+            platform: "qq".to_owned(),
             group: "20001".to_owned(),
             message_id: id.to_owned(),
             sender_id: sender.to_owned(),
@@ -840,7 +924,7 @@ mod tests {
             Action::Stay
         );
         assert_eq!(pipeline.archive().retained("alice"), 1);
-        assert!(pipeline.archive().unread("alice", "20001").is_empty());
+        assert!(pipeline.archive().unread("alice", &key("20001")).is_empty());
     }
 
     #[test]
@@ -950,9 +1034,9 @@ mod tests {
         };
 
         pipeline
-            .confirm("alice", "20001", delivery.watermark)
+            .confirm("alice", &key("20001"), delivery.watermark)
             .expect("应能推进");
-        assert!(pipeline.archive().unread("alice", "20001").is_empty());
+        assert!(pipeline.archive().unread("alice", &key("20001")).is_empty());
 
         // 回合结束，队列空闲，下一轮才能开始。
         assert!(
@@ -974,7 +1058,7 @@ mod tests {
             panic!("应能开始");
         };
         assert_eq!(second.watermark, 2);
-        assert_eq!(pipeline.archive().unread("alice", "20001").len(), 1);
+        assert_eq!(pipeline.archive().unread("alice", &key("20001")).len(), 1);
     }
 
     #[test]
@@ -1032,6 +1116,248 @@ mod tests {
         );
     }
 
+    /// 一台设备订阅两个群时用的设备。两个范围共用同一个记忆名——这正是「一个 agent
+    /// 会话处理两个聊天」的形态。
+    fn two_scopes() -> Device {
+        Device {
+            scopes: vec![
+                ScopeConfig {
+                    platform: "qq".to_owned(),
+                    conversation: "20001".to_owned(),
+                    receive: vec!["main".to_owned()],
+                    send: vec!["main".to_owned()],
+                },
+                ScopeConfig {
+                    platform: "qq".to_owned(),
+                    conversation: "20003".to_owned(),
+                    receive: vec!["main".to_owned()],
+                    send: vec!["main".to_owned()],
+                },
+            ],
+            ..device()
+        }
+    }
+
+    fn scope_of(device: &Device, conversation: &str) -> ScopeConfig {
+        device
+            .scopes
+            .iter()
+            .find(|scope| scope.conversation == conversation)
+            .cloned()
+            .expect("范围必须存在")
+    }
+
+    fn in_group(id: &str, group: &str, text: &str) -> Message {
+        Message {
+            group: group.to_owned(),
+            ..mentioned(id, "30002", text)
+        }
+    }
+
+    #[test]
+    fn backlog_of_another_group_is_not_lost_when_a_turn_ends() {
+        // 一个记忆名订阅两个群：chat1 忙时 chat2 的 @ 到达。收尾必须把 chat2 这一批投出去，
+        // 而不是拿刚结束的 chat1 去组装（那会组装不出内容，把 chat2 的消息一直压着）。
+        let mut pipeline = pipeline();
+        let device = two_scopes();
+
+        let Action::Deliver(first) = pipeline.ingest(
+            &device,
+            &scope_of(&device, "20001"),
+            "你是……",
+            in_group("1", "20001", "在吗"),
+            now(),
+            0.0,
+        ) else {
+            panic!("第一轮应能开始");
+        };
+
+        assert_eq!(
+            pipeline.ingest(
+                &device,
+                &scope_of(&device, "20003"),
+                "你是……",
+                in_group("1", "20003", "另一个群在吗"),
+                now(),
+                0.0
+            ),
+            Action::Defer,
+            "队列按记忆名串行，另一个群也要积压"
+        );
+
+        let merged = pipeline
+            .finish(
+                &device,
+                &scope_of(&device, "20001"),
+                "你是……",
+                &first.ticket,
+                now(),
+            )
+            .expect("应能收尾")
+            .expect("另一个群有积压，必须再投一次");
+
+        assert_eq!(merged.scope.conversation, "20003", "投出去的是积压的那个群");
+        let qqab_proto::Block::Text { text } = &merged.blocks[0] else {
+            panic!("第一块应是文本");
+        };
+        assert!(text.contains("另一个群在吗"), "内容必须是 chat2 的：{text}");
+    }
+
+    #[test]
+    fn two_groups_take_turns_until_both_are_delivered() {
+        // 两个群都有积压时不能只服务一个：每次收尾投一个，另一个留在积压里等下一次。
+        let mut pipeline = pipeline();
+        let device = two_scopes();
+
+        let Action::Deliver(first) = pipeline.ingest(
+            &device,
+            &scope_of(&device, "20001"),
+            "你是……",
+            in_group("1", "20001", "甲群一"),
+            now(),
+            0.0,
+        ) else {
+            panic!("应能开始");
+        };
+        pipeline.ingest(
+            &device,
+            &scope_of(&device, "20001"),
+            "你是……",
+            in_group("2", "20001", "甲群二"),
+            now(),
+            0.0,
+        );
+        pipeline.ingest(
+            &device,
+            &scope_of(&device, "20003"),
+            "你是……",
+            in_group("1", "20003", "乙群一"),
+            now(),
+            0.0,
+        );
+
+        // 收尾：刚结束的甲群优先。
+        let second = pipeline
+            .finish(
+                &device,
+                &scope_of(&device, "20001"),
+                "你是……",
+                &first.ticket,
+                now(),
+            )
+            .expect("应能收尾")
+            .expect("应再投一次");
+        assert_eq!(second.scope.conversation, "20001", "同一场对话先续话");
+
+        // 再收尾：轮到乙群，它不能被上一轮吞掉。
+        let third = pipeline
+            .finish(
+                &device,
+                &scope_of(&device, "20001"),
+                "你是……",
+                &second.ticket,
+                now(),
+            )
+            .expect("应能收尾")
+            .expect("乙群还压着，必须投");
+        assert_eq!(third.scope.conversation, "20003", "轮到另一个群");
+
+        let qqab_proto::Block::Text { text } = &third.blocks[0] else {
+            panic!("第一块应是文本");
+        };
+        assert!(text.contains("乙群一"), "乙群的未读要完整投出：{text}");
+
+        // 两个群都投完了，队列空闲。
+        assert!(
+            pipeline
+                .finish(
+                    &device,
+                    &scope_of(&device, "20003"),
+                    "你是……",
+                    &third.ticket,
+                    now()
+                )
+                .expect("应能收尾")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn backlog_reason_is_remembered_per_group() {
+        // 两个群各有一个唤醒原因。共用一个槽会让先到的那条规则决定另一个群的标签。
+        let mut pipeline = Pipeline::new(Limits::default(), 100, Duration::minutes(10));
+        let device = Device {
+            wake: WakeConfig {
+                any_message: true,
+                ..WakeConfig::default()
+            },
+            ..two_scopes()
+        };
+
+        // 甲群：@（rank 0）。
+        let Action::Deliver(first) = pipeline.ingest(
+            &device,
+            &scope_of(&device, "20001"),
+            "你是……",
+            in_group("1", "20001", "在吗"),
+            now(),
+            0.0,
+        ) else {
+            panic!("应能开始");
+        };
+        // 甲群也再来一条：它才会有积压，两个群同时压着才谈得上「轮转」。
+        pipeline.ingest(
+            &device,
+            &scope_of(&device, "20001"),
+            "你是……",
+            in_group("2", "20001", "再说一句"),
+            now(),
+            0.0,
+        );
+        // 乙群：any_message（rank 5）。两个原因不同。
+        pipeline.ingest(
+            &device,
+            &scope_of(&device, "20003"),
+            "你是……",
+            Message {
+                at_self: false,
+                ..in_group("1", "20003", "随便说说")
+            },
+            now(),
+            0.0,
+        );
+
+        // 甲群先续话（at_mention），乙群那一批仍带着自己的 any_message。
+        let second = pipeline
+            .finish(
+                &device,
+                &scope_of(&device, "20001"),
+                "你是……",
+                &first.ticket,
+                now(),
+            )
+            .expect("应能收尾")
+            .expect("应再投一次");
+        assert_eq!(second.scope.conversation, "20001");
+        assert_eq!(second.wake_reason, "at_mention");
+
+        let third = pipeline
+            .finish(
+                &device,
+                &scope_of(&device, "20001"),
+                "你是……",
+                &second.ticket,
+                now(),
+            )
+            .expect("应能收尾")
+            .expect("乙群还压着");
+        assert_eq!(third.scope.conversation, "20003");
+        assert_eq!(
+            third.wake_reason, "any_message",
+            "原因按群分开记，不能被甲群的 @ 冒名"
+        );
+    }
+
     #[test]
     fn finish_without_unread_releases_the_ticket() {
         // 积压的未读被别处确认掉了（例如重复到达后水位推进），收尾时组装不出内容：
@@ -1060,13 +1386,18 @@ mod tests {
         );
 
         // 把积压那批也确认掉，模拟「别处已经推进了水位」。
-        pipeline.confirm("alice", "20001", 2).expect("应能推进水位");
+        pipeline
+            .confirm("alice", &key("20001"), 2)
+            .expect("应能推进水位");
 
+        // 有积压却没有未读：这一批没什么可投，但票必须收回、队列回到空闲——否则
+        // 队列永久卡在忙。
         assert_eq!(
             pipeline.finish(&device(), &scope(), "你是……", &first.ticket, now()),
-            Err(PipelineError::NoUnread)
+            Ok(None)
         );
         assert!(!pipeline.turns.is_busy("alice"), "票收回了，队列不该还忙");
+        assert!(!pipeline.turns.has_backlog("alice"), "空的积压就地清掉");
     }
 
     #[test]

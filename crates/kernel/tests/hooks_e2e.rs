@@ -32,7 +32,7 @@ accounts = ["main"]
 hooks = "hooks/alice.lua"
 
   [[devices.scopes]]
-  group = "20001"
+  conversation = "20001"
   receive = ["main"]
   send = ["main"]
 
@@ -93,6 +93,7 @@ fn scope(config: &Config) -> ScopeConfig {
 fn message(id: &str, text: &str) -> Message {
     Message {
         account: "main".to_owned(),
+        platform: "qq".to_owned(),
         group: "20001".to_owned(),
         message_id: id.to_owned(),
         sender_id: "30002".to_owned(),
@@ -253,7 +254,7 @@ fn hook_state_is_per_device_not_global() {
         Default::default(),
     )
     .unwrap();
-    let event = qqab_kernel::hooks::Snapshot::of_poke("20001", "30002", 0);
+    let event = qqab_kernel::hooks::Snapshot::of_poke("qq", "20001", "30002", 0);
     assert_eq!(
         a.should_wake(&event.view(), &[], None),
         Ok(Some("count:0".into()))
