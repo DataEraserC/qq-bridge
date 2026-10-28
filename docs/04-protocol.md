@@ -72,7 +72,12 @@ sequenceDiagram
 - `id`：房间内递增编号，水位按它推进。
 - `kind`：`message` 或 `{"kind":"event","event":"poke"}`；拍一拍就是 `event: poke`（[ADR-0007](../adr/0007-poke-as-message.md)）。
 - `at_self`：这条是不是冲本账号来的（@ 到我、拍我）。
-- `redelivery`：非空表示「第 N 次投递」，文本里会附「调 ack_messages 确认后即停止重复投递」。
+- `redelivery`：非空表示「第 N 次投递」。**桥同时会在这条记录的元素末尾追加一段文本**，
+  写明是第几次、确认哪个编号就不再重投（如「第 2 次投递；调 ack_messages 确认 #12 之后
+  就不再重复投递」）。追加只发生在投给 harness 的副本上，流水里的原文不变。
+
+  为什么由桥来做：这句话是**行为要求**，不是某一家 harness 的排版偏好。放在桥里，
+  每接一个新 harness 都不用重新发明一遍；放在 harness 里，迟早有人漏（[ADR-0010](../adr/0010-ack-watermark.md)）。
 
 ## 内容元素
 

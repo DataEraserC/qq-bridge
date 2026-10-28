@@ -375,6 +375,20 @@ fn unacked_records_come_back_marked_as_redelivery() {
         "第二次投递要标出来，AI 才知道这条重复了"
     );
     assert_eq!(second.records[1].redelivery, None, "新的一条是第一次投");
+
+    // 光有 `redelivery` 字段不够：模型看的是内容，得在内容里就告诉它怎么止投。
+    let hint = qqab_proto::element::flatten_text(&second.records[0].elements);
+    assert!(hint.contains("第 2 次投递"), "重投要写明第几次：{hint}");
+    assert!(hint.contains("#1"), "要写清确认哪条：{hint}");
+    assert!(
+        hint.contains("ack_messages"),
+        "要告诉 AI 用什么止投：{hint}"
+    );
+    assert_eq!(
+        second.records[1].elements.len(),
+        1,
+        "第一次投递不该被塞任何提示"
+    );
 }
 
 // ---------------------------------------------------------------------------

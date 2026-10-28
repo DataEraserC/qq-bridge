@@ -31,6 +31,7 @@ flowchart LR
 | **笔记** | 设备在单个房间里的速记事实，按房间隔离，跨平台不串 | [0003](adr/0003-serial-turns.md) |
 | **工具面** | agent 能调用的全部工具：发送类 + 读取类。身份靠回合票 | [0006](adr/0006-tool-surface.md) |
 | **适配器** | 一种平台协议的实现：解帧成事件、编动作成帧、内容元素双向转换 | [0004](adr/0004-content-elements.md) |
+| **harness 适配器** | 桥外面那一半：把轮次变成 harness 里的一次对话，把工具挂进去。有插件 API 的走插件，没有的走进程外驱动或 MCP | [0013](adr/0013-harness-adapter-shape.md) |
 | **Web 管理页** | 管理员改配置的唯一入口：订阅、策略参数、人格、账号。配置修改不进 agent 工具面 | [0009](adr/0009-config-management.md) |
 
 ## 两条数据流
@@ -100,18 +101,26 @@ flowchart TD
 2. **读取类工具第一版范围**：全做——`get_history` / `list_rooms` / `get_notes` / `set_note` / `del_note` / `get_platform_events`。每个工具都很薄，成本主要在协议层，一次做齐省得反复改。
 3. **标准元素表**：第一版就 8 个（text / at / quote / image / audio / video / file / 表情），不加 markdown。平台富文本走不透明载荷透传；等真有跨平台富文本需求再加元素，加元素是兼容演进。
 
-## 目录规划（写代码时）
+## 目录规划
 
 ```
 crates/
-  proto/      桥 ↔ harness 的协议（帧定义、错误码）
-  kernel/     核心：接入点、回合调度、订阅、策略、流水、工具面、Web 管理页
-  adapters/   适配器：onebot11、satori（每个一个子目录）
+  proto/                 桥 ↔ harness 的协议（帧、内容元素、记录、回合票）
+  kernel/                核心：订阅、唤醒、流水、水位、笔记、回合调度、工具面、接入点
+  adapters/onebot11/     OneBot 11 适配器（QQ 群与私聊）
+  bridge/                可执行程序：读配置、连平台、起接入点
+    src/main.rs          桥本体
+    src/bin/dev-harness  开发用的最小 harness（验「桥 ↔ 平台」这一段）
+harnesses/
+  opencode/              opencode 的适配器：插件 + 协议客户端 + 探针（见 06）
 docs/
-  01-vision.md      愿景与范围（已过目）
-  02-glossary.md    术语表（已过目）
+  01-vision.md       愿景与范围（已过目）
+  02-glossary.md     术语表（已过目）
   03-architecture.md 本文
-  adr/              决策记录（每条标来源）
+  04-protocol.md     桥 ↔ harness 的协议细节
+  05-adapters.md     平台适配器：房间写法、事件与元素映射、已知限制
+  06-harness-adapters.md harness 适配器：工具面与轮次驱动两半，各家怎么接
+  adr/               决策记录（每条标来源）
 ```
 
 ## 文档书写约定
