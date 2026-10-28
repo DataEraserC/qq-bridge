@@ -27,7 +27,8 @@ use thiserror::Error;
 use crate::config::{Config, WakeDecision, WakeInput, WakePolicy};
 use crate::outbound::{Outbound, OutboundError};
 use crate::storage::{
-    Cursor, Note, NoteKey, NoteKind, RecordDraft, StorageError, Store, TopicStatus, unread,
+    Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
+    TopicStatus, unread,
 };
 use crate::tools::{
     AckArgs, DelNoteArgs, EventsArgs, HistoryArgs, NotesArgs, SendArgs, SendToArgs, SetNoteArgs,
@@ -57,6 +58,16 @@ pub enum Ingest {
     Recorded { id: u64, woke: Vec<String> },
     /// 没有任何设备订阅这个房间——什么都不做，连流水都不写。
     NotSubscribed { room: RoomId },
+}
+
+/// 一次清理里某个房间的战果，给日志用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pruned {
+    pub room: RoomId,
+    /// 删掉多少条。
+    pub deleted: u64,
+    /// 还剩多少条。
+    pub kept: u64,
 }
 
 /// 等着开轮次的（设备，房间）。
@@ -113,6 +124,78 @@ impl<S: Store> Bridge<S> {
         let mut devices: Vec<String> = self.active.keys().cloned().collect();
         devices.sort();
         devices
+    }
+
+    /// 清一次旧流水，返回真的删了东西的房间。
+    ///
+    /// `now` 是「现在」的 Unix 毫秒——传进来而不是自己取，是为了让测试能造出「很久以前」。
+    ///
+    /// 三条规矩：
+    /// 1. **只删读过的**：安全线取所有在册订阅者水位的最小值。有一个设备一条都没读到过，
+    ///    这个房间这次就一条都不删——未读是投递的原料，删了就是真丢了。
+    /// 2. **只删还在订阅的房间**：没人订的房间不归这里管，判据（谁在读）也不成立了。
+    /// 3. **每房间至少留一条**：编号靠 `MAX+1` 推，删光了下一个又回到 1，而水位还在几百，
+    ///    新消息会被当成已读直接消失（[`MIN_KEPT`]）。
+    pub fn prune(&mut self, now: i64) -> Result<Vec<Pruned>, BridgeError> {
+        let retention = self.config.retention;
+        if !retention.enabled() {
+            return Ok(Vec::new());
+        }
+
+        let older_than = (retention.max_age_days > 0).then(|| {
+            now.saturating_sub((retention.max_age_days as i64).saturating_mul(86_400_000))
+        });
+
+        let mut report = Vec::new();
+        for room in self.store.rooms()? {
+            let devices = self.subscribing_devices(&room);
+            if devices.is_empty() {
+                continue;
+            }
+
+            // 安全线：所有在册设备都已读到的那个位置。初值是「一条都没删」的边界。
+            let mut below = self.store.latest(&room)?.map_or(0, |latest| latest + 1);
+            for device in &devices {
+                let cursor = Cursor::new(device.clone(), room.clone());
+                below = below.min(self.store.watermark(&cursor)?);
+            }
+            if below == 0 {
+                continue;
+            }
+
+            let before = self.store.count(&room)?;
+            let deleted = self.store.prune(
+                &room,
+                &PrunePlan {
+                    below,
+                    keep_newest: retention.max_records_per_room.max(MIN_KEPT),
+                    older_than,
+                },
+            )?;
+            if deleted > 0 {
+                report.push(Pruned {
+                    room,
+                    deleted,
+                    kept: before - deleted,
+                });
+            }
+        }
+        Ok(report)
+    }
+
+    /// 订阅了这个房间的在册设备。
+    fn subscribing_devices(&self, room: &RoomId) -> Vec<String> {
+        self.config
+            .devices
+            .iter()
+            .filter(|device| {
+                device
+                    .subscriptions
+                    .iter()
+                    .any(|subscription| &subscription.room == room)
+            })
+            .map(|device| device.id.clone())
+            .collect()
     }
 
     /// 一条入站记录进来。

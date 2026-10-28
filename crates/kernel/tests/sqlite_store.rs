@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qqab_kernel::{
-    Cursor, Deliveries, Element, Note, NoteKey, NoteKind, Notes, RecordDraft, RoomId, Sender,
-    StorageError, Store, TopicStatus, Transcript, Watermarks, unread,
+    Cursor, Deliveries, Element, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft, RoomId,
+    Sender, StorageError, Store, TopicStatus, Transcript, Watermarks, unread,
 };
 
 const AT: i64 = 1_793_000_000_000;
@@ -378,4 +378,73 @@ fn counts_reflect_what_is_in_the_file() {
 fn sqlite_store_satisfies_store_trait() {
     fn assert_store<S: Store>() {}
     assert_store::<qqab_kernel::SqliteStore>();
+}
+
+#[test]
+fn pruning_keeps_numbering_going_and_drops_orphans() {
+    let db = TempDb::new("prune");
+    let qq = room("qq:private/1");
+    let main = Cursor::new("main", qq.clone());
+    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+
+    for text in ["1", "2", "3", "4", "5"] {
+        store.append(message(&qq, text)).expect("可写");
+    }
+    store.count_delivery(&main, 1).expect("能记");
+    store.count_delivery(&main, 1).expect("能记");
+    store.ack(&main, &[1, 2, 3, 4, 5]).expect("可确认");
+    assert_eq!(store.count(&qq).expect("能数"), 5);
+
+    let plan = PrunePlan {
+        below: 6,
+        keep_newest: 2,
+        older_than: None,
+    };
+    assert_eq!(store.prune(&qq, &plan).expect("能清"), 3, "留最新 2 条");
+
+    let left: Vec<u64> = store
+        .since(&qq, 0, 100)
+        .expect("可读")
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(left, vec![4, 5]);
+
+    // 编号靠 MAX+1 推：清完之后下一句仍然是 6，不会回到 1。
+    let next = store.append(message(&qq, "6")).expect("可写");
+    assert_eq!(next.id, 6);
+
+    // 指向已删记录的投递计数跟着没了：再记一次还是第 1 次。
+    assert_eq!(store.count_delivery(&main, 1).expect("能记"), 1);
+}
+
+#[test]
+fn a_pruned_room_stays_pruned_after_reopen() {
+    let db = TempDb::new("prune-reopen");
+    let qq = room("qq:private/1");
+    let main = Cursor::new("main", qq.clone());
+
+    {
+        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        for text in ["1", "2", "3", "4"] {
+            store.append(message(&qq, text)).expect("可写");
+        }
+        store.ack(&main, &[1, 2, 3, 4]).expect("可确认");
+        let plan = PrunePlan {
+            below: 5,
+            keep_newest: 1,
+            older_than: None,
+        };
+        assert_eq!(store.prune(&qq, &plan).expect("能清"), 3);
+    }
+
+    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    assert_eq!(store.count(&qq).expect("能数"), 1, "删了就是删了，不回来");
+    assert_eq!(store.latest(&qq).expect("可读"), Some(4));
+    assert_eq!(
+        store.append(message(&qq, "5")).expect("可写").id,
+        5,
+        "重启之后编号还是接着 4 往上"
+    );
+    assert_eq!(store.rooms().expect("可读"), vec![qq]);
 }

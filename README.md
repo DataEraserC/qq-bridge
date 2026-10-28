@@ -20,7 +20,7 @@
 | harness 适配器（DSH / Trae / Codex…） | 没写，判断方法见 [docs/06](docs/06-harness-adapters.md) |
 | QQ 适配器（OneBot 11） | 可用：群与私聊收发、拍一拍、其它平台事件，断线自动重连 |
 | Discord / KOOK / Telegram | 没写 |
-| 存储 | 可用：SQLite 落盘，重启接着上次的账做（编号、水位、笔记、投递次数都在） |
+| 存储 | 可用：SQLite 落盘，重启接着上次的账做（编号、水位、笔记、投递次数都在）；旧流水按条数/天数自动清理，只削读过的 |
 | Web 管理页 | 没做，现在改配置要改文件重启 |
 | `wait_message`（阻塞等新消息） | 没做 |
 | 时钟策略（房间安静时例行检查） | 没做 |
@@ -79,7 +79,7 @@ QQ 这一侧需要 OneBot 11 实现（NapCat / Lagrange / go-cqhttp 等）开出
 | [docs/04-protocol.md](docs/04-protocol.md) | 桥与 harness 之间的协议 |
 | [docs/05-adapters.md](docs/05-adapters.md) | 适配器：房间写法、事件与元素映射、限制 |
 | [docs/06-harness-adapters.md](docs/06-harness-adapters.md) | harness 适配器：两半能力、各家怎么接、opencode 那一份怎么用 |
-| [docs/07-storage.md](docs/07-storage.md) | 状态库：每张表干什么、怎么查、怎么备份、已知限制 |
+| [docs/07-storage.md](docs/07-storage.md) | 状态库：每张表干什么、清理规则、怎么查、怎么备份、已知限制 |
 | [docs/adr/](docs/adr/) | 决策记录，每条标「用户裁定」或「实现默认」 |
 
 ## 验证

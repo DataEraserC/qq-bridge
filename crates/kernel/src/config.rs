@@ -16,6 +16,13 @@ pub const DEFAULT_ACCUMULATE: u32 = 10;
 /// 来源：实现默认。放 `state/` 是因为那里已经在 .gitignore 里，不会被误提交。
 pub const DEFAULT_STORAGE_PATH: &str = "state/qqab.db";
 
+/// 没配「每个房间留多少条」时的默认值。来源：实现默认。
+/// 5000 条对一个群来说大概是几个月的体量，够 `get_history` 往前翻。
+pub const DEFAULT_MAX_RECORDS_PER_ROOM: u64 = 5000;
+
+/// 没配「留多少天」时的默认值。来源：实现默认。
+pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
+
 /// 整份配置。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -26,6 +33,36 @@ pub struct Config {
     pub adapters: Vec<AdapterConfig>,
     /// 状态存哪。流水、水位、笔记、投递计数都在这里，重启不改。
     pub storage: StorageConfig,
+    /// 流水保留：旧记录什么时候可以删。
+    pub retention: RetentionConfig,
+}
+
+/// 流水保留策略。
+///
+/// 只管**已经读过**的那一段：任何在册订阅者还没读到的记录，一条都不删（见
+/// `Bridge::prune`）。两项都是 0 表示不作任何清理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// 每个房间最多留多少条。0 = 不按条数清。
+    pub max_records_per_room: u64,
+    /// 记录最多留多少天。0 = 不按天数清。
+    pub max_age_days: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_records_per_room: DEFAULT_MAX_RECORDS_PER_ROOM,
+            max_age_days: DEFAULT_MAX_AGE_DAYS,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// 两项都为 0 就是完全不清。
+    pub fn enabled(self) -> bool {
+        self.max_records_per_room > 0 || self.max_age_days > 0
+    }
 }
 
 /// 状态存储：一个 SQLite 文件。
@@ -252,6 +289,16 @@ impl Config {
             None => StorageConfig::default(),
         };
 
+        let retention = match raw.retention {
+            Some(raw) => RetentionConfig {
+                max_records_per_room: raw
+                    .max_records_per_room
+                    .unwrap_or(DEFAULT_MAX_RECORDS_PER_ROOM),
+                max_age_days: raw.max_age_days.unwrap_or(DEFAULT_MAX_AGE_DAYS),
+            },
+            None => RetentionConfig::default(),
+        };
+
         let endpoint = match raw.endpoint {
             Some(raw) => {
                 let address = raw.listen.trim().to_owned();
@@ -370,6 +417,7 @@ impl Config {
             endpoint,
             adapters,
             storage,
+            retention,
         })
     }
 
@@ -462,11 +510,18 @@ struct RawConfig {
     #[serde(default)]
     adapters: Vec<RawAdapter>,
     storage: Option<RawStorage>,
+    retention: Option<RawRetention>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawStorage {
     path: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawRetention {
+    max_records_per_room: Option<u64>,
+    max_age_days: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -910,6 +965,29 @@ mod tests {
             Config::parse(&text),
             Err(ConfigError::EmptyStoragePath)
         ));
+    }
+
+    #[test]
+    fn retention_falls_back_to_the_documented_defaults() {
+        let config = Config::parse(MINIMAL).expect("应当能解析");
+        assert_eq!(config.retention.max_records_per_room, 5000);
+        assert_eq!(config.retention.max_age_days, 90);
+        assert!(config.retention.enabled());
+    }
+
+    #[test]
+    fn retention_can_turn_each_limit_off() {
+        let text = format!("{MINIMAL}\n[retention]\nmax_records_per_room = 0\nmax_age_days = 0\n");
+        let config = Config::parse(&text).expect("应当能解析");
+        assert!(!config.retention.enabled(), "两项都是 0 就是不清理");
+
+        let text = format!("{MINIMAL}\n[retention]\nmax_records_per_room = 20\n");
+        let config = Config::parse(&text).expect("应当能解析");
+        assert_eq!(config.retention.max_records_per_room, 20);
+        assert_eq!(
+            config.retention.max_age_days, 90,
+            "只写一项时，另一项走默认"
+        );
     }
 
     // ---- 唤醒判定 ----

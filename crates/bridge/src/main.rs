@@ -6,15 +6,20 @@
 //! 3. 给每个平台配一个适配器，拿到「发送端口」；
 //! 4. 建桥（配置 + 存储 + 一组发送端口）；
 //! 5. 每个适配器起一个守护线程，连不上就等一会儿再连；
-//! 6. 起接入点，等 harness 连进来。
+//! 6. 起一个清理线程，定时削旧流水（只削读过的）；
+//! 7. 起接入点，等 harness 连进来。
 
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use qqab_adapter_onebot11::{LinkSlot, OneBotOutbound, supervise};
 use qqab_kernel::{Bridge, Config, Outbounds, SqliteStore, serve};
+
+/// 清理线程隔多久扫一次。来源：实现默认——桥不是数据库，5 分钟一次足够，
+/// 真需要更勤/更懒再做成配置项。
+const PRUNE_EVERY: Duration = Duration::from_secs(300);
 
 fn main() -> ExitCode {
     match run() {
@@ -97,11 +102,52 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => println!("没有配 [endpoint]，harness 连不进来"),
     }
 
+    {
+        let bridge = Arc::clone(&bridge);
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            // 起来先扫一次：上次跑完留下的旧账不用等到下个周期才削。
+            prune_once(&bridge);
+            while !shutdown.load(Ordering::Relaxed) {
+                std::thread::sleep(PRUNE_EVERY);
+                prune_once(&bridge);
+            }
+        });
+    }
+
     println!("桥在跑。按 Ctrl-C 停。");
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(3600));
     }
     Ok(())
+}
+
+/// 扫一次旧流水。删了什么就打一行，没删就不吭声——安静的日志才好读。
+fn prune_once(bridge: &Mutex<Bridge<SqliteStore>>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+
+    let report = {
+        // 锁被毒死也接着用：桥的状态没有「半条」这种中间态（同 endpoint::lock）。
+        let mut bridge = bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        bridge.prune(now)
+    };
+
+    match report {
+        Ok(pruned) => {
+            for item in pruned {
+                println!(
+                    "清理：{} 删掉 {} 条已读记录，留 {} 条",
+                    item.room, item.deleted, item.kept
+                );
+            }
+        }
+        Err(error) => eprintln!("清理失败（不影响收发，下次再试）：{error}"),
+    }
 }
 
 /// 命令行参数。
@@ -173,5 +219,22 @@ fn print_summary(config: &Config, path: &str) {
                 );
             }
         }
+    }
+
+    let retention = config.retention;
+    if retention.enabled() {
+        let by_count = if retention.max_records_per_room > 0 {
+            format!("每房间留 {} 条", retention.max_records_per_room)
+        } else {
+            "不按条数清".to_owned()
+        };
+        let by_age = if retention.max_age_days > 0 {
+            format!("最多留 {} 天", retention.max_age_days)
+        } else {
+            "不按天数清".to_owned()
+        };
+        println!("  流水保留：{by_count}，{by_age}（只削已读的，未读一条不动）");
+    } else {
+        println!("  流水保留：不清理——库只增不减");
     }
 }

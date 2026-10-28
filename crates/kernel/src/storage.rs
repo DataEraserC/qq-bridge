@@ -93,7 +93,36 @@ pub trait Transcript {
 
     /// 房间里最大的编号；空房间给 `None`。
     fn latest(&self, room: &RoomId) -> Result<Option<u64>, StorageError>;
+
+    /// 有记录的房间（清理由这里出发）。
+    fn rooms(&self) -> Result<Vec<RoomId>, StorageError>;
+
+    /// 房间里现有多少条。
+    fn count(&self, room: &RoomId) -> Result<u64, StorageError>;
+
+    /// 按 [`PrunePlan`] 删旧记录，返回删掉的条数。指向被删记录的投递计数与确认一起清掉。
+    fn prune(&mut self, room: &RoomId, plan: &PrunePlan) -> Result<u64, StorageError>;
 }
+
+/// 一次清理的判据。三条**同时**成立才删——这是「宁可少删」的意思。
+///
+/// 判据由调度层算好（它才看得见水位与配置），存储层只负责按判据执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrunePlan {
+    /// 编号必须小于它。安全边界：不碰任何在册设备的未读。
+    pub below: u64,
+    /// 至少留下最新的这么多条。实现里会夹到 >= 1——见 [`MIN_KEPT`]。
+    pub keep_newest: u64,
+    /// 时间必须早于它（Unix 毫秒）。`None` 表示不按时间判。
+    pub older_than: Option<i64>,
+}
+
+/// 每个房间至少留一条。
+///
+/// 这条不是为了「留个纪念」，是为了**编号基准**：`MAX(record_id)+1` 是下一个编号，
+/// 全删光了下一个编号就会从 1 重新开始，而水位还停在几百——新消息会被当成已读，
+/// 直接消失。留一条就堵死了这个坑。
+pub const MIN_KEPT: u64 = 1;
 
 /// 水位：每个「设备 + 房间」的「处理到哪条了」。
 pub trait Watermarks {
@@ -280,6 +309,61 @@ impl Transcript for MemoryStore {
 
     fn latest(&self, room: &RoomId) -> Result<Option<u64>, StorageError> {
         Ok(self.next_id.get(room).copied())
+    }
+
+    fn rooms(&self) -> Result<Vec<RoomId>, StorageError> {
+        let mut rooms: Vec<RoomId> = self
+            .records
+            .iter()
+            .filter(|(_, records)| !records.is_empty())
+            .map(|(room, _)| room.clone())
+            .collect();
+        rooms.sort();
+        Ok(rooms)
+    }
+
+    fn count(&self, room: &RoomId) -> Result<u64, StorageError> {
+        Ok(self
+            .records
+            .get(room)
+            .map_or(0, |records| records.len() as u64))
+    }
+
+    fn prune(&mut self, room: &RoomId, plan: &PrunePlan) -> Result<u64, StorageError> {
+        let Some(records) = self.records.get_mut(room) else {
+            return Ok(0);
+        };
+
+        let keep = plan.keep_newest.max(MIN_KEPT) as usize;
+        let keep_from = records.len().saturating_sub(keep);
+
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(records.len());
+        for (index, record) in records.drain(..).enumerate() {
+            let dead = index < keep_from
+                && record.id < plan.below
+                && plan.older_than.is_none_or(|before| record.at < before);
+            if dead {
+                removed.push(record.id);
+            } else {
+                kept.push(record);
+            }
+        }
+        *records = kept;
+
+        if !removed.is_empty() {
+            self.deliveries
+                .retain(|(cursor, id), _| cursor.room != *room || !removed.contains(id));
+            for (cursor, acked) in self.acked.iter_mut() {
+                if cursor.room == *room {
+                    for id in &removed {
+                        acked.remove(id);
+                    }
+                }
+            }
+        }
+
+        Ok(removed.len() as u64)
     }
 }
 
@@ -537,5 +621,148 @@ mod tests {
         assert_eq!(all.len(), 2, "拍一拍和平常消息在同一条流水里");
         assert!(all[1].is_event("poke"));
         assert!(all[1].at_self);
+    }
+
+    // ---- 清理 ----
+
+    fn at(room: RoomId, text: &str, at: i64) -> RecordDraft {
+        let mut draft = draft(room, text);
+        draft.at = at;
+        draft
+    }
+
+    fn ids(store: &MemoryStore, room: &RoomId) -> Vec<u64> {
+        store
+            .since(room, 0, 100)
+            .expect("可读")
+            .iter()
+            .map(|record| record.id)
+            .collect()
+    }
+
+    #[test]
+    fn prune_takes_only_what_is_below_the_line() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        for text in ["a", "b", "c", "d"] {
+            store.append(draft(qq.clone(), text)).expect("可写");
+        }
+
+        let plan = PrunePlan {
+            below: 3,
+            keep_newest: 1,
+            older_than: None,
+        };
+        assert_eq!(store.prune(&qq, &plan).expect("可清"), 2);
+        assert_eq!(ids(&store, &qq), vec![3, 4]);
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_even_if_the_line_is_high() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        for text in ["a", "b", "c", "d", "e"] {
+            store.append(draft(qq.clone(), text)).expect("可写");
+        }
+
+        // 水位已经推到最新，但要求每房间至少留 2 条：只能删 1、2、3。
+        let plan = PrunePlan {
+            below: 6,
+            keep_newest: 2,
+            older_than: None,
+        };
+        assert_eq!(store.prune(&qq, &plan).expect("可清"), 3);
+        assert_eq!(ids(&store, &qq), vec![4, 5]);
+    }
+
+    #[test]
+    fn prune_respects_the_time_line() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        let now = 1_793_000_000_000;
+        store
+            .append(at(qq.clone(), "很久以前", now - 60 * 86_400_000))
+            .expect("可写");
+        store.append(at(qq.clone(), "刚才", now)).expect("可写");
+
+        let plan = PrunePlan {
+            below: 3,
+            keep_newest: 1,
+            older_than: Some(now - 30 * 86_400_000),
+        };
+        assert_eq!(
+            store.prune(&qq, &plan).expect("可清"),
+            1,
+            "只删 60 天前那条"
+        );
+        assert_eq!(ids(&store, &qq), vec![2]);
+    }
+
+    #[test]
+    fn prune_never_empties_a_room() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        for text in ["a", "b"] {
+            store.append(draft(qq.clone(), text)).expect("可写");
+        }
+
+        // keep_newest 传 0 也只会被抬到 1：编号基准不能没有。
+        let plan = PrunePlan {
+            below: 3,
+            keep_newest: 0,
+            older_than: None,
+        };
+        assert_eq!(store.prune(&qq, &plan).expect("可清"), 1);
+        assert_eq!(ids(&store, &qq), vec![2]);
+
+        let next = store.append(draft(qq.clone(), "c")).expect("可写");
+        assert_eq!(next.id, 3, "清完之后编号接着 2 往上，不能回到 1");
+    }
+
+    #[test]
+    fn prune_drops_delivery_counts_of_removed_records() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        let main = cursor("main", &qq);
+        store.append(draft(qq.clone(), "a")).expect("可写");
+        store.append(draft(qq.clone(), "b")).expect("可写");
+
+        store.count_delivery(&main, 1).expect("能记");
+        store.count_delivery(&main, 1).expect("能记");
+
+        store
+            .prune(
+                &qq,
+                &PrunePlan {
+                    below: 2,
+                    keep_newest: 1,
+                    older_than: None,
+                },
+            )
+            .expect("可清");
+
+        assert_eq!(
+            store.count_delivery(&main, 1).expect("能记"),
+            1,
+            "旧计数跟着记录一起没了，不是接着 3 往上数"
+        );
+        assert_eq!(
+            store.count_delivery(&main, 2).expect("能记"),
+            1,
+            "没删的那条不受影响"
+        );
+    }
+
+    #[test]
+    fn rooms_lists_only_rooms_with_records() {
+        let mut store = MemoryStore::new();
+        assert!(store.rooms().expect("可读").is_empty());
+
+        let qq = room("qq", "1");
+        let discord = room("discord", "1");
+        store.append(draft(discord.clone(), "b")).expect("可写");
+        store.append(draft(qq.clone(), "a")).expect("可写");
+
+        assert_eq!(store.rooms().expect("可读"), vec![discord, qq]);
     }
 }

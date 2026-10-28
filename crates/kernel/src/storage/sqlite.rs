@@ -13,8 +13,8 @@ use qqab_proto::{Element, Record, RecordKind, RoomId, Sender};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    Cursor, Deliveries, Note, NoteKey, NoteKind, Notes, RecordDraft, StorageError, TopicStatus,
-    Transcript, Watermarks,
+    Cursor, Deliveries, MIN_KEPT, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft,
+    StorageError, TopicStatus, Transcript, Watermarks,
 };
 
 /// 这个程序认识的库结构版本。改表就加一。
@@ -307,6 +307,93 @@ impl Transcript for SqliteStore {
             )
             .map_err(io_error)?;
         Ok(max.map(|value| value.max(0) as u64))
+    }
+
+    fn rooms(&self) -> Result<Vec<RoomId>, StorageError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT DISTINCT platform, room FROM records ORDER BY platform, room")
+            .map_err(io_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(io_error)?;
+
+        let mut rooms = Vec::new();
+        for row in rows {
+            let (platform, room) = row.map_err(io_error)?;
+            let room = RoomId::new(&platform, &room).map_err(|error| {
+                backend(format!("库里的房间读不懂：{platform}:{room}（{error}）"))
+            })?;
+            rooms.push(room);
+        }
+        Ok(rooms)
+    }
+
+    fn count(&self, room: &RoomId) -> Result<u64, StorageError> {
+        let value: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE platform = ?1 AND room = ?2",
+                params![room.platform, room.room],
+                |row| row.get(0),
+            )
+            .map_err(io_error)?;
+        Ok(value.max(0) as u64)
+    }
+
+    fn prune(&mut self, room: &RoomId, plan: &PrunePlan) -> Result<u64, StorageError> {
+        let keep = plan.keep_newest.max(MIN_KEPT) as i64;
+        let transaction = self.conn.transaction().map_err(io_error)?;
+
+        // 三个条件同时成立才删：早于时间线、低于编号安全线、排不进最新的 keep 条。
+        // `LIMIT -1` 在 SQLite 里表示「不设上限」，所以 keep_newest 传 0 时会退化成一条都不删，
+        // 但上面的 `max(MIN_KEPT)` 已经把它抬到 1 了。
+        let deleted = transaction
+            .execute(
+                "DELETE FROM records
+                 WHERE platform = ?1 AND room = ?2
+                   AND record_id < ?3
+                   AND (?4 IS NULL OR at < ?4)
+                   AND record_id NOT IN (
+                       SELECT record_id FROM records
+                       WHERE platform = ?1 AND room = ?2
+                       ORDER BY record_id DESC
+                       LIMIT ?5
+                   )",
+                params![
+                    room.platform,
+                    room.room,
+                    plan.below as i64,
+                    plan.older_than,
+                    keep
+                ],
+            )
+            .map_err(io_error)?;
+
+        if deleted > 0 {
+            // 指向已删记录的账要一起清：投递计数没意义了；乱序确认也不可能再推进水位
+            // （它前面那条已经不在了，前沿永远等不到）。
+            for table in ["deliveries", "acks"] {
+                transaction
+                    .execute(
+                        &format!(
+                            "DELETE FROM {table}
+                             WHERE platform = ?1 AND room = ?2
+                               AND record_id NOT IN (
+                                   SELECT record_id FROM records
+                                   WHERE platform = ?1 AND room = ?2
+                               )"
+                        ),
+                        params![room.platform, room.room],
+                    )
+                    .map_err(io_error)?;
+            }
+        }
+
+        transaction.commit().map_err(io_error)?;
+        Ok(deleted as u64)
     }
 }
 
