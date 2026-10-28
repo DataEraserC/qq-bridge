@@ -2,10 +2,14 @@
 //!
 //! 三样东西的关系：
 //! - **流水**是每个房间的完整记录，永久保存，投没投过都在；
-//! - **水位**是「处理到哪条了」的游标，只经显式确认往前推（ADR-0010）；
+//! - **水位**是「这个设备处理到哪条了」的游标，只经显式确认往前推（ADR-0010）；
 //! - **未读**不是独立存储，是流水里水位之后的部分——算出来的，不是攒出来的。
 //!
-//! 笔记按房间隔离，主键带平台，跨平台不串。
+//! 粒度不一样，别搞混：
+//! - 流水**按房间**，一个房间一条流水，同房间的所有设备看的是同一份历史；
+//! - 水位**按「设备 + 房间」**（[`Cursor`]），因为「处理到哪条」是设备自己的进度——
+//!   两个设备同时订一个群，各自的进度不能互相踩；
+//! - 笔记**按房间**，是「关于这个房间的共识」，同房间的设备共享。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -87,22 +91,41 @@ pub trait Transcript {
     fn latest(&self, room: &RoomId) -> Result<Option<u64>, StorageError>;
 }
 
-/// 水位：每个房间的「处理到哪条了」。
+/// 水位：每个「设备 + 房间」的「处理到哪条了」。
 pub trait Watermarks {
     /// 当前水位。没有记录过就是 0（编号从 1 开始）。
-    fn watermark(&self, room: &RoomId) -> Result<u64, StorageError>;
+    fn watermark(&self, cursor: &Cursor) -> Result<u64, StorageError>;
 
     /// 确认这批编号已处理。只前进、不后退；只推进**连续**的前沿——中间缺一条就停在缺口前。
-    fn ack(&mut self, room: &RoomId, ids: &[u64]) -> Result<u64, StorageError>;
+    fn ack(&mut self, cursor: &Cursor, ids: &[u64]) -> Result<u64, StorageError>;
+}
+
+/// 一条水位游标：哪个设备、哪个房间。
+///
+/// 两个设备订同一个房间时各自推进、互不影响。这个键是存储层的，别和
+/// [`NoteKey`] 混——笔记按房间共享，不按设备分。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Cursor {
+    pub device: String,
+    pub room: RoomId,
+}
+
+impl Cursor {
+    pub fn new(device: impl Into<String>, room: RoomId) -> Self {
+        Self {
+            device: device.into(),
+            room,
+        }
+    }
 }
 
 /// 未经确认的未读：水位之后的流水。
-pub fn unread<S>(store: &S, room: &RoomId, limit: usize) -> Result<Vec<Record>, StorageError>
+pub fn unread<S>(store: &S, cursor: &Cursor, limit: usize) -> Result<Vec<Record>, StorageError>
 where
     S: Transcript + Watermarks,
 {
-    let watermark = store.watermark(room)?;
-    store.since(room, watermark, limit)
+    let watermark = store.watermark(cursor)?;
+    store.since(&cursor.room, watermark, limit)
 }
 
 /// 笔记的种类。只有话题带状态。
@@ -178,13 +201,18 @@ pub trait Notes {
     fn notes_in(&self, room: &RoomId) -> Result<Vec<Note>, StorageError>;
 }
 
+/// 三件套合起来。桥只依赖这一个约束，换后端只换实现。
+pub trait Store: Transcript + Watermarks + Notes {}
+
+impl<T> Store for T where T: Transcript + Watermarks + Notes {}
+
 /// 内存实现。测试与开发用；正式存储（SQLite）按同一组 trait 实现。
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     next_id: HashMap<RoomId, u64>,
     records: HashMap<RoomId, Vec<Record>>,
-    watermark: HashMap<RoomId, u64>,
-    acked: HashMap<RoomId, BTreeSet<u64>>,
+    watermark: HashMap<Cursor, u64>,
+    acked: HashMap<Cursor, BTreeSet<u64>>,
     notes: BTreeMap<NoteKey, Note>,
 }
 
@@ -233,32 +261,32 @@ impl Transcript for MemoryStore {
 }
 
 impl Watermarks for MemoryStore {
-    fn watermark(&self, room: &RoomId) -> Result<u64, StorageError> {
-        Ok(self.watermark.get(room).copied().unwrap_or(0))
+    fn watermark(&self, cursor: &Cursor) -> Result<u64, StorageError> {
+        Ok(self.watermark.get(cursor).copied().unwrap_or(0))
     }
 
-    fn ack(&mut self, room: &RoomId, ids: &[u64]) -> Result<u64, StorageError> {
-        let latest = self.next_id.get(room).copied().unwrap_or(0);
-        let current = self.watermark.get(room).copied().unwrap_or(0);
+    fn ack(&mut self, cursor: &Cursor, ids: &[u64]) -> Result<u64, StorageError> {
+        let latest = self.next_id.get(&cursor.room).copied().unwrap_or(0);
+        let current = self.watermark.get(cursor).copied().unwrap_or(0);
 
         for &id in ids {
             if id > latest {
                 return Err(StorageError::UnknownRecord {
-                    room: room.to_string(),
+                    room: cursor.room.to_string(),
                     id,
                 });
             }
             if id > current {
-                self.acked.entry(room.clone()).or_default().insert(id);
+                self.acked.entry(cursor.clone()).or_default().insert(id);
             }
         }
 
-        let acked = self.acked.entry(room.clone()).or_default();
+        let acked = self.acked.entry(cursor.clone()).or_default();
         let mut frontier = current;
         while acked.remove(&(frontier + 1)) {
             frontier += 1;
         }
-        self.watermark.insert(room.clone(), frontier);
+        self.watermark.insert(cursor.clone(), frontier);
         Ok(frontier)
     }
 }
@@ -296,6 +324,10 @@ mod tests {
         RoomId::new(platform, id).expect("合法")
     }
 
+    fn cursor(device: &str, room: &RoomId) -> Cursor {
+        Cursor::new(device, room.clone())
+    }
+
     fn draft(room: RoomId, text: &str) -> RecordDraft {
         RecordDraft::message(
             room,
@@ -328,27 +360,29 @@ mod tests {
     fn unread_is_everything_after_the_watermark() {
         let mut store = MemoryStore::new();
         let qq = room("qq", "1");
+        let main = cursor("main", &qq);
         store.append(draft(qq.clone(), "a")).expect("可写");
         store.append(draft(qq.clone(), "b")).expect("可写");
         store.append(draft(qq.clone(), "c")).expect("可写");
 
-        assert_eq!(unread(&store, &qq, 100).expect("可读").len(), 3);
-        store.ack(&qq, &[1]).expect("可确认");
-        assert_eq!(unread(&store, &qq, 100).expect("可读").len(), 2);
+        assert_eq!(unread(&store, &main, 100).expect("可读").len(), 3);
+        store.ack(&main, &[1]).expect("可确认");
+        assert_eq!(unread(&store, &main, 100).expect("可读").len(), 2);
     }
 
     #[test]
     fn watermark_only_moves_over_a_contiguous_frontier() {
         let mut store = MemoryStore::new();
         let qq = room("qq", "1");
+        let main = cursor("main", &qq);
         for text in ["a", "b", "c"] {
             store.append(draft(qq.clone(), text)).expect("可写");
         }
 
-        let frontier = store.ack(&qq, &[1, 3]).expect("可确认");
+        let frontier = store.ack(&main, &[1, 3]).expect("可确认");
         assert_eq!(frontier, 1, "缺了 2，只能推到 1");
 
-        let frontier = store.ack(&qq, &[2]).expect("可确认");
+        let frontier = store.ack(&main, &[2]).expect("可确认");
         assert_eq!(frontier, 3, "补上 2 之后一次推到 3");
     }
 
@@ -356,20 +390,22 @@ mod tests {
     fn watermark_never_moves_backwards() {
         let mut store = MemoryStore::new();
         let qq = room("qq", "1");
+        let main = cursor("main", &qq);
         store.append(draft(qq.clone(), "a")).expect("可写");
         store.append(draft(qq.clone(), "b")).expect("可写");
 
-        assert_eq!(store.ack(&qq, &[1, 2]).expect("可确认"), 2);
-        assert_eq!(store.ack(&qq, &[1]).expect("可确认"), 2, "旧编号不影响");
+        assert_eq!(store.ack(&main, &[1, 2]).expect("可确认"), 2);
+        assert_eq!(store.ack(&main, &[1]).expect("可确认"), 2, "旧编号不影响");
     }
 
     #[test]
     fn acking_a_missing_record_is_an_error() {
         let mut store = MemoryStore::new();
         let qq = room("qq", "1");
+        let main = cursor("main", &qq);
         store.append(draft(qq.clone(), "a")).expect("可写");
 
-        let error = store.ack(&qq, &[9]).expect_err("应当报错");
+        let error = store.ack(&main, &[9]).expect_err("应当报错");
         assert!(matches!(error, StorageError::UnknownRecord { id: 9, .. }));
     }
 
@@ -381,14 +417,34 @@ mod tests {
 
         store.append(draft(qq.clone(), "a")).expect("可写");
         store.append(draft(discord.clone(), "b")).expect("可写");
-        store.ack(&qq, &[1]).expect("可确认");
+        store.ack(&cursor("main", &qq), &[1]).expect("可确认");
 
-        assert_eq!(store.watermark(&qq).expect("可读"), 1);
+        assert_eq!(store.watermark(&cursor("main", &qq)).expect("可读"), 1);
         assert_eq!(
-            store.watermark(&discord).expect("可读"),
+            store.watermark(&cursor("main", &discord)).expect("可读"),
             0,
             "另一个平台的 123 不能被带着走"
         );
+    }
+
+    #[test]
+    fn two_devices_in_one_room_keep_separate_progress() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "123");
+        let alice = cursor("alice", &qq);
+        let bob = cursor("bob", &qq);
+
+        store.append(draft(qq.clone(), "a")).expect("可写");
+        store.append(draft(qq.clone(), "b")).expect("可写");
+
+        store.ack(&alice, &[1, 2]).expect("可确认");
+        assert_eq!(store.watermark(&alice).expect("可读"), 2);
+        assert_eq!(
+            store.watermark(&bob).expect("可读"),
+            0,
+            "同一房间的另一个设备有自己的进度"
+        );
+        assert_eq!(unread(&store, &bob, 100).expect("可读").len(), 2);
     }
 
     #[test]
@@ -441,7 +497,7 @@ mod tests {
             ))
             .expect("可写");
 
-        let all = unread(&store, &qq, 100).expect("可读");
+        let all = unread(&store, &cursor("main", &qq), 100).expect("可读");
         assert_eq!(all.len(), 2, "拍一拍和平常消息在同一条流水里");
         assert!(all[1].is_event("poke"));
         assert!(all[1].at_self);
