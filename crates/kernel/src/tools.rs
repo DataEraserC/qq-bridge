@@ -31,7 +31,7 @@ pub struct SendArgs {
 pub struct SendToArgs {
     pub elements: Vec<qqab_proto::Element>,
     /// 目标房间，形如 `qq:123`。必须是本设备订阅过的房间。
-    pub room: String,
+    pub to: String,
 }
 
 /// 确认这批消息处理完了。

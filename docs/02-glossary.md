@@ -36,6 +36,7 @@
 | **适配器** | adapter | 一种平台协议的实现（OneBot 11、Satori、将来的 Discord / KOOK 直连）。职责：把平台帧解成事件、把动作编成平台帧 |
 | **harness** | harness | 承载 agent 的运行环境（DSH、WorkBuddy、Trae、Codex……）。桥不实现 agent，只接 harness |
 | **接入点** | endpoint | harness 连接桥的通道（本机套接字 / TCP + 接入令牌） |
+| **接入令牌** | token | 每个设备一把。harness 握手时出示，令牌对上哪个设备，那条连接就绑到哪个设备；令牌不对直接断开 |
 
 ## 工具面
 

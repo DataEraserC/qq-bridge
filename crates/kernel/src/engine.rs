@@ -179,6 +179,22 @@ impl<S: Store> Bridge<S> {
         self.open_turn(pending).map(Some)
     }
 
+    /// 只给某个设备取活。接入点用这个——一条连接只服务一个设备，不能把别人的活领走。
+    pub fn poll_turn_for(&mut self, device: &str) -> Result<Option<Delivery>, BridgeError> {
+        if self.active.contains_key(device) {
+            return Ok(None);
+        }
+        let index = self
+            .pending
+            .iter()
+            .position(|pending| pending.device == device);
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let pending = self.pending.remove(index).expect("刚刚找到的");
+        self.open_turn(pending).map(Some)
+    }
+
     /// 一轮收工。票作废，设备空出来。
     ///
     /// **不推水位**：没确认的消息仍然算未读，下一轮接着投。
@@ -223,7 +239,7 @@ impl<S: Store> Bridge<S> {
             }
             "send_message_to" => {
                 let args: SendToArgs = parse(args)?;
-                let target = resolve_room(&args.room)?;
+                let target = resolve_room(&args.to)?;
                 let subscription = self.subscription(&device, &target)?;
                 let account = subscription.send_account.clone();
                 self.deliver_out(&device, &target, &account, args.elements)

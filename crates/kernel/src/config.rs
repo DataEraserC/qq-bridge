@@ -16,6 +16,15 @@ pub const DEFAULT_ACCUMULATE: u32 = 10;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub devices: Vec<Device>,
+    /// 接入点配置。没配就不监听——只跑内存里的桥（测试、嵌入式）。
+    pub endpoint: Option<EndpointConfig>,
+}
+
+/// 接入点：harness 连进来的地址。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointConfig {
+    /// 监听地址，形如 `127.0.0.1:7700`。
+    pub listen: String,
 }
 
 /// 一个设备：虚拟订阅者。
@@ -24,6 +33,8 @@ pub struct Device {
     pub id: String,
     pub persona: String,
     pub memory: String,
+    /// 这个设备的接入令牌。harness 拿它握手，握手成功后这条连接就绑到这个设备。
+    pub token: String,
     pub subscriptions: Vec<Subscription>,
 }
 
@@ -163,6 +174,12 @@ pub enum ConfigError {
     EmptyAccount { device: String, room: String },
     #[error("设备 {device} 的房间 {room} 的 accumulate 必须是正整数")]
     BadAccumulate { device: String, room: String },
+    #[error("设备 {device} 的接入令牌不能为空")]
+    EmptyToken { device: String },
+    #[error("接入令牌重复：设备 {first} 和 {second} 用了同一个令牌")]
+    DuplicateToken { first: String, second: String },
+    #[error("接入点监听地址不合法：{address}（{detail}）")]
+    BadListen { address: String, detail: String },
 }
 
 impl Config {
@@ -175,8 +192,24 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let endpoint = match raw.endpoint {
+            Some(raw) => {
+                let address = raw.listen.trim().to_owned();
+                // 解析不了就别启动：监听地址写错了，等到运行时才发现只会更晚。
+                if address.parse::<std::net::SocketAddr>().is_err() {
+                    return Err(ConfigError::BadListen {
+                        address,
+                        detail: "要写成 主机:端口，如 127.0.0.1:7700".into(),
+                    });
+                }
+                Some(EndpointConfig { listen: address })
+            }
+            None => None,
+        };
+
         let mut devices = Vec::with_capacity(raw.devices.len());
         let mut seen_devices = Vec::new();
+        let mut seen_tokens: Vec<(String, String)> = Vec::new();
 
         for raw_device in raw.devices {
             let id = raw_device.id;
@@ -201,6 +234,17 @@ impl Config {
                     field,
                 }
             })?;
+            check_not_blank(&raw_device.token, "token")
+                .map_err(|_| ConfigError::EmptyToken { device: id.clone() })?;
+
+            let token = raw_device.token.trim().to_owned();
+            if let Some((first, _)) = seen_tokens.iter().find(|(_, seen)| seen == &token) {
+                return Err(ConfigError::DuplicateToken {
+                    first: first.clone(),
+                    second: id,
+                });
+            }
+            seen_tokens.push((id.clone(), token.clone()));
 
             let mut subscriptions = Vec::with_capacity(raw_device.subscriptions.len());
             let mut seen_rooms: Vec<RoomId> = Vec::new();
@@ -220,11 +264,12 @@ impl Config {
                 id,
                 persona: raw_device.persona,
                 memory: raw_device.memory,
+                token,
                 subscriptions,
             });
         }
 
-        Ok(Self { devices })
+        Ok(Self { devices, endpoint })
     }
 
     /// 找设备的某条订阅。发送与工具鉴权都从这里查。
@@ -235,6 +280,13 @@ impl Config {
             .subscriptions
             .iter()
             .find(|subscription| &subscription.room == room)
+    }
+
+    /// 按接入令牌找设备。握手时用：令牌对了，这条连接就绑到那个设备。
+    pub fn device_by_token(&self, token: &str) -> Option<&Device> {
+        self.devices
+            .iter()
+            .find(|candidate| candidate.token == token)
     }
 }
 
@@ -298,6 +350,12 @@ fn check_not_blank(value: &str, field: &'static str) -> Result<(), &'static str>
 struct RawConfig {
     #[serde(default)]
     devices: Vec<RawDevice>,
+    endpoint: Option<RawEndpoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEndpoint {
+    listen: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +363,8 @@ struct RawDevice {
     id: String,
     persona: String,
     memory: String,
+    /// 接入令牌。必填——没有令牌就没有身份，桥不知道该把这条连接绑到哪个设备。
+    token: String,
     #[serde(default)]
     subscriptions: Vec<RawSubscription>,
 }
@@ -337,6 +397,7 @@ mod tests {
         id = "main"
         persona = "default"
         memory = "main-memory"
+        token = "t-main"
 
         [[devices.subscriptions]]
         room = "qq:123"
@@ -364,6 +425,7 @@ mod tests {
             id = "main"
             persona = "p"
             memory = "m"
+            token = "t-main"
 
             [[devices.subscriptions]]
             room = "discord:456"
@@ -395,6 +457,7 @@ mod tests {
             id = "main"
             persona = "p"
             memory = "m"
+            token = "t-main"
 
             [[devices.subscriptions]]
             room = "qq:123"
@@ -415,6 +478,7 @@ mod tests {
             id = "main"
             persona = "p"
             memory = "m"
+            token = "t-main"
 
             [[devices.subscriptions]]
             room = "qq:123"
@@ -437,11 +501,13 @@ mod tests {
             id = "main"
             persona = "p"
             memory = "m"
+            token = "t-main"
 
             [[devices]]
             id = "main"
             persona = "p2"
             memory = "m2"
+            token = "t-other"
         "#;
         assert!(matches!(
             Config::parse(text),
@@ -456,6 +522,7 @@ mod tests {
             id = "main"
             persona = "p"
             memory = "m"
+            token = "t-main"
 
             [[devices.subscriptions]]
             room = "没有平台前缀"
@@ -474,6 +541,7 @@ mod tests {
             id = "main"
             persona = "  "
             memory = "m"
+            token = "t-main"
         "#;
         assert!(matches!(
             Config::parse(text),
@@ -488,6 +556,7 @@ mod tests {
             id = "main"
             persona = "p"
             memory = "m"
+            token = "t-main"
 
             [[devices.subscriptions]]
             room = "qq:1"
@@ -506,6 +575,7 @@ mod tests {
             id = "main"
             persona = "p"
             memory = "m"
+            token = "t-main"
 
             [[devices.subscriptions]]
             room = "qq:1"
@@ -525,6 +595,95 @@ mod tests {
         assert!(matches!(
             Config::parse("这不是 toml"),
             Err(ConfigError::ParseFailed { .. })
+        ));
+    }
+
+    // ---- 接入令牌与接入点 ----
+
+    #[test]
+    fn a_device_without_token_is_rejected() {
+        let text = r#"
+            [[devices]]
+            id = "main"
+            persona = "p"
+            memory = "m"
+        "#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(ConfigError::ParseFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn blank_token_is_rejected() {
+        let text = r#"
+            [[devices]]
+            id = "main"
+            persona = "p"
+            memory = "m"
+            token = "   "
+        "#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(ConfigError::EmptyToken { .. })
+        ));
+    }
+
+    #[test]
+    fn two_devices_may_not_share_a_token() {
+        let text = r#"
+            [[devices]]
+            id = "main"
+            persona = "p"
+            memory = "m"
+            token = "same"
+
+            [[devices]]
+            id = "side"
+            persona = "p2"
+            memory = "m2"
+            token = "same"
+        "#;
+        assert!(matches!(
+            Config::parse(text),
+            Err(ConfigError::DuplicateToken { .. })
+        ));
+    }
+
+    #[test]
+    fn token_maps_to_its_device() {
+        let config = Config::parse(MINIMAL).expect("应当能解析");
+        assert_eq!(
+            config
+                .device_by_token("t-main")
+                .map(|device| device.id.as_str()),
+            Some("main")
+        );
+        assert!(config.device_by_token("nope").is_none());
+    }
+
+    #[test]
+    fn endpoint_section_is_optional() {
+        let config = Config::parse(MINIMAL).expect("应当能解析");
+        assert!(config.endpoint.is_none(), "不配就不监听");
+    }
+
+    #[test]
+    fn endpoint_listen_must_be_a_socket_address() {
+        let text = format!("{MINIMAL}\n[endpoint]\nlisten = \"127.0.0.1:7700\"\n");
+        let config = Config::parse(&text).expect("应当能解析");
+        assert_eq!(
+            config
+                .endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.listen.as_str()),
+            Some("127.0.0.1:7700")
+        );
+
+        let text = format!("{MINIMAL}\n[endpoint]\nlisten = \"随便写的\"\n");
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::BadListen { .. })
         ));
     }
 

@@ -4,12 +4,16 @@
 //! 平台语义在适配器里，harness 语义在接入点后面。
 
 pub mod config;
+pub mod endpoint;
 pub mod engine;
 pub mod outbound;
 pub mod storage;
 pub mod tools;
 
-pub use config::{Config, Device, Subscription, WakeDecision, WakeInput, WakePolicy};
+pub use config::{
+    Config, Device, EndpointConfig, Subscription, WakeDecision, WakeInput, WakePolicy,
+};
+pub use endpoint::{EndpointError, Session, handshake, run_connection, serve};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY};
 pub use outbound::{Outbound, OutboundError, Sent};
 pub use storage::{

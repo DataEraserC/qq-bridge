@@ -48,6 +48,7 @@ fn config() -> &'static str {
         id = "main"
         persona = "p"
         memory = "m"
+        token = "t-main"
 
         [[devices.subscriptions]]
         room = "qq:123"
@@ -394,7 +395,7 @@ fn send_message_to_is_fenced_by_subscriptions() {
             &ticket,
             "send_message_to",
             json!({
-                "room": "discord:456",
+                "to": "discord:456",
                 "elements": [{"type": "text", "text": "转过去"}]
             }),
         )
@@ -407,7 +408,7 @@ fn send_message_to_is_fenced_by_subscriptions() {
             &ticket,
             "send_message_to",
             json!({
-                "room": "telegram:789",
+                "to": "telegram:789",
                 "elements": [{"type": "text", "text": "发不出去"}]
             }),
         )
