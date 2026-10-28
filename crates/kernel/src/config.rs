@@ -18,7 +18,25 @@ pub struct Config {
     pub devices: Vec<Device>,
     /// 接入点配置。没配就不监听——只跑内存里的桥（测试、嵌入式）。
     pub endpoint: Option<EndpointConfig>,
+    /// 平台侧适配器。一个平台一个，桥按房间的平台名把出站交给对应的适配器。
+    pub adapters: Vec<AdapterConfig>,
 }
+
+/// 一个平台侧适配器：往哪个平台、用哪种协议、连到哪个地址。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdapterConfig {
+    /// 平台名，要跟订阅里的房间前缀一致（`qq` 的房间写成 `qq:...`）。
+    pub platform: String,
+    /// 协议种类，目前只有 `onebot11`。
+    pub kind: String,
+    /// 连接地址，形如 `ws://127.0.0.1:3001`。
+    pub url: String,
+    /// 访问令牌。OneBot 实现开了 token 就要填，握手时放在 `Authorization` 头里。
+    pub token: Option<String>,
+}
+
+/// 目前认识的适配器种类。加新适配器时在这里登记。
+pub const KNOWN_ADAPTERS: &[&str] = &["onebot11"];
 
 /// 接入点：harness 连进来的地址。
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +198,14 @@ pub enum ConfigError {
     DuplicateToken { first: String, second: String },
     #[error("接入点监听地址不合法：{address}（{detail}）")]
     BadListen { address: String, detail: String },
+    #[error("适配器的平台名不能为空")]
+    EmptyAdapterPlatform,
+    #[error("平台 {platform} 配了不止一个适配器")]
+    DuplicateAdapter { platform: String },
+    #[error("适配器 {platform} 的种类不认识：{kind}（目前只有 onebot11）")]
+    UnknownAdapterKind { platform: String, kind: String },
+    #[error("适配器 {platform} 的连接地址不合法：{url}（目前只支持 ws://主机:端口/路径）")]
+    BadAdapterUrl { platform: String, url: String },
 }
 
 impl Config {
@@ -206,6 +232,42 @@ impl Config {
             }
             None => None,
         };
+
+        let mut adapters = Vec::with_capacity(raw.adapters.len());
+        for raw_adapter in raw.adapters {
+            let platform = raw_adapter.platform.trim().to_owned();
+            if platform.is_empty() {
+                return Err(ConfigError::EmptyAdapterPlatform);
+            }
+            if adapters
+                .iter()
+                .any(|seen: &AdapterConfig| seen.platform == platform)
+            {
+                return Err(ConfigError::DuplicateAdapter { platform });
+            }
+
+            let kind = raw_adapter.kind.trim().to_owned();
+            if !KNOWN_ADAPTERS.contains(&kind.as_str()) {
+                return Err(ConfigError::UnknownAdapterKind { platform, kind });
+            }
+
+            let url = raw_adapter.url.trim().to_owned();
+            // 只支持不加密的 ws://：wss 要拉 TLS 依赖，等真有需求再说。
+            let looks_like_url = url.starts_with("ws://") && url.len() > "ws://".len();
+            if !looks_like_url {
+                return Err(ConfigError::BadAdapterUrl { platform, url });
+            }
+
+            adapters.push(AdapterConfig {
+                platform,
+                kind,
+                url,
+                token: raw_adapter
+                    .token
+                    .map(|token| token.trim().to_owned())
+                    .filter(|token| !token.is_empty()),
+            });
+        }
 
         let mut devices = Vec::with_capacity(raw.devices.len());
         let mut seen_devices = Vec::new();
@@ -269,7 +331,18 @@ impl Config {
             });
         }
 
-        Ok(Self { devices, endpoint })
+        Ok(Self {
+            devices,
+            endpoint,
+            adapters,
+        })
+    }
+
+    /// 找某个平台的适配器配置。
+    pub fn adapter(&self, platform: &str) -> Option<&AdapterConfig> {
+        self.adapters
+            .iter()
+            .find(|adapter| adapter.platform == platform)
     }
 
     /// 找设备的某条订阅。发送与工具鉴权都从这里查。
@@ -351,6 +424,16 @@ struct RawConfig {
     #[serde(default)]
     devices: Vec<RawDevice>,
     endpoint: Option<RawEndpoint>,
+    #[serde(default)]
+    adapters: Vec<RawAdapter>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAdapter {
+    platform: String,
+    kind: String,
+    url: String,
+    token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,6 +767,82 @@ mod tests {
         assert!(matches!(
             Config::parse(&text),
             Err(ConfigError::BadListen { .. })
+        ));
+    }
+
+    // ---- 适配器 ----
+
+    #[test]
+    fn adapters_section_is_optional() {
+        let config = Config::parse(MINIMAL).expect("应当能解析");
+        assert!(config.adapters.is_empty(), "不配适配器就没有平台连接");
+    }
+
+    #[test]
+    fn adapter_is_found_by_platform() {
+        let text = format!(
+            "{MINIMAL}\n[[adapters]]\nplatform = \"qq\"\nkind = \"onebot11\"\nurl = \"ws://127.0.0.1:3001\"\n"
+        );
+        let config = Config::parse(&text).expect("应当能解析");
+        assert_eq!(
+            config.adapter("qq").map(|adapter| adapter.url.as_str()),
+            Some("ws://127.0.0.1:3001")
+        );
+        assert!(config.adapter("discord").is_none());
+    }
+
+    #[test]
+    fn adapter_token_is_optional_and_trimmed() {
+        let text = format!(
+            "{MINIMAL}\n[[adapters]]\nplatform = \"qq\"\nkind = \"onebot11\"\nurl = \"ws://127.0.0.1:3001\"\ntoken = \"  abc  \"\n"
+        );
+        let config = Config::parse(&text).expect("应当能解析");
+        assert_eq!(
+            config
+                .adapter("qq")
+                .and_then(|adapter| adapter.token.as_deref()),
+            Some("abc")
+        );
+
+        let text = format!(
+            "{MINIMAL}\n[[adapters]]\nplatform = \"qq\"\nkind = \"onebot11\"\nurl = \"ws://127.0.0.1:3001\"\n"
+        );
+        let config = Config::parse(&text).expect("应当能解析");
+        assert!(config.adapter("qq").expect("有适配器").token.is_none());
+    }
+
+    #[test]
+    fn unknown_adapter_kind_is_rejected() {
+        let text = format!(
+            "{MINIMAL}\n[[adapters]]\nplatform = \"qq\"\nkind = \"telepathy\"\nurl = \"ws://127.0.0.1:3001\"\n"
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::UnknownAdapterKind { .. })
+        ));
+    }
+
+    #[test]
+    fn adapter_url_must_be_ws() {
+        let text = format!(
+            "{MINIMAL}\n[[adapters]]\nplatform = \"qq\"\nkind = \"onebot11\"\nurl = \"http://127.0.0.1:3001\"\n"
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::BadAdapterUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn one_platform_may_not_have_two_adapters() {
+        let text = format!(
+            "{MINIMAL}\n\
+             [[adapters]]\nplatform = \"qq\"\nkind = \"onebot11\"\nurl = \"ws://127.0.0.1:3001\"\n\
+             [[adapters]]\nplatform = \"qq\"\nkind = \"onebot11\"\nurl = \"ws://127.0.0.1:3002\"\n"
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::DuplicateAdapter { .. })
         ));
     }
 

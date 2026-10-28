@@ -3,12 +3,23 @@
 # 一个设备 = 一个虚拟订阅者：一个人格、一份记忆、一组订阅。
 # 一条订阅 = 一个房间 + 发送账号 + 唤醒策略。
 #
+# 房间写法是「平台:房间号」。QQ 用 group/<群号> 或 private/<号码>，
+# 所以 QQ 群 123 要写成 qq:group/123。
+#
 # 令牌是 harness 连进来时用的身份：令牌对上哪个设备，那条连接就绑到哪个设备。
 # 别把示例里的令牌直接用在真环境里。
 
 [endpoint]
 # harness 连这个地址。默认只听本机，外网连不上。
 listen = "127.0.0.1:7700"
+
+# 平台侧连接。一个平台一个适配器，桥按房间的平台名把消息交给它。
+# OneBot 11 走正向 WebSocket：这里的地址是 OneBot 实现（NapCat / Lagrange / go-cqhttp…）
+# 开出来的 WS 服务端地址。
+[[adapters]]
+platform = "qq"
+kind = "onebot11"
+url = "ws://127.0.0.1:3001"
 
 [[devices]]
 id = "main"
@@ -18,8 +29,8 @@ token = "换成你自己的一长串随机字符"
 
 # QQ 群：@ 我、叫我名字、攒够 10 条就醒；被拍也醒。
 [[devices.subscriptions]]
-room = "qq:123456789"
-send_account = "qq-bot"
+room = "qq:group/123456789"
+send_account = "10001"
 
 [devices.subscriptions.wake]
 at_mention = true
@@ -29,6 +40,7 @@ accumulate = 10
 poke = true
 
 # Discord 频道：只在 @ 我时醒；老王说话不叫醒（但照常记录）。
+# 注意：Discord 适配器还没写，这一条只是示范「同一个设备可以跨平台订阅」。
 [[devices.subscriptions]]
 room = "discord:987654321"
 send_account = "discord-bot"

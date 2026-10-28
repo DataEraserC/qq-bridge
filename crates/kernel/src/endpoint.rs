@@ -189,15 +189,16 @@ impl Session {
 /// 服务一条已经建立的连接，直到对端断开或出错。
 pub fn run_connection<S: Store>(
     bridge: &Mutex<Bridge<S>>,
-    stream: TcpStream,
+    mut stream: TcpStream,
 ) -> Result<(), EndpointError> {
     let _ = stream.set_nodelay(true);
-    let mut reader = LineReader::new(stream.try_clone()?);
-    let mut writer = stream;
+    // 一个句柄读写到底，不复制 fd：读和写在同一个线程里本来就是串行的，
+    // 复制一份除了多一个要管的东西没别的用。
+    let mut buffer: Vec<u8> = Vec::new();
 
     // 握手：第一帧必须是 hello。
     let device = {
-        let line = match reader.next(HANDSHAKE_TIMEOUT)? {
+        let line = match read_line(&mut stream, &mut buffer, HANDSHAKE_TIMEOUT)? {
             Incoming::Line(line) => line,
             Incoming::Idle => return Err(EndpointError::Handshake("握手超时".into())),
             Incoming::Closed => return Err(EndpointError::Handshake("还没握手就断了".into())),
@@ -207,7 +208,7 @@ pub fn run_connection<S: Store>(
         handshake(&guard, frame)?
     };
     write_frame(
-        &mut writer,
+        &mut stream,
         &Frame::Ready {
             device: device.clone(),
         },
@@ -224,7 +225,7 @@ pub fn run_connection<S: Store>(
             };
             match delivery {
                 Ok(Some(delivery)) => {
-                    if let Err(error) = write_frame(&mut writer, &Frame::TurnStart { delivery }) {
+                    if let Err(error) = write_frame(&mut stream, &Frame::TurnStart { delivery }) {
                         break 'conn Err(error);
                     }
                 }
@@ -234,7 +235,7 @@ pub fn run_connection<S: Store>(
         }
 
         // 2. 看看 harness 说了什么。等不到就回头再看一眼有没有活。
-        match reader.next(POLL_INTERVAL) {
+        match read_line(&mut stream, &mut buffer, POLL_INTERVAL) {
             Ok(Incoming::Idle) => continue,
             Ok(Incoming::Closed) => break 'conn Ok(()),
             Ok(Incoming::Line(line)) => {
@@ -250,7 +251,7 @@ pub fn run_connection<S: Store>(
                     }
                 };
                 for reply in replies {
-                    if let Err(error) = write_frame(&mut writer, &reply) {
+                    if let Err(error) = write_frame(&mut stream, &reply) {
                         break 'conn Err(error);
                     }
                 }
@@ -283,8 +284,10 @@ pub fn serve<S: Store + Send + 'static>(
                 stream.set_nonblocking(false)?;
                 let bridge = Arc::clone(&bridge);
                 std::thread::spawn(move || {
-                    // 一条连接坏了不影响别的连接。
-                    let _ = run_connection(&bridge, stream);
+                    // 一条连接坏了不影响别的连接，但要说清楚为什么坏的。
+                    if let Err(error) = run_connection(&bridge, stream) {
+                        eprintln!("接入点：一条连接结束了：{error}");
+                    }
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -321,55 +324,45 @@ enum Incoming {
     Closed,
 }
 
-/// 按行读，自带缓冲区。
+/// 按行读一帧，自带缓冲区。
 ///
 /// 不直接用 `BufRead::read_line`：带读超时时它会「读了一半就报错」，半个帧的数据就丢了。
 /// 这里把读到的字节攒着，下次接着攒，攒到换行才算一帧。
-struct LineReader {
-    stream: TcpStream,
-    buffer: Vec<u8>,
-}
-
-impl LineReader {
-    fn new(stream: TcpStream) -> Self {
-        Self {
-            stream,
-            buffer: Vec::new(),
+fn read_line(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<Incoming, EndpointError> {
+    stream.set_read_timeout(Some(timeout))?;
+    loop {
+        if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = buffer.drain(..=position).collect();
+            let text = String::from_utf8(line)
+                .map_err(|error| EndpointError::Protocol(format!("不是 UTF-8：{error}")))?;
+            return Ok(Incoming::Line(text));
         }
-    }
+        if buffer.len() > qqab_proto::frame::MAX_FRAME_BYTES {
+            return Err(EndpointError::Protocol("帧太大，没有换行".into()));
+        }
 
-    fn next(&mut self, timeout: Duration) -> Result<Incoming, EndpointError> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        loop {
-            if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                let line: Vec<u8> = self.buffer.drain(..=position).collect();
-                let text = String::from_utf8(line)
-                    .map_err(|error| EndpointError::Protocol(format!("不是 UTF-8：{error}")))?;
-                return Ok(Incoming::Line(text));
+        let mut chunk = [0_u8; 8192];
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return if buffer.is_empty() {
+                    Ok(Incoming::Closed)
+                } else {
+                    Err(EndpointError::Protocol("连接在半个帧处断了".into()))
+                };
             }
-            if self.buffer.len() > qqab_proto::frame::MAX_FRAME_BYTES {
-                return Err(EndpointError::Protocol("帧太大，没有换行".into()));
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(Incoming::Idle);
             }
-
-            let mut chunk = [0_u8; 8192];
-            match self.stream.read(&mut chunk) {
-                Ok(0) => {
-                    return if self.buffer.is_empty() {
-                        Ok(Incoming::Closed)
-                    } else {
-                        Err(EndpointError::Protocol("连接在半个帧处断了".into()))
-                    };
-                }
-                Ok(read) => self.buffer.extend_from_slice(&chunk[..read]),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        || error.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    return Ok(Incoming::Idle);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(EndpointError::Io(error)),
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(EndpointError::Io(error)),
         }
     }
 }

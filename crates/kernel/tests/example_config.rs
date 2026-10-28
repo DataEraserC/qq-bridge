@@ -50,3 +50,30 @@ fn example_config_demonstrates_per_subscription_wake_rules() {
     );
     assert_eq!(discord.wake.ignore_speakers, vec!["10001".to_string()]);
 }
+
+#[test]
+fn example_config_connects_qq_through_onebot() {
+    let text = std::fs::read_to_string(example_path()).expect("示例配置应当存在");
+    let config = Config::parse(&text).expect("示例配置应当能解析");
+
+    let qq = config.adapter("qq").expect("示例里 QQ 要有适配器");
+    assert_eq!(qq.kind, "onebot11");
+    assert!(
+        qq.url.starts_with("ws://"),
+        "OneBot 11 走 WebSocket：{}",
+        qq.url
+    );
+
+    // QQ 房间要按适配器的写法来，否则适配器认不出是群还是私聊。
+    let room = &config.devices[0]
+        .subscriptions
+        .iter()
+        .find(|subscription| subscription.room.platform == "qq")
+        .expect("应当有 QQ 订阅")
+        .room;
+    assert!(
+        room.room.starts_with("group/") || room.room.starts_with("private/"),
+        "QQ 房间要写成 group/<群号> 或 private/<号码>，示例里是 {}",
+        room.room
+    );
+}
