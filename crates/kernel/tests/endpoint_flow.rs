@@ -358,6 +358,82 @@ fn a_real_connection_carries_a_whole_turn() {
 }
 
 #[test]
+fn redelivery_hint_rides_on_note_not_on_content() {
+    let server = TestServer::start();
+    let bridge = Arc::clone(&server.bridge);
+
+    let mut stream = TcpStream::connect(server.address).expect("能连上");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("能设超时");
+    let mut reader = BufReader::new(stream.try_clone().expect("能复制"));
+
+    write_frame(
+        &mut stream,
+        &Frame::Hello {
+            version: PROTOCOL_VERSION,
+            token: Some(TOKEN.into()),
+        },
+    );
+    assert!(matches!(
+        read_frame(&mut reader).expect("能读到 ready"),
+        Frame::Ready { .. }
+    ));
+
+    // 第一轮：投一条，不确认就收工。
+    {
+        let mut guard = bridge.lock().expect("没被毒死");
+        guard.ingest(message("在吗")).expect("能记下来");
+    }
+    let first = match read_frame(&mut reader).expect("能读到 turn_start") {
+        Frame::TurnStart { delivery } => delivery,
+        other => panic!("应当是 turn_start，实际是 {}", other.kind()),
+    };
+    assert!(first.records[0].note.is_none(), "第一次投递不需要旁白");
+    write_frame(
+        &mut stream,
+        &Frame::TurnEnd {
+            ticket: first.ticket,
+            error: None,
+        },
+    );
+
+    // 第二轮：新消息叫醒，上一条重投。
+    {
+        let mut guard = bridge.lock().expect("没被毒死");
+        guard.ingest(message("还在吗")).expect("能记下来");
+    }
+    let second = match read_frame(&mut reader).expect("能读到 turn_start") {
+        Frame::TurnStart { delivery } => delivery,
+        other => panic!("应当是 turn_start，实际是 {}", other.kind()),
+    };
+    assert_eq!(second.records.len(), 2);
+
+    let redelivered = &second.records[0];
+    assert_eq!(redelivered.redelivery, Some(2));
+    let note = redelivered.note.as_deref().unwrap_or_default();
+    assert!(note.contains("第 2 次投递"), "旁白要写明第几次：{note}");
+    assert!(note.contains("#1"), "旁白要写明确认哪条：{note}");
+    assert!(note.contains("ack_messages"), "旁白要写明怎么止投：{note}");
+    assert_eq!(
+        redelivered.elements.len(),
+        1,
+        "旁白不能混进内容元素：{:?}",
+        redelivered.elements
+    );
+    assert_eq!(
+        qqab_proto::element::flatten_text(&redelivered.elements),
+        "在吗",
+        "内容要原样，一个字都不能被塞进去"
+    );
+    assert!(second.records[1].note.is_none());
+
+    drop(reader);
+    drop(stream);
+    server.stop();
+}
+
+#[test]
 fn a_bad_token_gets_no_ready() {
     let server = TestServer::start();
 

@@ -65,17 +65,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     delivery.records.len()
                 );
                 for record in &delivery.records {
-                    let redelivery = record
-                        .redelivery
-                        .map(|count| format!(" [第 {count} 次投递]"))
-                        .unwrap_or_default();
                     println!(
-                        "  #{} {}{}：{}",
+                        "  #{} {}：{}",
                         record.id,
                         record.sender.name,
-                        redelivery,
                         flatten_text(&record.elements)
                     );
+                    // 桥附的旁白（重投说明之类）另起一行，别和人家说的话混在一起。
+                    if let Some(note) = &record.note {
+                        println!("    ※ {note}");
+                    }
                 }
 
                 if !delivery.records.is_empty() {

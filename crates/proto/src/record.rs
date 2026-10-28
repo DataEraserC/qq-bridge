@@ -42,6 +42,13 @@ pub struct Record {
     /// 非空表示「第 N 次投递」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redelivery: Option<u32>,
+    /// 桥附在这条投递上的说明，比如重投时「第 2 次投递；调 ack_messages 确认 #5 之后
+    /// 就不再重复投递」。
+    ///
+    /// **这不是发送者说的话**，所以不能混进 [`Record::elements`]：内容就是内容，系统的
+    /// 话另起一行。harness 必须把它呈现出来，否则 agent 永远不知道该停哪条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl Record {
@@ -73,6 +80,7 @@ mod tests {
             elements: vec![Element::text("在吗")],
             at_self: false,
             redelivery: None,
+            note: None,
         }
     }
 
@@ -110,5 +118,23 @@ mod tests {
     fn redelivery_is_omitted_when_absent() {
         let value = serde_json::to_value(sample()).expect("可序列化");
         assert!(value.get("redelivery").is_none());
+        assert!(value.get("note").is_none(), "没有说明时不该出现 note 字段");
+    }
+
+    #[test]
+    fn note_is_a_separate_field_not_content() {
+        let mut record = sample();
+        record.redelivery = Some(2);
+        record.note = Some("第 2 次投递；调 ack_messages 确认 #42 之后就不再重复投递".into());
+
+        let value = serde_json::to_value(&record).expect("可序列化");
+        let note = value["note"].as_str().expect("note 是字符串");
+        assert!(note.contains("第 2 次投递"), "旁白要写明第几次：{note}");
+        assert_eq!(
+            value["elements"].as_array().expect("是数组").len(),
+            1,
+            "说明不能混进内容元素里"
+        );
+        assert_eq!(value["elements"][0]["text"], "在吗");
     }
 }

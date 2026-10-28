@@ -234,6 +234,8 @@ impl Transcript for MemoryStore {
             elements: draft.elements,
             at_self: draft.at_self,
             redelivery: None,
+            // 流水里存的是原话，旁白只在投递时由调度层补（见 engine::open_turn）。
+            note: None,
         };
         self.next_id.insert(draft.room.clone(), next);
         self.records

@@ -280,6 +280,36 @@ test("空记录的一轮也要说清楚是例行检查", () => {
   assert.match(text, /没有新记录/)
 })
 
+test("桥的旁白单独一行，不拼进对方说的话里", () => {
+  const record = {
+    ...delivery().records[0],
+    id: 5,
+    elements: [{ type: "text", text: "1" }],
+    redelivery: 2,
+    note: "第 2 次投递；调 ack_messages 确认 #5 之后就不再重复投递",
+  }
+  const text = renderTurn({ ...delivery(), records: [record] }, { now: Date.now() })
+  const lines = text.split("\n")
+
+  assert.ok(
+    lines.some((line) => line.trim() === "1"),
+    `内容那行必须只有「1」，实际是：${JSON.stringify(lines)}`,
+  )
+  assert.ok(
+    lines.some(
+      (line) =>
+        line.trim().startsWith("※") &&
+        line.includes("第 2 次投递") &&
+        line.includes("#5") &&
+        line.includes("ack_messages"),
+    ),
+    `旁白要单独一行且说清怎么止投：${JSON.stringify(lines)}`,
+  )
+  // 有 note 就不在标题里重复一遍「第 N 次投递」。
+  const header = lines.find((line) => line.startsWith("#5"))
+  assert.ok(!header.includes("第 2 次投递"), `标题别重复：${header}`)
+})
+
 test("内容元素都摊得开，平台内容不假装能懂", () => {
   const text = renderElements([
     { type: "text", text: "看图 " },

@@ -376,19 +376,22 @@ fn unacked_records_come_back_marked_as_redelivery() {
     );
     assert_eq!(second.records[1].redelivery, None, "新的一条是第一次投");
 
-    // 光有 `redelivery` 字段不够：模型看的是内容，得在内容里就告诉它怎么止投。
-    let hint = qqab_proto::element::flatten_text(&second.records[0].elements);
-    assert!(hint.contains("第 2 次投递"), "重投要写明第几次：{hint}");
-    assert!(hint.contains("#1"), "要写清确认哪条：{hint}");
+    // 光有 `redelivery` 字段不够：模型看的是内容，得在内容旁边就告诉它怎么止投。
+    // 但这句话不能进 elements——那是对方说的话，混进去就成了「对方打了这行字」。
+    let note = second.records[0].note.as_deref().unwrap_or_default();
+    assert!(note.contains("第 2 次投递"), "重投要写明第几次：{note}");
+    assert!(note.contains("#1"), "要写清确认哪条：{note}");
     assert!(
-        hint.contains("ack_messages"),
-        "要告诉 AI 用什么止投：{hint}"
+        note.contains("ack_messages"),
+        "要告诉 AI 用什么止投：{note}"
     );
+    assert_eq!(second.records[0].elements.len(), 1, "旁白不能混进内容元素");
     assert_eq!(
         second.records[1].elements.len(),
         1,
         "第一次投递不该被塞任何提示"
     );
+    assert!(second.records[1].note.is_none(), "第一次投递不需要旁白");
 }
 
 // ---------------------------------------------------------------------------

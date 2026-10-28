@@ -276,7 +276,8 @@ export class BridgeLink {
 /**
  * 把 `delivery` 摊平成人能读、模型能直接吃的一段文本。
  *
- * 桥已经在重投的记录里塞了「第 N 次投递 + 怎么止投」，这里只做呈现，不再造信息。
+ * 桥已经在重投的记录上写好了旁白（`note`：第 N 次投递 + 怎么止投），这里只做呈现，
+ * 不再造信息；旁白永远单独一行，不拼进对方说的话里。
  */
 export function renderTurn(delivery, { now = Date.now() } = {}) {
   const lines = []
@@ -300,10 +301,18 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
       marks.push(`事件 ${record.kind.event}`)
     }
     if (record.at_self) marks.push("冲你来的")
-    if (record.redelivery) marks.push(`第 ${record.redelivery} 次投递`)
+    // 桥一般会给一句 `note`（写在下面单独一行）。没有 note 但标了重投，就在标题里
+    // 提一句，别让「这条重复了」这件事丢掉。
+    if (record.redelivery && !record.note) {
+      marks.push(`第 ${record.redelivery} 次投递`)
+    }
     const tail = marks.length ? `（${marks.join("、")}）` : ""
     lines.push(`#${record.id} ${when} ${who}(${record.sender.id})${tail}`)
     lines.push(`  ${renderElements(record.elements ?? [])}`)
+    // 桥的旁白不是对方说的话，单独一行，绝不拼进上面那行内容里。
+    if (record.note) {
+      lines.push(`  ※ ${record.note}`)
+    }
   }
 
   lines.push("")

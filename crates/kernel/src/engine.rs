@@ -342,10 +342,13 @@ impl<S: Store> Bridge<S> {
                 // 「第 N 次投递」和「怎么让它别再重投」必须跟着记录一起到模型眼前。
                 // 这件事放在桥里做，不指望每个 harness 都记得补：harness 的职责只是
                 // 把 records 塞进上下文，多一句话都不该由它发明（ADR-0010）。
-                record.elements.push(Element::text(format!(
-                    "（第 {} 次投递；调 ack_messages 确认 #{} 之后就不再重复投递）",
+                //
+                // 注意写在 `note` 上，不塞进 elements：elements 是发送者说的话，
+                // 系统的旁白混进去会让人（和模型）以为是对方打的字。
+                record.note = Some(format!(
+                    "第 {} 次投递；调 ack_messages 确认 #{} 之后就不再重复投递",
                     *count, record.id
-                )));
+                ));
             }
             delivered.insert(record.id);
         }

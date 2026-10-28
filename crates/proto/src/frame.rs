@@ -216,6 +216,7 @@ mod tests {
                 elements: vec![Element::text("在吗")],
                 at_self: true,
                 redelivery: None,
+                note: None,
             }],
             reason: TurnReason::Wake,
         }
