@@ -1,0 +1,33 @@
+# 桥的示例配置。字段语义见 docs/01-vision.md 与 docs/adr/0002-subscription-model.md。
+#
+# 一个设备 = 一个虚拟订阅者：一个人格、一份记忆、一组订阅。
+# 一条订阅 = 一个房间 + 发送账号 + 唤醒策略。
+
+[[devices]]
+id = "main"
+persona = "默认人格"
+memory = "main-memory"
+
+# QQ 群：@ 我、叫我名字、攒够 10 条就醒；被拍也醒。
+[[devices.subscriptions]]
+room = "qq:123456789"
+send_account = "qq-bot"
+
+[devices.subscriptions.wake]
+at_mention = true
+name_mention = true
+names = ["小助手"]
+accumulate = 10
+poke = true
+
+# Discord 频道：只在 @ 我时醒；老王说话不叫醒（但照常记录）。
+[[devices.subscriptions]]
+room = "discord:987654321"
+send_account = "discord-bot"
+
+[devices.subscriptions.wake]
+at_mention = true
+name_mention = false
+accumulate = 20
+poke = false
+ignore_speakers = ["10001"]

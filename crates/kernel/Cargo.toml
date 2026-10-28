@@ -1,0 +1,14 @@
+[package]
+name = "qqab-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "桥的核心：订阅、唤醒、流水、水位、笔记"
+
+[dependencies]
+qqab-proto = { path = "../proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
