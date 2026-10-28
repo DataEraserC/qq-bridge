@@ -5,7 +5,7 @@
 // 它用和插件完全同一个协议客户端（`qqab-wire.mjs`），只是把「交给 opencode 会话」
 // 换成了「打印出来 + 回一句固定的话」。所以能看到这一段的，插件也一定能看到。
 
-import { BridgeLink, renderTurn } from "./qqab-wire.mjs"
+import { BridgeLink, renderTurn } from "./plugin/qqab-wire.mjs"
 
 const options = parseArgs(process.argv.slice(2))
 if (!options.token) {

@@ -122,7 +122,10 @@ crates/
     src/main.rs          桥本体
     src/bin/dev-harness  开发用的最小 harness（验「桥 ↔ 平台」这一段）
 harnesses/
-  opencode/              opencode 的适配器：插件 + 协议客户端 + 探针（见 06）
+  opencode/
+    plugin/             v2 插件目录：index.js（工具面 + 轮次驱动）+ qqab-wire.mjs（协议客户端）
+    probe.mjs           不用 opencode 也能验「桥这一段」的探针
+    test/               协议层 15 + 插件逻辑 8（后者对面是模拟的 v2 宿主）
 docs/
   01-vision.md       愿景与范围（已过目）
   02-glossary.md     术语表（已过目）

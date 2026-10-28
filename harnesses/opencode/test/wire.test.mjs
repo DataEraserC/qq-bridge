@@ -14,119 +14,13 @@ import {
   parseEndpoint,
   renderElements,
   renderTurn,
-} from "../qqab-wire.mjs"
-
-const TICKET = "main-1"
-
-function delivery(overrides = {}) {
-  return {
-    ticket: TICKET,
-    device: "main",
-    room: { platform: "qq", room: "group/158296748" },
-    reason: "wake",
-    records: [
-      {
-        id: 12,
-        room: { platform: "qq", room: "group/158296748" },
-        kind: { kind: "message" },
-        sender: { id: "10001", name: "老王" },
-        at: Date.now(),
-        elements: [{ type: "text", text: "在吗" }],
-        at_self: true,
-      },
-    ],
-    ...overrides,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 假桥
-// ---------------------------------------------------------------------------
-
-class FakeBridge {
-  constructor({ device = "main", token = "t-main" } = {}) {
-    this.device = device
-    this.token = token
-    this.frames = []
-    this.socket = null
-  }
-
-  async start() {
-    this.server = net.createServer((socket) => {
-      this.socket = socket
-      socket.setEncoding("utf8")
-      this.lines = new LineQueue(socket)
-      void this.#greet()
-    })
-    await new Promise((resolve) => this.server.listen(0, "127.0.0.1", resolve))
-    this.port = this.server.address().port
-    return this
-  }
-
-  get endpoint() {
-    return `127.0.0.1:${this.port}`
-  }
-
-  async #greet() {
-    const hello = await this.lines.next()
-    this.hello = hello
-    this.#write({ frame: "ready", device: this.device })
-  }
-
-  async next() {
-    const frame = await this.lines.next()
-    this.frames.push(frame)
-    return frame
-  }
-
-  async send(frame) {
-    this.#write(frame)
-  }
-
-  #write(frame) {
-    this.socket.write(`${JSON.stringify(frame)}\n`)
-  }
-
-  async stop() {
-    this.socket?.destroy()
-    await new Promise((resolve) => this.server.close(resolve))
-  }
-}
-
-class LineQueue {
-  constructor(socket) {
-    this.buffer = ""
-    this.waiting = []
-    this.lines = []
-    socket.on("data", (chunk) => {
-      this.buffer += chunk
-      for (;;) {
-        const at = this.buffer.indexOf("\n")
-        if (at < 0) return
-        const line = this.buffer.slice(0, at)
-        this.buffer = this.buffer.slice(at + 1)
-        this.#push(JSON.parse(line))
-      }
-    })
-  }
-
-  #push(value) {
-    const waiter = this.waiting.shift()
-    if (waiter) waiter(value)
-    else this.lines.push(value)
-  }
-
-  next() {
-    if (this.lines.length) return Promise.resolve(this.lines.shift())
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("假桥等帧超时")), 2000)
-      this.waiting.push((value) => {
-        clearTimeout(timer)
-        resolve(value)
-      })
-    })
-  }
-}
+} from "../plugin/qqab-wire.mjs"
+import {
+  FakeBridge,
+  TICKET,
+  delivery,
+  waitFor,
+} from "./fake-bridge.mjs"
 
 // ---------------------------------------------------------------------------
 // 握手与轮次
@@ -390,11 +284,3 @@ test("其它工具原样透传，顺手去掉空字段", () => {
   )
 })
 
-async function waitFor(predicate, message) {
-  const deadline = Date.now() + 2000
-  while (Date.now() < deadline) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  assert.fail(message)
-}

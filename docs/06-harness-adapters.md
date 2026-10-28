@@ -1,6 +1,8 @@
 # 06 · harness 适配器
 
-> 状态：opencode 那一份写完并测过协议层，还没在真的 opencode 上跑过（本机没装）。
+> 状态：opencode 那一份按 **v2 API** 写完了，协议层与插件逻辑都有测试；**还没在真的
+> opencode 里跑完一轮**——本机 opencode2 2.0.22（Bun 1.4.2）加载任何插件都会段错误，
+> 连 4 行空插件都崩。详见下面「卡在哪」。
 > 原则：桥不懂 harness 的内脏，harness 也不懂平台细节。适配器是那个翻译。
 
 ## 一个适配器要干两件事
@@ -48,7 +50,7 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 
 | harness | 扩展点 | 轮次驱动 | 判断 |
 |---------|--------|----------|------|
-| opencode | 插件（`.opencode/plugins/`，可 `tool()` 注册、可拿 SDK client） | 进程内：`client.session.prompt` 返回即一轮结束 | 插件型，已实现，见 `harnesses/opencode/` |
+| opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，已按 v2 实现，见 `harnesses/opencode/plugin/`；真机跑到一半被 Bun 崩溃挡住 |
 | DSH | 插件 | 待核实 | 用户说可以走插件，具体接口未看 |
 | WorkBuddy | 待核实 | 待核实 | 未看 |
 | Trae | 待核实 | 待核实 | 未看 |
@@ -57,56 +59,100 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 
 ## opencode 这一份怎么用
 
-两个文件必须挨着放（`qqab.mjs` import `qqab-wire.mjs`）：
+opencode 有 v1 和 v2 两套插件 API，**写法不通用**。我们按 v2 写（本机能装到的是 v2）。
+
+v2 的插件是一个目录：`index.js` 是入口，`qqab-wire.mjs` 是协议客户端（入口 import 它）。
 
 ```bash
-cp harnesses/opencode/qqab.mjs harnesses/opencode/qqab-wire.mjs ~/.config/opencode/plugins/
+# 整体拷进 opencode 的插件目录，目录名随便，这里叫 qqab
+cp -r harnesses/opencode/plugin ~/.config/opencode/plugins/qqab
 ```
 
-配置全走环境变量——插件读不到桥的配置文件，那是桥自己的事：
+配置两种给法，选项优先于环境变量：
 
-| 变量 | 作用 |
-|------|------|
-| `QQAB_ENDPOINT` | 桥的接入点，默认 `127.0.0.1:7700` |
-| `QQAB_TOKEN` | 设备令牌，必填；和 `config.toml` 里设备的 `token` 一致 |
-| `QQAB_SESSION` | 钉死用哪个 opencode 会话；不填就按 `qqab:<设备>` 自动找 / 建 |
+```jsonc
+// ~/.config/opencode/opencode.jsonc
+{
+  "plugins": [
+    { "package": "/home/me/.config/opencode/plugins/qqab", "options": { "token": "设备令牌" } }
+  ]
+}
+```
 
-没给 `QQAB_TOKEN` 时插件直接不启用，只写一条警告——不阻塞 opencode 启动。
+```bash
+export QQAB_TOKEN=<设备令牌>         # 和 config.toml 里设备的 token 一致
+export QQAB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
+```
+
+没给令牌时插件直接不启用，只写一条警告——不阻塞 opencode 启动。
 
 几个刻意的做法：
 
-- **会话按设备一份**，标题 `qqab:<设备>`。启动时先找同名会话，有就接着用，没有才新建。
+- **会话按设备一份**，标题 `qqab:<设备>`。会话 id 记在插件自己的 storage 里，重开接上，
+  找不到才新建；每次用前确认它还活着（用户在 TUI 里删了会话也能自愈）。
   会话就是设备的记忆（[ADR-0002](adr/0002-subscription-model.md)），重开 harness 不能失忆。
-- **`prompt` 返回就是一轮结束**。不再去盯 `session.idle`——多一个状态源就多一处能对不上。
+- **`prompt` 排话、`wait` 等它说完**，两个连起来才是一轮。v2 的 `prompt` 只保证把话排进
+  会话，模型随后才跑；只看 `prompt` 返回就收工，会把票提前作废，工具调用全成
+  `unauthorized`（假宿主测试里踩过这个）。
 - **工具只在轮次内可用**。没有票的调用一律 `unauthorized`。这样人在 TUI 里手动跟同一个实例
   聊天，也不会把话发到别人的房间里。
 - **失败也回 `turn_end`**。`prompt` 抛错、会话被删、连接断了，都带着错误收工——桥靠
   `turn_end` 或断连释放设备，不回就一直占着。
 - **断线自己重连**，退避 1 秒起、最长 10 秒。桥比 opencode 晚启动也能接上。
 
+### 写 v2 插件绕不过去的四个坑（都是实测）
+
+| 现象 | 原因 / 做法 |
+|------|-------------|
+| 插件放进去没反应，日志里连「loading plugin」都没有 | `.opencode/plugins/` 只自动发现**直接的 `.js` / `.ts` 文件**和**插件目录**；`.mjs` 文件不认。入口用 `index.js` |
+| `Cannot find package '@opencode/plugin'` | 本地插件不自动带这个包。不用它就行：直接 `export default { id, setup }`，功能一样（`Plugin.define` 只是语法糖） |
+| 插件一加载，opencode 报 `Transport: The socket connection was closed unexpectedly` | 插件里 `console.log` 写到了 **stdout**，而 `serve --stdio` 用 stdout 当 RPC 通道，协议被污染。日志只能走 `ctx.app.log` 或 `console.error` |
+| 配置写 `"plugin": ["./qqab.js"]` 报 `configured plugin path must be a directory` | v2 的键叫 `plugins`（复数），且本地路径必须是**目录**，指向单个文件会被跳过 |
+
 ## 怎么验
 
-三层，越往下越真：
+四层，越往下越真：
 
 ```bash
-# 1. 协议层：假桥，验握手 / 开轮 / 工具配对 / 错误码 / 渲染
-node --test harnesses/opencode/test/*.test.mjs
+# 1. 协议层：假桥，验握手 / 开轮 / 工具配对 / 错误码 / 渲染（15 个）
+node --test harnesses/opencode/test/wire.test.mjs
 
-# 2. 对着真桥（不用 opencode）：握手成不成
+# 2. 插件逻辑：假桥 + 模拟的 v2 宿主，验工具注册 / 一轮的完整动作 / 会话复用 / 卸载（8 个）
+node --test harnesses/opencode/test/plugin.test.mjs
+
+# 3. 对着真桥（不用 opencode）：握手成不成
 node harnesses/opencode/probe.mjs --token <设备令牌>
 
-# 3. 真链路：另开一个终端起桥，然后给人发一条 QQ 消息
-cargo run -p qqab-bridge -- --config config.toml
+# 4. 真链路：真 opencode + 真桥 + 真 QQ（目前被上游 bug 挡住，见下）
 ```
 
 第 3 步里 `probe.mjs` 会把投递的内容打出来、回一句话、确认水位。它和插件用的是同一个
 协议客户端，所以这里看得到的，插件也看得到——区别只在「交给谁去思考」。
 
+## 卡在哪：opencode2 加载插件就段错误
+
+本机 `opencode2 2.0.22`（内嵌 Bun 1.4.2）只要加载插件，`serve --stdio` 进程就崩：
+
+```
+panic: Segmentation fault at address 0x...
+oh no: Bun has crashed. This indicates a bug in Bun, not your code.
+```
+
+最小复现是一个 4 行插件，什么都不做：
+
+```js
+// .opencode/plugins/x.js
+export default { id: "x", async setup() {} }
+```
+
+同一个目录里没有插件时 `opencode2 run` 一切正常，放进去就崩。所以这不是我们的代码问题，
+是上游。等它修好，第 4 层才算验过；在那之前，插件逻辑靠第 2 层（假宿主）兜着。
+
 ## 已知没验的地方
 
-- 从插件内部调 `client.session.prompt`，会不会和 opencode 自己的事件派发互相等，没验过。
-  兜底是轮次串行链 + 独立会话 + 失败即收工。真跑起来卡住，第一嫌疑是这里。
-- 工具参数的 schema 用 `z.array(z.any())` 接内容段，靠描述文字教模型写元素。宁松勿严：
-  写错了桥那边会给出比 zod 更准的话。
-- `session.create` / `session.list` 的返回形状按文档写（`result.data.id`），两种形状都兼容了；
-  opencode 换版本改形状时，这里要跟着看。
+- **真 opencode 里的整轮**：被上面的 Bun 崩溃挡住。具体没验到的是「`prompt` 之后工具调用
+  是否真能拿到票」「工具 schema 它认不认」。假宿主能证明我们的顺序对，不能证明它的行为。
+- 内容段参数用宽松的 `items: { type: "object" }` 接，靠描述文字教模型写元素。宁松勿严：
+  写错了桥那边会给出比 JSON Schema 更准的话。
+- `ctx.session.create` 的返回形状按文档写（`id`），另外兼容 `sessionID` / `session.id` /
+  `data.id` 三种老形状；opencode 换版本改形状时，这里要跟着看。

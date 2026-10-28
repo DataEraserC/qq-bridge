@@ -35,20 +35,25 @@
 ## 技术细节
 
 - opencode 选**插件型**，代码在 `harnesses/opencode/`：
-  - `qqab-wire.mjs`：协议客户端 + 投递渲染。不依赖 opencode，可以单独测（14 个测试，
-    对着一个假桥跑——假的是桥，不是平台）。
-  - `qqab.mjs`：插件本体。注册九个工具；起一个后台连接，收到轮次就
-    `client.session.prompt` 提问，`prompt` 返回即这一轮结束，回 `turn_end`。
-- **会话按设备一份**：标题 `qqab:<设备>`。启动时先找同名会话，找到就接着用，找不到才新建。
-  会话就是设备的记忆（ADR-0002），重开 harness 不能失忆。`QQAB_SESSION` 可以钉死。
+  - `plugin/qqab-wire.mjs`：协议客户端 + 投递渲染。不依赖 opencode，可以单独测
+    （15 个测试，对着一个假桥跑——假的是桥，不是平台）。
+  - `plugin/index.js`：插件本体（**v2 API**，`export default { id, setup(ctx) }`）。
+    用 `ctx.tool.transform` 注册九个工具（参数是 JSON Schema，不是 zod）；起一个后台连接，
+    收到轮次就 `ctx.session.prompt` 排话、`ctx.session.wait` 等这一轮说完，再回 `turn_end`。
+- **会话按设备一份**：标题 `qqab:<设备>`，id 存在 `ctx.storage` 里，重开能接上；每次用前
+  确认它还活着。会话就是设备的记忆（ADR-0002），重开 harness 不能失忆。options 里的
+  `session` 可以钉死。
 - **工具只在轮次内可用**：没有票的调用直接以 `unauthorized` 拒掉。这样人在 TUI 里手动
   跟同一个实例聊天时，也不会把话发到别人的房间里去。
 - **失败也回 `turn_end`**：`prompt` 抛错、会话被删、连接断了，都带着错误收工，不能让设备
   一直占着——桥那边是靠 `turn_end` 或断连释放设备的。
-- 从插件内部调 `client.session.prompt` 会不会和事件派发互相等，**没有在真 opencode 上验过**
-  （本机没装）。现有的兜底：轮次串行链、独立会话、失败即收工。真跑起来若卡住，第一嫌疑是这里。
+- **已知未验（实测受阻）**：本机 opencode2 2.0.22（Bun 1.4.2）加载**任何**插件都会段错误，
+  4 行空插件也崩，所以「真 opencode 跑完一轮」没验成。替代验证是一个照着 v2 文档写的
+  假宿主（8 个测试），能证明我们的顺序与工具面，不能证明 opencode 的实际行为。
+  详见 [ADR-0016](0016-opencode-v2-plugin.md) 与 `docs/06`。
 
 ## 参考
 
 - 分家依据、各家 harness 的判断、怎么验：[`docs/06-harness-adapters.md`](../06-harness-adapters.md)
+- opencode 用哪套插件 API：[`ADR-0016`](0016-opencode-v2-plugin.md)
 - 帧的形状：[`docs/04-protocol.md`](../04-protocol.md)
