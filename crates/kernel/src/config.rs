@@ -12,6 +12,10 @@ use thiserror::Error;
 /// 没配「攒多少条」时的默认值。来源：实现默认，可推翻。
 pub const DEFAULT_ACCUMULATE: u32 = 10;
 
+/// 没配存储路径时的默认值：工作目录下的 `state/qqab.db`。
+/// 来源：实现默认。放 `state/` 是因为那里已经在 .gitignore 里，不会被误提交。
+pub const DEFAULT_STORAGE_PATH: &str = "state/qqab.db";
+
 /// 整份配置。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -20,6 +24,23 @@ pub struct Config {
     pub endpoint: Option<EndpointConfig>,
     /// 平台侧适配器。一个平台一个，桥按房间的平台名把出站交给对应的适配器。
     pub adapters: Vec<AdapterConfig>,
+    /// 状态存哪。流水、水位、笔记、投递计数都在这里，重启不改。
+    pub storage: StorageConfig,
+}
+
+/// 状态存储：一个 SQLite 文件。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StorageConfig {
+    /// 库文件路径。相对路径按启动时的工作目录算。
+    pub path: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            path: DEFAULT_STORAGE_PATH.to_owned(),
+        }
+    }
 }
 
 /// 一个平台侧适配器：往哪个平台、用哪种协议、连到哪个地址。
@@ -206,6 +227,8 @@ pub enum ConfigError {
     UnknownAdapterKind { platform: String, kind: String },
     #[error("适配器 {platform} 的连接地址不合法：{url}（目前只支持 ws://主机:端口/路径）")]
     BadAdapterUrl { platform: String, url: String },
+    #[error("存储路径不能为空（不配就用默认的 {DEFAULT_STORAGE_PATH}）")]
+    EmptyStoragePath,
 }
 
 impl Config {
@@ -218,6 +241,17 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let storage = match raw.storage {
+            Some(raw) => {
+                let path = raw.path.trim().to_owned();
+                if path.is_empty() {
+                    return Err(ConfigError::EmptyStoragePath);
+                }
+                StorageConfig { path }
+            }
+            None => StorageConfig::default(),
+        };
+
         let endpoint = match raw.endpoint {
             Some(raw) => {
                 let address = raw.listen.trim().to_owned();
@@ -335,6 +369,7 @@ impl Config {
             devices,
             endpoint,
             adapters,
+            storage,
         })
     }
 
@@ -426,6 +461,12 @@ struct RawConfig {
     endpoint: Option<RawEndpoint>,
     #[serde(default)]
     adapters: Vec<RawAdapter>,
+    storage: Option<RawStorage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStorage {
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,6 +884,31 @@ mod tests {
         assert!(matches!(
             Config::parse(&text),
             Err(ConfigError::DuplicateAdapter { .. })
+        ));
+    }
+
+    // ---- 存储 ----
+
+    #[test]
+    fn storage_defaults_to_state_dir_when_absent() {
+        let config = Config::parse(MINIMAL).expect("应当能解析");
+        assert_eq!(config.storage.path, DEFAULT_STORAGE_PATH);
+        assert_eq!(DEFAULT_STORAGE_PATH, "state/qqab.db");
+    }
+
+    #[test]
+    fn storage_path_can_be_set() {
+        let text = format!("{MINIMAL}\n[storage]\npath = \"/var/lib/qqab/bridge.db\"\n");
+        let config = Config::parse(&text).expect("应当能解析");
+        assert_eq!(config.storage.path, "/var/lib/qqab/bridge.db");
+    }
+
+    #[test]
+    fn a_blank_storage_path_is_rejected() {
+        let text = format!("{MINIMAL}\n[storage]\npath = \"  \"\n");
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::EmptyStoragePath)
         ));
     }
 

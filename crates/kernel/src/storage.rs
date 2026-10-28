@@ -1,6 +1,6 @@
-//! 存储层：流水、水位、笔记。
+//! 存储层：流水、水位、笔记、投递计数。
 //!
-//! 三样东西的关系：
+//! 四样东西的关系：
 //! - **流水**是每个房间的完整记录，永久保存，投没投过都在；
 //! - **水位**是「这个设备处理到哪条了」的游标，只经显式确认往前推（ADR-0010）；
 //! - **未读**不是独立存储，是流水里水位之后的部分——算出来的，不是攒出来的。
@@ -9,7 +9,11 @@
 //! - 流水**按房间**，一个房间一条流水，同房间的所有设备看的是同一份历史；
 //! - 水位**按「设备 + 房间」**（[`Cursor`]），因为「处理到哪条」是设备自己的进度——
 //!   两个设备同时订一个群，各自的进度不能互相踩；
-//! - 笔记**按房间**，是「关于这个房间的共识」，同房间的设备共享。
+//! - 笔记**按房间**，是「关于这个房间的共识」，同房间的设备共享；
+//! - 投递计数**按「设备 + 房间 + 记录」**，只为一件事存在：重投时说得出「第 N 次」。
+//!
+//! 两份实现：`MemoryStore`（测试、嵌入式）与 [`SqliteStore`]（正式跑，跨重启）。
+//! 桥只依赖 [`Store`] 这组约束，换后端不改调度（ADR-0014）。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -201,12 +205,28 @@ pub trait Notes {
     fn notes_in(&self, room: &RoomId) -> Result<Vec<Note>, StorageError>;
 }
 
-/// 三件套合起来。桥只依赖这一个约束，换后端只换实现。
-pub trait Store: Transcript + Watermarks + Notes {}
+/// 投递计数：同一条记录第几次投给同一个设备。
+///
+/// 只服务一个目的——重投时说得清「第 N 次投递」。放在存储层而不是调度层的内存里，
+/// 是为了重启之后同一个 N 还能接着数（否则重启一次就从「第 1 次」重来，看着像没投过）。
+pub trait Deliveries {
+    /// 记一次投递，返回这是第几次（第一次给 1）。
+    fn count_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<u32, StorageError>;
 
-impl<T> Store for T where T: Transcript + Watermarks + Notes {}
+    /// 丢掉计数。确认之后这条不会再投了，留着只是垃圾。
+    fn forget_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<(), StorageError>;
+}
 
-/// 内存实现。测试与开发用；正式存储（SQLite）按同一组 trait 实现。
+/// 四样东西合起来。桥只依赖这一个约束，换后端只换实现。
+pub trait Store: Transcript + Watermarks + Notes + Deliveries {}
+
+impl<T> Store for T where T: Transcript + Watermarks + Notes + Deliveries {}
+
+mod sqlite;
+
+pub use sqlite::{Counts, SCHEMA_VERSION, SqliteStore};
+
+/// 内存实现。测试与开发用；正式跑用 [`SqliteStore`]。
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     next_id: HashMap<RoomId, u64>,
@@ -214,6 +234,7 @@ pub struct MemoryStore {
     watermark: HashMap<Cursor, u64>,
     acked: HashMap<Cursor, BTreeSet<u64>>,
     notes: BTreeMap<NoteKey, Note>,
+    deliveries: HashMap<(Cursor, u64), u32>,
 }
 
 impl MemoryStore {
@@ -314,6 +335,19 @@ impl Notes for MemoryStore {
             .filter(|(key, _)| &key.room == room)
             .map(|(_, note)| note.clone())
             .collect())
+    }
+}
+
+impl Deliveries for MemoryStore {
+    fn count_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<u32, StorageError> {
+        let count = self.deliveries.entry((cursor.clone(), id)).or_insert(0);
+        *count += 1;
+        Ok(*count)
+    }
+
+    fn forget_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<(), StorageError> {
+        self.deliveries.remove(&(cursor.clone(), id));
+        Ok(())
     }
 }
 

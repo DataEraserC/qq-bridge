@@ -13,6 +13,12 @@
 # harness 连这个地址。默认只听本机，外网连不上。
 listen = "127.0.0.1:7700"
 
+[storage]
+# 状态库：流水、水位、笔记、「第几次投递」都在这一个 SQLite 文件里。
+# 不配就用 state/qqab.db（相对启动时的工作目录）。目录不存在会自动建。
+# 备份就是拷这个文件；删了等于失忆，但桥不会因此起不来。
+path = "state/qqab.db"
+
 # 平台侧连接。一个平台一个适配器，桥按房间的平台名把消息交给它。
 # OneBot 11 走正向 WebSocket：这里的地址是 OneBot 实现（NapCat / Lagrange / go-cqhttp…）
 # 开出来的 WS 服务端地址。

@@ -83,8 +83,6 @@ pub struct Bridge<S: Store> {
     pending: VecDeque<Pending>,
     active: HashMap<String, ActiveTurn>,
     by_ticket: HashMap<Ticket, String>,
-    /// 每条记录被投递过几次，用来标「第 N 次投递」。
-    deliveries: HashMap<(String, RoomId, u64), u32>,
     ticket_seq: u64,
 }
 
@@ -97,7 +95,6 @@ impl<S: Store> Bridge<S> {
             pending: VecDeque::new(),
             active: HashMap::new(),
             by_ticket: HashMap::new(),
-            deliveries: HashMap::new(),
             ticket_seq: 0,
         }
     }
@@ -333,12 +330,12 @@ impl<S: Store> Bridge<S> {
         let mut records = self.pending_records(&pending.device, &pending.room, &account)?;
 
         let mut delivered = BTreeSet::new();
+        let cursor = Cursor::new(pending.device.clone(), pending.room.clone());
         for record in &mut records {
-            let key = (pending.device.clone(), pending.room.clone(), record.id);
-            let count = self.deliveries.entry(key).or_insert(0);
-            *count += 1;
-            if *count > 1 {
-                record.redelivery = Some(*count);
+            // 计数落在存储里：重启之后同一个 N 接着数，不然看着像从没投过。
+            let count = self.store.count_delivery(&cursor, record.id)?;
+            if count > 1 {
+                record.redelivery = Some(count);
                 // 「第 N 次投递」和「怎么让它别再重投」必须跟着记录一起到模型眼前。
                 // 这件事放在桥里做，不指望每个 harness 都记得补：harness 的职责只是
                 // 把 records 塞进上下文，多一句话都不该由它发明（ADR-0010）。
@@ -347,7 +344,7 @@ impl<S: Store> Bridge<S> {
                 // 系统的旁白混进去会让人（和模型）以为是对方打的字。
                 record.note = Some(format!(
                     "第 {} 次投递；调 ack_messages 确认 #{} 之后就不再重复投递",
-                    *count, record.id
+                    count, record.id
                 ));
             }
             delivered.insert(record.id);
@@ -455,8 +452,7 @@ impl<S: Store> Bridge<S> {
         let cursor = Cursor::new(device, room.clone());
         let watermark = self.store.ack(&cursor, &ids).map_err(internal)?;
         for id in &ids {
-            self.deliveries
-                .remove(&(device.to_owned(), room.clone(), *id));
+            self.store.forget_delivery(&cursor, *id).map_err(internal)?;
         }
 
         Ok(json!({ "watermark": watermark }))

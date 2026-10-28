@@ -2,13 +2,11 @@
 //!
 //! 启动顺序：
 //! 1. 校验配置（不对就在启动时死掉，不带病运行）；
-//! 2. 给每个平台配一个适配器，拿到「发送端口」；
-//! 3. 建桥（配置 + 存储 + 一组发送端口）；
-//! 4. 每个适配器起一个守护线程，连不上就等一会儿再连；
-//! 5. 起接入点，等 harness 连进来。
-//!
-//! 现在存储还是内存实现：进程一退，流水和笔记就没了。SQLite 那一批补上之前，别拿它存
-//! 重要的东西。
+//! 2. 打开状态库（流水、水位、笔记、投递计数都在里面，重启接着用）；
+//! 3. 给每个平台配一个适配器，拿到「发送端口」；
+//! 4. 建桥（配置 + 存储 + 一组发送端口）；
+//! 5. 每个适配器起一个守护线程，连不上就等一会儿再连；
+//! 6. 起接入点，等 harness 连进来。
 
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use qqab_adapter_onebot11::{LinkSlot, OneBotOutbound, supervise};
-use qqab_kernel::{Bridge, Config, MemoryStore, Outbounds, serve};
+use qqab_kernel::{Bridge, Config, Outbounds, SqliteStore, serve};
 
 fn main() -> ExitCode {
     match run() {
@@ -40,6 +38,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // 先开库：库打不开就别往下走。宁可起不来，也别用内存悄悄跑起来——
+    // 那样它看着一切正常，直到你重启才发现什么都没留下。
+    let store = SqliteStore::open(&config.storage.path)?;
+    let counts = store.counts()?;
+    println!(
+        "状态库：{}（已有 {} 条记录、{} 个房间、{} 条笔记）",
+        config.storage.path, counts.records, counts.rooms, counts.notes
+    );
+
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // 每条平台连接先占一个发送口，桥建好之后再起守护线程去连。
@@ -56,7 +63,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let bridge = Arc::new(Mutex::new(Bridge::new(
         config.clone(),
-        MemoryStore::new(),
+        store,
         Box::new(outbounds),
     )));
 

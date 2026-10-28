@@ -20,7 +20,7 @@
 | harness 适配器（DSH / Trae / Codex…） | 没写，判断方法见 [docs/06](docs/06-harness-adapters.md) |
 | QQ 适配器（OneBot 11） | 可用：群与私聊收发、拍一拍、其它平台事件，断线自动重连 |
 | Discord / KOOK / Telegram | 没写 |
-| 存储 | **内存实现**：进程一退，流水和笔记就没了。SQLite 还没做 |
+| 存储 | 可用：SQLite 落盘，重启接着上次的账做（编号、水位、笔记、投递次数都在） |
 | Web 管理页 | 没做，现在改配置要改文件重启 |
 | `wait_message`（阻塞等新消息） | 没做 |
 | 时钟策略（房间安静时例行检查） | 没做 |
@@ -42,6 +42,9 @@ cargo run -p qqab-bridge -- --config config.toml
 # 4. 另开一个终端，接一个最小 harness（真 harness 还没接）
 cargo run -p qqab-bridge --bin dev-harness -- --token <配置里设备的 token>
 ```
+
+第一次起桥会在工作目录建 `state/qqab.db`：流水、水位、笔记、「第几次投递」全在里面，
+重启接着用。删了等于失忆（但不会起不来）。细节见 [docs/07-storage.md](docs/07-storage.md)。
 
 要用真的 opencode 接进来，把插件放进它的插件目录：
 
@@ -76,6 +79,7 @@ QQ 这一侧需要 OneBot 11 实现（NapCat / Lagrange / go-cqhttp 等）开出
 | [docs/04-protocol.md](docs/04-protocol.md) | 桥与 harness 之间的协议 |
 | [docs/05-adapters.md](docs/05-adapters.md) | 适配器：房间写法、事件与元素映射、限制 |
 | [docs/06-harness-adapters.md](docs/06-harness-adapters.md) | harness 适配器：两半能力、各家怎么接、opencode 那一份怎么用 |
+| [docs/07-storage.md](docs/07-storage.md) | 状态库：每张表干什么、怎么查、怎么备份、已知限制 |
 | [docs/adr/](docs/adr/) | 决策记录，每条标「用户裁定」或「实现默认」 |
 
 ## 验证

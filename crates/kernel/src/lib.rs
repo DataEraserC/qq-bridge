@@ -11,15 +11,15 @@ pub mod storage;
 pub mod tools;
 
 pub use config::{
-    AdapterConfig, Config, Device, EndpointConfig, KNOWN_ADAPTERS, Subscription, WakeDecision,
-    WakeInput, WakePolicy,
+    AdapterConfig, Config, DEFAULT_STORAGE_PATH, Device, EndpointConfig, KNOWN_ADAPTERS,
+    StorageConfig, Subscription, WakeDecision, WakeInput, WakePolicy,
 };
 pub use endpoint::{EndpointError, Session, handshake, run_connection, serve};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY};
 pub use outbound::{Outbound, OutboundError, Outbounds, Sent};
 pub use storage::{
-    Cursor, MemoryStore, Note, NoteKey, NoteKind, Notes, RecordDraft, StorageError, Store,
-    TopicStatus, Transcript, Watermarks, unread,
+    Counts, Cursor, Deliveries, MemoryStore, Note, NoteKey, NoteKind, Notes, RecordDraft,
+    SCHEMA_VERSION, SqliteStore, StorageError, Store, TopicStatus, Transcript, Watermarks, unread,
 };
 pub use tools::TOOL_NAMES;
 

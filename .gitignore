@@ -11,6 +11,10 @@ config.toml
 *.log
 *.bak
 *.bak-*
+# 状态库（含 WAL 的伴生文件）
+*.db
+*.db-wal
+*.db-shm
 
 # 编辑器与本地环境
 .direnv/
