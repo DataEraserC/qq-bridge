@@ -412,7 +412,13 @@ export function normalizeToolArgs(tool, args = {}) {
           "send_message_to 要写 to，形如 qq:group/12345；只能是这个设备订阅过的房间",
         )
       }
-      return { elements: elementsOf(given), to: given.to }
+      // 同一房间被本组多台设备订阅时，`device` 用来指明用谁的身份说。
+      // 这不是提权：桥会核对它落不落在这把令牌代表的那组设备里。
+      const wire = { elements: elementsOf(given), to: given.to }
+      if (typeof given.device === "string" && given.device.trim()) {
+        wire.device = given.device.trim()
+      }
+      return wire
     }
     case "ack_messages": {
       const ids = Array.isArray(given.ids) ? given.ids : []

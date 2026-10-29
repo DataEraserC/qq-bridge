@@ -1008,6 +1008,136 @@ mod tests {
     }
 
     #[test]
+    fn keywords_can_wake() {
+        let policy = WakePolicy {
+            keywords: vec!["桥".into()],
+            accumulate: None,
+            ..WakePolicy::default()
+        };
+        // 关掉攒条数，避免它把「没命中关键词」也判成醒。
+        let hit = WakeInput {
+            sender_id: "someone",
+            text: "这个桥能不能重启一下",
+            at_self: false,
+            reply_to_self: false,
+            event: None,
+            unread: 1,
+        };
+        let miss = WakeInput {
+            text: "今天天气不错",
+            ..hit
+        };
+        assert_eq!(policy.decide(&hit), WakeDecision::Wake);
+        assert_eq!(policy.decide(&miss), WakeDecision::Stay);
+    }
+
+    #[test]
+    fn accumulating_enough_messages_wakes() {
+        let policy = WakePolicy {
+            accumulate: Some(3),
+            ..WakePolicy::default()
+        };
+        let input = WakeInput {
+            sender_id: "someone",
+            text: "闲聊",
+            at_self: false,
+            reply_to_self: false,
+            event: None,
+            unread: 2,
+        };
+        assert_eq!(policy.decide(&input), WakeDecision::Stay);
+
+        let enough = WakeInput { unread: 3, ..input };
+        assert_eq!(policy.decide(&enough), WakeDecision::Wake);
+    }
+
+    #[test]
+    fn accumulate_off_means_no_waiting_for_a_number() {
+        let policy = WakePolicy {
+            accumulate: None,
+            ..WakePolicy::default()
+        };
+        let input = WakeInput {
+            sender_id: "someone",
+            text: "闲聊",
+            at_self: false,
+            reply_to_self: false,
+            event: None,
+            unread: 999,
+        };
+        // 不看条数：攒再多也不醒，得靠 @ / 引用 / 关键词这些。
+        assert_eq!(policy.decide(&input), WakeDecision::Stay);
+    }
+
+    #[test]
+    fn name_mention_wakes_only_when_names_configured() {
+        let without_names = WakePolicy {
+            accumulate: None,
+            ..WakePolicy::default()
+        };
+        let input = WakeInput {
+            sender_id: "someone",
+            text: "小桥你说说看",
+            at_self: false,
+            reply_to_self: false,
+            event: None,
+            unread: 1,
+        };
+        // 没配昵称就等于没法点名：默认开着也不能凭空认出一个名字。
+        assert_eq!(without_names.decide(&input), WakeDecision::Stay);
+
+        let with_names = WakePolicy {
+            names: vec!["小桥".into()],
+            ..without_names
+        };
+        assert_eq!(with_names.decide(&input), WakeDecision::Wake);
+    }
+
+    #[test]
+    fn poke_wakes_only_when_it_targets_me() {
+        let policy = WakePolicy::default();
+        let aimed = WakeInput {
+            sender_id: "someone",
+            text: "",
+            at_self: true,
+            reply_to_self: false,
+            event: Some("poke"),
+            unread: 1,
+        };
+        let elsewhere = WakeInput {
+            at_self: false,
+            ..aimed
+        };
+        assert_eq!(policy.decide(&aimed), WakeDecision::Wake);
+        // 拍别人不该把我也吵起来。
+        assert_eq!(policy.decide(&elsewhere), WakeDecision::Stay);
+
+        let deaf = WakePolicy {
+            poke: false,
+            ..policy
+        };
+        assert_eq!(deaf.decide(&aimed), WakeDecision::Stay);
+    }
+
+    #[test]
+    fn plain_chatter_stays_quiet_under_the_default_policy() {
+        let policy = WakePolicy {
+            accumulate: None,
+            ..WakePolicy::default()
+        };
+        let input = WakeInput {
+            sender_id: "someone",
+            text: "群里日常闲聊",
+            at_self: false,
+            reply_to_self: false,
+            event: None,
+            unread: 1,
+        };
+        // 默认策略不能变成「谁说话都回」，否则群里没法待。
+        assert_eq!(policy.decide(&input), WakeDecision::Stay);
+    }
+
+    #[test]
     fn ignored_speaker_never_wakes() {
         let policy = WakePolicy {
             ignore_speakers: vec!["noisy".into()],

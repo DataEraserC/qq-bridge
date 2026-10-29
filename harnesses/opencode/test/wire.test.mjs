@@ -295,6 +295,22 @@ test("发到别的房间必须有 to", () => {
   assert.throws(() => normalizeToolArgs("send_message_to", { text: "喂" }), /要写 to/)
 })
 
+test("房间撞本组多台设备时，可以指明用谁的身份说", () => {
+  assert.deepEqual(
+    normalizeToolArgs("send_message_to", {
+      to: "qq:group/1",
+      device: "helper",
+      text: "喂",
+    }),
+    { elements: [{ type: "text", text: "喂" }], to: "qq:group/1", device: "helper" },
+  )
+  // 没撞车就别带：桥看参数里多出 device 会以为要切身份。
+  assert.deepEqual(normalizeToolArgs("send_message_to", { to: "qq:group/1", text: "喂" }), {
+    elements: [{ type: "text", text: "喂" }],
+    to: "qq:group/1",
+  })
+})
+
 test("确认的编号必须是整数，空的不算", () => {
   assert.deepEqual(normalizeToolArgs("ack_messages", { ids: [1, 2] }), {
     ids: [1, 2],
