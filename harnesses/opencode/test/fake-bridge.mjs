@@ -11,8 +11,7 @@ export const TICKET = "main-1"
 export function delivery(overrides = {}) {
   return {
     ticket: TICKET,
-    device: "main",
-    memory: "main-memory",
+    session: "main",
     room: { connection: "qq", path: ["group", "158296748"] },
     reason: "wake",
     records: [
@@ -31,8 +30,8 @@ export function delivery(overrides = {}) {
 }
 
 export class FakeBridge {
-  constructor({ devices = ["main"], token = "t-main" } = {}) {
-    this.devices = devices
+  constructor({ sessions = ["main"], token = "t-main" } = {}) {
+    this.sessions = sessions
     this.token = token
     this.frames = []
     this.socket = null
@@ -72,7 +71,7 @@ export class FakeBridge {
   async #greet() {
     const hello = await this.lines.next()
     this.hello = hello
-    this.#write({ frame: "ready", devices: this.devices })
+    this.#write({ frame: "ready", sessions: this.sessions })
   }
 
   async next() {

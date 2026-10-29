@@ -4,14 +4,16 @@
 // 关键点：`package` 直接指向仓库里的目录，不要拷贝到 ~/.config/opencode/plugins/。
 // 本机是 NixOS（根目录是 tmpfs），只有仓库是可靠的持久位置。
 //
-// 令牌在 config.toml 的 [[devices]] 里，和设备那一节的 token 一致。
+// 令牌在 config.toml 的 [[sessions]] 里，和会话那一节的 token 一致；harness 要和
+// 会话配置里的 harness 名对得上（这里是 opencode）。
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
       "package": "/path/to/agent-chat-bridge/harnesses/opencode/plugin",
       "options": {
-        "token": "<设备令牌，见 config.toml>",
+        "token": "<会话令牌，见 config.toml>",
+        "harness": "opencode",
         "endpoint": "127.0.0.1:7700"
       }
     }

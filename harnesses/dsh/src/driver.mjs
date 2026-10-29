@@ -2,7 +2,7 @@
 //
 //   1. 作为 acb 桥的客户端（BridgeLink，复用 opencode 的 acb-wire.mjs）：
 //      连桥、被推 turn_start、发 tool_call、回 turn_end。
-//   2. 作为 MCP server（stdio）：被 dsh 的 dsh-mcp-client 拉起，暴露桥上九个工具，
+//   2. 作为 MCP server（stdio）：被 dsh 的 dsh-mcp-client 拉起，暴露桥上的工具，
 //      工具名在 dsh 那边变成 mcp__<serverName>__<tool>。
 //   3. 作为 dsh 的客户端（DshClient）：调 dsh webui 的 HTTP/WS API 驱动会话，
 //      session/prompt 投话、session/follow 等 turn/end。
@@ -62,7 +62,7 @@ async function main() {
     onTurn: (delivery) => driver.run(delivery, link),
   })
 
-  // MCP server：暴露九个工具，工具调用转成 tool_call（带当前 ticket）。
+  // MCP server：暴露桥上的工具，工具调用转成 tool_call（带当前 ticket）。
   const mcp = new McpServer({
     name: "acb",
     version: "0.1.0",
@@ -78,7 +78,7 @@ async function main() {
   // 桥是独立的 TCP 连接，可以现在就连；MCP 的 stdio 由 dsh 拉起时接管。
   void link
     .connect()
-    .then(() => log("info", `已接入桥，绑定设备组 ${link.devices.join("、")}`))
+    .then(() => log("info", `已接入桥，绑定会话组 ${link.sessions.join("、")}`))
     .catch((error) => log("warn", `暂时连不上桥：${error.message}，会一直重试`))
 
   // stdio 挂上（dsh 拉起本进程时，stdin/stdout 已经就位）。
@@ -101,7 +101,7 @@ class TurnDriver {
   constructor({ dsh, log }) {
     this.dsh = dsh
     this.log = log
-    this.sessions = new Map() // memory -> sessionId
+    this.sessions = new Map() // acb session id -> dsh sessionId
     this.chain = Promise.resolve()
   }
 
@@ -114,7 +114,7 @@ class TurnDriver {
   async #one(delivery, link) {
     let failure = null
     try {
-      const sessionId = await this.#session(delivery.memory ?? delivery.device)
+      const sessionId = await this.#session(delivery.session)
       const text = renderTurn(delivery)
       this.log(
         "debug",
@@ -126,7 +126,7 @@ class TurnDriver {
     } catch (error) {
       failure = error?.message ?? String(error)
       this.log("error", `这一轮失败了：${failure}`)
-      this.sessions.delete(delivery.memory ?? delivery.device)
+      this.sessions.delete(delivery.session)
     } finally {
       try {
         link.endTurn(delivery.ticket, failure)
@@ -137,16 +137,16 @@ class TurnDriver {
   }
 
   /**
-   * 这份记忆的会话：记住的 > 新建。dsh 的 sessionId 我们存内存里；进程重启会
+   * 这个会话的 dsh 会话：记住的 > 新建。dsh 的 sessionId 我们存内存里；进程重启会
    * 丢，但 dsh 那边会话还活着，下次可以用 session/list 按标题找回（先做简单的：
    * 内存缓存 + 进程内复用）。
    */
-  async #session(memory) {
-    const cached = this.sessions.get(memory)
+  async #session(session) {
+    const cached = this.sessions.get(session)
     if (cached) return cached
-    const sessionId = await this.dsh.createSession(`acb:${memory}`)
-    this.sessions.set(memory, sessionId)
-    this.log("info", `新 dsh 会话 ${sessionId}（acb:${memory}）`)
+    const sessionId = await this.dsh.createSession(`acb:${session}`)
+    this.sessions.set(session, sessionId)
+    this.log("info", `新 dsh 会话 ${sessionId}（acb:${session}）`)
     return sessionId
   }
 

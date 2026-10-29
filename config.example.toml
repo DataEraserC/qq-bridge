@@ -27,6 +27,11 @@ listen = "127.0.0.1:7700"
 # 备份就是拷这个文件；删了等于失忆，但桥不会因此起不来。
 path = "state/acb.db"
 
+# worktree 根目录：每个「会话 × 记忆」的 worktree 都 checkout 到这里，
+# 按「根/记忆id/会话id」分层。不配就用 state/worktrees。
+# 桥只负责第一次把 worktree 建出来，之后文件读写和 git 操作全交给 harness。
+worktrees_root = "state/worktrees"
+
 [retention]
 # 旧流水什么时候可以删。只削**已经读过**的那一段：任何在册会话还没读到的记录，
 # 一条都不删。两项写 0 就是不作任何清理（库只增不减）。

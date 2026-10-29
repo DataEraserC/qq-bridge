@@ -39,6 +39,7 @@ export default {
     const link = new BridgeLink({
       endpoint: config.endpoint,
       token: config.token,
+      harness: config.harness,
       log,
       onTurn: (delivery) => driver.run(delivery, link),
     })
@@ -59,7 +60,7 @@ export default {
 
     void link
       .connect()
-      .then(() => log("info", `已接入桥，绑定设备组 ${link.devices.join("、")}`))
+      .then(() => log("info", `已接入桥，绑定会话组 ${link.sessions.join("、")}`))
       .catch((error) => log("warn", `暂时连不上桥：${error.message}，会一直重试`))
 
     return async () => {
@@ -103,7 +104,7 @@ class TurnDriver {
     this.log = log
     this.pinned = pinned || ""
     this.sessions = new Map()
-    /** 串行链：同一设备本来就串行，这里再兜一层，免得两轮叠在一起。 */
+    /** 串行链：同一会话本来就串行，这里再兜一层，免得两轮叠在一起。 */
     this.chain = Promise.resolve()
   }
 
@@ -116,7 +117,7 @@ class TurnDriver {
   async #one(delivery, link) {
     let failure = null
     try {
-      const sessionID = await this.#session(delivery.memory ?? delivery.device)
+      const sessionID = await this.#session(delivery.session)
       const text = renderTurn(delivery) + CODE_MODE_HINT
       this.log(
         "debug",
@@ -131,7 +132,7 @@ class TurnDriver {
       failure = error?.message ?? String(error)
       this.log("error", `这一轮失败了：${failure}`)
       // 会话可能被删了：下次重建，别一直往一个死会话里灌。
-      this.#forget(delivery.memory ?? delivery.device)
+      this.#forget(delivery.session)
     } finally {
       try {
         link.endTurn(delivery.ticket, failure)
@@ -142,28 +143,28 @@ class TurnDriver {
   }
 
   /**
-   * 这份记忆的会话：钉死的 > 记住的 > 新建。
+   * 这个会话的 opencode 会话：钉死的 > 记住的 > 新建。
    *
-   * 记忆就是 agent 侧的会话：桥按记忆串行、按记忆投递，这里也必须按记忆找会话。
-   * 两台设备共用一份记忆时，它们本来就该落在同一个会话里。所以重开 opencode 要能
-   * 接上上次那条——v2 没有「按标题列会话」，把会话 id 存进插件自己的 storage。
+   * 串行键是会话（ADR-0017），这里按会话 id 找/建 opencode 会话，保证同一会话
+   * 的轮次都落在同一条 opencode 会话里。重开 opencode 要能接上上次那条——v2 没有
+   * 「按标题列会话」，把会话 id 存进插件自己的 storage。
    */
-  async #session(memory) {
+  async #session(session) {
     if (this.pinned) return this.pinned
 
     // 缓存里的也要确认还活着：用户可能在 opencode 里把会话删了。
-    const cached = this.sessions.get(memory)
+    const cached = this.sessions.get(session)
     if (cached && (await this.#alive(cached))) return cached
-    if (cached) this.#forget(memory)
+    if (cached) this.#forget(session)
 
-    const stored = await this.#storageGet(`session:${memory}`)
+    const stored = await this.#storageGet(`session:${session}`)
     if (stored && (await this.#alive(stored))) {
-      this.sessions.set(memory, stored)
-      this.log("info", `接上会话 ${stored}（acb:${memory}）`)
+      this.sessions.set(session, stored)
+      this.log("info", `接上会话 ${stored}（acb:${session}）`)
       return stored
     }
 
-    const created = await this.ctx.session.create({ title: `acb:${memory}` })
+    const created = await this.ctx.session.create({ title: `acb:${session}` })
     const id =
       created?.id ??
       created?.sessionID ??
@@ -174,15 +175,15 @@ class TurnDriver {
         `建会话没拿到 id，opencode 的返回形状可能变了：${JSON.stringify(created).slice(0, 200)}`,
       )
     }
-    this.sessions.set(memory, id)
-    await this.#storageSet(`session:${memory}`, id)
-    this.log("info", `新会话 ${id}（acb:${memory}）`)
+    this.sessions.set(session, id)
+    await this.#storageSet(`session:${session}`, id)
+    this.log("info", `新会话 ${id}（acb:${session}）`)
     return id
   }
 
-  #forget(memory) {
-    this.sessions.delete(memory)
-    void this.#storageSet(`session:${memory}`, null)
+  #forget(session) {
+    this.sessions.delete(session)
+    void this.#storageSet(`session:${session}`, null)
   }
 
   async #alive(sessionID) {
@@ -274,18 +275,14 @@ ${ELEMENTS_DOC}
   },
   {
     name: "send_message_to",
-    description: `发到另一个房间（比如私聊汇报到群里）。参数和 send_message 一样，只多一个 to。
+    description: `发到另一个房间。参数和 send_message 一样，只多一个 to。
 to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/323622442。
-只能发到「你这组设备订阅过的房间」——订阅表在桥的配置里，改不了也不该改。
-同一个房间被本组两台设备都订了时，要用 device 指明用谁的身份说。`,
+只能发到「当前会话订阅过的房间」——订阅表在桥的配置里，改不了也不该改。
+跨会话发送已经砍掉：你不能替别的人格/会话发言。`,
     input: {
       type: "object",
       properties: {
         to: { type: "string", description: "目标房间，形如 qq:group/12345" },
-        device: {
-          type: "string",
-          description: "用哪台设备的身份说；只在目标房间被本组多台设备订阅时才需要",
-        },
         elements: ELEMENTS_SCHEMA,
         text: TEXT_SCHEMA,
       },
@@ -330,7 +327,7 @@ ids 就是投递记录前面的编号。`,
   {
     name: "list_rooms",
     description:
-      "你这组设备订阅了哪些房间、各自未读多少。想发消息前先看能发到哪（一行一台设备的视角）。",
+      "这个会话订阅了哪些房间、各自未读多少。想发消息前先看能发到哪。",
     input: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -395,6 +392,154 @@ ids 就是投递记录前面的编号。`,
       additionalProperties: false,
     },
   },
+  {
+    name: "memory_read",
+    description: `读记忆仓库里的一个文件。memory 是记忆 id（投递里的 memories 字段列了
+本会话能碰哪些），path 是 worktree 内的相对路径。`,
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对 worktree 的路径" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_write",
+    description: `写记忆仓库里的一个文件（覆盖）。memory 是记忆 id，path 是相对路径，
+content 是内容。父目录不存在会自动建。`,
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对 worktree 的路径" },
+        content: { type: "string", description: "要写的内容" },
+      },
+      required: ["memory", "path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_list",
+    description: "列记忆仓库里某个目录下的条目。memory 是记忆 id，path 默认仓库根。",
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对路径，默认根" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_search",
+    description: "在记忆仓库里搜文本（grep）。返回命中行「文件:行号:内容」。",
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "搜索起点，默认仓库根" },
+        needle: { type: "string", description: "要搜的关键字" },
+      },
+      required: ["memory", "needle"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_status",
+    description: "看记忆仓库的 git 状态（哪些文件改过、新增、删除）。",
+    input: {
+      type: "object",
+      properties: { memory: { type: "string", description: "记忆 id" } },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_log",
+    description: "看记忆仓库最近的提交记录。",
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        limit: { type: "number", description: "看最近几条，默认 10" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_diff",
+    description: "看记忆仓库工作区相对最近提交的改动。",
+    input: {
+      type: "object",
+      properties: { memory: { type: "string", description: "记忆 id" } },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_blame",
+    description: "查记忆仓库里某个文件每一行是谁改的。",
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对路径" },
+      },
+      required: ["memory", "path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_add",
+    description: "暂存记忆仓库的改动。path 留空表示暂存全部。",
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对路径，留空=全部" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_commit",
+    description: "提交记忆仓库已暂存的改动。",
+    input: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        message: { type: "string", description: "提交信息" },
+      },
+      required: ["memory", "message"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_push",
+    description: "推送记忆仓库到默认远端（origin）。",
+    input: {
+      type: "object",
+      properties: { memory: { type: "string", description: "记忆 id" } },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_branch",
+    description: "列出记忆仓库的本地分支。",
+    input: {
+      type: "object",
+      properties: { memory: { type: "string", description: "记忆 id" } },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
 ]
 
 function readConfig(ctx) {
@@ -408,6 +553,10 @@ function readConfig(ctx) {
       (typeof options.token === "string" && options.token.trim()) ||
       process.env.ACB_TOKEN?.trim() ||
       "",
+    harness:
+      (typeof options.harness === "string" && options.harness.trim()) ||
+      process.env.ACB_HARNESS?.trim() ||
+      "opencode",
     session:
       (typeof options.session === "string" && options.session.trim()) || "",
   }

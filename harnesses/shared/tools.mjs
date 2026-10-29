@@ -1,5 +1,5 @@
-// 桥上的九个工具，名字、给人看的话、JSON Schema 都在这里。opencode 和 dsh
-// 两个 harness 都从这里拿，保证工具面不漂移。
+// 桥上的工具（消息工具 + 记忆工具），名字、给人看的话、JSON Schema 都在这里。
+// opencode 和 dsh 两个 harness 都从这里拿，保证工具面不漂移。
 //
 // schema 是 JSON Schema，两个 harness 各自适配字段名：
 //   opencode v2 用 `input`，dsh 的 MCP 用 `inputSchema`。
@@ -28,7 +28,7 @@ const ROOM_SCHEMA = {
   description: "房间，形如 qq:group/123；不填就是当前轮次的房间",
 }
 
-/** 九个工具。`schema` 是 JSON Schema，`name`/`description` 是给模型看的。 */
+/** 全部工具。`schema` 是 JSON Schema，`name`/`description` 是给模型看的。 */
 export const TOOLS = [
   {
     name: "send_message",
@@ -43,18 +43,14 @@ ${ELEMENTS_DOC}
   },
   {
     name: "send_message_to",
-    description: `发到另一个房间（比如私聊汇报到群里）。参数和 send_message 一样，只多一个 to。
+    description: `发到另一个房间。参数和 send_message 一样，只多一个 to。
 to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/323622442。
-只能发到「你这组设备订阅过的房间」——订阅表在桥的配置里，改不了也不该改。
-同一个房间被本组两台设备都订了时，要用 device 指明用谁的身份说。`,
+只能发到「当前会话订阅过的房间」——订阅表在桥的配置里，改不了也不该改。
+跨会话发送已经砍掉：你不能替别的人格/会话发言。`,
     schema: {
       type: "object",
       properties: {
         to: { type: "string", description: "目标房间，形如 qq:group/12345" },
-        device: {
-          type: "string",
-          description: "用哪台设备的身份说；只在目标房间被本组多台设备订阅时才需要",
-        },
         elements: ELEMENTS_SCHEMA,
         text: TEXT_SCHEMA,
       },
@@ -152,6 +148,162 @@ ids 就是投递记录前面的编号。`,
         room: ROOM_SCHEMA,
         limit: { type: "number", description: "最多几条，默认 20" },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_read",
+    description: `读记忆仓库里的一个文件。memory 是记忆 id（投递里的 memories 字段列了
+本会话能碰哪些），path 是 worktree 内的相对路径。`,
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对 worktree 的路径，如 shared.md 或 notes/foo.md" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_write",
+    description: `写记忆仓库里的一个文件（覆盖）。memory 是记忆 id，path 是相对路径，
+content 是内容。父目录不存在会自动建。`,
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对 worktree 的路径" },
+        content: { type: "string", description: "要写的内容" },
+      },
+      required: ["memory", "path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_list",
+    description: "列记忆仓库里某个目录下的条目。memory 是记忆 id，path 默认仓库根。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对路径，默认根" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_search",
+    description: "在记忆仓库里搜文本（grep）。返回命中行「文件:行号:内容」。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "搜索起点，默认仓库根" },
+        needle: { type: "string", description: "要搜的关键字" },
+      },
+      required: ["memory", "needle"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_status",
+    description: "看记忆仓库的 git 状态（哪些文件改过、新增、删除）。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_log",
+    description: "看记忆仓库最近的提交记录。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        limit: { type: "number", description: "看最近几条，默认 10" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_diff",
+    description: "看记忆仓库工作区相对最近提交的改动。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_blame",
+    description: "查记忆仓库里某个文件每一行是谁改的。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对路径" },
+      },
+      required: ["memory", "path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_add",
+    description: "暂存记忆仓库的改动。path 留空表示暂存全部。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        path: { type: "string", description: "相对路径，留空=全部" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_commit",
+    description: "提交记忆仓库已暂存的改动。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+        message: { type: "string", description: "提交信息" },
+      },
+      required: ["memory", "message"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_push",
+    description: "推送记忆仓库到默认远端（origin）。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+      },
+      required: ["memory"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "memory_git_branch",
+    description: "列出记忆仓库的本地分支。",
+    schema: {
+      type: "object",
+      properties: {
+        memory: { type: "string", description: "记忆 id" },
+      },
+      required: ["memory"],
       additionalProperties: false,
     },
   },

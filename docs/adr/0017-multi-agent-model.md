@@ -130,7 +130,24 @@
   原则，具体 `type` 值和接口签名实现时再细化（用户裁定：记忆不该只有 git 一种形式）。git 这一种的
   接口形态已定：**文件 + git 两层直接交给 harness、读写自然分列、桥只管路径与 worktree**；其它
   `type` 是否也沿用「把底层能力透出去」的思路，实现到那一步再定。
-- 本次为架构决策，未动代码；实现排期待用户拍板。
+
+## 实现记录（2026-10-30）
+
+- 会话模型改造（device → 四对象）已落地：config 拆 Persona/Memory/Session，串行键改
+  「harness 名 + 会话 id」，`send_message_to` 收缩为本会话订阅集，协议 v2→v3（hello 加
+  harness、delivery 的 device/memory 合并成 session），水位键 device→session，schema 3→4。
+- 记忆接口（git 实现）已落地：
+  - `Memory.location` = 裸 git 仓库路径，桥用 git2 库 `init --bare` 就位（空仓库）。
+  - 配置加 `worktrees_root`（默认 `state/worktrees`），每个「会话 × 记忆」的 worktree 路径
+    固定为 `根/记忆id/会话id`。
+  - 惰性初始化 + 幂等：worktree 存在且有效就复用，异常就报错，不存在才 checkout；空裸仓库
+    （HEAD unborn）直接 `init` 成独立仓库（无历史可共享）。
+  - 文件 + git 工具加进桥的工具清单（`memory_read/write/list/search` + `memory_git_*`），
+    走现有 `tool_call` 帧、带 ticket；每个工具带 `memory` 参数指认操作哪个仓库；所有路径
+    锁死在 worktree 内，`..`/绝对路径越界一律拒绝。
+  - `Delivery` 加 `memories` 字段（id + worktree 路径），投递时带给 harness。
+  - git 的写（add/commit/push/branch）完整放开给 harness，桥只做「第一次建 worktree」；
+    commit 无 user.name/user.email 时用桥固定身份兜底。
 
 ## 参考
 

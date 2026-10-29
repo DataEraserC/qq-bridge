@@ -6,14 +6,16 @@
 pub mod config;
 pub mod endpoint;
 pub mod engine;
+pub mod memory;
 pub mod outbound;
 pub mod storage;
 pub mod tools;
 
 pub use config::{
     Config, Connection, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM, DEFAULT_STORAGE_PATH,
-    EndpointConfig, KNOWN_ADAPTERS, KNOWN_MEMORY_KINDS, Memory, Persona, RetentionConfig, Session,
-    StorageConfig, Subscription, Transport, WakeDecision, WakeInput, WakePolicy,
+    DEFAULT_WORKTREES_ROOT, EndpointConfig, KNOWN_ADAPTERS, KNOWN_MEMORY_KINDS, Memory, Persona,
+    RetentionConfig, Session, StorageConfig, Subscription, Transport, WakeDecision, WakeInput,
+    WakePolicy,
 };
 pub use endpoint::{Conn, EndpointError, handshake, run_connection, serve};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY, Pruned};

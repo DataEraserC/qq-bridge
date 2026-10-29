@@ -30,6 +30,11 @@ pub const DEFAULT_MAX_RECORDS_PER_ROOM: u64 = 5000;
 /// 没配「留多少天」时的默认值。来源：实现默认。
 pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
 
+/// 没配 worktree 根目录时的默认值：工作目录下的 `state/worktrees`。
+/// 来源：实现默认。放 `state/` 是因为那里已经在 .gitignore 里。
+/// 每个「会话 × 记忆」的 worktree 按 `根/记忆id/会话id` 分层，路径固定才谈得上幂等。
+pub const DEFAULT_WORKTREES_ROOT: &str = "state/worktrees";
+
 /// 整份配置。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -47,6 +52,8 @@ pub struct Config {
     pub storage: StorageConfig,
     /// 流水保留：旧记录什么时候可以删。
     pub retention: RetentionConfig,
+    /// 记忆 worktree 的根目录。每个「会话 × 记忆」checkout 到这下面。
+    pub worktrees_root: String,
 }
 
 /// 流水保留策略。
@@ -390,6 +397,8 @@ pub enum ConfigError {
     EmptyAccount { connection: String },
     #[error("存储路径不能为空（不配就用默认的 {DEFAULT_STORAGE_PATH}）")]
     EmptyStoragePath,
+    #[error("worktree 根目录不能为空（不配就用默认的 {DEFAULT_WORKTREES_ROOT}）")]
+    EmptyWorktreesRoot,
 }
 
 impl Config {
@@ -421,6 +430,17 @@ impl Config {
                 max_age_days: raw.max_age_days.unwrap_or(DEFAULT_MAX_AGE_DAYS),
             },
             None => RetentionConfig::default(),
+        };
+
+        let worktrees_root = match raw.worktrees_root {
+            Some(raw) => {
+                let root = raw.trim().to_owned();
+                if root.is_empty() {
+                    return Err(ConfigError::EmptyWorktreesRoot);
+                }
+                root
+            }
+            None => DEFAULT_WORKTREES_ROOT.to_owned(),
         };
 
         let endpoint = match raw.endpoint {
@@ -610,6 +630,7 @@ impl Config {
             connections,
             storage,
             retention,
+            worktrees_root,
         })
     }
 
@@ -827,6 +848,7 @@ struct RawConfig {
     connections: Vec<RawConnection>,
     storage: Option<RawStorage>,
     retention: Option<RawRetention>,
+    worktrees_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1155,6 +1177,18 @@ mod tests {
         let policy = WakePolicy::default();
         assert!(policy.at_mention && policy.reply && policy.name_mention && policy.poke);
         assert_eq!(policy.accumulate, Some(DEFAULT_ACCUMULATE));
+    }
+
+    #[test]
+    fn worktrees_root_defaults_and_can_be_overridden() {
+        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
+        assert_eq!(config.worktrees_root, DEFAULT_WORKTREES_ROOT);
+
+        // worktrees_root 是顶层字段，得放在任何 [[...]] 表格之前。
+        let with_root =
+            format!("worktrees_root = \"/srv/worktrees\"\n{ONE_CONNECTION}\n{ONE_SESSION}");
+        let config = Config::parse(&with_root).expect("能解析");
+        assert_eq!(config.worktrees_root, "/srv/worktrees");
     }
 
     #[test]

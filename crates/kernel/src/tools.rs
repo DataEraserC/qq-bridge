@@ -21,6 +21,20 @@ pub const TOOL_NAMES: &[&str] = &[
     "set_note",
     "del_note",
     "get_platform_events",
+    // 记忆：文件层
+    "memory_read",
+    "memory_write",
+    "memory_list",
+    "memory_search",
+    // 记忆：git 层
+    "memory_git_status",
+    "memory_git_log",
+    "memory_git_diff",
+    "memory_git_blame",
+    "memory_git_add",
+    "memory_git_commit",
+    "memory_git_push",
+    "memory_git_branch",
 ];
 
 /// 发给当前轮次房间的参数。
@@ -102,6 +116,64 @@ pub struct EventsArgs {
     pub room: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// 记忆工具公共参数：操作哪个记忆 + worktree 内的相对路径。
+///
+/// `memory` 是记忆 id（必填——一个会话可能引用多份记忆）；`path` 是相对 worktree 的
+/// 路径，空串或 `.` 表示仓库根。
+#[derive(Debug, Default, Deserialize)]
+pub struct MemoryArgs {
+    pub memory: String,
+    #[serde(default)]
+    pub path: String,
+}
+
+/// 写文件：`path` + `content`。
+#[derive(Debug, Deserialize)]
+pub struct MemoryWriteArgs {
+    pub memory: String,
+    pub path: String,
+    pub content: String,
+}
+
+/// 搜索：`path`（搜索起点）+ `needle`（关键字）。
+#[derive(Debug, Deserialize)]
+pub struct MemorySearchArgs {
+    pub memory: String,
+    #[serde(default)]
+    pub path: String,
+    pub needle: String,
+}
+
+/// git log：`limit` 条。
+#[derive(Debug, Default, Deserialize)]
+pub struct MemoryLogArgs {
+    pub memory: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// git add：`path` 空串表示暂存全部。
+#[derive(Debug, Default, Deserialize)]
+pub struct MemoryAddArgs {
+    pub memory: String,
+    #[serde(default)]
+    pub path: String,
+}
+
+/// git commit：`message` 提交信息。
+#[derive(Debug, Deserialize)]
+pub struct MemoryCommitArgs {
+    pub memory: String,
+    pub message: String,
+}
+
+/// git blame：`path` 必填。
+#[derive(Debug, Deserialize)]
+pub struct MemoryBlameArgs {
+    pub memory: String,
+    pub path: String,
 }
 
 /// 工具的真假判定：这个名字认识不认识。

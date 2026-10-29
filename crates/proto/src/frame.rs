@@ -34,6 +34,20 @@ pub struct Delivery {
     pub records: Vec<Record>,
     /// 为什么开这一轮。
     pub reason: TurnReason,
+    /// 这个会话引用的记忆：每份的 id + worktree 路径。harness 据此让 agent 操作记忆
+    /// （文件 + git），`memory_*` 工具用记忆 id 指认要碰哪一份。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<MemoryInfo>,
+}
+
+/// 一份记忆在本轮投递里的信息。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryInfo {
+    /// 记忆 id，`memory_*` 工具的 `memory` 参数用它。
+    pub id: String,
+    /// 这个会话在该记忆上的 worktree 路径（绝对路径）。agent 通过 `memory_*` 工具碰它，
+    /// 桥负责把路径锁死在 worktree 内。
+    pub worktree: String,
 }
 
 /// 开轮原因。
@@ -230,6 +244,7 @@ mod tests {
                 note: None,
             }],
             reason: TurnReason::Wake,
+            memories: Vec::new(),
         }
     }
 

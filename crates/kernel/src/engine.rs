@@ -17,21 +17,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
 use acb_proto::{
-    Delivery, Element, ErrorCode, Record, RecordKind, RoomId, Sender, Ticket, ToolError, TurnReason,
+    Delivery, Element, ErrorCode, MemoryInfo, Record, RecordKind, RoomId, Sender, Ticket,
+    ToolError, TurnReason,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::config::{Config, Session, WakeDecision, WakeInput, WakePolicy};
+use crate::memory::{
+    MemoryRepo, git_add, git_blame, git_branch, git_commit, git_diff, git_log, git_push,
+    git_status, list_dir, read_file, search, write_file,
+};
 use crate::outbound::{Outbound, OutboundError};
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
     TopicStatus, unread,
 };
 use crate::tools::{
-    AckArgs, DelNoteArgs, EventsArgs, HistoryArgs, NotesArgs, SendArgs, SendToArgs, SetNoteArgs,
-    is_known,
+    AckArgs, DelNoteArgs, EventsArgs, HistoryArgs, MemoryAddArgs, MemoryArgs, MemoryBlameArgs,
+    MemoryCommitArgs, MemoryLogArgs, MemorySearchArgs, MemoryWriteArgs, NotesArgs, SendArgs,
+    SendToArgs, SetNoteArgs, is_known,
 };
 
 /// 一轮最多投多少条。剩下的下一轮再投，免得一次塞爆上下文。
@@ -107,10 +113,13 @@ pub struct Bridge<S: Store> {
     /// 票 → 会话。票是开轮时签发的，收工作废。
     by_ticket: HashMap<Ticket, String>,
     ticket_seq: u64,
+    /// 记忆仓库管理器：负责裸仓库 init 与 worktree checkout。
+    memory: MemoryRepo,
 }
 
 impl<S: Store> Bridge<S> {
     pub fn new(config: Config, store: S, outbound: Box<dyn Outbound>) -> Self {
+        let memory = MemoryRepo::new(config.worktrees_root.clone());
         Self {
             config,
             store,
@@ -119,6 +128,7 @@ impl<S: Store> Bridge<S> {
             active: HashMap::new(),
             by_ticket: HashMap::new(),
             ticket_seq: 0,
+            memory,
         }
     }
 
@@ -390,6 +400,56 @@ impl<S: Store> Bridge<S> {
                 let args: EventsArgs = parse(args)?;
                 self.events(sessions, &room, args)
             }
+            // 记忆：文件层。
+            "memory_read" => {
+                let args: MemoryArgs = parse(args)?;
+                self.memory_read(&turn_session, args)
+            }
+            "memory_write" => {
+                let args: MemoryWriteArgs = parse(args)?;
+                self.memory_write(&turn_session, args)
+            }
+            "memory_list" => {
+                let args: MemoryArgs = parse(args)?;
+                self.memory_list(&turn_session, args)
+            }
+            "memory_search" => {
+                let args: MemorySearchArgs = parse(args)?;
+                self.memory_search(&turn_session, args)
+            }
+            // 记忆：git 层。
+            "memory_git_status" => {
+                let args: MemoryArgs = parse(args)?;
+                self.memory_git_status(&turn_session, args)
+            }
+            "memory_git_log" => {
+                let args: MemoryLogArgs = parse(args)?;
+                self.memory_git_log(&turn_session, args)
+            }
+            "memory_git_diff" => {
+                let args: MemoryArgs = parse(args)?;
+                self.memory_git_diff(&turn_session, args)
+            }
+            "memory_git_blame" => {
+                let args: MemoryBlameArgs = parse(args)?;
+                self.memory_git_blame(&turn_session, args)
+            }
+            "memory_git_add" => {
+                let args: MemoryAddArgs = parse(args)?;
+                self.memory_git_add(&turn_session, args)
+            }
+            "memory_git_commit" => {
+                let args: MemoryCommitArgs = parse(args)?;
+                self.memory_git_commit(&turn_session, args)
+            }
+            "memory_git_push" => {
+                let args: MemoryArgs = parse(args)?;
+                self.memory_git_push(&turn_session, args)
+            }
+            "memory_git_branch" => {
+                let args: MemoryArgs = parse(args)?;
+                self.memory_git_branch(&turn_session, args)
+            }
             other => Err(ToolError::new(
                 ErrorCode::ToolNotAllowed,
                 format!("没有这个工具：{other}"),
@@ -530,13 +590,41 @@ impl<S: Store> Bridge<S> {
             },
         );
 
+        // 把这个会话引用的记忆连同 worktree 路径一起带给 harness。惰性初始化：worktree
+        // 第一次用到才 checkout，之后复用。
+        let memories = self.session_memories(&pending.session);
+
         Ok(Delivery {
             ticket,
             session: pending.session,
             room: pending.room,
             records,
             reason: pending.reason,
+            memories,
         })
+    }
+
+    /// 会话引用的记忆列表（id + worktree 路径）。worktree 惰性 checkout，失败这一轮就
+    /// 开不成——记忆配错了要早点暴露，别让 harness 拿到一个碰不了的路径。
+    fn session_memories(&self, session: &str) -> Vec<MemoryInfo> {
+        let Some(session_cfg) = self.config.session(session) else {
+            return Vec::new();
+        };
+        session_cfg
+            .memories
+            .iter()
+            .filter_map(|memory_id| {
+                let memory = self.config.memory(memory_id)?;
+                let worktree = self
+                    .memory
+                    .ensure_worktree(&memory.location, memory_id, session)
+                    .ok()?;
+                Some(MemoryInfo {
+                    id: memory_id.clone(),
+                    worktree: worktree.display().to_string(),
+                })
+            })
+            .collect()
     }
 
     fn deliver_out(
@@ -789,6 +877,101 @@ impl<S: Store> Bridge<S> {
             Some(text) => resolve_room(text),
             None => Ok(turn_room.clone()),
         }
+    }
+
+    // ---- 记忆工具：文件层 ----
+
+    /// 定位当前会话在 `memory` 上的 worktree。校验「这个会话确实引用了该记忆」，
+    /// 并惰性初始化 worktree。
+    fn memory_worktree(
+        &self,
+        session: &str,
+        memory: &str,
+    ) -> Result<std::path::PathBuf, ToolError> {
+        let Some(session_cfg) = self.config.session(session) else {
+            return Err(ToolError::new(
+                ErrorCode::Internal,
+                format!("会话 {session} 不存在"),
+            ));
+        };
+        self.memory
+            .resolve_for(session, memory, &session_cfg.memories, &|memory_id| {
+                self.config.memory(memory_id).map(|m| m.location.clone())
+            })
+    }
+
+    fn memory_read(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let content = read_file(&worktree, &args.path)?;
+        Ok(json!({ "path": args.path, "content": content }))
+    }
+
+    fn memory_write(&self, session: &str, args: MemoryWriteArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        write_file(&worktree, &args.path, &args.content)?;
+        Ok(json!({ "path": args.path, "written": true }))
+    }
+
+    fn memory_list(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let entries = list_dir(&worktree, &args.path)?;
+        Ok(json!({ "path": args.path, "entries": entries }))
+    }
+
+    fn memory_search(&self, session: &str, args: MemorySearchArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let hits = search(&worktree, &args.path, &args.needle)?;
+        Ok(json!({ "needle": args.needle, "hits": hits }))
+    }
+
+    // ---- 记忆工具：git 层 ----
+
+    fn memory_git_status(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let status = git_status(&worktree)?;
+        Ok(json!({ "status": status }))
+    }
+
+    fn memory_git_log(&self, session: &str, args: MemoryLogArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let log = git_log(&worktree, args.limit.unwrap_or(10));
+        Ok(json!({ "log": log }))
+    }
+
+    fn memory_git_diff(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let diff = git_diff(&worktree)?;
+        Ok(json!({ "diff": diff }))
+    }
+
+    fn memory_git_blame(&self, session: &str, args: MemoryBlameArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let blame = git_blame(&worktree, &args.path)?;
+        Ok(json!({ "path": args.path, "blame": blame }))
+    }
+
+    fn memory_git_add(&self, session: &str, args: MemoryAddArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        git_add(&worktree, &args.path)?;
+        Ok(json!({ "staged": if args.path.is_empty() { "全部" } else { &args.path } }))
+    }
+
+    fn memory_git_commit(&self, session: &str, args: MemoryCommitArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let result = git_commit(&worktree, &args.message)?;
+        Ok(json!({ "result": result }))
+    }
+
+    fn memory_git_push(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let result = git_push(&worktree)?;
+        Ok(json!({ "result": result }))
+    }
+
+    fn memory_git_branch(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(session, &args.memory)?;
+        let branches = git_branch(&worktree)?;
+        Ok(json!({ "branches": branches }))
     }
 }
 

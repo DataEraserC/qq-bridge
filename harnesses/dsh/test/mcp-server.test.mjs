@@ -44,7 +44,7 @@ test("initialize 回 protocolVersion + capabilities", async () => {
   assert.deepEqual(lines[0].result.capabilities, { tools: {} })
 })
 
-test("tools/list 返回九个工具", async () => {
+test("tools/list 返回全部工具", async () => {
   const { lines, output } = collect()
   const server = new McpServer({ tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.schema })), onCall: async () => ({}) })
   const { input, push } = feed([])
@@ -53,7 +53,7 @@ test("tools/list 返回九个工具", async () => {
 
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(lines.length, 1)
-  assert.equal(lines[0].result.tools.length, 9)
+  assert.equal(lines[0].result.tools.length, TOOLS.length)
   const names = lines[0].result.tools.map((t) => t.name)
   assert.ok(names.includes("send_message"))
   assert.ok(names.includes("ack_messages"))

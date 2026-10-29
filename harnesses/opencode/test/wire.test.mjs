@@ -32,6 +32,7 @@ async function setup(t, { onTurn } = {}) {
   const link = new BridgeLink({
     endpoint: bridge.endpoint,
     token: "t-main",
+    harness: "opencode",
     onTurn,
   })
   t.after(async () => {
@@ -49,11 +50,11 @@ async function openTurn(bridge, link, payload = delivery()) {
   return payload
 }
 
-test("握手带上协议版本和令牌，拿到设备组", async (t) => {
+test("握手带上协议版本和令牌，拿到会话组", async (t) => {
   const { bridge, link } = await setup(t)
 
-  assert.deepEqual(link.devices, ["main"])
-  assert.deepEqual(bridge.hello, { frame: "hello", version: 2, token: "t-main" })
+  assert.deepEqual(link.sessions, ["main"])
+  assert.deepEqual(bridge.hello, { frame: "hello", version: 3, harness: "opencode", token: "t-main" })
 })
 
 test("桥断了会自己重连，重连成功后重新绑上设备", async (t) => {
@@ -62,6 +63,7 @@ test("桥断了会自己重连，重连成功后重新绑上设备", async (t) =
   const link = new BridgeLink({
     endpoint: bridge.endpoint,
     token: "t-main",
+    harness: "opencode",
     log: (level, message) => logs.push(`${level} ${message}`),
   })
   t.after(async () => {
@@ -77,7 +79,7 @@ test("桥断了会自己重连，重连成功后重新绑上设备", async (t) =
     () => logs.some((line) => line.includes("重连成功")),
     "应该自己重连回来，日志是：" + logs.join(" | "),
   )
-  assert.deepEqual(link.devices, ["main"], "重连之后设备要重新绑上，不然工具会一直 unauthorized")
+  assert.deepEqual(link.sessions, ["main"], "重连之后会话要重新绑上，不然工具会一直 unauthorized")
 })
 
 test("开轮之后工具调用带着本轮的票，结果能对上号", async (t) => {
@@ -295,20 +297,16 @@ test("发到别的房间必须有 to", () => {
   assert.throws(() => normalizeToolArgs("send_message_to", { text: "喂" }), /要写 to/)
 })
 
-test("房间撞本组多台设备时，可以指明用谁的身份说", () => {
+test("send_message_to 不再有 device 身份参数（跨会话发送已砍）", () => {
+  // 多传的 device 会被忽略——桥这边根本不会再把它透过去。
   assert.deepEqual(
     normalizeToolArgs("send_message_to", {
       to: "qq:group/1",
       device: "helper",
       text: "喂",
     }),
-    { elements: [{ type: "text", text: "喂" }], to: "qq:group/1", device: "helper" },
+    { elements: [{ type: "text", text: "喂" }], to: "qq:group/1" },
   )
-  // 没撞车就别带：桥看参数里多出 device 会以为要切身份。
-  assert.deepEqual(normalizeToolArgs("send_message_to", { to: "qq:group/1", text: "喂" }), {
-    elements: [{ type: "text", text: "喂" }],
-    to: "qq:group/1",
-  })
 })
 
 test("确认的编号必须是整数，空的不算", () => {

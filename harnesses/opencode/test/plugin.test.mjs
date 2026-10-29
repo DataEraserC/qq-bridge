@@ -98,7 +98,7 @@ class FakeHost {
 
 /** 起假桥 + 假宿主，装上插件，测完都收掉。 */
 async function boot(t, { token = TOKEN } = {}) {
-  const bridge = await new FakeBridge({ devices: ["main"], token: TOKEN }).start()
+  const bridge = await new FakeBridge({ sessions: ["main"], token: TOKEN }).start()
   const host = new FakeHost()
   // 选项必须在 setup 之前摆好：插件读一次配置就定了。
   host.options = { endpoint: bridge.endpoint }
@@ -143,6 +143,18 @@ test("装上之后工具面齐全，名字和桥上的对得上", async (t) => {
     "get_notes",
     "get_platform_events",
     "list_rooms",
+    "memory_git_add",
+    "memory_git_blame",
+    "memory_git_branch",
+    "memory_git_commit",
+    "memory_git_diff",
+    "memory_git_log",
+    "memory_git_push",
+    "memory_git_status",
+    "memory_list",
+    "memory_read",
+    "memory_search",
+    "memory_write",
     "send_message",
     "send_message_to",
     "set_note",
@@ -160,7 +172,7 @@ test("一轮走完：建会话 → 提问 → 等它说完 → 收工", async (t
   await openTurn(bridge, host)
 
   assert.equal(host.created.length, 1, "应该建了一个会话")
-  assert.equal(host.created[0].title, "acb:main-memory", "会话按记忆一份")
+  assert.equal(host.created[0].title, "acb:main", "会话按会话 id 一份")
   assert.equal(host.prompts[0].sessionID, host.created[0].id)
   assert.match(host.prompts[0].text, /在吗/, "投递的内容要进上下文")
   assert.match(
@@ -253,7 +265,7 @@ test("桥报错时工具抛错，带上错误码", async (t) => {
 })
 
 test("没有令牌就不启用：不注册工具、不连桥", async (t) => {
-  const bridge = await new FakeBridge({ devices: ["main"], token: TOKEN }).start()
+  const bridge = await new FakeBridge({ sessions: ["main"], token: TOKEN }).start()
   const host = new FakeHost()
   const saved = process.env.ACB_TOKEN
   delete process.env.ACB_TOKEN
@@ -275,7 +287,7 @@ test("没有令牌就不启用：不注册工具、不连桥", async (t) => {
 })
 
 test("卸载时把连接关掉（不留后台线程）", async (t) => {
-  const bridge = await new FakeBridge({ devices: ["main"], token: TOKEN }).start()
+  const bridge = await new FakeBridge({ sessions: ["main"], token: TOKEN }).start()
   const host = new FakeHost()
   const saved = process.env.ACB_TOKEN
   process.env.ACB_TOKEN = TOKEN
@@ -294,28 +306,27 @@ test("卸载时把连接关掉（不留后台线程）", async (t) => {
   await closed
 })
 
-test("send_message_to 留了 device 这个口子：同一房间两台设备时指明身份", async (t) => {
+test("send_message_to 不再有 device 身份参数（跨会话发送已砍）", async (t) => {
   const { host } = await boot(t)
 
   const spec = host.tools.get("send_message_to")
-  assert.ok(spec.input.properties.device, "要给 device 参数，否则模型没法指明用谁说")
-  assert.match(spec.description, /device/, "说明里要提到 device")
+  assert.ok(!spec.input.properties.device, "不该再有 device 参数")
   assert.match(spec.description, /订阅/, "说明里要讲清范围是订阅")
 })
 
-test("两台设备共用一份记忆时，落进同一个会话", async (t) => {
+test("同一会话的轮次都落进同一个 opencode 会话", async (t) => {
   const { bridge, host } = await boot(t)
 
-  // 同一份记忆 m，先由 main 跑一轮。
-  await openTurn(bridge, host, delivery({ ticket: "main-1", device: "main", memory: "m" }))
+  // 会话 main 跑一轮。
+  await openTurn(bridge, host, delivery({ ticket: "main-1", session: "main" }))
   host.finishTurn()
   await bridge.next()
 
-  // helper 那台设备也看同一份记忆：不该再建一个会话。
-  await openTurn(bridge, host, delivery({ ticket: "helper-2", device: "helper", memory: "m" }))
+  // 同一会话再来一轮：不该再建一个会话。
+  await openTurn(bridge, host, delivery({ ticket: "main-2", session: "main" }))
   host.finishTurn()
   await bridge.next()
 
-  assert.equal(host.created.length, 1, "记忆就是会话，两台设备共用记忆只该有一个会话")
+  assert.equal(host.created.length, 1, "会话就是串行单元，同一会话只该有一个 opencode 会话")
   assert.equal(host.prompts[1].sessionID, host.created[0].id)
 })

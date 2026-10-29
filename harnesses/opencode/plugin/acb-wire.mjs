@@ -8,7 +8,7 @@
 import net from "node:net"
 
 /// 协议版本。和 `acb_proto::frame::PROTOCOL_VERSION` 必须一致。
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 3
 
 const MAX_FRAME_BYTES = 1024 * 1024
 const HANDSHAKE_TIMEOUT_MS = 10_000
@@ -47,17 +47,21 @@ export function parseEndpoint(text) {
  * `onTurn` 不会并发。
  */
 export class BridgeLink {
-  constructor({ endpoint, token, onTurn, log }) {
+  constructor({ endpoint, token, harness, onTurn, log }) {
     if (!token) {
-      throw new Error("没有接入令牌：要和配置里设备的 token 一致")
+      throw new Error("没有接入令牌：要和配置里会话的 token 一致")
+    }
+    if (!harness) {
+      throw new Error("没有 harness 名：要和配置里会话的 harness 一致")
     }
     parseEndpoint(endpoint) // 早报错，别等连的时候才炸
     this.endpoint = endpoint
     this.token = token
+    this.harness = harness
     this.onTurn = onTurn ?? (async () => {})
     this.log = log ?? (() => {})
 
-    this.devices = []
+    this.sessions = []
     /** 当前这一轮的票；没有票就没有进行中的轮次。 */
     this.ticket = null
     this.socket = null
@@ -98,7 +102,7 @@ export class BridgeLink {
       }
 
       socket.on("connect", () => {
-        this.#write({ frame: "hello", version: PROTOCOL_VERSION, token: this.token })
+        this.#write({ frame: "hello", version: PROTOCOL_VERSION, harness: this.harness, token: this.token })
       })
       socket.on("data", (chunk) => this.#onData(chunk))
       socket.on("error", (error) => {
@@ -200,7 +204,7 @@ export class BridgeLink {
   #onFrame(frame) {
     switch (frame.frame) {
       case "ready":
-        this.devices = Array.isArray(frame.devices) ? frame.devices : []
+        this.sessions = Array.isArray(frame.sessions) ? frame.sessions : []
         this.backoff = RECONNECT_MIN_MS
         this.handshake?.resolve()
         return
@@ -252,7 +256,7 @@ export class BridgeLink {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.connect()
-        .then(() => this.log("info", `重连成功，重新绑定设备组 ${this.devices.join("、")}`))
+        .then(() => this.log("info", `重连成功，重新绑定会话组 ${this.sessions.join("、")}`))
         .catch((error) => this.log("error", `重连失败：${error.message}`))
     }, this.backoff)
     this.backoff = Math.min(this.backoff * 2, RECONNECT_MAX_MS)
@@ -409,16 +413,11 @@ export function normalizeToolArgs(tool, args = {}) {
       if (!given.to || typeof given.to !== "string") {
         throw new BridgeError(
           "bad_request",
-          "send_message_to 要写 to，形如 qq:group/12345；只能是这个设备订阅过的房间",
+          "send_message_to 要写 to，形如 qq:group/12345；只能是当前会话订阅过的房间",
         )
       }
-      // 同一房间被本组多台设备订阅时，`device` 用来指明用谁的身份说。
-      // 这不是提权：桥会核对它落不落在这把令牌代表的那组设备里。
-      const wire = { elements: elementsOf(given), to: given.to }
-      if (typeof given.device === "string" && given.device.trim()) {
-        wire.device = given.device.trim()
-      }
-      return wire
+      // 跨会话发送已砍：to 只落在当前会话订阅的房间，没有 device 身份一说。
+      return { elements: elementsOf(given), to: given.to }
     }
     case "ack_messages": {
       const ids = Array.isArray(given.ids) ? given.ids : []

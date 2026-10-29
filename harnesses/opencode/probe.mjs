@@ -18,6 +18,7 @@ const log = (level, message) => console.log(`[${level}] ${message}`)
 const link = new BridgeLink({
   endpoint: options.endpoint,
   token: options.token,
+  harness: "opencode",
   log,
   async onTurn(delivery) {
     console.log("")
@@ -57,7 +58,7 @@ try {
   process.exit(1)
 }
 
-console.log(`已绑定到设备组 ${link.devices.join("、")}，等着开轮（Ctrl-C 退出）`)
+console.log(`已绑定到会话组 ${link.sessions.join("、")}，等着开轮（Ctrl-C 退出）`)
 
 process.on("SIGINT", () => {
   link.close()
