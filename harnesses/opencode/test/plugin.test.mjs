@@ -103,9 +103,9 @@ async function boot(t, { token = TOKEN } = {}) {
   // 选项必须在 setup 之前摆好：插件读一次配置就定了。
   host.options = { endpoint: bridge.endpoint }
 
-  const saved = process.env.QQAB_TOKEN
-  if (token === null) delete process.env.QQAB_TOKEN
-  else process.env.QQAB_TOKEN = token
+  const saved = process.env.ACB_TOKEN
+  if (token === null) delete process.env.ACB_TOKEN
+  else process.env.ACB_TOKEN = token
 
   const cleanup = await plugin.setup(host.ctx)
 
@@ -113,8 +113,8 @@ async function boot(t, { token = TOKEN } = {}) {
     host.finishTurn()
     await cleanup?.()
     await bridge.stop()
-    if (saved === undefined) delete process.env.QQAB_TOKEN
-    else process.env.QQAB_TOKEN = saved
+    if (saved === undefined) delete process.env.ACB_TOKEN
+    else process.env.ACB_TOKEN = saved
   })
 
   await bridge.whenConnected()
@@ -160,7 +160,7 @@ test("一轮走完：建会话 → 提问 → 等它说完 → 收工", async (t
   await openTurn(bridge, host)
 
   assert.equal(host.created.length, 1, "应该建了一个会话")
-  assert.equal(host.created[0].title, "qqab:main", "会话按设备一份")
+  assert.equal(host.created[0].title, "acb:main", "会话按设备一份")
   assert.equal(host.prompts[0].sessionID, host.created[0].id)
   assert.match(host.prompts[0].text, /在吗/, "投递的内容要进上下文")
   assert.match(
@@ -255,12 +255,12 @@ test("桥报错时工具抛错，带上错误码", async (t) => {
 test("没有令牌就不启用：不注册工具、不连桥", async (t) => {
   const bridge = await new FakeBridge({ device: "main", token: TOKEN }).start()
   const host = new FakeHost()
-  const saved = process.env.QQAB_TOKEN
-  delete process.env.QQAB_TOKEN
+  const saved = process.env.ACB_TOKEN
+  delete process.env.ACB_TOKEN
   host.options = { endpoint: bridge.endpoint }
   t.after(async () => {
     await bridge.stop()
-    if (saved !== undefined) process.env.QQAB_TOKEN = saved
+    if (saved !== undefined) process.env.ACB_TOKEN = saved
   })
 
   const cleanup = await plugin.setup(host.ctx)
@@ -277,12 +277,12 @@ test("没有令牌就不启用：不注册工具、不连桥", async (t) => {
 test("卸载时把连接关掉（不留后台线程）", async (t) => {
   const bridge = await new FakeBridge({ device: "main", token: TOKEN }).start()
   const host = new FakeHost()
-  const saved = process.env.QQAB_TOKEN
-  process.env.QQAB_TOKEN = TOKEN
+  const saved = process.env.ACB_TOKEN
+  process.env.ACB_TOKEN = TOKEN
   t.after(async () => {
     await bridge.stop()
-    if (saved === undefined) delete process.env.QQAB_TOKEN
-    else process.env.QQAB_TOKEN = saved
+    if (saved === undefined) delete process.env.ACB_TOKEN
+    else process.env.ACB_TOKEN = saved
   })
 
   host.options = { endpoint: bridge.endpoint }

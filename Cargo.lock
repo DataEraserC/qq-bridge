@@ -3,6 +3,48 @@
 version = 4
 
 [[package]]
+name = "acb-adapter-onebot11"
+version = "0.1.0"
+dependencies = [
+ "acb-kernel",
+ "acb-proto",
+ "serde_json",
+ "thiserror",
+ "tungstenite",
+]
+
+[[package]]
+name = "acb-bridge"
+version = "0.1.0"
+dependencies = [
+ "acb-adapter-onebot11",
+ "acb-kernel",
+ "acb-proto",
+ "serde_json",
+]
+
+[[package]]
+name = "acb-kernel"
+version = "0.1.0"
+dependencies = [
+ "acb-proto",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "acb-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -240,48 +282,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "qqab-adapter-onebot11"
-version = "0.1.0"
-dependencies = [
- "qqab-kernel",
- "qqab-proto",
- "serde_json",
- "thiserror",
- "tungstenite",
-]
-
-[[package]]
-name = "qqab-bridge"
-version = "0.1.0"
-dependencies = [
- "qqab-adapter-onebot11",
- "qqab-kernel",
- "qqab-proto",
- "serde_json",
-]
-
-[[package]]
-name = "qqab-kernel"
-version = "0.1.0"
-dependencies = [
- "qqab-proto",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "qqab-proto"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]

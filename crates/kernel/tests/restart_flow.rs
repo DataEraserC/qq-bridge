@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use qqab_kernel::{
+use acb_kernel::{
     Bridge, Config, Element, Ingest, Outbound, OutboundError, RecordDraft, RoomId, Sender, Sent,
     SqliteStore, Transcript, TurnReason,
 };
@@ -23,12 +23,10 @@ impl TempDb {
             .duration_since(UNIX_EPOCH)
             .expect("时间正常")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "qqab-restart-{}-{name}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("acb-restart-{}-{name}-{nanos}", std::process::id()));
         Self {
-            path: dir.join("qqab.db"),
+            path: dir.join("acb.db"),
         }
     }
 

@@ -2,10 +2,10 @@
 //
 //   node probe.mjs --token <设备令牌> [--endpoint 127.0.0.1:7700] [--reply 收到] [--once]
 //
-// 它用和插件完全同一个协议客户端（`qqab-wire.mjs`），只是把「交给 opencode 会话」
+// 它用和插件完全同一个协议客户端（`acb-wire.mjs`），只是把「交给 opencode 会话」
 // 换成了「打印出来 + 回一句固定的话」。所以能看到这一段的，插件也一定能看到。
 
-import { BridgeLink, renderTurn } from "./plugin/qqab-wire.mjs"
+import { BridgeLink, renderTurn } from "./plugin/acb-wire.mjs"
 
 const options = parseArgs(process.argv.slice(2))
 if (!options.token) {

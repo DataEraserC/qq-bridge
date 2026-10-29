@@ -1,5 +1,5 @@
 [package]
-name = "qqab-adapter-onebot11"
+name = "acb-adapter-onebot11"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,8 +7,8 @@ rust-version.workspace = true
 description = "OneBot 11 适配器：QQ 群与私聊"
 
 [dependencies]
-qqab-proto = { path = "../../proto" }
-qqab-kernel = { path = "../../kernel" }
+acb-proto = { path = "../../proto" }
+acb-kernel = { path = "../../kernel" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tungstenite = "0.30"

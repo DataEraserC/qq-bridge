@@ -118,13 +118,13 @@ url = "ws://127.0.0.1:3001"
 
 ```bash
 # 1. 先只检查配置，不启动
-cargo run -p qqab-bridge -- --config config.toml --check
+cargo run -p acb-bridge -- --config config.toml --check
 
 # 2. 起桥
-cargo run -p qqab-bridge -- --config config.toml
+cargo run -p acb-bridge -- --config config.toml
 
 # 3. 另开一个终端，用开发用的最小 harness 接上去
-cargo run -p qqab-bridge --bin dev-harness -- --token <配置里的 token>
+cargo run -p acb-bridge --bin dev-harness -- --token <配置里的 token>
 ```
 
 然后在群里 @ 一下那个号，桥上应当看到：

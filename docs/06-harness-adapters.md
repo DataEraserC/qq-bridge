@@ -61,7 +61,7 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 
 opencode 有 v1 和 v2 两套插件 API，**写法不通用**。我们按 v2 写（本机能装到的是 v2）。
 
-v2 的插件是一个目录：`index.js` 是入口，`qqab-wire.mjs` 是协议客户端（入口 import 它）。
+v2 的插件是一个目录：`index.js` 是入口，`acb-wire.mjs` 是协议客户端（入口 import 它）。
 
 **不拷贝，直接指向本仓库的这个目录。** 本机根目录是 tmpfs，只有仓库是可靠的持久位置；
 拷到 `~/.config/opencode/plugins/` 的东西哪天就没了。配置文件里写绝对路径即可：
@@ -71,7 +71,7 @@ v2 的插件是一个目录：`index.js` 是入口，`qqab-wire.mjs` 是协议�
 {
   "plugins": [
     {
-      "package": "/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/harnesses/opencode/plugin",
+      "package": "/path/to/agent-chat-bridge/harnesses/opencode/plugin",
       "options": { "token": "设备令牌" }
     }
   ]
@@ -83,8 +83,8 @@ v2 的插件是一个目录：`index.js` 是入口，`qqab-wire.mjs` 是协议�
 也可以用环境变量，选项优先于环境变量：
 
 ```bash
-export QQAB_TOKEN=<设备令牌>         # 和 config.toml 里设备的 token 一致
-export QQAB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
+export ACB_TOKEN=<设备令牌>         # 和 config.toml 里设备的 token 一致
+export ACB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 ```
 
 没给令牌时插件直接不启用，只写一条警告——不阻塞 opencode 启动。
@@ -96,7 +96,7 @@ export QQAB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 
 几个刻意的做法：
 
-- **会话按设备一份**，标题 `qqab:<设备>`。会话 id 记在插件自己的 storage 里，重开接上，
+- **会话按设备一份**，标题 `acb:<设备>`。会话 id 记在插件自己的 storage 里，重开接上，
   找不到才新建；每次用前确认它还活着（用户在 TUI 里删了会话也能自愈）。
   会话就是设备的记忆（[ADR-0002](adr/0002-subscription-model.md)），重开 harness 不能失忆。
 - **`prompt` 排话、`wait` 等它说完**，两个连起来才是一轮。v2 的 `prompt` 只保证把话排进
@@ -117,7 +117,7 @@ export QQAB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 | 插件一加载，opencode 报 `Transport: The socket connection was closed unexpectedly` | 插件里 `console.log` 写到了 **stdout**，而 `serve --stdio` 用 stdout 当 RPC 通道，协议被污染。日志只能走 `ctx.app.log` 或 `console.error` |
 | 插件明明连上了，日志里却一个字都没有，查不到「已接入桥」 | 实测 2.0.22 在 `serve --stdio` 下 `ctx.app.log` **不落盘**（`~/.local/share/opencode/log/opencode.log` 里搜不到任何 `service=` 的行），所以日志必须**同时**写一份 `console.error`（stderr 安全，stdout 不行） |
 | 模型照你说的直呼 `send_message`，报 `No tool named "send_message" is currently available` | v2 里插件注册的工具进的是「Code Mode」目录，**不在**模型的原生工具表里；必须用 `execute` 跑一行 JS：`await tools.send_message({ text: "…" })`。插件现在会在投递末尾附这条提示，免得模型白失败一次 |
-| 配置写 `"plugin": ["./qqab.js"]` 报 `configured plugin path must be a directory` | v2 的键叫 `plugins`（复数），且本地路径必须是**目录**，指向单个文件会被跳过 |
+| 配置写 `"plugin": ["./acb.js"]` 报 `configured plugin path must be a directory` | v2 的键叫 `plugins`（复数），且本地路径必须是**目录**，指向单个文件会被跳过 |
 
 ## 怎么验
 
@@ -151,10 +151,10 @@ opencode2 --standalone
 看到这两样就算接上了：
 
 ```
-[qqab] info 已接入桥，绑定设备 main
+[acb] info 已接入桥，绑定设备 main
 ```
 ```
-ESTAB 127.0.0.1:7700   127.0.0.1:44758  users:(("qqab-bridge",pid=17401,fd=7))
+ESTAB 127.0.0.1:7700   127.0.0.1:44758  users:(("acb-bridge",pid=17401,fd=7))
 ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=26))
 ```
 
@@ -168,7 +168,7 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
 ```
 真 QQ 发「在吗」
   → 桥归档 #3、开轮（票 main-1）
-  → 插件渲染投递 → opencode 会话 qqab:main
+  → 插件渲染投递 → opencode 会话 acb:main
   → 模型用 execute 调 await tools.send_message({text:"你好！我在。…"})
   → 桥 → OneBot → QQ 里真收到了
   → 模型再调 await tools.ack_messages({ids:[…]})
@@ -176,7 +176,7 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
 ```
 
 群里那一轮（`@机器人 你是什么模型？`）同样走通，回答落在群里，不是私聊。
-另外重启 opencode 之后 `接上会话 ses_e7a5…（qqab:main）`——**会话就是设备记忆，重启接得上**。
+另外重启 opencode 之后 `接上会话 ses_e7a5…（acb:main）`——**会话就是设备记忆，重启接得上**。
 
 ### 模型这一环，踩过的坑
 
@@ -245,7 +245,7 @@ opencode 那边要带 `NODE_EXTRA_CA_CERTS=<ca.pem>`，模型条目里写 `outpu
 ### 坑二：会话钉在「它出生的那个目录」，换目录不换配置（来源：实测）
 
 opencode 的模型是**按会话所在目录**去解配置的，不是按你启动时的 cwd。
-`qqab:main` 这条会话是在 `/tmp/oc6` 生的，于是不管从哪个目录启动、全局配置写什么，
+`acb:main` 这条会话是在 `/tmp/oc6` 生的，于是不管从哪个目录启动、全局配置写什么，
 它都回去读 `/tmp/oc6/opencode.jsonc`——那里还写着 openrouter 的 nemotron，
 所以现象是「配置明明改了，还在报 openrouter 额度用完」。
 
@@ -277,7 +277,7 @@ update session_v2 set project_id='<新项目的 id>', directory='/home/nixos/qqa
 python3 ~/qqab-scratch/oc-live/tls_proxy.py
 
 # 2. 桥（跑在仓库根，配置 config.toml）
-cd <仓库根> && ./target/debug/qqab-bridge --config config.toml
+cd <仓库根> && ./target/debug/acb-bridge --config config.toml
 
 # 3. opencode：必须 --standalone（否则插件找不到入口），必须走 pty（否则 TUI 起不来）
 cd ~/qqab-scratch/oc-live && script -qec "env -u HTTP_PROXY -u HTTPS_PROXY \

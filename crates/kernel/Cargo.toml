@@ -1,5 +1,5 @@
 [package]
-name = "qqab-kernel"
+name = "acb-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 description = "桥的核心：订阅、唤醒、流水、水位、笔记"
 
 [dependencies]
-qqab-proto = { path = "../proto" }
+acb-proto = { path = "../proto" }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

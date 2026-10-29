@@ -1,13 +1,13 @@
-// qqab 桥的协议客户端：一行一帧 JSON，桥那一侧是 `crates/kernel/src/endpoint.rs`，
+// acb 桥的协议客户端：一行一帧 JSON，桥那一侧是 `crates/kernel/src/endpoint.rs`，
 // 帧的形状见 `docs/04-protocol.md`。
 //
 // 这个文件只负责「把话按协议说对」：握手、接轮次、发工具调用、收结果、断线重连。
 // 它不认识 opencode，也不认识任何聊天平台——所以能单独测（`test/wire.test.mjs`
-// 用一个假的桥验它）。opencode 那一侧的粘合全在 `qqab.mjs`。
+// 用一个假的桥验它）。opencode 那一侧的粘合全在 `acb.mjs`。
 
 import net from "node:net"
 
-/// 协议版本。和 `qqab_proto::frame::PROTOCOL_VERSION` 必须一致。
+/// 协议版本。和 `acb_proto::frame::PROTOCOL_VERSION` 必须一致。
 export const PROTOCOL_VERSION = 1
 
 const MAX_FRAME_BYTES = 1024 * 1024
@@ -374,7 +374,7 @@ function formatTime(at, now) {
 // 工具参数：模型给的东西 → 桥要的东西
 // ---------------------------------------------------------------------------
 
-/** 标准元素表的类型名，和 `qqab_proto::Element` 一一对应。 */
+/** 标准元素表的类型名，和 `acb_proto::Element` 一一对应。 */
 export const ELEMENT_TYPES = [
   "text",
   "at",

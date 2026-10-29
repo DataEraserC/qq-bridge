@@ -6,7 +6,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use qqab_kernel::{Element, Outbound, OutboundError, RoomId, Sent};
+use acb_kernel::{Element, Outbound, OutboundError, RoomId, Sent};
 use serde_json::{Value, json};
 
 use crate::link::{Action, LinkError, LinkSlot};
@@ -65,7 +65,7 @@ impl Outbound for OneBotOutbound {
         };
 
         self.seq += 1;
-        let echo = format!("qqab-{}", self.seq);
+        let echo = format!("acb-{}", self.seq);
         let (reply_tx, reply_rx) = mpsc::channel();
         sender
             .send(Action {

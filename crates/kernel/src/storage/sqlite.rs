@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use qqab_proto::{Element, Record, RecordKind, RoomId, Sender};
+use acb_proto::{Element, Record, RecordKind, RoomId, Sender};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use qqab_kernel::Config;
+use acb_kernel::Config;
 
 fn example_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml")

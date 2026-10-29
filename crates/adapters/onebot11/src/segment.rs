@@ -4,7 +4,7 @@
 //! - 出去：标准元素翻成 OneBot 段，翻不出来报 `Unsupported`；
 //! - 进来：不认识的段装进 [`Element::Opaque`] 原样留着，编回 QQ 时照搬。
 
-use qqab_proto::Element;
+use acb_proto::Element;
 use serde_json::{Value, json};
 
 /// 平台名。房间写成 `qq:group/123`。

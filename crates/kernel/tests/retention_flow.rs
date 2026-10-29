@@ -6,7 +6,7 @@
 //! 判据有一条最容易搞错、后果也最严重：一个房间有两个设备订阅时，安全线取两者水位的
 //! **最小值**。任何一方没读到，这个房间就一条都不删——那几条还是人家下一轮的投递原料。
 
-use qqab_kernel::{
+use acb_kernel::{
     Bridge, Cursor, Element, MemoryStore, Outbound, OutboundError, RecordDraft, RoomId, Sender,
     Sent, Transcript, unread,
 };
@@ -69,7 +69,7 @@ fn config(max_records: u64, max_days: u64) -> String {
 
 fn bridge(max_records: u64, max_days: u64) -> Bridge<MemoryStore> {
     Bridge::new(
-        qqab_kernel::Config::parse(&config(max_records, max_days)).expect("配置合法"),
+        acb_kernel::Config::parse(&config(max_records, max_days)).expect("配置合法"),
         MemoryStore::new(),
         Box::new(Sink),
     )
@@ -190,7 +190,7 @@ fn numbering_survives_a_room_being_pruned_to_one() {
     let ingest = bridge.ingest(message("新话", AT)).expect("能记");
     assert_eq!(
         ingest,
-        qqab_kernel::Ingest::Recorded {
+        acb_kernel::Ingest::Recorded {
             id: 4,
             woke: vec!["main".into(), "helper".into()]
         }

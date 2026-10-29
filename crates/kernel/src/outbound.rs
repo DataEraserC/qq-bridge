@@ -3,7 +3,7 @@
 //! 桥不碰平台细节，只知道「把这个设备、这个房间、用这个账号，发这些元素」。怎么编成
 //! OneBot 消息链或 Discord 消息，是适配器的事。
 
-use qqab_proto::{Element, RoomId};
+use acb_proto::{Element, RoomId};
 use thiserror::Error;
 
 /// 一条已经发出去的消息。

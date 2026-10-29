@@ -1,8 +1,8 @@
-// qqab 的 opencode v2 插件：把「桥推来的一轮」变成「opencode 会话里的一次提问」，
+// acb 的 opencode v2 插件：把「桥推来的一轮」变成「opencode 会话里的一次提问」，
 // 同时把桥的九个工具挂进这个实例，让模型直接看见它们。
 //
-// 装法：把这个目录整体放到 `.opencode/plugins/qqab/`（或 `~/.config/opencode/plugins/qqab/`）。
-// v2 认目录里的 `index.js`，两个文件必须挨着——`index.js` 会 import `qqab-wire.mjs`。
+// 装法：把这个目录整体放到 `.opencode/plugins/acb/`（或 `~/.config/opencode/plugins/acb/`）。
+// v2 认目录里的 `index.js`，两个文件必须挨着——`index.js` 会 import `acb-wire.mjs`。
 //
 // 配置走插件选项（opencode.jsonc）或环境变量，选项优先：
 //   endpoint  桥的接入点，默认 127.0.0.1:7700
@@ -19,9 +19,9 @@ import {
   BridgeLink,
   normalizeToolArgs,
   renderTurn,
-} from "./qqab-wire.mjs"
+} from "./acb-wire.mjs"
 
-const SERVICE = "qqab"
+const SERVICE = "acb"
 
 export default {
   id: SERVICE,
@@ -31,7 +31,7 @@ export default {
     const log = makeLogger(ctx)
 
     if (!config.token) {
-      log("warn", "没有令牌（ctx.options.token 或 QQAB_TOKEN），qqab 不启用")
+      log("warn", "没有令牌（ctx.options.token 或 ACB_TOKEN），acb 不启用")
       return
     }
 
@@ -157,11 +157,11 @@ class TurnDriver {
     const stored = await this.#storageGet(`session:${device}`)
     if (stored && (await this.#alive(stored))) {
       this.sessions.set(device, stored)
-      this.log("info", `接上会话 ${stored}（qqab:${device}）`)
+      this.log("info", `接上会话 ${stored}（acb:${device}）`)
       return stored
     }
 
-    const created = await this.ctx.session.create({ title: `qqab:${device}` })
+    const created = await this.ctx.session.create({ title: `acb:${device}` })
     const id =
       created?.id ??
       created?.sessionID ??
@@ -174,7 +174,7 @@ class TurnDriver {
     }
     this.sessions.set(device, id)
     await this.#storageSet(`session:${device}`, id)
-    this.log("info", `新会话 ${id}（qqab:${device}）`)
+    this.log("info", `新会话 ${id}（acb:${device}）`)
     return id
   }
 
@@ -395,11 +395,11 @@ function readConfig(ctx) {
   return {
     endpoint:
       (typeof options.endpoint === "string" && options.endpoint.trim()) ||
-      process.env.QQAB_ENDPOINT?.trim() ||
+      process.env.ACB_ENDPOINT?.trim() ||
       "127.0.0.1:7700",
     token:
       (typeof options.token === "string" && options.token.trim()) ||
-      process.env.QQAB_TOKEN?.trim() ||
+      process.env.ACB_TOKEN?.trim() ||
       "",
     session:
       (typeof options.session === "string" && options.session.trim()) || "",

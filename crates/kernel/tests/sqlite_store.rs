@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use qqab_kernel::{
+use acb_kernel::{
     Cursor, Deliveries, Element, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft, RoomId,
     Sender, StorageError, Store, TopicStatus, Transcript, Watermarks, unread,
 };
@@ -25,9 +25,9 @@ impl TempDb {
             .expect("时间正常")
             .as_nanos();
         let dir =
-            std::env::temp_dir().join(format!("qqab-store-{}-{name}-{nanos}", std::process::id()));
+            std::env::temp_dir().join(format!("acb-store-{}-{name}-{nanos}", std::process::id()));
         Self {
-            path: dir.join("qqab.db"),
+            path: dir.join("acb.db"),
         }
     }
 
@@ -67,13 +67,13 @@ fn restart_keeps_records_and_numbering() {
     let qq = room("qq:private/1");
 
     {
-        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         store.append(message(&qq, "第一句")).expect("可写");
         store.append(message(&qq, "第二句")).expect("可写");
     }
 
     // 关掉再开：同一个文件，等于桥重启。
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     let third = store.append(message(&qq, "第三句")).expect("可写");
     assert_eq!(third.id, 3, "重启之后编号要接着数，不能从 1 重来");
 
@@ -92,7 +92,7 @@ fn restart_keeps_records_and_numbering() {
 #[test]
 fn records_keep_their_identity_across_platforms() {
     let db = TempDb::new("platforms");
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
 
     let qq = room("qq:123");
     let discord = room("discord:123");
@@ -113,7 +113,7 @@ fn restart_keeps_watermark_and_pending_acks() {
     let cursor = Cursor::new("main", qq.clone());
 
     {
-        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         for text in ["a", "b", "c"] {
             store.append(message(&qq, text)).expect("可写");
         }
@@ -121,7 +121,7 @@ fn restart_keeps_watermark_and_pending_acks() {
         assert_eq!(store.ack(&cursor, &[1, 3]).expect("可确认"), 1);
     }
 
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     assert_eq!(store.watermark(&cursor).expect("可读"), 1, "水位要留着");
     assert_eq!(
         unread(&store, &cursor, 100).expect("可读").len(),
@@ -141,7 +141,7 @@ fn acking_a_missing_record_writes_nothing() {
     let db = TempDb::new("ack-missing");
     let qq = room("qq:1");
     let cursor = Cursor::new("main", qq.clone());
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
     store.append(message(&qq, "只有这一条")).expect("可写");
 
     let error = store.ack(&cursor, &[1, 9]).expect_err("9 不存在，应当报错");
@@ -177,7 +177,7 @@ fn elements_survive_the_round_trip() {
         },
     ];
 
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
     let draft = RecordDraft::message(
         qq.clone(),
         Sender {
@@ -191,7 +191,7 @@ fn elements_survive_the_round_trip() {
     store.append(draft).expect("可写");
     drop(store);
 
-    let store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     let back = store.since(&qq, 0, 10).expect("可读");
     assert_eq!(back[0].elements, elements, "元素数组要一字不差");
     assert!(back[0].at_self, "「@ 到我」这个判定也要留着");
@@ -201,7 +201,7 @@ fn elements_survive_the_round_trip() {
 fn events_keep_their_type() {
     let db = TempDb::new("events");
     let qq = room("qq:1");
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
 
     store
         .append(RecordDraft::event(
@@ -218,7 +218,7 @@ fn events_keep_their_type() {
         .expect("可写");
     drop(store);
 
-    let store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     let back = store.since(&qq, 0, 10).expect("可读");
     assert!(back[0].is_event("poke"), "事件类型不能丢");
     assert!(!back[0].is_message());
@@ -232,7 +232,7 @@ fn restart_keeps_notes_with_all_their_parts() {
     let key = NoteKey::new(qq.clone(), NoteKind::Topic, "部署");
 
     {
-        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         store
             .upsert_note(Note {
                 key: key.clone(),
@@ -245,7 +245,7 @@ fn restart_keeps_notes_with_all_their_parts() {
             .expect("可写");
     }
 
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     let note = store.note(&key).expect("可读").expect("笔记还在");
     assert_eq!(note.value, "蓝绿发布，周五不动");
     assert_eq!(note.label.as_deref(), Some("运维"));
@@ -286,13 +286,13 @@ fn delivery_counts_survive_restart() {
     let cursor = Cursor::new("main", qq.clone());
 
     {
-        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         store.append(message(&qq, "喂")).expect("可写");
         assert_eq!(store.count_delivery(&cursor, 1).expect("可写"), 1);
         assert_eq!(store.count_delivery(&cursor, 1).expect("可写"), 2);
     }
 
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     assert_eq!(
         store.count_delivery(&cursor, 1).expect("可写"),
         3,
@@ -315,7 +315,7 @@ fn delivery_counts_survive_restart() {
 fn a_newer_schema_is_refused_instead_of_being_written_to() {
     let db = TempDb::new("schema");
     {
-        let store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         drop(store);
     }
 
@@ -329,11 +329,11 @@ fn a_newer_schema_is_refused_instead_of_being_written_to() {
         .expect("能改");
     }
 
-    let error = qqab_kernel::SqliteStore::open(db.path()).expect_err("应当拒绝打开");
+    let error = acb_kernel::SqliteStore::open(db.path()).expect_err("应当拒绝打开");
     let message = error.to_string();
     assert!(message.contains("99"), "要说清库是第几版：{message}");
     assert!(
-        message.contains(&format!("第 {} 版", qqab_kernel::SCHEMA_VERSION)),
+        message.contains(&format!("第 {} 版", acb_kernel::SCHEMA_VERSION)),
         "也要说清程序认识第几版：{message}"
     );
 }
@@ -341,7 +341,7 @@ fn a_newer_schema_is_refused_instead_of_being_written_to() {
 #[test]
 fn an_empty_file_gets_its_tables_created() {
     let db = TempDb::new("fresh");
-    let store = qqab_kernel::SqliteStore::open(db.path()).expect("新库能建起来");
+    let store = acb_kernel::SqliteStore::open(db.path()).expect("新库能建起来");
     let counts = store.counts().expect("能数");
     assert_eq!(counts.records, 0);
     assert_eq!(counts.notes, 0);
@@ -352,7 +352,7 @@ fn counts_reflect_what_is_in_the_file() {
     let db = TempDb::new("counts");
     let qq = room("qq:1");
     let discord = room("discord:9");
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
     store.append(message(&qq, "一")).expect("可写");
     store.append(message(&qq, "二")).expect("可写");
     store.append(message(&discord, "三")).expect("可写");
@@ -377,7 +377,7 @@ fn counts_reflect_what_is_in_the_file() {
 #[test]
 fn sqlite_store_satisfies_store_trait() {
     fn assert_store<S: Store>() {}
-    assert_store::<qqab_kernel::SqliteStore>();
+    assert_store::<acb_kernel::SqliteStore>();
 }
 
 #[test]
@@ -385,7 +385,7 @@ fn pruning_keeps_numbering_going_and_drops_orphans() {
     let db = TempDb::new("prune");
     let qq = room("qq:private/1");
     let main = Cursor::new("main", qq.clone());
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
 
     for text in ["1", "2", "3", "4", "5"] {
         store.append(message(&qq, text)).expect("可写");
@@ -425,7 +425,7 @@ fn a_pruned_room_stays_pruned_after_reopen() {
     let main = Cursor::new("main", qq.clone());
 
     {
-        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         for text in ["1", "2", "3", "4"] {
             store.append(message(&qq, text)).expect("可写");
         }
@@ -438,7 +438,7 @@ fn a_pruned_room_stays_pruned_after_reopen() {
         assert_eq!(store.prune(&qq, &plan).expect("能清"), 3);
     }
 
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     assert_eq!(store.count(&qq).expect("能数"), 1, "删了就是删了，不回来");
     assert_eq!(store.latest(&qq).expect("可读"), Some(4));
     assert_eq!(
@@ -455,7 +455,7 @@ fn platform_id_survives_a_restart_and_is_findable() {
     let qq = room("qq:group/769843907");
 
     {
-        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         // 我们自己发出去的那条：带平台编号。
         let draft = RecordDraft::message(
             qq.clone(),
@@ -472,7 +472,7 @@ fn platform_id_survives_a_restart_and_is_findable() {
         store.append(message(&qq, "只发子网")).expect("能写");
     }
 
-    let store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     let sender = store
         .sender_of(&qq, "592852179")
         .expect("能查")
@@ -490,12 +490,12 @@ fn reply_to_self_survives_a_restart() {
     let qq = room("qq:group/1");
 
     {
-        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
         let draft = message(&qq, "只发子网").with_reply_to_self(true);
         store.append(draft).expect("能写");
     }
 
-    let store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     let records = store.since(&qq, 0, 10).expect("能读");
     assert!(records[0].reply_to_self, "重启之后「这是在回我」不能丢");
 }
@@ -540,7 +540,7 @@ fn a_version_one_database_is_migrated_in_place() {
         .expect("写旧数据");
     }
 
-    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("老库应当能升上来");
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("老库应当能升上来");
     let qq = room("qq:group/1");
 
     let records = store.since(&qq, 0, 10).expect("老数据还得读得出来");

@@ -7,7 +7,7 @@
 
 - opencode 适配器**只针对 v2**（`opencode2 2.x`）。v1 那套写法（`export const X = async
   ({client}) => ({ tool: {...} })`）在 v2 里**根本不会被加载**，所以不做双兼容。
-- 插件入口是一个**普通对象默认导出**：`export default { id: "qqab", async setup(ctx) {…} }`。
+- 插件入口是一个**普通对象默认导出**：`export default { id: "acb", async setup(ctx) {…} }`。
   不 import `@opencode/plugin`（本地插件解析不到这个包，实测报
   `Cannot find package '@opencode/plugin'`）；`Plugin.define` 只是语法糖，不用它也能加载。
 - 工具用 `ctx.tool.transform(editor => editor.add({ name, description, input, execute }))`
@@ -31,8 +31,8 @@
 
 ## 技术细节
 
-- 目录：`harnesses/opencode/plugin/`（`index.js` + `qqab-wire.mjs`）。整体拷到
-  `~/.config/opencode/plugins/qqab/` 或 `<项目>/.opencode/plugins/qqab/` 即可，v2 会按目录加载。
+- 目录：`harnesses/opencode/plugin/`（`index.js` + `acb-wire.mjs`）。整体拷到
+  `~/.config/opencode/plugins/acb/` 或 `<项目>/.opencode/plugins/acb/` 即可，v2 会按目录加载。
   `.opencode/plugins/` 下直接放 `.mjs` 文件**不会**被发现，只认 `.js` / `.ts` 和插件目录。
 - 配置键是 `plugins`（复数，v1 的 `plugin` 已废弃），本地路径必须是**目录**——
   指向单个文件会被跳过，只在日志里留一句 `configured plugin path must be a directory`。

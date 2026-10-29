@@ -1,8 +1,8 @@
 {
-  "name": "qqab-opencode",
+  "name": "acb-opencode",
   "private": true,
   "type": "module",
-  "description": "qqab 的 opencode harness 适配器：把桥推来的一轮变成 opencode 的一次提问，并把桥的工具挂进去",
+  "description": "acb 的 opencode harness 适配器：把桥推来的一轮变成 opencode 的一次提问，并把桥的工具挂进去",
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "probe": "node probe.mjs"

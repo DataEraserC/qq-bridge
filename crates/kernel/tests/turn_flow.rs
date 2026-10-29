@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use qqab_kernel::{
+use acb_kernel::{
     Bridge, Cursor, Element, ErrorCode, Ingest, MemoryStore, NoteKey, NoteKind, Notes, Outbound,
     OutboundError, RecordDraft, RoomId, Sender, Sent, Transcript, TurnReason, Watermarks, unread,
 };
@@ -69,7 +69,7 @@ fn config() -> &'static str {
 fn bridge() -> (Bridge<MemoryStore>, Sends) {
     let sends: Sends = Arc::new(Mutex::new(Vec::new()));
     let bridge = Bridge::new(
-        qqab_kernel::Config::parse(config()).expect("配置合法"),
+        acb_kernel::Config::parse(config()).expect("配置合法"),
         MemoryStore::new(),
         Box::new(Recorder {
             sends: sends.clone(),
@@ -568,7 +568,7 @@ fn notes_are_isolated_per_platform_down_to_storage() {
 
     let qq_key = NoteKey::new(qq.clone(), NoteKind::Term, "部署");
     store
-        .upsert_note(qqab_kernel::Note {
+        .upsert_note(acb_kernel::Note {
             key: qq_key.clone(),
             value: "蓝绿发布".to_owned(),
             label: None,

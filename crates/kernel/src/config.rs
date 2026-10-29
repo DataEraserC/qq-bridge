@@ -5,16 +5,16 @@
 //!
 //! 配置从 TOML 读进来后**完全校验**：非法配置在这里就死，不会带病启动。
 
-use qqab_proto::RoomId;
+use acb_proto::RoomId;
 use serde::Deserialize;
 use thiserror::Error;
 
 /// 没配「攒多少条」时的默认值。来源：实现默认，可推翻。
 pub const DEFAULT_ACCUMULATE: u32 = 10;
 
-/// 没配存储路径时的默认值：工作目录下的 `state/qqab.db`。
+/// 没配存储路径时的默认值：工作目录下的 `state/acb.db`。
 /// 来源：实现默认。放 `state/` 是因为那里已经在 .gitignore 里，不会被误提交。
-pub const DEFAULT_STORAGE_PATH: &str = "state/qqab.db";
+pub const DEFAULT_STORAGE_PATH: &str = "state/acb.db";
 
 /// 没配「每个房间留多少条」时的默认值。来源：实现默认。
 /// 5000 条对一个群来说大概是几个月的体量，够 `get_history` 往前翻。
@@ -961,14 +961,14 @@ mod tests {
     fn storage_defaults_to_state_dir_when_absent() {
         let config = Config::parse(MINIMAL).expect("应当能解析");
         assert_eq!(config.storage.path, DEFAULT_STORAGE_PATH);
-        assert_eq!(DEFAULT_STORAGE_PATH, "state/qqab.db");
+        assert_eq!(DEFAULT_STORAGE_PATH, "state/acb.db");
     }
 
     #[test]
     fn storage_path_can_be_set() {
-        let text = format!("{MINIMAL}\n[storage]\npath = \"/var/lib/qqab/bridge.db\"\n");
+        let text = format!("{MINIMAL}\n[storage]\npath = \"/var/lib/acb/bridge.db\"\n");
         let config = Config::parse(&text).expect("应当能解析");
-        assert_eq!(config.storage.path, "/var/lib/qqab/bridge.db");
+        assert_eq!(config.storage.path, "/var/lib/acb/bridge.db");
     }
 
     #[test]

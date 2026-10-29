@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use qqab_kernel::endpoint::{read_frame, reader_of};
-use qqab_kernel::{
+use acb_kernel::endpoint::{read_frame, reader_of};
+use acb_kernel::{
     Bridge, Element, Frame, MemoryStore, Outbound, OutboundError, RecordDraft, RoomId, Sender,
     Sent, Session, handshake, serve,
 };
-use qqab_proto::frame::{PROTOCOL_VERSION, encode};
+use acb_proto::frame::{PROTOCOL_VERSION, encode};
 use serde_json::json;
 
 const TOKEN: &str = "t-main";
@@ -88,7 +88,7 @@ fn write_frame(stream: &mut TcpStream, frame: &Frame) {
 
 fn bridge() -> Bridge<MemoryStore> {
     Bridge::new(
-        qqab_kernel::Config::parse(config()).expect("配置合法"),
+        acb_kernel::Config::parse(config()).expect("配置合法"),
         MemoryStore::new(),
         Box::new(Recorder::default()),
     )
@@ -168,7 +168,7 @@ fn session_refuses_a_ticket_it_did_not_receive() {
             &mut bridge,
             Frame::ToolCall {
                 id: "c-1".into(),
-                ticket: qqab_kernel::Ticket::new("main-99").expect("合法"),
+                ticket: acb_kernel::Ticket::new("main-99").expect("合法"),
                 tool: "send_message".into(),
                 args: json!({"elements": [{"type": "text", "text": "hi"}]}),
             },
@@ -178,7 +178,7 @@ fn session_refuses_a_ticket_it_did_not_receive() {
         Frame::ToolResult {
             error: Some(error), ..
         } => {
-            assert_eq!(error.code, qqab_kernel::ErrorCode::Unauthorized);
+            assert_eq!(error.code, acb_kernel::ErrorCode::Unauthorized);
         }
         other => panic!("应当是错误结果，实际是 {}", other.kind()),
     }
@@ -283,7 +283,7 @@ fn a_real_connection_carries_a_whole_turn() {
     {
         let mut guard = bridge.lock().expect("没被毒死");
         let ingested = guard.ingest(message("在吗")).expect("能记下来");
-        assert!(matches!(ingested, qqab_kernel::Ingest::Recorded { .. }));
+        assert!(matches!(ingested, acb_kernel::Ingest::Recorded { .. }));
     }
 
     // 这一端应当把轮次推过来。
@@ -422,7 +422,7 @@ fn redelivery_hint_rides_on_note_not_on_content() {
         redelivered.elements
     );
     assert_eq!(
-        qqab_proto::element::flatten_text(&redelivered.elements),
+        acb_proto::element::flatten_text(&redelivered.elements),
         "在吗",
         "内容要原样，一个字都不能被塞进去"
     );

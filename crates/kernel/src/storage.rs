@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use qqab_proto::{Element, Record, RecordKind, RoomId, Sender};
+use acb_proto::{Element, Record, RecordKind, RoomId, Sender};
 use thiserror::Error;
 
 /// 存储层错误。
@@ -485,7 +485,7 @@ impl Deliveries for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qqab_proto::Element;
+    use acb_proto::Element;
 
     fn room(platform: &str, id: &str) -> RoomId {
         RoomId::new(platform, id).expect("合法")

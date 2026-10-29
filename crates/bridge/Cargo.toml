@@ -1,15 +1,15 @@
 [package]
-name = "qqab-bridge"
+name = "acb-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "桥本体：读配置、连平台、等 harness"
 # 这个 crate 有两个可执行文件，默认跑桥本体。
-default-run = "qqab-bridge"
+default-run = "acb-bridge"
 
 [dependencies]
-qqab-kernel = { path = "../kernel" }
-qqab-adapter-onebot11 = { path = "../adapters/onebot11" }
-qqab-proto = { path = "../proto" }
+acb-kernel = { path = "../kernel" }
+acb-adapter-onebot11 = { path = "../adapters/onebot11" }
+acb-proto = { path = "../proto" }
 serde_json = { workspace = true }

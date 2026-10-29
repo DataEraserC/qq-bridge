@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use qqab_proto::frame::{decode, encode};
-use qqab_proto::{Delivery, ErrorCode, Frame, LogLevel, Ticket, ToolError};
+use acb_proto::frame::{decode, encode};
+use acb_proto::{Delivery, ErrorCode, Frame, LogLevel, Ticket, ToolError};
 use thiserror::Error;
 
 use crate::engine::{Bridge, BridgeError};
@@ -53,10 +53,10 @@ pub fn handshake<S: Store>(bridge: &Bridge<S>, frame: Frame) -> Result<String, E
             )));
         }
     };
-    if !qqab_proto::frame::version_compatible(version) {
+    if !acb_proto::frame::version_compatible(version) {
         return Err(EndpointError::Handshake(format!(
             "协议版本不兼容：对面是 {version}，这边是 {}",
-            qqab_proto::frame::PROTOCOL_VERSION
+            acb_proto::frame::PROTOCOL_VERSION
         )));
     }
     let Some(token) = token else {
@@ -341,7 +341,7 @@ fn read_line(
                 .map_err(|error| EndpointError::Protocol(format!("不是 UTF-8：{error}")))?;
             return Ok(Incoming::Line(text));
         }
-        if buffer.len() > qqab_proto::frame::MAX_FRAME_BYTES {
+        if buffer.len() > acb_proto::frame::MAX_FRAME_BYTES {
             return Err(EndpointError::Protocol("帧太大，没有换行".into()));
         }
 

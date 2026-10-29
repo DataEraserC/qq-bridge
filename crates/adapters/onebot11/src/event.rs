@@ -7,7 +7,7 @@
 //! - 群 → `qq:group/<群号>`
 //! - 私聊 → `qq:private/<对方号>`
 
-use qqab_kernel::{Element, RecordDraft, RoomId, Sender};
+use acb_kernel::{Element, RecordDraft, RoomId, Sender};
 use serde_json::Value;
 
 use crate::segment;
@@ -346,7 +346,7 @@ mod tests {
         };
         assert_eq!(
             draft.kind,
-            qqab_proto::RecordKind::Event {
+            acb_proto::RecordKind::Event {
                 event: "poke".into()
             }
         );
@@ -387,7 +387,7 @@ mod tests {
         };
         assert_eq!(
             draft.kind,
-            qqab_proto::RecordKind::Event {
+            acb_proto::RecordKind::Event {
                 event: "group_increase".into()
             }
         );

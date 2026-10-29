@@ -3,7 +3,7 @@
 //! 真 harness（DSH / WorkBuddy / Trae）还没接进来之前，用它验「桥 ↔ 平台」这一段：
 //!
 //! ```text
-//! cargo run -p qqab-bridge --bin dev-harness -- --endpoint 127.0.0.1:7700 --token 你的令牌
+//! cargo run -p acb-bridge --bin dev-harness -- --endpoint 127.0.0.1:7700 --token 你的令牌
 //! ```
 //!
 //! 它只做三件事：把投递过来的记录打出来、回一句固定的话、确认这些记录已处理。
@@ -14,9 +14,9 @@ use std::net::TcpStream;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use qqab_proto::element::flatten_text;
-use qqab_proto::frame::{PROTOCOL_VERSION, decode, encode};
-use qqab_proto::{Frame, Ticket};
+use acb_proto::element::flatten_text;
+use acb_proto::frame::{PROTOCOL_VERSION, decode, encode};
+use acb_proto::{Frame, Ticket};
 
 fn main() -> ExitCode {
     match run() {
@@ -150,7 +150,7 @@ fn ack(
     writer: &mut TcpStream,
     reader: &mut BufReader<TcpStream>,
     ticket: &Ticket,
-    records: &[qqab_proto::Record],
+    records: &[acb_proto::Record],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ids: Vec<u64> = records.iter().map(|record| record.id).collect();
     send(

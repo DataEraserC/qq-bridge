@@ -23,13 +23,13 @@ pub const TOOL_NAMES: &[&str] = &[
 /// 发给当前轮次房间的参数。
 #[derive(Debug, Deserialize)]
 pub struct SendArgs {
-    pub elements: Vec<qqab_proto::Element>,
+    pub elements: Vec<acb_proto::Element>,
 }
 
 /// 发到别的房间的参数。形状和 [`SendArgs`] 一样，只多一个目标。
 #[derive(Debug, Deserialize)]
 pub struct SendToArgs {
-    pub elements: Vec<qqab_proto::Element>,
+    pub elements: Vec<acb_proto::Element>,
     /// 目标房间，形如 `qq:123`。必须是本设备订阅过的房间。
     pub to: String,
 }

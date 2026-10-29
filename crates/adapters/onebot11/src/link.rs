@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use qqab_kernel::{Bridge, Config, RecordDraft, Store};
+use acb_kernel::{Bridge, Config, RecordDraft, Store};
 use serde_json::Value;
 use tungstenite::error::Error as WsError;
 use tungstenite::{Message, WebSocket};
@@ -344,7 +344,7 @@ pub fn supervise<S: Store + Send + 'static>(
 fn probe_login<S: Store>(sender: &Sender<Action>, bridge: &Mutex<Bridge<S>>, platform: &str) {
     let (reply_tx, reply_rx) = mpsc::channel();
     let request = Action {
-        body: serde_json::json!({"action": "get_login_info", "params": {}, "echo": "qqab-probe"}),
+        body: serde_json::json!({"action": "get_login_info", "params": {}, "echo": "acb-probe"}),
         reply: reply_tx,
     };
     if sender.send(request).is_err() {

@@ -35,12 +35,12 @@
 ## 技术细节
 
 - opencode 选**插件型**，代码在 `harnesses/opencode/`：
-  - `plugin/qqab-wire.mjs`：协议客户端 + 投递渲染。不依赖 opencode，可以单独测
+  - `plugin/acb-wire.mjs`：协议客户端 + 投递渲染。不依赖 opencode，可以单独测
     （15 个测试，对着一个假桥跑——假的是桥，不是平台）。
   - `plugin/index.js`：插件本体（**v2 API**，`export default { id, setup(ctx) }`）。
     用 `ctx.tool.transform` 注册九个工具（参数是 JSON Schema，不是 zod）；起一个后台连接，
     收到轮次就 `ctx.session.prompt` 排话、`ctx.session.wait` 等这一轮说完，再回 `turn_end`。
-- **会话按设备一份**：标题 `qqab:<设备>`，id 存在 `ctx.storage` 里，重开能接上；每次用前
+- **会话按设备一份**：标题 `acb:<设备>`，id 存在 `ctx.storage` 里，重开能接上；每次用前
   确认它还活着。会话就是设备的记忆（ADR-0002），重开 harness 不能失忆。options 里的
   `session` 可以钉死。
 - **工具只在轮次内可用**：没有票的调用直接以 `unauthorized` 拒掉。这样人在 TUI 里手动

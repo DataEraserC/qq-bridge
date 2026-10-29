@@ -26,7 +26,7 @@ pub use storage::{
 pub use tools::TOOL_NAMES;
 
 /// 协议类型顺手转出去：下游（接入点、适配器）依赖 kernel 一个 crate 就够。
-pub use qqab_proto::{
+pub use acb_proto::{
     Delivery, Element, ErrorCode, Frame, Record, RecordKind, RoomId, Sender, Ticket, ToolError,
     TurnReason,
 };

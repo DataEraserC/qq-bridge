@@ -123,7 +123,7 @@ crates/
     src/bin/dev-harness  开发用的最小 harness（验「桥 ↔ 平台」这一段）
 harnesses/
   opencode/
-    plugin/             v2 插件目录：index.js（工具面 + 轮次驱动）+ qqab-wire.mjs（协议客户端）
+    plugin/             v2 插件目录：index.js（工具面 + 轮次驱动）+ acb-wire.mjs（协议客户端）
     probe.mjs           不用 opencode 也能验「桥这一段」的探针
     test/               协议层 15 + 插件逻辑 8（后者对面是模拟的 v2 宿主）
 docs/

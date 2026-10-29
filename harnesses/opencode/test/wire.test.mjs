@@ -14,7 +14,7 @@ import {
   parseEndpoint,
   renderElements,
   renderTurn,
-} from "../plugin/qqab-wire.mjs"
+} from "../plugin/acb-wire.mjs"
 import {
   FakeBridge,
   TICKET,

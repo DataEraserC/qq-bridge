@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use qqab_adapter_onebot11::{LinkSlot, OneBotOutbound, supervise};
-use qqab_kernel::{Bridge, Config, Outbounds, SqliteStore, serve};
+use acb_adapter_onebot11::{LinkSlot, OneBotOutbound, supervise};
+use acb_kernel::{Bridge, Config, Outbounds, SqliteStore, serve};
 
 /// 清理线程隔多久扫一次。来源：实现默认——桥不是数据库，5 分钟一次足够，
 /// 真需要更勤/更懒再做成配置项。
@@ -169,7 +169,7 @@ impl Options {
                 }
                 "--check" => check_only = true,
                 "--help" | "-h" => {
-                    println!("用法：qqab-bridge [--config 路径] [--check]");
+                    println!("用法：acb-bridge [--config 路径] [--check]");
                     std::process::exit(0);
                 }
                 other => return Err(format!("不认识的参数：{other}（用 --help 看用法）").into()),

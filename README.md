@@ -1,4 +1,4 @@
-# qq-agent-bridge
+# agent-chat-bridge
 
 把各种 agent harness（DSH / WorkBuddy / Trae / Codex / OpenClaw…）接进各种聊天平台
 （QQ / KOOK / Discord / Telegram…）的桥。让你在群里或私聊里，跟你自己的 agent 说话。
@@ -34,16 +34,16 @@
 cp config.example.toml config.toml
 
 # 2. 只检查配置，不启动
-cargo run -p qqab-bridge -- --config config.toml --check
+cargo run -p acb-bridge -- --config config.toml --check
 
 # 3. 起桥
-cargo run -p qqab-bridge -- --config config.toml
+cargo run -p acb-bridge -- --config config.toml
 
 # 4. 另开一个终端，接一个最小 harness（真 harness 还没接）
-cargo run -p qqab-bridge --bin dev-harness -- --token <配置里设备的 token>
+cargo run -p acb-bridge --bin dev-harness -- --token <配置里设备的 token>
 ```
 
-第一次起桥会在工作目录建 `state/qqab.db`：流水、水位、笔记、「第几次投递」全在里面，
+第一次起桥会在工作目录建 `state/acb.db`：流水、水位、笔记、「第几次投递」全在里面，
 重启接着用。删了等于失忆（但不会起不来）。细节见 [docs/07-storage.md](docs/07-storage.md)。
 
 要用真的 opencode 接进来（**只支持 v2**）。插件留在仓库里，配置文件指向它就行，不要拷贝
@@ -60,7 +60,7 @@ opencode2 --standalone     # 必须带 --standalone，后台 service 模式解�
 ```
 
 现成能抄的那份在 [harnesses/opencode/opencode.jsonc.example](harnesses/opencode/opencode.jsonc.example)。
-接上之后 stderr 会打 `[qqab] info 已接入桥，绑定设备 main`；有人在 QQ 里说话，模型就会通过
+接上之后 stderr 会打 `[acb] info 已接入桥，绑定设备 main`；有人在 QQ 里说话，模型就会通过
 `execute` 调 `await tools.send_message({...})` 回过去（插件工具在 opencode 里走 Code Mode，
 不在原生工具表里——这条坑和整轮实测记录见 [docs/06](docs/06-harness-adapters.md)）。
 
