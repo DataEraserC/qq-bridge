@@ -131,6 +131,8 @@ pub struct WakeInput<'a> {
     pub text: &'a str,
     /// 是不是冲本账号来的（@ 到我、拍我）。
     pub at_self: bool,
+    /// 这条是不是引用了我发的某条消息。
+    pub reply_to_self: bool,
     /// 平台事件类型；普通消息为 `None`。
     pub event: Option<&'a str>,
     /// 这条进来之后，该房间待处理的未读条数。
@@ -146,12 +148,16 @@ pub enum WakeDecision {
 
 /// 唤醒策略。
 ///
-/// 默认四件套：@ 我就醒、叫昵称就醒、攒够 N 条就醒、被拍就醒（ADR-0002 / 0007）。
-/// 关键词、事件类型、免打扰名单是可选开关，默认全关。
+/// 默认五件套：@ 我就醒、引用我的话也醒、叫昵称就醒、攒够 N 条就醒、被拍就醒
+/// （ADR-0002 / 0007）。关键词、事件类型、免打扰名单是可选开关，默认全关。
 #[derive(Debug, Clone, PartialEq)]
 pub struct WakePolicy {
     /// @ 到本账号就醒。
     pub at_mention: bool,
+    /// 引用我发的消息就醒（QQ 的「回复」就是这种）。
+    ///
+    /// 和 `at_mention` 分开：有人只想被 @ 叫醒，不想被人引用一条旧消息就醒。
+    pub reply: bool,
     /// 文本里出现 `names` 里任意一个就醒。
     pub name_mention: bool,
     pub names: Vec<String>,
@@ -171,6 +177,7 @@ impl Default for WakePolicy {
     fn default() -> Self {
         Self {
             at_mention: true,
+            reply: true,
             name_mention: true,
             names: Vec::new(),
             accumulate: Some(DEFAULT_ACCUMULATE),
@@ -206,6 +213,10 @@ impl WakePolicy {
         }
 
         if self.at_mention && input.at_self {
+            return WakeDecision::Wake;
+        }
+        // 引用我的话等同于对我说：QQ 里「回复」是最自然的追问方式，很多人不会再加 @。
+        if self.reply && input.reply_to_self {
             return WakeDecision::Wake;
         }
         if self.name_mention && matches_any(&self.names, input.text) {
@@ -481,6 +492,7 @@ fn build_wake(device: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, C
 
     Ok(WakePolicy {
         at_mention: raw.at_mention.unwrap_or(default.at_mention),
+        reply: raw.reply.unwrap_or(default.reply),
         name_mention: raw.name_mention.unwrap_or(default.name_mention),
         names: raw.names.unwrap_or(default.names),
         accumulate: raw.accumulate.map(Some).unwrap_or(default.accumulate),
@@ -558,6 +570,7 @@ struct RawSubscription {
 #[derive(Debug, Default, Deserialize)]
 struct RawWake {
     at_mention: Option<bool>,
+    reply: Option<bool>,
     name_mention: Option<bool>,
     names: Option<Vec<String>>,
     accumulate: Option<u32>,
@@ -997,9 +1010,41 @@ mod tests {
             sender_id: "10001",
             text,
             at_self,
+            reply_to_self: false,
             event: None,
             unread,
         }
+    }
+
+    /// 引用了我某条消息的输入。
+    fn reply<'a>(text: &'a str, unread: u32) -> WakeInput<'a> {
+        WakeInput {
+            reply_to_self: true,
+            ..input(text, false, unread)
+        }
+    }
+
+    #[test]
+    fn quoting_my_message_wakes_by_default() {
+        let policy = WakePolicy::default();
+        assert_eq!(
+            policy.decide(&reply("只发子网", 1)),
+            WakeDecision::Wake,
+            "引用我的话就是对我说话，没 @ 也该醒"
+        );
+    }
+
+    #[test]
+    fn reply_switch_can_be_turned_off() {
+        let policy = WakePolicy {
+            reply: false,
+            ..WakePolicy::default()
+        };
+        assert_eq!(
+            policy.decide(&reply("只发子网", 1)),
+            WakeDecision::Stay,
+            "关掉之后只认 @，引用不叫醒"
+        );
     }
 
     #[test]
@@ -1048,6 +1093,7 @@ mod tests {
             sender_id: "10001",
             text: "",
             at_self: true,
+            reply_to_self: false,
             event: Some("poke"),
             unread: 0,
         };
@@ -1066,6 +1112,7 @@ mod tests {
             sender_id: "10001",
             text: "",
             at_self: true,
+            reply_to_self: false,
             event: Some("kook.channel.created"),
             unread: 5,
         };

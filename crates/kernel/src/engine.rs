@@ -207,6 +207,15 @@ impl<S: Store> Bridge<S> {
             return Ok(Ingest::NotSubscribed { room });
         }
 
+        // 「引用的是不是我发的」要查库，所以入库前先判。判据是本房间各个发送账号——
+        // 被引用的那条如果是我方账号发的，这条就算冲我来的（WakePolicy::reply）。
+        let accounts: Vec<String> = subscribers
+            .iter()
+            .map(|(_, account, _)| account.clone())
+            .collect();
+        let reply_to_self = self.quotes_own_message(&draft, &accounts)?;
+        let draft = draft.with_reply_to_self(reply_to_self);
+
         let record = self.store.append(draft)?;
         let text = flatten_text(&record.elements);
         let event = match &record.kind {
@@ -229,6 +238,7 @@ impl<S: Store> Bridge<S> {
                 sender_id: &record.sender.id,
                 text: &text,
                 at_self: record.at_self,
+                reply_to_self: record.reply_to_self,
                 event,
                 unread: pending,
             };
@@ -242,6 +252,29 @@ impl<S: Store> Bridge<S> {
             id: record.id,
             woke,
         })
+    }
+
+    /// 这条消息里有没有「引用我方账号发过的消息」。
+    ///
+    /// 查不到被引用那条（被清理了、对面没给编号）就当不是——宁可少叫醒一次，
+    /// 也不要凭编号长相猜。平台把自己的消息编号给全了，这件事才判得准。
+    fn quotes_own_message(
+        &self,
+        draft: &RecordDraft,
+        accounts: &[String],
+    ) -> Result<bool, StorageError> {
+        for element in &draft.elements {
+            let Element::Quote { message_id } = element else {
+                continue;
+            };
+            let Some(sender) = self.store.sender_of(&draft.room, message_id)? else {
+                continue;
+            };
+            if accounts.iter().any(|account| account == &sender.id) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 取下一轮。没有就返回 `None`。
@@ -487,16 +520,20 @@ impl<S: Store> Bridge<S> {
 
         let record = self
             .store
-            .append(RecordDraft::message(
-                room.clone(),
-                Sender {
-                    id: account.to_owned(),
-                    name: account.to_owned(),
-                },
-                sent.at,
-                elements,
-                false,
-            ))
+            .append(
+                RecordDraft::message(
+                    room.clone(),
+                    Sender {
+                        id: account.to_owned(),
+                        name: account.to_owned(),
+                    },
+                    sent.at,
+                    elements,
+                    false,
+                )
+                // 记下平台编号：下次有人引用这条，桥才反查得出「是我的话」。
+                .with_platform_id(sent.platform_id.clone()),
+            )
             .map_err(internal)?;
 
         // 自己说的话不是未读：写进流水的同时确认掉。

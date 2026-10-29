@@ -303,6 +303,8 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
       marks.push(`事件 ${record.kind.event}`)
     }
     if (record.at_self) marks.push("冲你来的")
+    // 引用我发的某条消息 = 在跟我说，但不是 @。分两个词，模型才知道对方是在追问哪件事。
+    if (record.reply_to_self) marks.push("回你的话")
     // 桥一般会给一句 `note`（写在下面单独一行）。没有 note 但标了重投，就在标题里
     // 提一句，别让「这条重复了」这件事丢掉。
     if (record.redelivery && !record.note) {

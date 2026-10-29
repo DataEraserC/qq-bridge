@@ -40,6 +40,10 @@ pub struct RecordDraft {
     pub at: i64,
     pub elements: Vec<Element>,
     pub at_self: bool,
+    /// 平台自己的消息编号；事件没有，留 `None`。
+    pub platform_id: Option<String>,
+    /// 是不是引用了我发的某条消息。由调度层在入库前填（要查库才判得出）。
+    pub reply_to_self: bool,
 }
 
 impl RecordDraft {
@@ -58,6 +62,8 @@ impl RecordDraft {
             at,
             elements,
             at_self,
+            platform_id: None,
+            reply_to_self: false,
         }
     }
 
@@ -79,7 +85,26 @@ impl RecordDraft {
             at,
             elements,
             at_self,
+            platform_id: None,
+            reply_to_self: false,
         }
+    }
+
+    /// 带上平台消息编号。适配器解析消息时填，用来反查「被引用的是谁」。
+    #[must_use]
+    pub fn with_platform_id(mut self, platform_id: impl Into<String>) -> Self {
+        let platform_id = platform_id.into();
+        if !platform_id.is_empty() {
+            self.platform_id = Some(platform_id);
+        }
+        self
+    }
+
+    /// 标记「这是在回复我发的消息」。
+    #[must_use]
+    pub fn with_reply_to_self(mut self, reply_to_self: bool) -> Self {
+        self.reply_to_self = reply_to_self;
+        self
     }
 }
 
@@ -102,6 +127,13 @@ pub trait Transcript {
 
     /// 按 [`PrunePlan`] 删旧记录，返回删掉的条数。指向被删记录的投递计数与确认一起清掉。
     fn prune(&mut self, room: &RoomId, plan: &PrunePlan) -> Result<u64, StorageError>;
+
+    /// 房间里那条平台编号为 `platform_id` 的记录是谁发的。
+    ///
+    /// 用途只有一个：别人引用了一条消息时，反查被引用的是不是我们自己发的
+    /// （见 [`Record::reply_to_self`]）。查不到给 `None`——可能被清理掉了，
+    /// 也可能对面没给编号，两种情况都不能瞎猜。
+    fn sender_of(&self, room: &RoomId, platform_id: &str) -> Result<Option<Sender>, StorageError>;
 }
 
 /// 一次清理的判据。三条**同时**成立才删——这是「宁可少删」的意思。
@@ -283,6 +315,8 @@ impl Transcript for MemoryStore {
             at: draft.at,
             elements: draft.elements,
             at_self: draft.at_self,
+            reply_to_self: draft.reply_to_self,
+            platform_id: draft.platform_id,
             redelivery: None,
             // 流水里存的是原话，旁白只在投递时由调度层补（见 engine::open_turn）。
             note: None,
@@ -364,6 +398,19 @@ impl Transcript for MemoryStore {
         }
 
         Ok(removed.len() as u64)
+    }
+
+    fn sender_of(&self, room: &RoomId, platform_id: &str) -> Result<Option<Sender>, StorageError> {
+        if platform_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.records.get(room).and_then(|records| {
+            records
+                .iter()
+                .rev()
+                .find(|record| record.platform_id.as_deref() == Some(platform_id))
+                .map(|record| record.sender.clone())
+        }))
     }
 }
 

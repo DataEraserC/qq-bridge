@@ -79,16 +79,20 @@ fn message(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Pars
     let (elements, at_self) =
         segment::from_onebot(event.get("message").unwrap_or(&Value::Null), self_id);
 
-    Ok(Parsed::Record(RecordDraft::message(
-        room,
-        Sender {
-            id: sender_id,
-            name: display_name(event),
-        },
-        at,
-        elements,
-        at_self,
-    )))
+    Ok(Parsed::Record(
+        RecordDraft::message(
+            room,
+            Sender {
+                id: sender_id,
+                name: display_name(event),
+            },
+            at,
+            elements,
+            at_self,
+        )
+        // 平台消息编号留着：别人引用了某条消息时，桥要靠它反查「被引用的是谁发的」。
+        .with_platform_id(id_of(event.get("message_id"))),
+    ))
 }
 
 fn notice(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Parsed, EventError> {
@@ -271,6 +275,39 @@ mod tests {
         assert_eq!(draft.sender.name, "老王八", "群名片优先");
         assert!(draft.at_self, "被 @ 了");
         assert_eq!(draft.at, 1_793_000_000_000, "秒要换成毫秒");
+    }
+
+    #[test]
+    fn message_keeps_the_platform_id_and_the_quote_target() {
+        let event = json!({
+            "post_type": "message",
+            "message_type": "group",
+            "self_id": 999,
+            "group_id": 456,
+            "user_id": 10001,
+            "message_id": 592852179,
+            "message": [
+                {"type": "reply", "data": {"id": "592852178"}},
+                {"type": "text", "data": {"text": "只发子网"}}
+            ]
+        });
+        let Parsed::Record(draft) = parse("qq", &event).expect("能解析") else {
+            panic!("应当成一条记录");
+        };
+
+        assert_eq!(
+            draft.platform_id.as_deref(),
+            Some("592852179"),
+            "自己的平台编号要留着，别人才引用得了我"
+        );
+        assert!(
+            matches!(
+                draft.elements.first(),
+                Some(Element::Quote { message_id }) if message_id == "592852178"
+            ),
+            "被引用那条的编号也要留着，否则判不出是不是在回我"
+        );
+        assert!(!draft.at_self, "引用不算 @，两件事分开记");
     }
 
     #[test]

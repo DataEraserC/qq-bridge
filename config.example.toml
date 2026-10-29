@@ -40,13 +40,14 @@ persona = "默认人格"
 memory = "main-memory"
 token = "换成你自己的一长串随机字符"
 
-# QQ 群：@ 我、叫我名字、攒够 10 条就醒；被拍也醒。
+# QQ 群：@ 我、引用我的话、叫我名字、攒够 10 条就醒；被拍也醒。
 [[devices.subscriptions]]
 room = "qq:group/123456789"
 send_account = "10001"
 
 [devices.subscriptions.wake]
 at_mention = true
+reply = true          # 引用我发的某条消息也算对我说话（QQ 的「回复」就是这种）
 name_mention = true
 names = ["小助手"]
 accumulate = 10

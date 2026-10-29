@@ -39,6 +39,18 @@ pub struct Record {
     /// 是不是冲本账号来的（@ 到我、拍我）。
     #[serde(default)]
     pub at_self: bool,
+    /// 这条是不是「引用了我发的某条消息」的回复。
+    ///
+    /// 和 `at_self` 分开记：引用和 @ 是两种不同的动作，有人会只想要其中一种叫醒。
+    /// 判定要查被引用那条是谁发的，所以得先有 [`Record::platform_id`]。
+    #[serde(default)]
+    pub reply_to_self: bool,
+    /// 平台自己的消息编号（QQ 的 `message_id`）。
+    ///
+    /// 只为一件事存在：别人引用了某条消息时，拿这个编号反查「被引用的是谁发的」。
+    /// 我们发出去的消息也带，所以「引用了我」才判得出来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_id: Option<String>,
     /// 非空表示「第 N 次投递」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redelivery: Option<u32>,
@@ -79,6 +91,8 @@ mod tests {
             at: 1_793_000_000_000,
             elements: vec![Element::text("在吗")],
             at_self: false,
+            reply_to_self: false,
+            platform_id: None,
             redelivery: None,
             note: None,
         }

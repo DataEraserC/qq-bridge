@@ -65,6 +65,8 @@ sequenceDiagram
   "at": 1793000000000,
   "elements": [{"type": "text", "text": "在吗"}],
   "at_self": false,
+  "reply_to_self": false,
+  "platform_id": "592852179",
   "redelivery": null
 }
 ```
@@ -72,6 +74,13 @@ sequenceDiagram
 - `id`：房间内递增编号，水位按它推进。
 - `kind`：`message` 或 `{"kind":"event","event":"poke"}`；拍一拍就是 `event: poke`（[ADR-0007](../adr/0007-poke-as-message.md)）。
 - `at_self`：这条是不是冲本账号来的（@ 到我、拍我）。
+- `reply_to_self`：这条是不是**引用了我发的某条消息**。
+  `at_self` 和 `reply_to_self` 是两个事实，不是一个：@ 是明确点名，引用是接着某句话往下说。
+  默认两者都会叫醒（`wake.at_mention` / `wake.reply`），但可以分别关掉。
+  判定靠反查：被引用那条如果是本房间的发送账号发的，就算数；查不到（被清理了、对面没给编号）
+  就当不是——宁可少叫醒一次，也不凭编号长相猜。
+- `platform_id`：平台自己的消息编号（QQ 的 `message_id`）。留着只有一个用途：别人引用某条时，
+  靠它反查「被引用的是谁发的」。我方发出去的消息也带，所以「引用了我」才判得出来。
 - `redelivery`：非空表示「第 N 次投递」。
 - `note`：桥附在**这次投递**上的旁白，不是发送者说的话。目前只在重投时出现，内容是
   「第 2 次投递；调 ack_messages 确认 #5 之后就不再重复投递」。

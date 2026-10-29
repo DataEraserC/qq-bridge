@@ -586,3 +586,107 @@ fn notes_are_isolated_per_platform_down_to_storage() {
             .is_none()
     );
 }
+
+// ---------------------------------------------------------------------------
+// 引用回复：QQ 里「回复」不带 @，也该叫醒
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quoting_my_message_wakes_without_a_mention() {
+    let (mut bridge, _sends) = bridge();
+
+    // 1. 先让我方把话说出去：这条会带着平台编号 p-1 进流水。
+    bridge
+        .ingest(message("qq:123", "10001", "在吗", true))
+        .expect("能记下来");
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    let ticket = delivery.ticket;
+    bridge
+        .tool_call(
+            &ticket,
+            "send_message",
+            json!({"elements": [{"type": "text", "text": "在"}]}),
+        )
+        .expect("能发");
+    bridge
+        .tool_call(&ticket, "ack_messages", json!({"ids": [1]}))
+        .expect("能确认");
+    bridge.end_turn(&ticket).expect("能收尾");
+
+    // 2. 对方「引用」我那条再说一句，既没 @ 也没叫名字，条数更不到 50。
+    let quoted = RecordDraft::message(
+        room("qq:123"),
+        Sender {
+            id: "10001".into(),
+            name: "老王".into(),
+        },
+        AT + 1000,
+        vec![
+            Element::Quote {
+                message_id: "p-1".into(),
+            },
+            Element::text("只发子网"),
+        ],
+        false,
+    );
+    let ingested = bridge.ingest(quoted).expect("能记下来");
+
+    assert_eq!(
+        ingested,
+        Ingest::Recorded {
+            id: 3,
+            woke: vec!["main".to_owned()]
+        },
+        "引用我的话就是在跟我说话，不 @ 也该醒"
+    );
+    assert!(
+        bridge
+            .store()
+            .since(&room("qq:123"), 2, 10)
+            .expect("能读")
+            .last()
+            .expect("有那条")
+            .reply_to_self,
+        "记录上要留下这个事实，不能只用来叫醒就丢了"
+    );
+}
+
+#[test]
+fn quoting_someone_elses_message_stays_quiet() {
+    let (mut bridge, _sends) = bridge();
+
+    // 别人的一条消息，带平台编号 m-9。它不会叫醒（没 @、没名字、不到 50 条）。
+    let others = message("qq:123", "10001", "随便说说", false).with_platform_id("m-9");
+    assert_eq!(
+        bridge.ingest(others).expect("能记下来"),
+        Ingest::Recorded {
+            id: 1,
+            woke: Vec::new()
+        }
+    );
+
+    // 引用的是别人的话，不是我的 → 照旧不醒。
+    let quoted = RecordDraft::message(
+        room("qq:123"),
+        Sender {
+            id: "10001".into(),
+            name: "老王".into(),
+        },
+        AT + 1000,
+        vec![
+            Element::Quote {
+                message_id: "m-9".into(),
+            },
+            Element::text("我也这么想"),
+        ],
+        false,
+    );
+    assert_eq!(
+        bridge.ingest(quoted).expect("能记下来"),
+        Ingest::Recorded {
+            id: 2,
+            woke: Vec::new()
+        },
+        "引用别人的话不算冲我来的"
+    );
+}

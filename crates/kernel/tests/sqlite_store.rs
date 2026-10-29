@@ -333,7 +333,7 @@ fn a_newer_schema_is_refused_instead_of_being_written_to() {
     let message = error.to_string();
     assert!(message.contains("99"), "要说清库是第几版：{message}");
     assert!(
-        message.contains("第 1 版"),
+        message.contains(&format!("第 {} 版", qqab_kernel::SCHEMA_VERSION)),
         "也要说清程序认识第几版：{message}"
     );
 }
@@ -447,4 +447,123 @@ fn a_pruned_room_stays_pruned_after_reopen() {
         "重启之后编号还是接着 4 往上"
     );
     assert_eq!(store.rooms().expect("可读"), vec![qq]);
+}
+
+#[test]
+fn platform_id_survives_a_restart_and_is_findable() {
+    let db = TempDb::new("platform-id");
+    let qq = room("qq:group/769843907");
+
+    {
+        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        // 我们自己发出去的那条：带平台编号。
+        let draft = RecordDraft::message(
+            qq.clone(),
+            Sender {
+                id: "3683924053".into(),
+                name: "3683924053".into(),
+            },
+            AT,
+            vec![Element::text("只发 192.168 网段")],
+            false,
+        )
+        .with_platform_id("592852179");
+        store.append(draft).expect("能写");
+        store.append(message(&qq, "只发子网")).expect("能写");
+    }
+
+    let store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let sender = store
+        .sender_of(&qq, "592852179")
+        .expect("能查")
+        .expect("应当查得到");
+    assert_eq!(sender.id, "3683924053", "反查要能认出是我方账号发的");
+    assert!(
+        store.sender_of(&qq, "999").expect("能查").is_none(),
+        "没这个编号就给 None，不许瞎猜"
+    );
+}
+
+#[test]
+fn reply_to_self_survives_a_restart() {
+    let db = TempDb::new("reply-flag");
+    let qq = room("qq:group/1");
+
+    {
+        let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("能打开");
+        let draft = message(&qq, "只发子网").with_reply_to_self(true);
+        store.append(draft).expect("能写");
+    }
+
+    let store = qqab_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let records = store.since(&qq, 0, 10).expect("能读");
+    assert!(records[0].reply_to_self, "重启之后「这是在回我」不能丢");
+}
+
+/// 老库（第 1 版，没有这两列）能不能就地升上来，而不是让用户删库。
+#[test]
+fn a_version_one_database_is_migrated_in_place() {
+    let db = TempDb::new("migrate-v1");
+    if let Some(parent) = db.path().parent() {
+        std::fs::create_dir_all(parent).expect("建目录");
+    }
+
+    // 手搓一个第 1 版的库：records 表没有 reply_to_self / platform_id。
+    {
+        let conn = rusqlite::Connection::open(db.path()).expect("能开");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE records (
+                platform TEXT NOT NULL,
+                room TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                event TEXT,
+                sender_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                at_self INTEGER NOT NULL,
+                elements TEXT NOT NULL,
+                PRIMARY KEY (platform, room, record_id)
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+            "#,
+        )
+        .expect("建旧库");
+        conn.execute(
+            "INSERT INTO records
+             (platform, room, record_id, kind, event, sender_id, sender_name, at, at_self, elements)
+             VALUES ('qq', 'group/1', 1, 'message', NULL, '10001', '老王', ?1, 0, ?2)",
+            rusqlite::params![AT, r#"[{"type":"text","text":"老消息"}]"#],
+        )
+        .expect("写旧数据");
+    }
+
+    let mut store = qqab_kernel::SqliteStore::open(db.path()).expect("老库应当能升上来");
+    let qq = room("qq:group/1");
+
+    let records = store.since(&qq, 0, 10).expect("老数据还得读得出来");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].elements, vec![Element::text("老消息")]);
+    assert!(!records[0].reply_to_self, "老数据没有这个信息，按不是处理");
+    assert!(records[0].platform_id.is_none(), "老数据没有平台编号");
+
+    // 升上来之后新功能要能用。
+    let draft = RecordDraft::message(
+        qq.clone(),
+        Sender {
+            id: "3683924053".into(),
+            name: "bot".into(),
+        },
+        AT,
+        vec![Element::text("新消息")],
+        false,
+    )
+    .with_platform_id("m-7");
+    store.append(draft).expect("升级后能写新列");
+    assert!(
+        store.sender_of(&qq, "m-7").expect("能查").is_some(),
+        "升级后新写的平台编号要查得到"
+    );
 }

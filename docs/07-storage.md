@@ -32,6 +32,9 @@ erDiagram
         text event
         text sender_id
         text elements
+        integer at_self
+        integer reply_to_self
+        text platform_id
     }
     watermarks {
         text device
@@ -148,10 +151,18 @@ EOF
 
 ## 结构版本
 
-`meta.schema_version` 记着这个库是第几版结构。程序只认识自己那一版：
+`meta.schema_version` 记着这个库是第几版结构：
 
 - 库比程序**新** → 拒绝打开，报「库是第 N 版，本程序只认识第 M 版」。这是故意的：老程序往新库里写，比起不来严重得多。
-- 改表流程：先写迁移（把老数据搬到新结构），再加版本号，最后才改代码。
+- 库比程序**老** → 就地升级（补列、建索引，最后才改版本号），老数据照旧读得出来。
+  补列是幂等的：中途失败，下次启动接着补。
+- 改表流程：先把迁移写进 `SqliteStore::check_version`，再把 `SCHEMA_VERSION` 加一，最后才改读写代码。
+
+已经发生过的迁移：
+
+| 版本 | 改了什么 | 为什么 |
+|---|---|---|
+| 1 → 2 | `records` 加 `reply_to_self`、`platform_id` 与对应索引 | 判「别人引用的是不是我发的消息」，靠平台编号反查 |
 
 ## 已知限制
 

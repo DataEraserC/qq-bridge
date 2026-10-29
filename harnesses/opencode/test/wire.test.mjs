@@ -198,6 +198,20 @@ test("空记录的一轮也要说清楚是例行检查", () => {
   assert.match(text, /没有新记录/)
 })
 
+test("引用我的话单独标出来，和 @ 分开说", () => {
+  const record = {
+    ...delivery().records[0],
+    id: 7,
+    at_self: false,
+    reply_to_self: true,
+    elements: [{ type: "quote", message_id: "592852179" }, { type: "text", text: "只发子网" }],
+  }
+  const text = renderTurn({ ...delivery(), records: [record] }, { now: Date.now() })
+
+  assert.match(text, /回你的话/, "引用要是看不出来，模型就不知道人在追问哪件事")
+  assert.ok(!text.includes("冲你来的"), `引用不是 @，别混着说：${text}`)
+})
+
 test("桥的旁白单独一行，不拼进对方说的话里", () => {
   const record = {
     ...delivery().records[0],

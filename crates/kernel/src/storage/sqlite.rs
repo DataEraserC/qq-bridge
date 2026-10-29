@@ -18,7 +18,9 @@ use super::{
 };
 
 /// 这个程序认识的库结构版本。改表就加一。
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// 1 → 2：`records` 加 `reply_to_self` 与 `platform_id`（引用回复的判定要用）。
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -37,6 +39,8 @@ CREATE TABLE IF NOT EXISTS records (
     sender_name TEXT    NOT NULL,
     at          INTEGER NOT NULL,   -- Unix 毫秒
     at_self     INTEGER NOT NULL,   -- 0 / 1
+    reply_to_self INTEGER NOT NULL DEFAULT 0, -- 0 / 1，引用的是我发的消息
+    platform_id TEXT,               -- 平台自己的消息编号，反查引用对象用
     elements    TEXT    NOT NULL,   -- 内容元素的 JSON 数组
     PRIMARY KEY (platform, room, record_id)
 );
@@ -143,6 +147,10 @@ impl SqliteStore {
         Ok(store)
     }
 
+    /// 把库升到 [`SCHEMA_VERSION`]。
+    ///
+    /// 规矩：**先补列再改版本号**，中途失败下次还能接着补。比当前版本新的库直接拒绝——
+    /// 老程序往新库里写，就是在拿不认识的结构瞎猜。
     fn check_version(&self) -> Result<(), StorageError> {
         let found: Option<String> = self
             .conn
@@ -154,25 +162,69 @@ impl SqliteStore {
             .optional()
             .map_err(|error| backend(error.to_string()))?;
 
-        match found {
-            None => {
-                self.conn
-                    .execute(
-                        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
-                        params![SCHEMA_VERSION.to_string()],
-                    )
-                    .map_err(|error| backend(error.to_string()))?;
-                Ok(())
-            }
-            Some(raw) => match raw.trim().parse::<i64>() {
-                Ok(version) if version == SCHEMA_VERSION => Ok(()),
-                Ok(version) => Err(backend(format!(
-                    "这个库是第 {version} 版的结构，本程序只认识第 {SCHEMA_VERSION} 版。\
-                     别拿新库配老程序——先升级程序，或者换一个库文件"
-                ))),
-                Err(_) => Err(backend(format!("库里的版本号读不懂：{raw}"))),
-            },
+        // 新库（或被清过版本号的库）：按 0 处理，后面照常补列，不会漏。
+        let version = match found {
+            None => 0,
+            Some(raw) => raw
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| backend(format!("库里的版本号读不懂：{raw}")))?,
+        };
+
+        if version > SCHEMA_VERSION {
+            return Err(backend(format!(
+                "这个库是第 {version} 版的结构，本程序只认识第 {SCHEMA_VERSION} 版。\
+                 别拿新库配老程序——先升级程序，或者换一个库文件"
+            )));
         }
+
+        // 1 → 2：引用回复要判「被引用的是谁发的」，得留下平台消息编号。
+        if version < 2 {
+            self.add_column_if_missing("records", "reply_to_self", "INTEGER NOT NULL DEFAULT 0")?;
+            self.add_column_if_missing("records", "platform_id", "TEXT")?;
+        }
+
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![SCHEMA_VERSION.to_string()],
+            )
+            .map_err(|error| backend(error.to_string()))?;
+
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS records_platform_id
+                     ON records (platform, room, platform_id);",
+            )
+            .map_err(|error| backend(format!("建索引失败：{error}")))?;
+        Ok(())
+    }
+
+    /// 列不存在才加。`ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，只能先问一嘴。
+    fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), StorageError> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| backend(error.to_string()))?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| backend(error.to_string()))?;
+        for name in names {
+            if name.map_err(|error| backend(error.to_string()))? == column {
+                return Ok(());
+            }
+        }
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+            ))
+            .map_err(|error| backend(format!("给 {table} 补列 {column} 失败：{error}")))
     }
 
     /// 库里有多少东西。只给启动摘要用，不算进 [`Store`] 约束。
@@ -227,8 +279,9 @@ impl Transcript for SqliteStore {
         transaction
             .execute(
                 "INSERT INTO records
-                 (platform, room, record_id, kind, event, sender_id, sender_name, at, at_self, elements)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (platform, room, record_id, kind, event, sender_id, sender_name, at, at_self,
+                  reply_to_self, platform_id, elements)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     draft.room.platform,
                     draft.room.room,
@@ -239,6 +292,8 @@ impl Transcript for SqliteStore {
                     draft.sender.name,
                     draft.at,
                     if draft.at_self { 1 } else { 0 },
+                    if draft.reply_to_self { 1 } else { 0 },
+                    draft.platform_id,
                     elements,
                 ],
             )
@@ -253,6 +308,8 @@ impl Transcript for SqliteStore {
             at: draft.at,
             elements: draft.elements,
             at_self: draft.at_self,
+            reply_to_self: draft.reply_to_self,
+            platform_id: draft.platform_id,
             // 流水里只有原话；重投的旁白由投递时补（见 engine::open_turn）。
             redelivery: None,
             note: None,
@@ -263,7 +320,8 @@ impl Transcript for SqliteStore {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT record_id, kind, event, sender_id, sender_name, at, at_self, elements
+                "SELECT record_id, kind, event, sender_id, sender_name, at, at_self,
+                        reply_to_self, platform_id, elements
                  FROM records
                  WHERE platform = ?1 AND room = ?2 AND record_id > ?3
                  ORDER BY record_id
@@ -283,7 +341,9 @@ impl Transcript for SqliteStore {
                         sender_name: row.get(4)?,
                         at: row.get(5)?,
                         at_self: row.get::<_, i64>(6)? != 0,
-                        elements: row.get(7)?,
+                        reply_to_self: row.get::<_, i64>(7)? != 0,
+                        platform_id: row.get(8)?,
+                        elements: row.get(9)?,
                     })
                 },
             )
@@ -341,6 +401,28 @@ impl Transcript for SqliteStore {
             )
             .map_err(io_error)?;
         Ok(value.max(0) as u64)
+    }
+
+    fn sender_of(&self, room: &RoomId, platform_id: &str) -> Result<Option<Sender>, StorageError> {
+        if platform_id.is_empty() {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT sender_id, sender_name FROM records
+                 WHERE platform = ?1 AND room = ?2 AND platform_id = ?3
+                 ORDER BY record_id DESC
+                 LIMIT 1",
+                params![room.platform, room.room, platform_id],
+                |row| {
+                    Ok(Sender {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(io_error)
     }
 
     fn prune(&mut self, room: &RoomId, plan: &PrunePlan) -> Result<u64, StorageError> {
@@ -406,6 +488,8 @@ struct RawRow {
     sender_name: String,
     at: i64,
     at_self: bool,
+    reply_to_self: bool,
+    platform_id: Option<String>,
     elements: String,
 }
 
@@ -432,6 +516,8 @@ impl RawRow {
             at: self.at,
             elements,
             at_self: self.at_self,
+            reply_to_self: self.reply_to_self,
+            platform_id: self.platform_id,
             redelivery: None,
             note: None,
         })
