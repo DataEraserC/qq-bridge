@@ -40,6 +40,10 @@ fn config(max_records: u64, max_days: u64) -> String {
         name = "人格"
         text = "你是桥。"
 
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
+
         [[sessions]]
         id = "main"
         harness = "dsh"

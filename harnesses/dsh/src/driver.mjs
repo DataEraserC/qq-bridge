@@ -116,9 +116,11 @@ class TurnDriver {
     try {
       const sessionId = await this.#session(delivery.session)
       const text = renderTurn(delivery)
+      const info = delivery.session_info ?? {}
+      const model = info.model ?? "(dsh 默认)"
       this.log(
         "debug",
-        `开轮 ${delivery.ticket}：${delivery.room.connection}:${delivery.room.path.join("/")}，${delivery.records.length} 条`,
+        `开轮 ${delivery.ticket}：${delivery.room.connection}:${delivery.room.path.join("/")}，${delivery.records.length} 条，模型 ${model}`,
       )
       // prompt 投话，follow 等这一轮真正结束（turn/end）。
       await this.dsh.prompt(sessionId, [{ type: "text", text }])

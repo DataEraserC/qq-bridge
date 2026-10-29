@@ -119,9 +119,11 @@ class TurnDriver {
     try {
       const sessionID = await this.#session(delivery.session)
       const text = renderTurn(delivery) + CODE_MODE_HINT
+      const info = delivery.session_info ?? {}
+      const model = info.model ?? "(opencode 默认)"
       this.log(
         "debug",
-        `开轮 ${delivery.ticket}：${delivery.room.connection}:${delivery.room.path.join("/")}，${delivery.records.length} 条`,
+        `开轮 ${delivery.ticket}：${delivery.room.connection}:${delivery.room.path.join("/")}，${delivery.records.length} 条，模型 ${model}`,
       )
       // prompt 把话排进会话；wait 等这一轮助手真正说完。
       await this.ctx.session.prompt({ sessionID, text })

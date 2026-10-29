@@ -25,6 +25,7 @@ export function delivery(overrides = {}) {
         at_self: true,
       },
     ],
+    session_info: { id: "main", name: "main", harness: "opencode", model: null },
     ...overrides,
   }
 }

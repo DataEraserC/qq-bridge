@@ -57,6 +57,10 @@ fn config() -> &'static str {
         name = "人格"
         text = "你是桥。"
 
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
+
         [[sessions]]
         id = "main"
         harness = "dsh"
@@ -756,6 +760,10 @@ fn group_config() -> &'static str {
         id = "p"
         name = "人格"
         text = "你是桥。"
+
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
 
         [[sessions]]
         id = "main"

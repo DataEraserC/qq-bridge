@@ -38,6 +38,24 @@ pub struct Delivery {
     /// （文件 + git），`memory_*` 工具用记忆 id 指认要碰哪一份。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memories: Vec<MemoryInfo>,
+    /// 这个会话的身份信息（名称、归哪个 harness、用哪个模型）。harness 据此知道
+    /// 「该以什么身份说话、用哪个模型」。可空是为了兼容旧协议帧。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_info: Option<SessionInfo>,
+}
+
+/// 一个会话在本轮投递里的身份信息。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// 会话 id（与 `Delivery.session` 一致）。
+    pub id: String,
+    /// 会话显示名（缺省 = id）。
+    pub name: String,
+    /// 归哪个 harness 接管。
+    pub harness: String,
+    /// 用哪个模型；没配就是 `None`，由 harness 侧决定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// 一份记忆在本轮投递里的信息。
@@ -245,6 +263,12 @@ mod tests {
             }],
             reason: TurnReason::Wake,
             memories: Vec::new(),
+            session_info: Some(SessionInfo {
+                id: "main".into(),
+                name: "main".into(),
+                harness: "dsh".into(),
+                model: None,
+            }),
         }
     }
 

@@ -8,7 +8,7 @@
 桥从「多 harness × 多设备」升级为「多 harness × 多 harness 会话」，核心是把两件一直绑在一起的
 事拆开：**「谁在说话、在哪活动、怎么串行」** 和 **「它记得什么」**。前者归会话，后者归记忆。
 
-### 四个一等对象（用户裁定）
+### 五个一等对象（用户裁定）
 
 - **社交平台连接列表**：一条连接 = 一个平台账号，同平台可多条（沿用 ADR-0012）。
 - **人格列表**：一个人格 = 一张纯文本人设卡（`id` + `name` + 「你是谁 / 什么性格 / 什么语气」
@@ -27,8 +27,15 @@
   - **git 仓库的写也完整放开给 harness**（用户裁定）：桥对 git 仓库**不做任何提交 / 推送 / 建分支 /
     改内容**等操作，唯一例外是「初始化 worktree」这类把仓库准备好的基建活。其余文件 + git 能力全部
     由 harness 直接持有，桥只负责把仓库初始化到位、并告诉 harness「当前会话的 worktree 路径」。
-- **harness 会话列表**：一个会话 = 一个串行单元，字段 `id` + `name` + `记忆 ids`（可空）+
-  `人格 id` + `订阅列表`。串行键 = **harness 名 + 会话 id**（用户裁定）。
+- **harness 列表**：一个 harness = 一个接管者（`id` + `name`）。桥**不主动连 harness**——是
+  harness 反过来连桥、报出名字 + 令牌。所以桥对 harness 只存「有哪些、id 是什么」用来校验会话
+  的引用，不存它的连接地址或内部配置（类比连接列表，但方向相反：连接是桥主动连平台，harness 是
+  harness 主动连桥）。会话的 `harness` 字段引用这里的某个 id（用户裁定：harness 升为一等对象）。
+- **harness 会话列表**：一个会话 = 一个串行单元，字段 `id` + `name`（可空，缺省 = id）+
+  `harness id` + `人格 id` + `记忆 ids`（可空）+ `model`（可空）+ `订阅列表`。串行键 =
+  **harness id + 会话 id**（用户裁定）。`model` 挂会话上（用户裁定）：每个会话可独立指定用哪个
+  模型，空则由 harness 侧自己决定；桥侧只负责把它存好、随投递带给 harness，真正切换模型由各
+  harness 自己实现（dsh 改 profile、opencode 改 config）。
 
 ### device 概念删除（用户裁定）
 
@@ -148,6 +155,16 @@
   - `Delivery` 加 `memories` 字段（id + worktree 路径），投递时带给 harness。
   - git 的写（add/commit/push/branch）完整放开给 harness，桥只做「第一次建 worktree」；
     commit 无 user.name/user.email 时用桥固定身份兜底。
+- harness 升一等对象 + 会话加 name/model（用户裁定，2026-10-30）：
+  - `Config` 加 `harnesses` 列表（`Harness { id, name }`），`Session.harness` 从「自由字符串」
+    改成「必须引用一个已声明的 harness id」（校验 `UnknownHarness` / `DuplicateHarness` /
+    `EmptyHarnessField`）。
+  - `Session` 加 `name`（可空，缺省 = id）与 `model`（可空）。
+  - `Delivery` 加 `session_info`（`SessionInfo { id, name, harness, model }`，可选、向后兼容），
+    投递时桥填好带出去，harness 据此知道「以什么身份说话、用哪个模型」。
+  - model 只挂会话、桥只透传：dsh 的 `session/prompt` 与 opencode 的 `ctx.session.prompt` 都
+    不接 model 参数，模型实际由各 harness 自己的 profile/config 决定；harness 侧先消费
+    `session_info.model` 做日志透传，真正的模型切换留待各 harness 自己实现。
 
 ## 参考
 

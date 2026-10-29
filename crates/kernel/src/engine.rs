@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
 use acb_proto::{
-    Delivery, Element, ErrorCode, MemoryInfo, Record, RecordKind, RoomId, Sender, Ticket,
-    ToolError, TurnReason,
+    Delivery, Element, ErrorCode, MemoryInfo, Record, RecordKind, RoomId, Sender, SessionInfo,
+    Ticket, ToolError, TurnReason,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -594,6 +594,17 @@ impl<S: Store> Bridge<S> {
         // 第一次用到才 checkout，之后复用。
         let memories = self.session_memories(&pending.session);
 
+        // 会话的身份信息：harness 据此知道「以什么身份说话、用哪个模型」。
+        let session_info = self
+            .config
+            .session(&pending.session)
+            .map(|session| SessionInfo {
+                id: session.id.clone(),
+                name: session.name.clone(),
+                harness: session.harness.clone(),
+                model: session.model.clone(),
+            });
+
         Ok(Delivery {
             ticket,
             session: pending.session,
@@ -601,6 +612,7 @@ impl<S: Store> Bridge<S> {
             records,
             reason: pending.reason,
             memories,
+            session_info,
         })
     }
 

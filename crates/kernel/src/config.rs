@@ -1,14 +1,16 @@
-//! 配置：连接、人格、记忆、harness 会话、订阅、三条策略。
+//! 配置：连接、人格、记忆、harness、harness 会话、订阅、三条策略。
 //!
-//! 四层，从下往上（ADR-0017 四对象模型）：
+//! 五个一等对象，从下往上（ADR-0017 五对象模型）：
 //! 1. **连接**：一条通到平台的管道（适配器种类 + 连接信息 + 登录账号）。同一平台可以有
 //!    多条，每条一个账号——一个账号一条连接是平台的硬事实，不是我们的选择。
 //! 2. **人格**：一张纯文本人设卡（id + name + 正文）。只管「是谁、什么语气、什么不能漏」，
 //!    不带记忆、不带订阅、不声明能力（能力由会话配置与 harness/适配器决定）。
 //! 3. **记忆**：一份长期知识，抽象接口（id + name + type + 位置参数）。type 可扩展，
 //!    当前第一种是 git。可被多个会话共享，最终一致。
-//! 4. **harness 会话**：一个串行单元（id + harness 名 + 人格 id + 记忆 ids 可空 + 订阅）。
-//!    串行键 = harness 名 + 会话 id；同一会话内严格串行，不同会话并发。
+//! 4. **harness**：一个接管者（id + name）。桥不主动连它——它反过来连桥报名字 + 令牌。
+//!    桥只存「有哪些 harness」用来校验会话的引用，不存它的连接地址。
+//! 5. **harness 会话**：一个串行单元（id + name 可空 + harness id + 人格 id + 记忆 ids
+//!    可空 + model 可空 + 订阅）。串行键 = harness id + 会话 id；同一会话内严格串行。
 //!
 //! 配置从 TOML 读进来后**完全校验**：非法配置在这里就死，不会带病启动。
 
@@ -42,6 +44,8 @@ pub struct Config {
     pub personas: Vec<Persona>,
     /// 记忆列表。
     pub memories: Vec<Memory>,
+    /// harness 列表。一等对象：会话用它引用「归谁接管」。
+    pub harnesses: Vec<Harness>,
     /// harness 会话列表。
     pub sessions: Vec<Session>,
     /// 接入点配置。没配就不监听——只跑内存里的桥（测试、嵌入式）。
@@ -182,12 +186,28 @@ pub struct Memory {
     pub location: String,
 }
 
+/// 一个 harness：一等对象，会话靠它引用「归谁接管」。
+///
+/// 桥不主动连 harness——是 harness 反过来连桥、报出名字 + 令牌。所以桥对 harness
+/// 只需要知道「有哪些、id 是什么」用来校验会话的引用，不存它的连接地址或内部配置。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Harness {
+    pub id: String,
+    /// 显示名，给人看的。
+    pub name: String,
+}
+
 /// 一个 harness 会话：一个串行单元。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub id: String,
-    /// 这个会话由哪个 harness 接管。串行键 = harness 名 + 会话 id。
+    /// 这个会话归哪个 harness 接管，引用 `harnesses` 里的某个 id。
+    /// 串行键 = harness 名 + 会话 id。
     pub harness: String,
+    /// 会话显示名，给人看的。可空，缺省 = id。
+    pub name: String,
+    /// 这个会话用哪个模型。可空 = 由 harness 侧自己决定。
+    pub model: Option<String>,
     /// 人格卡 id。
     pub persona: String,
     /// 引用的记忆 id 列表。可空（空 = 不存长期记忆）。
@@ -371,6 +391,15 @@ pub enum ConfigError {
     EmptyMemoryField { memory: String, field: &'static str },
     #[error("记忆 {memory} 的种类不认识：{kind}（目前只有 git）")]
     UnknownMemoryKind { memory: String, kind: String },
+    #[error("harness id 重复：{harness}")]
+    DuplicateHarness { harness: String },
+    #[error("harness {harness} 的 {field} 不能为空")]
+    EmptyHarnessField {
+        harness: String,
+        field: &'static str,
+    },
+    #[error("会话 {session} 引用了不存在的 harness {harness}")]
+    UnknownHarness { session: String, harness: String },
     #[error("接入点监听地址不合法：{address}（{detail}）")]
     BadListen { address: String, detail: String },
     #[error("连接名不能为空")]
@@ -538,6 +567,29 @@ impl Config {
             });
         }
 
+        // harness：一等对象，一个 id 一个。会话靠它引用「归谁接管」。
+        let mut harnesses: Vec<Harness> = Vec::with_capacity(raw.harnesses.len());
+        for raw_harness in raw.harnesses {
+            let id = raw_harness.id.trim().to_owned();
+            if id.is_empty() {
+                return Err(ConfigError::EmptyHarnessField {
+                    harness: id,
+                    field: "id",
+                });
+            }
+            if harnesses.iter().any(|seen| seen.id == id) {
+                return Err(ConfigError::DuplicateHarness { harness: id });
+            }
+            let name = raw_harness.name.trim().to_owned();
+            if name.is_empty() {
+                return Err(ConfigError::EmptyHarnessField {
+                    harness: id,
+                    field: "name",
+                });
+            }
+            harnesses.push(Harness { id, name });
+        }
+
         let mut sessions = Vec::with_capacity(raw.sessions.len());
         let mut seen_sessions: Vec<String> = Vec::new();
 
@@ -567,6 +619,15 @@ impl Config {
             check_not_blank(&raw_session.token, "token").map_err(|_| ConfigError::EmptyToken {
                 session: id.clone(),
             })?;
+
+            // 引用的 harness 必须真的存在。
+            let harness = raw_session.harness.trim().to_owned();
+            if !harnesses.iter().any(|h| h.id == harness) {
+                return Err(ConfigError::UnknownHarness {
+                    session: id.clone(),
+                    harness,
+                });
+            }
 
             // 引用的人格与记忆必须真的存在。
             if !personas
@@ -612,9 +673,32 @@ impl Config {
                 subscriptions.push(subscription);
             }
 
+            // name 可空：缺省 = id。model 可空：由 harness 侧决定。
+            let name = {
+                let trimmed = raw_session.name.trim().to_owned();
+                if trimmed.is_empty() {
+                    id.clone()
+                } else {
+                    trimmed
+                }
+            };
+            let model = raw_session
+                .model
+                .map(|m| {
+                    let trimmed = m.trim().to_owned();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                })
+                .flatten();
+
             sessions.push(Session {
                 id,
-                harness: raw_session.harness.trim().to_owned(),
+                harness,
+                name,
+                model,
                 persona: raw_session.persona,
                 memories: raw_session.memories,
                 token: raw_session.token.trim().to_owned(),
@@ -625,6 +709,7 @@ impl Config {
         Ok(Self {
             personas,
             memories,
+            harnesses,
             sessions,
             endpoint,
             connections,
@@ -649,6 +734,11 @@ impl Config {
     /// 找一份记忆。
     pub fn memory(&self, id: &str) -> Option<&Memory> {
         self.memories.iter().find(|memory| memory.id == id)
+    }
+
+    /// 找一个 harness。
+    pub fn harness(&self, id: &str) -> Option<&Harness> {
+        self.harnesses.iter().find(|harness| harness.id == id)
     }
 
     /// 找一个会话。
@@ -842,6 +932,8 @@ struct RawConfig {
     #[serde(default)]
     memories: Vec<RawMemory>,
     #[serde(default)]
+    harnesses: Vec<RawHarness>,
+    #[serde(default)]
     sessions: Vec<RawSession>,
     endpoint: Option<RawEndpoint>,
     #[serde(default)]
@@ -867,9 +959,19 @@ struct RawMemory {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawHarness {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawSession {
     id: String,
     harness: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: Option<String>,
     persona: String,
     #[serde(default)]
     memories: Vec<String>,
@@ -956,6 +1058,10 @@ mod tests {
         id = "default"
         name = "默认人格"
         text = "你是桥。"
+
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
 
         [[sessions]]
         id = "main"
@@ -1152,6 +1258,59 @@ mod tests {
             Config::parse(&config_with(ONE_CONNECTION, &session)),
             Err(ConfigError::UnknownMemory { .. })
         ));
+    }
+
+    #[test]
+    fn unknown_harness_is_rejected() {
+        let session = ONE_SESSION.replace("harness = \"dsh\"", "harness = \"nope\"");
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
+            Err(ConfigError::UnknownHarness { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_harness_is_rejected() {
+        let session = format!(
+            "{ONE_SESSION}\n{}",
+            r#"
+        [[harnesses]]
+        id = "dsh"
+        name = "另一个"
+        "#
+        );
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
+            Err(ConfigError::DuplicateHarness { .. })
+        ));
+    }
+
+    #[test]
+    fn session_name_defaults_to_id_and_model_is_optional() {
+        // 不写 name / model：name 默认 = id，model 为 None。
+        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
+        let session = &config.sessions[0];
+        assert_eq!(session.name, "main");
+        assert_eq!(session.model, None);
+
+        // 写 name + model：都读进来。
+        let with = ONE_SESSION.replace(
+            "token = \"t-main\"",
+            "name = \"主群助手\"\n        model = \"deepseek-chat\"\n        token = \"t-main\"",
+        );
+        let config = Config::parse(&config_with(ONE_CONNECTION, &with)).expect("能解析");
+        let session = &config.sessions[0];
+        assert_eq!(session.name, "主群助手");
+        assert_eq!(session.model.as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn harness_is_a_first_class_object() {
+        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
+        assert_eq!(config.harnesses.len(), 1);
+        let harness = config.harness("dsh").expect("有 dsh");
+        assert_eq!(harness.id, "dsh");
+        assert_eq!(harness.name, "DeepSeek");
     }
 
     #[test]
