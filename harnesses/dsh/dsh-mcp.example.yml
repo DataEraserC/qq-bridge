@@ -1,0 +1,19 @@
+# dsh 的 MCP 配置示例（加到 dsh 的 profile 补丁里，或 plugins 列表）
+#
+# 两个条目分别对应「工具面」和「轮次驱动」——其实是一个进程（src/driver.mjs）
+# 干的，这里 MCP 只挂工具面，轮次驱动由同一个进程的 BridgeLink 自动做。
+#
+#   - id: acb-mcp
+#     name: '@deepseek-ai/dsh-mcp-client'
+#     config:
+#       serverName: acb
+#       transport: stdio
+#       command: /path/to/node
+#       args: ['/path/to/agent-chat-bridge/harnesses/dsh/src/driver.mjs']
+#       env:
+#         ACB_ENDPOINT: 127.0.0.1:7700
+#         ACB_TOKEN: eb9b833ac1c57ac69f167517fb3a793d
+#         DSH_BASE_URL: http://127.0.0.1:3080
+#         # DSH_TOKEN: 可选；不填就走离线铸造 Cookie（读 ~/.dsh/.credentials.yaml）
+#
+# 工具在模型那边叫 mcp__acb__send_message、mcp__acb__ack_messages 等。

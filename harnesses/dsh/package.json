@@ -1,0 +1,10 @@
+{
+  "name": "acb-dsh",
+  "private": true,
+  "type": "module",
+  "description": "acb 的 dsh (DeepSeek Harness) 适配器：桥推来的一轮变成 dsh 会话里的一次提问，工具走 MCP",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "probe": "node src/driver.mjs"
+  }
+}

@@ -51,7 +51,7 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 | harness | 扩展点 | 轮次驱动 | 判断 |
 |---------|--------|----------|------|
 | opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册，模型经 `execute` 调 `tools.X`） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，见 `harnesses/opencode/plugin/`；真机整轮已验（私聊 + 群） |
-| DSH | 插件 | 待核实 | 用户说可以走插件，具体接口未看 |
+| DSH | MCP（`dsh-mcp-client`，工具名 `mcp__acb__*`） | 进程外：驱动器调 webui HTTP/WS API（`session/prompt` + `session/follow` 等 `turn/end`） | 进程外 + MCP，见 `harnesses/dsh/`；协议层真机已验，模型真回话待配模型 |
 | WorkBuddy | 待核实 | 待核实 | 未看 |
 | Trae | 待核实 | 待核实 | 未看 |
 | Codex | 无插件；有 `codex exec` 这类无头入口 | 进程外：每轮起一次 | 大概率进程外 + MCP 补工具面 |
@@ -327,3 +327,73 @@ curl -u "opencode:$PW" -H 'Content-Type: application/json' \
 
 所以「慢」来自上游模型的思考时间叠加会话语料增长。要快要换快模型；
 真要控上下文，是在**设备会话层面**做裁剪/摘要，不是改投递逻辑。
+
+## dsh（DeepSeek Harness）这一份（2026-10-29）
+
+dsh 跟 opencode 是**完全不同的接入方式**：opencode 走插件（进程内），dsh 走
+**进程外驱动 + MCP**。因为 dsh 是开发者预览（`dsh-v0.1.1-rc.2`，本机 nix 是
+`0.2.1-rc.2`），它的插件内部 API（`ctx.sessions`/`agent.inbox` 这些）最容易变，
+而它**明确支持、且上游 node 版已验证**的稳定接口是两样：
+
+1. **webui 的 HTTP/WS API**（进程外驱动）：`session/prompt` 投话、`session/follow`
+   的事件流等 `turn/end`。
+2. **MCP**（工具面）：`dsh-mcp-client` 插件，工具名 `mcp__<serverName>__<tool>`。
+
+所以 dsh 适配器是一个**单进程同时干三件事**：
+
+```
+桥(acb) ──turn_start/tool_call──> dsh 驱动器(harnesses/dsh/src/driver.mjs)
+                                    ├─ acb 客户端：BridgeLink 接桥（复用 opencode 的 acb-wire.mjs）
+                                    ├─ MCP server：stdio，被 dsh 拉起，暴露九个工具
+                                    └─ dsh 客户端：调 webui HTTP/WS API 驱动会话
+```
+
+**为什么要合成一个进程**：`tool_call` 必须带当前轮次的 `ticket`，而 ticket 从
+`turn_start` 拿。MCP server 和轮次驱动分开两个进程的话，ticket 没法共享，模型
+调工具时发不出带正确票的 `tool_call`。
+
+**拓扑约束**：MCP 用 stdio（dsh spawn 出驱动器子进程），所以**驱动器必须跟 dsh
+同机**；桥在哪无所谓——acb 协议是 TCP，端点可配，跨机也能连。
+
+### 文件
+
+- `harnesses/dsh/src/dsh-client.mjs` — dsh 客户端：鉴权（launch token 换 Cookie /
+  离线铸造 Cookie）+ `session/create`/`prompt`/`follow`（等 turn/end）。
+- `harnesses/dsh/src/mcp-server.mjs` — 最小 MCP server（stdio，newline JSON-RPC），
+  只实现 initialize / tools/list / tools/call / ping，零依赖。
+- `harnesses/dsh/src/driver.mjs` — 主进程：三件事合一。
+- `harnesses/shared/tools.mjs` — 九个工具的名字/描述/JSON Schema（opencode 和 dsh 共用）。
+
+### 实测探通的协议（隔离 DSH_HOME，真实跑过）
+
+| 步骤 | 结果 |
+|---|---|
+| 启动 | `dsh_real --profile web --no-open` → stdout 打 `http://127.0.0.1:3080/?token=<32字节>` |
+| 换 Cookie | `GET /?token=...` → 303 + `set-cookie: dsh-auth-<hex>=v1.<b64>.<sig>` |
+| 离线铸造 | 读 `~/.dsh/.credentials.yaml` 里 `client-connection/browser-session` 的 32 字节 secret，HMAC 签 Cookie |
+| unary RPC | `POST /api/<endpoint>`，body `{type:"client-request", rpcId, method, payload:{args}}` |
+| 参数包装 | `session/list` 用 `args._request`，其余用 `args.request` |
+| 结果包装 | **`{ ok:true, value:{...} }`**（业务数据在 `result.value`，不是直接返回） |
+| 建会话 | `session/create` → `value.sessionId` |
+| 投话 | `session/prompt`（sessionId+mode+requestId+content）→ `accepted:true` |
+| 事件流 | WS `/api/remote.mux`，open 一帧 `session/follow`，收 `turn/start`/`turn/end` |
+
+### 两个绕不过去的坑（都是实测）
+
+1. **结果被 `{ ok, value }` 包了一层**。`session/create` 不是直接回 `{ sessionId }`，
+   而是 `result: { ok:true, value:{ sessionId } }`。业务数据在 `result.value`。之前
+   用 curl 探测时把 `value` 里的内容当成了 `result`，写代码时纠正了。
+2. **managed Node 22 在这个沙箱里 http/WS 全废**。它的 `node:http` 底层走 undici
+   的 WASM（llhttp），沙箱限制 WASM 内存，报 `WebAssembly.instantiate(): Out of memory`
+   （`fetch failed` / `Received network error`）。系统 Node 24.21.0 正常。所以：
+   - dsh-client 用 `node:http` + 手写 WS 客户端（`node:net`），**不碰 undici**，任何
+     node 版本都能跑（比全局 fetch/WebSocket 更健壮）。
+   - **测试要用系统 node 跑**（`/etc/profiles/per-user/nixos/bin/node --test`）。
+
+### 还没验的
+
+- **模型真回话**：隔离探测的 dsh 没配模型，`session/prompt` 能 `accepted:true`、
+  `session/follow` 流能开，但 turn 不会真跑（没有 turn/end）。要完整闭环得给 dsh
+  配好模型 + 把驱动器挂成 MCP，这一步要动 dsh 的 profile/nix 配置，放下一轮。
+- **MCP 工具面真被 dsh 加载**：MCP server 的协议（initialize/tools/list/tools/call）
+  单测验过，但还没让真 dsh 的 `dsh-mcp-client` 拉起它跑一次。
