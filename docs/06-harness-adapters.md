@@ -183,9 +183,9 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
 - `opencode2` 自带的免费额度被限流（`Free usage limit reached`）。
 - 全局配置里的 `agentrouter-openai` 要 `AGENTROUTER_API_KEY`，本机没这个变量，报 `未提供令牌`。
 - `1AgentRouter/gpt-6.1-sol` 这类 key 本身没问题：直接 curl `localhost:1100` 的
-  `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三条路都能出字。但 opencode 只认
-  自己从 models.dev 拉下来的目录：新增的自定义 provider **不注册模型**（模型名带不带斜杠、
-  写成 `modelID` 还是别名、项目级/全局级都试过，一律 `model '…' not found`）。
+  `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三条路都能出字。当时接进 opencode
+  一律报 `model '…' not found`，一度以为是「只认 models.dev 目录」——**那个判断是错的**，
+  真因见下面「换成 1AgentRouter」一节。
 - 最后用本机 openrouter key + 免费模型 `nvidia/nemotron-3-ultra-550b-a55b:free` 跑通。
   另外 `liquid/lfm-2.5-2.6b:free` 也能接上，但它只会写思考、`finish=stop`，不肯调工具——
   模型太小的时候，链路没错也会看着像坏。
@@ -215,3 +215,85 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
   `data.id` 三种老形状；opencode 换版本改形状时，这里要跟着看。
 - 插件文件改动后 opencode 的 watcher 会热重载（日志里会再出现一次 `已接入桥`），旧连接自动断。
   这个行为没写进任何文档，属于实测观察。
+
+## 换成 1AgentRouter：卡住的两个真坑（2026-10-29 下午）
+
+想让设备走 `1AgentRouter/gpt-5.6-sol`（本机 `localhost:1100` 的中转），折腾一上午没成，
+下午找出来是**两个和模型本身无关的原因**。
+
+### 坑一：opencode 只接受 https 的 baseURL（来源：实测）
+
+同一条 provider 配置，只改地址，结果两样：
+
+| baseURL | 结果 |
+|---|---|
+| `https://ps.air-outer.com/v1` | 请求真的发出去了（回 401，说明模型已认） |
+| `http://127.0.0.1:1100/v1`、`http://localhost:1100/v1`、任何 http | `model '…' not found` |
+
+「模型不存在」是假象——http 地址进去以后，这个 provider 下的模型根本不会被列出来，
+于是最先报的是模型找不到，而不是连不上。所以**别信这条报错**，先看 scheme。
+
+本机的 1100 网关是 http，没法直接改，于是在中间垫一层 TLS 反代：
+
+```
+opencode ──https──> 127.0.0.1:11443（自签证书，字节透传，SSE 可用）──http──> 127.0.0.1:1100
+```
+
+脚本在 `~/qqab-scratch/oc-live/tls_proxy.py`（自带证书、日志、路径跟着脚本走），
+opencode 那边要带 `NODE_EXTRA_CA_CERTS=<ca.pem>`，模型条目里写 `output` 上限。
+
+### 坑二：会话钉在「它出生的那个目录」，换目录不换配置（来源：实测）
+
+opencode 的模型是**按会话所在目录**去解配置的，不是按你启动时的 cwd。
+`qqab:main` 这条会话是在 `/tmp/oc6` 生的，于是不管从哪个目录启动、全局配置写什么，
+它都回去读 `/tmp/oc6/opencode.jsonc`——那里还写着 openrouter 的 nemotron，
+所以现象是「配置明明改了，还在报 openrouter 额度用完」。
+
+改法（改一次就够）：把这条会话挪到常驻目录，两处表都要改：
+
+```sql
+update session_v2 set project_id='<新项目的 id>', directory='/home/nixos/qqab-scratch/oc-live'
+  where id='ses_…';
+```
+
+（`project_id` 必须是 `project` 表里完整那个 40 位 id，别用打印出来的前缀。）
+
+### 顺手确认的两件事
+
+- **余额是按 `max_tokens` 预扣的。** 余额只剩 ¥0.02 时，opencode 按模型默认上限要输出 token，
+  预扣 ¥0.03 直接被拒：`预扣费额度失败, 用户剩余额度…`。给模型条目加 `limit.output: 4096`
+  后预扣降到额度内，请求立刻 200。这个值不能太小：一轮要带思考 + 一次 `execute` 调用，
+  1024 容易截断；4096 实测够用。
+- **改完怎么确认真的换过来了**：不看 TUI 状态栏，直接看会话里最新一条 assistant 记录的
+  `model` 字段和 `finish`——`{"id":"1AgentRouter/gpt-5.6-sol","providerID":"arc"}` + `stop`
+  才算成。
+
+## 常驻的一套怎么起（2026-10-29）
+
+三个进程，缺一个都不通。放在 `~/qqab-scratch/oc-live/`（NixOS 的 `/tmp` 是 tmpfs，不放那儿）：
+
+```bash
+# 1. TLS 反代（opencode → 1100 的中间层）
+python3 ~/qqab-scratch/oc-live/tls_proxy.py
+
+# 2. 桥（跑在仓库根，配置 config.toml）
+cd <仓库根> && ./target/debug/qqab-bridge --config config.toml
+
+# 3. opencode：必须 --standalone（否则插件找不到入口），必须走 pty（否则 TUI 起不来）
+cd ~/qqab-scratch/oc-live && script -qec "env -u HTTP_PROXY -u HTTPS_PROXY \
+  NODE_EXTRA_CA_CERTS=$PWD/ca.pem opencode2 --standalone --print-logs --log-level info $PWD" /dev/null
+```
+
+`opencode.json` 里三块都要有：`model`（默认模型）、`provider.arc`（https 反代地址 + 模型条目
++ `limit.output`）、`plugins`（指向仓库里的插件目录 + 设备令牌）。
+
+不靠 QQ 消息也能验「模型这一环」通不通——拿私有服务的鉴权去直接投一个问题：
+
+```bash
+PW=$(tr '\0' '\n' < /proc/<opencode pid>/environ | grep '^OPENCODE_PASSWORD=' | cut -d= -f2-)
+curl -u "opencode:$PW" -H 'Content-Type: application/json' \
+  -X POST "http://127.0.0.1:<私有端口>/api/session/<会话 id>/prompt" -d '{"text":"只回复两个字：收到"}'
+```
+
+私有端口看 `ss -ltnp | grep opencode2-wrap`。`/api/session` 需要 basic 认证，
+用户名随便写（`opencode`），密码是进程环境里的 `OPENCODE_PASSWORD`。
