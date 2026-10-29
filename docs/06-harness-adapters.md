@@ -98,7 +98,7 @@ export ACB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 
 - **会话按设备一份**，标题 `acb:<设备>`。会话 id 记在插件自己的 storage 里，重开接上，
   找不到才新建；每次用前确认它还活着（用户在 TUI 里删了会话也能自愈）。
-  会话就是设备的记忆（[ADR-0002](adr/0002-subscription-model.md)），重开 harness 不能失忆。
+  会话就是那份记忆（[ADR-0002](adr/0002-subscription-model.md)），重开 harness 不能失忆。桥按 `memory` 找会话，所以两台设备共用一份记忆时它们落在同一个会话里。
 - **`prompt` 排话、`wait` 等它说完**，两个连起来才是一轮。v2 的 `prompt` 只保证把话排进
   会话，模型随后才跑；只看 `prompt` 返回就收工，会把票提前作废，工具调用全成
   `unauthorized`（假宿主测试里踩过这个）。
@@ -141,7 +141,7 @@ node harnesses/opencode/probe.mjs --token <设备令牌>
 
 ## 实测进度（2026-10-29）
 
-**加载 → setup → 握手 → 绑定设备，四步都验过了。** 启动方式：
+**加载 → setup → 握手 → 绑定设备组，四步都验过了。** 启动方式：
 
 ```bash
 # 项目根的 opencode.jsonc 里 plugins 指向本仓库的 plugin 目录（见 opencode.jsonc.example）
@@ -151,7 +151,7 @@ opencode2 --standalone
 看到这两样就算接上了：
 
 ```
-[acb] info 已接入桥，绑定设备 main
+[acb] info 已接入桥，绑定设备组 main
 ```
 ```
 ESTAB 127.0.0.1:7700   127.0.0.1:44758  users:(("acb-bridge",pid=17401,fd=7))
@@ -176,7 +176,7 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
 ```
 
 群里那一轮（`@机器人 你是什么模型？`）同样走通，回答落在群里，不是私聊。
-另外重启 opencode 之后 `接上会话 ses_e7a5…（acb:main）`——**会话就是设备记忆，重启接得上**。
+另外重启 opencode 之后会打 `接上会话 ses_…（acb:main-memory）`——**会话就是记忆，重启接得上**。
 
 ### 模型这一环，踩过的坑
 

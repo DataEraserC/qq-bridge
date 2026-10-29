@@ -98,7 +98,7 @@ class FakeHost {
 
 /** 起假桥 + 假宿主，装上插件，测完都收掉。 */
 async function boot(t, { token = TOKEN } = {}) {
-  const bridge = await new FakeBridge({ device: "main", token: TOKEN }).start()
+  const bridge = await new FakeBridge({ devices: ["main"], token: TOKEN }).start()
   const host = new FakeHost()
   // 选项必须在 setup 之前摆好：插件读一次配置就定了。
   host.options = { endpoint: bridge.endpoint }
@@ -160,7 +160,7 @@ test("一轮走完：建会话 → 提问 → 等它说完 → 收工", async (t
   await openTurn(bridge, host)
 
   assert.equal(host.created.length, 1, "应该建了一个会话")
-  assert.equal(host.created[0].title, "acb:main", "会话按设备一份")
+  assert.equal(host.created[0].title, "acb:main-memory", "会话按记忆一份")
   assert.equal(host.prompts[0].sessionID, host.created[0].id)
   assert.match(host.prompts[0].text, /在吗/, "投递的内容要进上下文")
   assert.match(
@@ -253,7 +253,7 @@ test("桥报错时工具抛错，带上错误码", async (t) => {
 })
 
 test("没有令牌就不启用：不注册工具、不连桥", async (t) => {
-  const bridge = await new FakeBridge({ device: "main", token: TOKEN }).start()
+  const bridge = await new FakeBridge({ devices: ["main"], token: TOKEN }).start()
   const host = new FakeHost()
   const saved = process.env.ACB_TOKEN
   delete process.env.ACB_TOKEN
@@ -275,7 +275,7 @@ test("没有令牌就不启用：不注册工具、不连桥", async (t) => {
 })
 
 test("卸载时把连接关掉（不留后台线程）", async (t) => {
-  const bridge = await new FakeBridge({ device: "main", token: TOKEN }).start()
+  const bridge = await new FakeBridge({ devices: ["main"], token: TOKEN }).start()
   const host = new FakeHost()
   const saved = process.env.ACB_TOKEN
   process.env.ACB_TOKEN = TOKEN
@@ -292,4 +292,30 @@ test("卸载时把连接关掉（不留后台线程）", async (t) => {
   const closed = new Promise((resolve) => bridge.socket.on("close", resolve))
   await cleanup()
   await closed
+})
+
+test("send_message_to 留了 device 这个口子：同一房间两台设备时指明身份", async (t) => {
+  const { host } = await boot(t)
+
+  const spec = host.tools.get("send_message_to")
+  assert.ok(spec.input.properties.device, "要给 device 参数，否则模型没法指明用谁说")
+  assert.match(spec.description, /device/, "说明里要提到 device")
+  assert.match(spec.description, /订阅/, "说明里要讲清范围是订阅")
+})
+
+test("两台设备共用一份记忆时，落进同一个会话", async (t) => {
+  const { bridge, host } = await boot(t)
+
+  // 同一份记忆 m，先由 main 跑一轮。
+  await openTurn(bridge, host, delivery({ ticket: "main-1", device: "main", memory: "m" }))
+  host.finishTurn()
+  await bridge.next()
+
+  // helper 那台设备也看同一份记忆：不该再建一个会话。
+  await openTurn(bridge, host, delivery({ ticket: "helper-2", device: "helper", memory: "m" }))
+  host.finishTurn()
+  await bridge.next()
+
+  assert.equal(host.created.length, 1, "记忆就是会话，两台设备共用记忆只该有一个会话")
+  assert.equal(host.prompts[1].sessionID, host.created[0].id)
 })

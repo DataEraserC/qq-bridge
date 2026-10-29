@@ -1,7 +1,10 @@
-//! 出站：桥把编好的内容元素交给平台适配器。
+//! 出站：桥把编好的内容元素交给平台连接。
 //!
-//! 桥不碰平台细节，只知道「把这个设备、这个房间、用这个账号，发这些元素」。怎么编成
-//! OneBot 消息链或 Discord 消息，是适配器的事。
+//! 桥不碰平台细节，只知道「往这个房间，发这些元素」。怎么编成 OneBot 消息链或 Discord
+//! 消息，是适配器的事。
+//!
+//! 分发按**连接**，不按平台：同一个平台可以挂多条连接（两个 QQ 号），房间的第一段就是
+//! 连接名，查表不会撞。
 
 use acb_proto::{Element, RoomId};
 use thiserror::Error;
@@ -29,25 +32,19 @@ pub enum OutboundError {
     Unavailable(String),
 }
 
-/// 出站通道。每个平台一个实现，由适配器提供。
+/// 出站通道。一条连接一个实现，由适配器提供。
 pub trait Outbound: Send {
-    /// 发一条。`account` 是订阅里配的发送账号。
-    fn send(
-        &mut self,
-        device: &str,
-        room: &RoomId,
-        account: &str,
-        elements: &[Element],
-    ) -> Result<Sent, OutboundError>;
+    /// 发一条到 `room` 指向的连接与位置。
+    fn send(&mut self, room: &RoomId, elements: &[Element]) -> Result<Sent, OutboundError>;
 }
 
-/// 按平台分发的一组出站通道。
+/// 按连接分发的一组出站通道。
 ///
 /// 一个设备可以同时订 QQ 群和 Discord 频道，所以桥不能只挂一个出站实现——发往哪个房间，
-/// 就交给那个平台的适配器。没接适配器的平台明确报错，不静默丢。
+/// 就交给那个房间第一段指向的连接。没接连接的名字明确报错，不静默丢。
 #[derive(Default)]
 pub struct Outbounds {
-    by_platform: std::collections::HashMap<String, Box<dyn Outbound>>,
+    by_connection: std::collections::HashMap<String, Box<dyn Outbound>>,
 }
 
 impl Outbounds {
@@ -55,33 +52,27 @@ impl Outbounds {
         Self::default()
     }
 
-    /// 给某个平台接上一个出站通道。同平台重复接会覆盖前一个。
-    pub fn with(mut self, platform: impl Into<String>, outbound: Box<dyn Outbound>) -> Self {
-        self.by_platform.insert(platform.into(), outbound);
+    /// 给某条连接接上一个出站通道。同名重复接会覆盖前一个（配置层已经拦了重名）。
+    pub fn with(mut self, connection: impl Into<String>, outbound: Box<dyn Outbound>) -> Self {
+        self.by_connection.insert(connection.into(), outbound);
         self
     }
 
-    /// 已经接了哪些平台。
-    pub fn platforms(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.by_platform.keys().map(String::as_str).collect();
+    /// 已经接了哪些连接。
+    pub fn connections(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.by_connection.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
     }
 }
 
 impl Outbound for Outbounds {
-    fn send(
-        &mut self,
-        device: &str,
-        room: &RoomId,
-        account: &str,
-        elements: &[Element],
-    ) -> Result<Sent, OutboundError> {
-        match self.by_platform.get_mut(&room.platform) {
-            Some(outbound) => outbound.send(device, room, account, elements),
+    fn send(&mut self, room: &RoomId, elements: &[Element]) -> Result<Sent, OutboundError> {
+        match self.by_connection.get_mut(&room.connection) {
+            Some(outbound) => outbound.send(room, elements),
             None => Err(OutboundError::Unavailable(format!(
-                "没有为平台 {} 接上适配器",
-                room.platform
+                "没有名为 {} 的连接，发不到 {}",
+                room.connection, room
             ))),
         }
     }
@@ -94,18 +85,12 @@ mod tests {
     /// 记下发过什么，不真发。
     #[derive(Default)]
     struct Recorder {
-        sent: Vec<(String, String)>,
+        sent: Vec<String>,
     }
 
     impl Outbound for Recorder {
-        fn send(
-            &mut self,
-            _device: &str,
-            room: &RoomId,
-            _account: &str,
-            _elements: &[Element],
-        ) -> Result<Sent, OutboundError> {
-            self.sent.push((room.platform.clone(), room.room.clone()));
+        fn send(&mut self, room: &RoomId, _elements: &[Element]) -> Result<Sent, OutboundError> {
+            self.sent.push(room.to_string());
             Ok(Sent {
                 platform_id: "p1".into(),
                 at: 0,
@@ -114,29 +99,35 @@ mod tests {
     }
 
     #[test]
-    fn routes_by_platform() {
+    fn routes_by_connection() {
         let mut outbounds = Outbounds::new()
             .with("qq", Box::new(Recorder::default()))
-            .with("discord", Box::new(Recorder::default()));
+            .with("qq2", Box::new(Recorder::default()));
 
-        let qq = RoomId::new("qq", "group/1").expect("合法");
-        let discord = RoomId::new("discord", "1").expect("合法");
         outbounds
-            .send("main", &qq, "a", &[Element::text("x")])
+            .send(
+                &RoomId::new("qq", "group/1").expect("合法"),
+                &[Element::text("x")],
+            )
             .expect("能发");
         outbounds
-            .send("main", &discord, "a", &[Element::text("y")])
+            .send(
+                &RoomId::new("qq2", "group/1").expect("合法"),
+                &[Element::text("y")],
+            )
             .expect("能发");
-        assert_eq!(outbounds.platforms(), vec!["discord", "qq"]);
+
+        // 第二个号在同一个群里：房间不同（连接不同），各发各的，不互相覆盖。
+        assert_eq!(outbounds.connections(), vec!["qq", "qq2"]);
     }
 
     #[test]
-    fn unconnected_platform_is_an_error() {
+    fn unconnected_room_is_an_error() {
         let mut outbounds = Outbounds::new();
         let room = RoomId::new("kook", "1").expect("合法");
         let error = outbounds
-            .send("main", &room, "a", &[Element::text("x")])
-            .expect_err("没接适配器就该报错");
+            .send(&room, &[Element::text("x")])
+            .expect_err("没接连接就该报错");
         assert!(matches!(error, OutboundError::Unavailable(_)));
     }
 }

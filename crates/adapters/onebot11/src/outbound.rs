@@ -15,20 +15,20 @@ use crate::segment::to_onebot;
 /// 等平台回话的上限。超了就报错，不无限挂着。
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// OneBot 出站通道。
+/// OneBot 出站通道。一条连接一个。
 pub struct OneBotOutbound {
     slot: LinkSlot,
-    /// 这个适配器只负责这个平台，别的平台发过来直接拒。
-    platform: String,
+    /// 这条连接的连接名，别的连接发过来直接拒。
+    connection: String,
     timeout: Duration,
     seq: u64,
 }
 
 impl OneBotOutbound {
-    pub fn new(slot: LinkSlot, platform: impl Into<String>) -> Self {
+    pub fn new(slot: LinkSlot, connection: impl Into<String>) -> Self {
         Self {
             slot,
-            platform: platform.into(),
+            connection: connection.into(),
             timeout: SEND_TIMEOUT,
             seq: 0,
         }
@@ -42,17 +42,11 @@ impl OneBotOutbound {
 }
 
 impl Outbound for OneBotOutbound {
-    fn send(
-        &mut self,
-        _device: &str,
-        room: &RoomId,
-        _account: &str,
-        elements: &[Element],
-    ) -> Result<Sent, OutboundError> {
-        if room.platform != self.platform {
+    fn send(&mut self, room: &RoomId, elements: &[Element]) -> Result<Sent, OutboundError> {
+        if room.connection != self.connection {
             return Err(OutboundError::Unavailable(format!(
-                "这个适配器只管 {}，收到 {}",
-                self.platform, room.platform
+                "这条连接叫 {}，收到 {}",
+                self.connection, room.connection
             )));
         }
 
@@ -60,7 +54,7 @@ impl Outbound for OneBotOutbound {
         let Some(sender) = self.slot.current() else {
             return Err(OutboundError::Unavailable(format!(
                 "{} 还没连上",
-                self.platform
+                self.connection
             )));
         };
 
@@ -83,27 +77,25 @@ impl Outbound for OneBotOutbound {
     }
 }
 
-/// 房间写法决定调哪个动作。
+/// 房间写法决定调哪个动作。路径是「段/段」，第一段说场所类型。
 fn action_of(room: &RoomId, elements: &[Element]) -> Result<(&'static str, Value), OutboundError> {
     let message =
         to_onebot(elements).map_err(|error| OutboundError::Unsupported(error.to_string()))?;
 
-    if let Some(group) = room.room.strip_prefix("group/") {
-        return Ok((
+    match room.path.as_slice() {
+        [kind, id] if kind == "group" => Ok((
             "send_group_msg",
-            json!({"group_id": group, "message": message}),
-        ));
-    }
-    if let Some(user) = room.room.strip_prefix("private/") {
-        return Ok((
+            json!({"group_id": id, "message": message}),
+        )),
+        [kind, id] if kind == "private" => Ok((
             "send_private_msg",
-            json!({"user_id": user, "message": message}),
-        ));
+            json!({"user_id": id, "message": message}),
+        )),
+        _ => Err(OutboundError::Unsupported(format!(
+            "不认识的房间写法：{}（QQ 要写成 group/群号 或 private/号码）",
+            room.key()
+        ))),
     }
-    Err(OutboundError::Unsupported(format!(
-        "不认识的房间写法：{}（QQ 要写成 group/群号 或 private/号码）",
-        room.room
-    )))
 }
 
 /// 平台回包 → 发送结果。
@@ -206,19 +198,26 @@ mod tests {
         let room = RoomId::new("qq", "group/456").expect("合法");
 
         let error = outbound
-            .send("main", &room, "999", &[Element::text("x")])
+            .send(&room, &[Element::text("x")])
             .expect_err("没连上就不该假装发成功");
         assert!(matches!(error, OutboundError::Unavailable(_)));
     }
 
     #[test]
-    fn a_room_on_another_platform_is_refused() {
+    fn a_room_on_another_connection_is_refused() {
         let mut outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
-        let room = RoomId::new("discord", "123").expect("合法");
+        let room = RoomId::new("qq2", "group/123").expect("合法");
 
         let error = outbound
-            .send("main", &room, "999", &[Element::text("x")])
-            .expect_err("一个适配器只管一个平台");
+            .send(&room, &[Element::text("x")])
+            .expect_err("一条连接只管它自己那个号");
         assert!(matches!(error, OutboundError::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_deep_path_is_not_a_qq_room() {
+        let room = RoomId::new("qq", "guild/9/channel/7").expect("合法");
+        let error = action_of(&room, &[Element::text("hi")]).expect_err("认不出房间");
+        assert!(matches!(error, OutboundError::Unsupported(_)));
     }
 }

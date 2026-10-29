@@ -1,11 +1,11 @@
 //! 桥的入口：读配置、接平台、等 harness。
 //!
 //! 启动顺序：
-//! 1. 校验配置（不对就在启动时死掉，不带病运行）；
+//! 1. 校验配置（不对就在启动时死掉，不带病运行）；可容忍的冲突只警告，停三秒再继续；
 //! 2. 打开状态库（流水、水位、笔记、投递计数都在里面，重启接着用）；
-//! 3. 给每个平台配一个适配器，拿到「发送端口」；
+//! 3. 给每条连接配一个适配器，拿到「发送端口」；
 //! 4. 建桥（配置 + 存储 + 一组发送端口）；
-//! 5. 每个适配器起一个守护线程，连不上就等一会儿再连；
+//! 5. 每条连接起一个守护线程，连不上就等一会儿再连；
 //! 6. 起一个清理线程，定时削旧流水（只削读过的）；
 //! 7. 起接入点，等 harness 连进来。
 
@@ -38,6 +38,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse(&text)?;
     print_summary(&config, &options.config);
 
+    // 有些配置是用户故意这么写的（两台设备共用一份记忆、两台设备订同一个房间）。
+    // 不拦，但要说清楚它意味着什么，并且停三秒——刚启动时人还在看屏幕。
+    let warnings = config.warnings();
+    if !warnings.is_empty() {
+        for warning in &warnings {
+            eprintln!("注意：{warning}");
+        }
+        eprintln!("这些是你配的，就按这样跑。三秒后继续（Ctrl-C 可以停）。");
+        std::thread::sleep(Duration::from_secs(3));
+    }
+
     if options.check_only {
         println!("配置没问题（只检查，没有启动）");
         return Ok(());
@@ -54,16 +65,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // 每条平台连接先占一个发送口，桥建好之后再起守护线程去连。
+    // 每条连接先占一个发送口，桥建好之后再起守护线程去连。
     let mut outbounds = Outbounds::new();
     let mut links = Vec::new();
-    for adapter in &config.adapters {
+    for connection in &config.connections {
         let slot = LinkSlot::new();
         outbounds = outbounds.with(
-            adapter.platform.clone(),
-            Box::new(OneBotOutbound::new(slot.clone(), adapter.platform.clone())),
+            connection.id.clone(),
+            Box::new(OneBotOutbound::new(slot.clone(), connection.id.clone())),
         );
-        links.push((adapter.clone(), slot));
+        links.push((connection.clone(), slot));
     }
 
     let bridge = Arc::new(Mutex::new(Bridge::new(
@@ -72,15 +83,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(outbounds),
     )));
 
-    for (adapter, slot) in links {
+    for (connection, slot) in links {
         let bridge = Arc::clone(&bridge);
         let shutdown = Arc::clone(&shutdown);
         std::thread::spawn(move || {
             supervise(
                 slot,
-                adapter.url,
-                adapter.token,
-                adapter.platform,
+                connection.url,
+                connection.token,
+                connection.id,
                 bridge,
                 shutdown,
             );
@@ -182,6 +193,20 @@ impl Options {
 
 fn print_summary(config: &Config, path: &str) {
     println!("配置：{path}");
+
+    println!("  连接：{} 条", config.connections.len());
+    for connection in &config.connections {
+        println!(
+            "    - {}（{} / {}，{}）连 {}，登录账号 {}",
+            connection.id,
+            connection.platform,
+            connection.kind,
+            connection.transport.as_str(),
+            connection.url,
+            connection.account
+        );
+    }
+
     for device in &config.devices {
         println!(
             "  设备 {}：{} 条订阅，人格 {}，记忆 {}",
@@ -191,33 +216,7 @@ fn print_summary(config: &Config, path: &str) {
             device.memory
         );
         for subscription in &device.subscriptions {
-            println!(
-                "    - {} 用 {} 发",
-                subscription.room, subscription.send_account
-            );
-        }
-    }
-
-    if config.adapters.is_empty() {
-        println!("  适配器：一个都没配——只能收 harness 的话，发不出去");
-    } else {
-        for adapter in &config.adapters {
-            println!(
-                "  适配器 {}：{} 连 {}",
-                adapter.platform, adapter.kind, adapter.url
-            );
-        }
-    }
-
-    // 订阅了某个平台却没给它配适配器：能记流水、收不到也发不出，说清楚免得白等。
-    for device in &config.devices {
-        for subscription in &device.subscriptions {
-            if config.adapter(&subscription.room.platform).is_none() {
-                eprintln!(
-                    "注意：设备 {} 订阅了 {}，但平台 {} 没有配适配器——这个房间发不出去",
-                    device.id, subscription.room, subscription.room.platform
-                );
-            }
+            println!("    - {}", subscription.room);
         }
     }
 

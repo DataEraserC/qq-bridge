@@ -49,11 +49,11 @@ async function openTurn(bridge, link, payload = delivery()) {
   return payload
 }
 
-test("握手带上协议版本和令牌，拿到设备", async (t) => {
+test("握手带上协议版本和令牌，拿到设备组", async (t) => {
   const { bridge, link } = await setup(t)
 
-  assert.equal(link.device, "main")
-  assert.deepEqual(bridge.hello, { frame: "hello", version: 1, token: "t-main" })
+  assert.deepEqual(link.devices, ["main"])
+  assert.deepEqual(bridge.hello, { frame: "hello", version: 2, token: "t-main" })
 })
 
 test("桥断了会自己重连，重连成功后重新绑上设备", async (t) => {
@@ -77,7 +77,7 @@ test("桥断了会自己重连，重连成功后重新绑上设备", async (t) =
     () => logs.some((line) => line.includes("重连成功")),
     "应该自己重连回来，日志是：" + logs.join(" | "),
   )
-  assert.equal(link.device, "main", "重连之后设备要重新绑上，不然工具会一直 unauthorized")
+  assert.deepEqual(link.devices, ["main"], "重连之后设备要重新绑上，不然工具会一直 unauthorized")
 })
 
 test("开轮之后工具调用带着本轮的票，结果能对上号", async (t) => {
@@ -169,7 +169,7 @@ test("一轮摊成给模型看的文本", () => {
         delivery().records[0],
         {
           id: 13,
-          room: { platform: "qq", room: "group/158296748" },
+          room: { connection: "qq", path: ["group", "158296748"] },
           kind: { kind: "event", event: "poke" },
           sender: { id: "10002", name: "小明" },
           at: Date.now(),

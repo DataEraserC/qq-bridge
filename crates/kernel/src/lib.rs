@@ -11,9 +11,9 @@ pub mod storage;
 pub mod tools;
 
 pub use config::{
-    AdapterConfig, Config, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM,
-    DEFAULT_STORAGE_PATH, Device, EndpointConfig, KNOWN_ADAPTERS, RetentionConfig, StorageConfig,
-    Subscription, WakeDecision, WakeInput, WakePolicy,
+    Config, Connection, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM, DEFAULT_STORAGE_PATH,
+    Device, EndpointConfig, KNOWN_ADAPTERS, RetentionConfig, StorageConfig, Subscription,
+    Transport, WakeDecision, WakeInput, WakePolicy,
 };
 pub use endpoint::{EndpointError, Session, handshake, run_connection, serve};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY, Pruned};

@@ -1,7 +1,8 @@
 //! 接入点：harness 连进来的那一端。
 //!
 //! 一条 TCP 长连接，一行一帧 JSON（见 `docs/04-protocol.md`）。连上来先握手：harness 报
-//! 协议版本和接入令牌，令牌对上了，这条连接就绑到那个设备——之后这一端只为这个设备取活。
+//! 协议版本和接入令牌，令牌对上了，这条连接就绑到那把令牌背后**那一组设备**——之后这一端
+//! 只为这组设备取活、替这组设备说话（ADR-0002）。
 //!
 //! 这里刻意分两层：
 //! - [`Session`] 是纯状态机，不碰 IO，测试可以直接把帧喂给它；
@@ -42,8 +43,8 @@ pub enum EndpointError {
     Bridge(#[from] BridgeError),
 }
 
-/// 握手：校验版本与令牌，返回这条连接绑定的设备。
-pub fn handshake<S: Store>(bridge: &Bridge<S>, frame: Frame) -> Result<String, EndpointError> {
+/// 握手：校验版本与令牌，返回这条连接代表的那组设备（配置顺序）。
+pub fn handshake<S: Store>(bridge: &Bridge<S>, frame: Frame) -> Result<Vec<String>, EndpointError> {
     let (version, token) = match frame {
         Frame::Hello { version, token } => (version, token),
         other => {
@@ -62,30 +63,38 @@ pub fn handshake<S: Store>(bridge: &Bridge<S>, frame: Frame) -> Result<String, E
     let Some(token) = token else {
         return Err(EndpointError::Handshake("没有带接入令牌".into()));
     };
-    let Some(device) = bridge.config().device_by_token(&token) else {
+    let devices: Vec<String> = bridge
+        .config()
+        .devices_by_token(&token)
+        .into_iter()
+        .map(|device| device.id.clone())
+        .collect();
+    if devices.is_empty() {
         return Err(EndpointError::Handshake("接入令牌无效".into()));
-    };
-    Ok(device.id.clone())
+    }
+    Ok(devices)
 }
 
 /// 一条连接上的协议状态机。不碰 IO，喂帧就行。
 #[derive(Debug)]
 pub struct Session {
-    device: String,
-    /// 这个设备当前这一轮的票；有票说明 harness 正在跑一轮。
+    /// 这条连接代表的设备组（同一把令牌）。
+    devices: Vec<String>,
+    /// 正在跑的那一轮的票；有票说明 harness 正在跑一轮。
     ticket: Option<Ticket>,
 }
 
 impl Session {
-    pub fn new(device: impl Into<String>) -> Self {
+    pub fn new(devices: Vec<String>) -> Self {
         Self {
-            device: device.into(),
+            devices,
             ticket: None,
         }
     }
 
-    pub fn device(&self) -> &str {
-        &self.device
+    /// 这条连接代表的设备组。
+    pub fn devices(&self) -> &[String] {
+        &self.devices
     }
 
     /// 正在跑的那一轮的票。
@@ -101,7 +110,7 @@ impl Session {
         if self.ticket.is_some() {
             return Ok(None);
         }
-        let Some(delivery) = bridge.poll_turn_for(&self.device)? else {
+        let Some(delivery) = bridge.poll_turn_for(&self.devices)? else {
             return Ok(None);
         };
         self.ticket = Some(delivery.ticket.clone());
@@ -125,7 +134,7 @@ impl Session {
             } => {
                 let reply = match &self.ticket {
                     Some(current) if current == &ticket => {
-                        match bridge.tool_call(&ticket, &tool, args) {
+                        match bridge.tool_call(&ticket, &self.devices, &tool, args) {
                             Ok(result) => Frame::ToolResult {
                                 id,
                                 result: Some(result),
@@ -197,7 +206,7 @@ pub fn run_connection<S: Store>(
     let mut buffer: Vec<u8> = Vec::new();
 
     // 握手：第一帧必须是 hello。
-    let device = {
+    let devices = {
         let line = match read_line(&mut stream, &mut buffer, HANDSHAKE_TIMEOUT)? {
             Incoming::Line(line) => line,
             Incoming::Idle => return Err(EndpointError::Handshake("握手超时".into())),
@@ -210,11 +219,11 @@ pub fn run_connection<S: Store>(
     write_frame(
         &mut stream,
         &Frame::Ready {
-            device: device.clone(),
+            devices: devices.clone(),
         },
     )?;
 
-    let mut session = Session::new(device);
+    let mut session = Session::new(devices);
 
     let outcome = 'conn: loop {
         // 1. 有活就发过去。

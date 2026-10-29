@@ -12,8 +12,9 @@
 ## 接入点
 
 - 监听地址来自配置的 `[endpoint] listen`，默认只听 `127.0.0.1`，外网连不上。
-- **令牌绑设备**：每个设备在配置里有自己的 `token`，握手时令牌对上哪个设备，这条连接就绑到哪个设备。令牌不对直接断开，不回 `ready`。
-- 一条连接只服务一个设备：`poll_turn` 只领本设备的活，不会把别人的轮次领走。
+- **令牌绑一组设备**：配置里几台设备写同一个 `token`，它们就是一组，由这条连接代表。令牌对不上任何设备就直接断开，不回 `ready`。
+- 一条连接只服务它那一组设备：`poll_turn` 只领这组里的活，不会把别人的轮次领走。
+- **跨设备说话只能走 `send_message_to`**：参数里没有「别的设备 id」这种入口，能发的范围就是这组设备订阅的并集（[ADR-0002](../adr/0002-subscription-model.md)）。
 - 握手 10 秒内不说话就断；空闲时桥每 100ms 回头看一眼有没有活，所以有活时最迟约 0.1 秒推过去。
 - **断线不丢消息**：连接断在轮次中间，这一轮直接放掉，不确认任何消息——它们还是未读，下一轮重投（[ADR-0010](../adr/0010-ack-watermark.md)）。
 - 同一设备开两条连接不会破坏串行：桥保证一个设备同时只有一轮，第二条连接暂时领不到活。
@@ -23,8 +24,9 @@
 | 帧 | 方向 | 用途 |
 |----|------|------|
 | `hello` | harness → 桥 | 握手：协议版本 + 接入令牌 |
-| `ready` | 桥 → harness | 握手成功：告诉 harness 绑定的设备 |
-| `turn_start` | 桥 → harness | 开一轮：回合票 + 房间 + 本次投递的记录 + 开轮原因 |
+| `hello` | harness → 桥 | 握手：协议版本 + 接入令牌 |
+| `ready` | 桥 → harness | 握手成功：`devices` = 这条连接代表哪几台设备（配置顺序） |
+| `turn_start` | 桥 → harness | 开一轮：回合票 + 设备 + 记忆 + 房间 + 本次投递的记录 + 开轮原因 |
 | `turn_end` | harness → 桥 | 本轮收工（可带错误） |
 | `tool_call` | harness → 桥 | 调用工具：票 + 工具名 + 参数 |
 | `tool_result` | 桥 → harness | 工具结果或错误 |
@@ -50,16 +52,28 @@ sequenceDiagram
 
 - **票是唯一身份**。`tool_call` 必须带本轮的票，票在 `turn_start` 签发、`turn_end` 作废。票不对，调用一律拒绝。
 - 一轮只投一个房间的记录（[ADR-0003](../adr/0003-serial-turns.md)）。
-- 同一设备的轮次串行：上一轮 `turn_end` 之前不会有下一轮 `turn_start`。
+- 同一份记忆的轮次串行：上一轮 `turn_end` 之前不会有下一轮 `turn_start`（哪怕两台设备共用一份记忆）。
+
+## 一次投递（delivery）
+
+`turn_start` 上带的 `delivery`：
+
+| 字段 | 含义 |
+|------|------|
+| `ticket` | 本轮的票。之后每个 `tool_call` 都要带上它 |
+| `device` | 这一轮替哪台设备说话 |
+| `memory` | 这台设备的记忆 id。 **harness 按记忆找会话**——两台设备共用一份记忆时，它们本该落在同一个会话里 |
+| `room` | 本轮只涉及这一个房间 |
+| `records` | 投递的记录，可能为空 |
+| `reason` | 为什么开这一轮：`wake` / `clock` |
 
 ## 记录（record）
 
 投递给 harness 的最小单位是「记录」，消息与平台事件统一用这个形状：
-
 ```json
 {
   "id": 42,
-  "room": {"platform": "qq", "room": "123456"},
+  "room": {"connection": "qq", "path": ["group", "123456"]},
   "kind": {"kind": "message"},
   "sender": {"id": "10001", "name": "老王"},
   "at": 1793000000000,
@@ -71,6 +85,9 @@ sequenceDiagram
 }
 ```
 
+- `room`：连接名 + 路径段。路径由适配器决定怎么切（QQ 是 `group/123`、`private/456`；
+  Discord 这类会更深，如 `guild/9/channel/7/post/8`）。核心不认识段里的词，只把它当一串段
+  ——所以要前缀查「这个群下面所有楼」也是免费的（[ADR-0012](../adr/0012-platform-connections.md)）。
 - `id`：房间内递增编号，水位按它推进。
 - `kind`：`message` 或 `{"kind":"event","event":"poke"}`；拍一拍就是 `event: poke`（[ADR-0007](../adr/0007-poke-as-message.md)）。
 - `at_self`：这条是不是冲本账号来的（@ 到我、拍我）。

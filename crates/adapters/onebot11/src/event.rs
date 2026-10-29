@@ -3,9 +3,9 @@
 //! 消息、拍一拍、其它群事件走同一条路（ADR-0005）：都变成一条 [`RecordDraft`]，交给桥
 //! 记流水、定未读、定叫醒。心跳这类「不是房间里发生的事」直接忽略，不进流水。
 //!
-//! 房间编号约定：
-//! - 群 → `qq:group/<群号>`
-//! - 私聊 → `qq:private/<对方号>`
+//! 房间编号约定（第一段是**连接名**，不是平台名：同一个平台可以有两个号）：
+//! - 群 → `<连接>:group/<群号>`
+//! - 私聊 → `<连接>:private/<对方号>`
 
 use acb_kernel::{Element, RecordDraft, RoomId, Sender};
 use serde_json::Value;
@@ -31,7 +31,7 @@ pub enum EventError {
 }
 
 /// 解析一条 OneBot 11 上报事件。
-pub fn parse(platform: &str, event: &Value) -> Result<Parsed, EventError> {
+pub fn parse(connection: &str, event: &Value) -> Result<Parsed, EventError> {
     let self_id = id_of(event.get("self_id"));
     let at = event
         .get("time")
@@ -40,13 +40,13 @@ pub fn parse(platform: &str, event: &Value) -> Result<Parsed, EventError> {
         .unwrap_or_else(now_millis);
 
     match post_type(event) {
-        Some("message") => message(platform, event, &self_id, at),
+        Some("message") => message(connection, event, &self_id, at),
         // 自己发出去的消息回执。桥在发送时已经记过流水了，再记一遍会重复。
         Some("message_sent") => Ok(Parsed::Ignored("自己消息的回执".into())),
-        Some("notice") => notice(platform, event, &self_id, at),
+        Some("notice") => notice(connection, event, &self_id, at),
         // 心跳每几秒一次，进流水只会把记录撑爆。
         Some("meta_event") => Ok(Parsed::Ignored("心跳/生命周期".into())),
-        Some("request") => request(platform, event, at),
+        Some("request") => request(connection, event, at),
         other => Ok(Parsed::Ignored(format!(
             "不认识的事件：{}",
             other.unwrap_or("没有 post_type")
@@ -58,7 +58,7 @@ fn post_type(event: &Value) -> Option<&str> {
     event.get("post_type").and_then(Value::as_str)
 }
 
-fn message(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Parsed, EventError> {
+fn message(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Parsed, EventError> {
     let sender_id = id_of(event.get("user_id"));
     if sender_id.is_empty() {
         return Err(EventError::Missing("user_id"));
@@ -70,9 +70,9 @@ fn message(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Pars
             if group.is_empty() {
                 return Err(EventError::Missing("group_id"));
             }
-            room(platform, &format!("group/{group}"))?
+            room(connection, &format!("group/{group}"))?
         }
-        Some("private") => room(platform, &format!("private/{sender_id}"))?,
+        Some("private") => room(connection, &format!("private/{sender_id}"))?,
         _ => return Err(EventError::Missing("message_type")),
     };
 
@@ -95,7 +95,7 @@ fn message(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Pars
     ))
 }
 
-fn notice(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Parsed, EventError> {
+fn notice(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Parsed, EventError> {
     let notice_type = event
         .get("notice_type")
         .and_then(Value::as_str)
@@ -108,7 +108,7 @@ fn notice(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Parse
             user
         }
     };
-    let room = notice_room(platform, event, &sender_id)?;
+    let room = notice_room(connection, event, &sender_id)?;
     let sender = Sender {
         id: sender_id.clone(),
         name: display_name(event),
@@ -145,13 +145,13 @@ fn notice(platform: &str, event: &Value, self_id: &str, at: i64) -> Result<Parse
     )))
 }
 
-fn request(platform: &str, event: &Value, at: i64) -> Result<Parsed, EventError> {
+fn request(connection: &str, event: &Value, at: i64) -> Result<Parsed, EventError> {
     let request_type = event
         .get("request_type")
         .and_then(Value::as_str)
         .ok_or(EventError::Missing("request_type"))?;
     let sender_id = id_of(event.get("user_id"));
-    let room = notice_room(platform, event, &sender_id)?;
+    let room = notice_room(connection, event, &sender_id)?;
     let body = format!("[请求 {request_type}] {}", comment_of(event));
 
     Ok(Parsed::Record(RecordDraft::event(
@@ -168,19 +168,19 @@ fn request(platform: &str, event: &Value, at: i64) -> Result<Parsed, EventError>
 }
 
 /// 事件发生在哪个房间：有群号就是群，否则算私聊。
-fn notice_room(platform: &str, event: &Value, who: &str) -> Result<RoomId, EventError> {
+fn notice_room(connection: &str, event: &Value, who: &str) -> Result<RoomId, EventError> {
     let group = id_of(event.get("group_id"));
     if !group.is_empty() {
-        return room(platform, &format!("group/{group}"));
+        return room(connection, &format!("group/{group}"));
     }
     if who.is_empty() {
         return Err(EventError::Missing("group_id / user_id"));
     }
-    room(platform, &format!("private/{who}"))
+    room(connection, &format!("private/{who}"))
 }
 
-fn room(platform: &str, part: &str) -> Result<RoomId, EventError> {
-    RoomId::new(platform, part).map_err(|error| EventError::BadRoom(error.to_string()))
+fn room(connection: &str, part: &str) -> Result<RoomId, EventError> {
+    RoomId::new(connection, part).map_err(|error| EventError::BadRoom(error.to_string()))
 }
 
 /// 显示名优先用群名片，其次昵称，都没有就用号码。
@@ -422,10 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn platform_name_comes_from_config_not_hardcoded() {
+    fn connection_name_comes_from_config_not_hardcoded() {
         let Parsed::Record(draft) = parse("qq-test", &group_message()).expect("能解析") else {
             panic!("应当成一条记录");
         };
-        assert_eq!(draft.room.platform, "qq-test");
+        assert_eq!(draft.room.connection, "qq-test");
     }
 }

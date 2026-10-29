@@ -14,8 +14,8 @@
 | 部分 | 状态 |
 |------|------|
 | 协议（桥 ↔ harness） | 可用：握手、开轮、工具调用、收工，一行一帧 JSON |
-| 核心（订阅/唤醒/流水/水位/笔记/回合调度） | 可用：工具面 9 个工具，设备内严格串行 |
-| 接入点（harness 连进来） | 可用：TCP 长连接 + 每设备接入令牌 |
+| 核心（连接/订阅/唤醒/流水/水位/笔记/回合调度） | 可用：工具面 9 个工具，同一份记忆的轮次严格串行 |
+| 接入点（harness 连进来） | 可用：TCP 长连接 + 接入令牌（一把令牌代表一组设备） |
 | harness 适配器（opencode v2） | **真机整轮验过**（2026-10-29）：真 QQ 发消息 → 桥开轮 → opencode 模型收到 → 调 `send_message` 回话 → `ack_messages` 推水位；私聊和群各跑通一轮，重启 opencode 还能接上同一个会话；引用机器人的消息也能叫醒。代码 25 个测试 |
 | harness 适配器（DSH / Trae / Codex…） | 没写，判断方法见 [docs/06](docs/06-harness-adapters.md) |
 | QQ 适配器（OneBot 11） | 可用：群与私聊收发、拍一拍、其它平台事件，断线自动重连 |
@@ -60,7 +60,7 @@ opencode2 --standalone     # 必须带 --standalone，后台 service 模式解�
 ```
 
 现成能抄的那份在 [harnesses/opencode/opencode.jsonc.example](harnesses/opencode/opencode.jsonc.example)。
-接上之后 stderr 会打 `[acb] info 已接入桥，绑定设备 main`；有人在 QQ 里说话，模型就会通过
+接上之后 stderr 会打 `[acb] info 已接入桥，绑定设备组 main`；有人在 QQ 里说话，模型就会通过
 `execute` 调 `await tools.send_message({...})` 回过去（插件工具在 opencode 里走 Code Mode，
 不在原生工具表里——这条坑和整轮实测记录见 [docs/06](docs/06-harness-adapters.md)）。
 

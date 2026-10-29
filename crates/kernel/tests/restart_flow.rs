@@ -47,13 +47,7 @@ impl Drop for TempDb {
 struct Sink;
 
 impl Outbound for Sink {
-    fn send(
-        &mut self,
-        _device: &str,
-        _room: &RoomId,
-        _account: &str,
-        _elements: &[Element],
-    ) -> Result<Sent, OutboundError> {
+    fn send(&mut self, _room: &RoomId, _elements: &[Element]) -> Result<Sent, OutboundError> {
         Ok(Sent {
             platform_id: "p-1".into(),
             at: AT,
@@ -63,6 +57,13 @@ impl Outbound for Sink {
 
 fn config() -> &'static str {
     r#"
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "3683924053"
+
         [[devices]]
         id = "main"
         persona = "p"
@@ -70,8 +71,8 @@ fn config() -> &'static str {
         token = "t-main"
 
         [[devices.subscriptions]]
-        room = "qq:private/323622442"
-        send_account = "3683924053"
+        connection = "qq"
+        room = "private/323622442"
 
         [devices.subscriptions.wake]
         at_mention = false
@@ -83,6 +84,11 @@ fn config() -> &'static str {
 
 fn room() -> RoomId {
     RoomId::parse("qq:private/323622442").expect("房间合法")
+}
+
+/// 一次接入代表的设备组（测试里就一台）。
+fn devices() -> Vec<String> {
+    vec!["main".to_owned()]
 }
 
 fn message(text: &str) -> RecordDraft {
@@ -166,6 +172,7 @@ fn a_restart_continues_numbering_and_redelivery_counts() {
     let result = bridge
         .tool_call(
             &ticket,
+            &devices(),
             "ack_messages",
             serde_json::json!({ "ids": [1, 2] }),
         )

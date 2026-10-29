@@ -8,7 +8,7 @@
 import net from "node:net"
 
 /// 协议版本。和 `acb_proto::frame::PROTOCOL_VERSION` 必须一致。
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 const MAX_FRAME_BYTES = 1024 * 1024
 const HANDSHAKE_TIMEOUT_MS = 10_000
@@ -57,7 +57,7 @@ export class BridgeLink {
     this.onTurn = onTurn ?? (async () => {})
     this.log = log ?? (() => {})
 
-    this.device = null
+    this.devices = []
     /** 当前这一轮的票；没有票就没有进行中的轮次。 */
     this.ticket = null
     this.socket = null
@@ -200,7 +200,7 @@ export class BridgeLink {
   #onFrame(frame) {
     switch (frame.frame) {
       case "ready":
-        this.device = frame.device
+        this.devices = Array.isArray(frame.devices) ? frame.devices : []
         this.backoff = RECONNECT_MIN_MS
         this.handshake?.resolve()
         return
@@ -252,7 +252,7 @@ export class BridgeLink {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.connect()
-        .then(() => this.log("info", `重连成功，重新绑定设备 ${this.device}`))
+        .then(() => this.log("info", `重连成功，重新绑定设备 ${this.devices.join("、")}`))
         .catch((error) => this.log("error", `重连失败：${error.message}`))
     }, this.backoff)
     this.backoff = Math.min(this.backoff * 2, RECONNECT_MAX_MS)
@@ -281,9 +281,14 @@ export class BridgeLink {
  * 桥已经在重投的记录上写好了旁白（`note`：第 N 次投递 + 怎么止投），这里只做呈现，
  * 不再造信息；旁白永远单独一行，不拼进对方说的话里。
  */
+/** 房间串：`连接:段/段`。核心和适配器都按这个写法互认。 */
+export function roomText(room) {
+  return `${room.connection}:${room.path.join("/")}`
+}
+
 export function renderTurn(delivery, { now = Date.now() } = {}) {
   const lines = []
-  const room = `${delivery.room.platform}:${delivery.room.room}`
+  const room = roomText(delivery.room)
   const count = delivery.records.length
   const reason =
     delivery.reason === "clock" ? "定时例行检查" : "有新消息"

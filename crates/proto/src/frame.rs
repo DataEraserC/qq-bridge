@@ -11,7 +11,10 @@ use crate::room::RoomId;
 use crate::ticket::Ticket;
 
 /// 协议版本。握手时两端必须一致。
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2：`ready` 从「绑一台设备」改成「绑一组设备」——一把接入令牌可以代表同一份记忆的
+/// 多台设备，`send_message_to` 因此才能跨设备发。这是改语义，不是加帧，所以要升版本。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 单帧上限：1 MiB。超了直接断连，不做截断。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -21,8 +24,11 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub struct Delivery {
     /// 本轮的票。
     pub ticket: Ticket,
-    /// 哪个设备（harness 侧按它绑定记忆）。
+    /// 这一轮替哪台设备说话。
     pub device: String,
+    /// 这台设备的记忆 id（agent 侧会话）。harness 按它找会话——两台设备共用一份记忆时，
+    /// 它们本该落在同一个会话里，串行也由那份记忆保证（ADR-0003）。
+    pub memory: String,
     /// 本轮只涉及这一个房间。
     pub room: RoomId,
     /// 要投递的记录，可能为空（时钟策略的例行检查）。
@@ -96,8 +102,10 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// 桥 → harness：握手成功，绑定到这个设备。
-    Ready { device: String },
+    /// 桥 → harness：握手成功，绑定到这组设备（同一把令牌对应的全部设备）。
+    ///
+    /// 顺序即配置里的顺序。单设备时只有一个元素。
+    Ready { devices: Vec<String> },
     /// 桥 → harness：开一轮。
     TurnStart { delivery: Delivery },
     /// harness → 桥：本轮收工。
@@ -203,10 +211,11 @@ mod tests {
         Delivery {
             ticket: Ticket::new("t-1").expect("合法"),
             device: "main".into(),
-            room: RoomId::new("qq", "123").expect("合法"),
+            memory: "main-memory".into(),
+            room: RoomId::new("qq", "group/123").expect("合法"),
             records: vec![Record {
                 id: 1,
-                room: RoomId::new("qq", "123").expect("合法"),
+                room: RoomId::new("qq", "group/123").expect("合法"),
                 kind: RecordKind::Message,
                 sender: Sender {
                     id: "10001".into(),
@@ -231,7 +240,7 @@ mod tests {
                 token: Some("secret".into()),
             },
             Frame::Ready {
-                device: "main".into(),
+                devices: vec!["main".into(), "second".into()],
             },
             Frame::TurnStart {
                 delivery: sample_delivery(),

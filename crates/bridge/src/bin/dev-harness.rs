@@ -45,7 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     match read(&mut reader)? {
-        Frame::Ready { device } => println!("已绑定到设备 {device}"),
+        Frame::Ready { devices } => println!("已绑定到设备组：{}", devices.join("、")),
         other => return Err(format!("握手失败：收到 {}", other.kind()).into()),
     }
 

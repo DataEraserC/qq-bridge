@@ -27,13 +27,7 @@ struct Recorder {
 }
 
 impl Outbound for Recorder {
-    fn send(
-        &mut self,
-        _device: &str,
-        room: &RoomId,
-        _account: &str,
-        elements: &[Element],
-    ) -> Result<Sent, OutboundError> {
+    fn send(&mut self, room: &RoomId, elements: &[Element]) -> Result<Sent, OutboundError> {
         self.sent.push((room.clone(), elements.to_vec()));
         Ok(Sent {
             platform_id: format!("p-{}", self.sent.len()),
@@ -44,6 +38,13 @@ impl Outbound for Recorder {
 
 fn config() -> &'static str {
     r#"
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "bot"
+
         [endpoint]
         listen = "127.0.0.1:7700"
 
@@ -54,8 +55,8 @@ fn config() -> &'static str {
         token = "t-main"
 
         [[devices.subscriptions]]
-        room = "qq:123"
-        send_account = "bot"
+        connection = "qq"
+        room = "group/123"
     "#
 }
 
@@ -65,7 +66,7 @@ fn room(text: &str) -> RoomId {
 
 fn message(text: &str) -> RecordDraft {
     RecordDraft::message(
-        room("qq:123"),
+        room("qq:group/123"),
         Sender {
             id: "10001".into(),
             name: "老王".into(),
@@ -95,9 +96,9 @@ fn bridge() -> Bridge<MemoryStore> {
 }
 
 #[test]
-fn handshake_binds_the_connection_to_the_token_owner() {
+fn handshake_binds_the_connection_to_the_token_group() {
     let bridge = bridge();
-    let device = handshake(
+    let devices = handshake(
         &bridge,
         Frame::Hello {
             version: PROTOCOL_VERSION,
@@ -105,7 +106,7 @@ fn handshake_binds_the_connection_to_the_token_owner() {
         },
     )
     .expect("能握手");
-    assert_eq!(device, "main");
+    assert_eq!(devices, vec!["main".to_owned()]);
 }
 
 #[test]
@@ -154,7 +155,7 @@ fn handshake_rejects_bad_token_version_and_wrong_first_frame() {
 fn session_refuses_a_ticket_it_did_not_receive() {
     let mut bridge = bridge();
     bridge.ingest(message("在吗")).expect("能记下来");
-    let mut session = Session::new("main");
+    let mut session = Session::new(vec!["main".to_owned()]);
 
     let delivery = session
         .take_delivery(&mut bridge)
@@ -188,7 +189,7 @@ fn session_refuses_a_ticket_it_did_not_receive() {
 fn session_answers_ping_and_ends_turns() {
     let mut bridge = bridge();
     bridge.ingest(message("在吗")).expect("能记下来");
-    let mut session = Session::new("main");
+    let mut session = Session::new(vec!["main".to_owned()]);
     let delivery = session
         .take_delivery(&mut bridge)
         .expect("能取活")
@@ -275,7 +276,7 @@ fn a_real_connection_carries_a_whole_turn() {
         },
     );
     match read_frame(&mut reader).expect("能读到 ready") {
-        Frame::Ready { device } => assert_eq!(device, "main"),
+        Frame::Ready { devices } => assert_eq!(devices, vec!["main".to_owned()]),
         other => panic!("应当是 ready，实际是 {}", other.kind()),
     }
 

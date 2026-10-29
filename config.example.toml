@@ -1,12 +1,16 @@
 # 桥的示例配置。字段语义见 docs/01-vision.md 与 docs/adr/0002-subscription-model.md。
 #
-# 一个设备 = 一个虚拟订阅者：一个人格、一份记忆、一组订阅。
-# 一条订阅 = 一个房间 + 发送账号 + 唤醒策略。
+# 三层，从下往上：
+#   连接 = 一条通到平台的管道（适配器 + 连接方式 + 地址 + 登录账号）。一个账号一条，
+#          同一个平台可以有多条——两个 QQ 号就是两条连接。
+#   设备 = 虚拟订阅者：一个人格、一份记忆、一把接入令牌、一组订阅。
+#   订阅 = 连接 + 房间 + 唤醒策略。
 #
-# 房间写法是「平台:房间号」。QQ 用 group/<群号> 或 private/<号码>，
-# 所以 QQ 群 123 要写成 qq:group/123。
+# 房间写法是「连接名:段/段」。QQ 的群要写成 group/<群号>、私聊写成 private/<号码>，
+# 所以「连接 qq 上那个群 123」要写成 qq:group/123。
+# 第一段是**连接名**不是平台名：同一个号看同一个群只算一个房间，两个号看同一个群是两个。
 #
-# 令牌是 harness 连进来时用的身份：令牌对上哪个设备，那条连接就绑到哪个设备。
+# 令牌是 harness 连进来时用的身份：令牌对上哪几台设备，那条连接就代表这几台设备。
 # 别把示例里的令牌直接用在真环境里。
 
 [endpoint]
@@ -26,42 +30,68 @@ path = "state/acb.db"
 max_records_per_room = 5000
 max_age_days = 90
 
-# 平台侧连接。一个平台一个适配器，桥按房间的平台名把消息交给它。
-# OneBot 11 走正向 WebSocket：这里的地址是 OneBot 实现（NapCat / Lagrange / go-cqhttp…）
-# 开出来的 WS 服务端地址。
-[[adapters]]
+# ---------------------------------------------------------------------------
+# 连接
+# ---------------------------------------------------------------------------
+# kind 说用哪个适配器（目前只有 onebot11），transport 说连接方向：
+#   ws-client = 桥主动去连平台开出来的 WS 服务端（NapCat / Lagrange 等）
+#   ws-server = 桥当服务端，等平台连过来（还没实现）
+# account 是这条连接登录的号：桥靠它认出「这句是我自己说的」。
+# 连上之后会跟平台报的号核对一次，对不上会警告。
+
+[[connections]]
+id = "qq"
 platform = "qq"
 kind = "onebot11"
+transport = "ws-client"
 url = "ws://127.0.0.1:3001"
+token = ""
+account = "10001"
+
+# 同一个平台的第二个号：id 换个名字就行。它看到的群是 qq2:group/123，
+# 跟 qq:group/123 是两个房间，各记各的水位，永远不会重复收。
+[[connections]]
+id = "qq2"
+platform = "qq"
+kind = "onebot11"
+transport = "ws-client"
+url = "ws://127.0.0.1:3002"
+token = ""
+account = "10002"
+
+# ---------------------------------------------------------------------------
+# 设备
+# ---------------------------------------------------------------------------
 
 [[devices]]
 id = "main"
 persona = "默认人格"
 memory = "main-memory"
+# 接入令牌：harness 用它连进来。同一把令牌配给多台设备 = 一次接入代表这几台设备。
 token = "换成你自己的一长串随机字符"
 
-# QQ 群：@ 我、引用我的话、叫我名字、攒够 10 条就醒；被拍也醒。
+# QQ 群：@ 我、引用我的话、叫我名字、攒够 5 条就醒；被拍也醒。
 [[devices.subscriptions]]
-room = "qq:group/123456789"
-send_account = "10001"
+connection = "qq"
+room = "group/123456789"
 
 [devices.subscriptions.wake]
 at_mention = true
 reply = true          # 引用我发的某条消息也算对我说话（QQ 的「回复」就是这种）
 name_mention = true
 names = ["小助手"]
-accumulate = 10
+accumulate = 5
 poke = true
 
-# Discord 频道：只在 @ 我时醒；老王说话不叫醒（但照常记录）。
-# 注意：Discord 适配器还没写，这一条只是示范「同一个设备可以跨平台订阅」。
+# 第二个号的私聊：只在 @ 我或回复我时醒；那个人说话不叫醒（但照常记录）。
 [[devices.subscriptions]]
-room = "discord:987654321"
-send_account = "discord-bot"
+connection = "qq2"
+room = "private/987654321"
 
 [devices.subscriptions.wake]
 at_mention = true
+reply = true
 name_mention = false
 accumulate = 20
 poke = false
-ignore_speakers = ["10001"]
+ignore_speakers = ["987654321"]

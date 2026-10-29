@@ -25,8 +25,9 @@ path = "/var/lib/acb/bridge.db"
 ```mermaid
 erDiagram
     records {
-        text platform
-        text room
+        text connection
+        text room_key
+        text room_json
         integer record_id
         text kind
         text event
@@ -63,7 +64,7 @@ erDiagram
 几件容易记错的事：
 
 - **未读不单独存**。它是「流水里水位之后的部分」，每次现算。不存第二份账，就不会出现两套账对不上。
-- **编号是房间内的**。QQ 群 123 和 Discord 频道 123 是两个房间，各自从 1 开始。
+- **编号是房间内的**。`qq:group/123` 和 `qq2:group/123`（两个号看同一个群）是两个房间，各自从 1 开始。
 - **流水里只有原话**。`redelivery` / `note`（「第 2 次投递；调 ack_messages 确认 #5…」）不落库，投递时由 `deliveries` 现场算出来。
 
 ## 清理：旧流水什么时候可以删
@@ -136,9 +137,9 @@ python3 - <<'EOF'
 import sqlite3
 con = sqlite3.connect("state/acb.db")
 room, device = "private/323622442", "main"
-water = con.execute("select watermark from watermarks where device=? and platform='qq' and room=?", (device, room)).fetchone()
+water = con.execute("select watermark from watermarks where device=? and connection='qq' and room_key=?", (device, room)).fetchone()
 water = water[0] if water else 0
-n = con.execute("select count(*) from records where platform='qq' and room=? and record_id>?", (room, water)).fetchone()[0]
+n = con.execute("select count(*) from records where connection='qq' and room_key=? and record_id>?", (room, water)).fetchone()[0]
 print(f"{device} 在 {room} 的未读：{n} 条（水位 {water}）")
 EOF
 ```
@@ -163,6 +164,7 @@ EOF
 | 版本 | 改了什么 | 为什么 |
 |---|---|---|
 | 1 → 2 | `records` 加 `reply_to_self`、`platform_id` 与对应索引 | 判「别人引用的是不是我发的消息」，靠平台编号反查 |
+| 2 → 3 | 五张表的 `platform` 列改名 `connection`、`room` 列改名 `room_key`；`records` 加 `room_json`；顺手删掉第 1 版留下的重复索引 `records_platform_id` | 房间从「平台 + 房间号」改成「连接 + 路径」。只改名不搬数据，老库照旧读得出来；`room_json` 是后路——以后房间要换成更自由的形状，原始结构还在 |
 
 ## 已知限制
 

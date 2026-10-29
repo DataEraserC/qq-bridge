@@ -59,7 +59,7 @@ export default {
 
     void link
       .connect()
-      .then(() => log("info", `已接入桥，绑定设备 ${link.device}`))
+      .then(() => log("info", `已接入桥，绑定设备组 ${link.devices.join("、")}`))
       .catch((error) => log("warn", `暂时连不上桥：${error.message}，会一直重试`))
 
     return async () => {
@@ -115,11 +115,11 @@ class TurnDriver {
   async #one(delivery, link) {
     let failure = null
     try {
-      const sessionID = await this.#session(delivery.device)
+      const sessionID = await this.#session(delivery.memory ?? delivery.device)
       const text = renderTurn(delivery) + CODE_MODE_HINT
       this.log(
         "debug",
-        `开轮 ${delivery.ticket}：${delivery.room.platform}:${delivery.room.room}，${delivery.records.length} 条`,
+        `开轮 ${delivery.ticket}：${delivery.room.connection}:${delivery.room.path.join("/")}，${delivery.records.length} 条`,
       )
       // prompt 把话排进会话；wait 等这一轮助手真正说完。
       await this.ctx.session.prompt({ sessionID, text })
@@ -130,7 +130,7 @@ class TurnDriver {
       failure = error?.message ?? String(error)
       this.log("error", `这一轮失败了：${failure}`)
       // 会话可能被删了：下次重建，别一直往一个死会话里灌。
-      this.#forget(delivery.device)
+      this.#forget(delivery.memory ?? delivery.device)
     } finally {
       try {
         link.endTurn(delivery.ticket, failure)
@@ -141,27 +141,28 @@ class TurnDriver {
   }
 
   /**
-   * 这个设备的会话：钉死的 > 记住的 > 新建。
+   * 这份记忆的会话：钉死的 > 记住的 > 新建。
    *
-   * 会话就是设备的记忆（记忆按设备一份），所以重开 opencode 要能接上上次那条。
-   * v2 没有「按标题列会话」，所以把会话 id 存进插件自己的 storage。
+   * 记忆就是 agent 侧的会话：桥按记忆串行、按记忆投递，这里也必须按记忆找会话。
+   * 两台设备共用一份记忆时，它们本来就该落在同一个会话里。所以重开 opencode 要能
+   * 接上上次那条——v2 没有「按标题列会话」，把会话 id 存进插件自己的 storage。
    */
-  async #session(device) {
+  async #session(memory) {
     if (this.pinned) return this.pinned
 
     // 缓存里的也要确认还活着：用户可能在 opencode 里把会话删了。
-    const cached = this.sessions.get(device)
+    const cached = this.sessions.get(memory)
     if (cached && (await this.#alive(cached))) return cached
-    if (cached) this.#forget(device)
+    if (cached) this.#forget(memory)
 
-    const stored = await this.#storageGet(`session:${device}`)
+    const stored = await this.#storageGet(`session:${memory}`)
     if (stored && (await this.#alive(stored))) {
-      this.sessions.set(device, stored)
-      this.log("info", `接上会话 ${stored}（acb:${device}）`)
+      this.sessions.set(memory, stored)
+      this.log("info", `接上会话 ${stored}（acb:${memory}）`)
       return stored
     }
 
-    const created = await this.ctx.session.create({ title: `acb:${device}` })
+    const created = await this.ctx.session.create({ title: `acb:${memory}` })
     const id =
       created?.id ??
       created?.sessionID ??
@@ -172,15 +173,15 @@ class TurnDriver {
         `建会话没拿到 id，opencode 的返回形状可能变了：${JSON.stringify(created).slice(0, 200)}`,
       )
     }
-    this.sessions.set(device, id)
-    await this.#storageSet(`session:${device}`, id)
-    this.log("info", `新会话 ${id}（acb:${device}）`)
+    this.sessions.set(memory, id)
+    await this.#storageSet(`session:${memory}`, id)
+    this.log("info", `新会话 ${id}（acb:${memory}）`)
     return id
   }
 
-  #forget(device) {
-    this.sessions.delete(device)
-    void this.#storageSet(`session:${device}`, null)
+  #forget(memory) {
+    this.sessions.delete(memory)
+    void this.#storageSet(`session:${memory}`, null)
   }
 
   async #alive(sessionID) {
@@ -255,7 +256,7 @@ const TEXT_SCHEMA = {
 
 const ROOM_SCHEMA = {
   type: "string",
-  description: "房间；不填就是当前轮次的房间",
+  description: "房间，形如 qq:group/123；不填就是当前轮次的房间",
 }
 
 const TOOL_SPECS = [
@@ -273,12 +274,17 @@ ${ELEMENTS_DOC}
   {
     name: "send_message_to",
     description: `发到另一个房间（比如私聊汇报到群里）。参数和 send_message 一样，只多一个 to。
-to 的写法是 平台:房间，例如 qq:group/158296748、qq:private/323622442。
-只能发到这个设备订阅过的房间——订阅表在桥的配置里，改不了也不该改。`,
+to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/323622442。
+只能发到「你这组设备订阅过的房间」——订阅表在桥的配置里，改不了也不该改。
+同一个房间被本组两台设备都订了时，要用 device 指明用谁的身份说。`,
     input: {
       type: "object",
       properties: {
         to: { type: "string", description: "目标房间，形如 qq:group/12345" },
+        device: {
+          type: "string",
+          description: "用哪台设备的身份说；只在目标房间被本组多台设备订阅时才需要",
+        },
         elements: ELEMENTS_SCHEMA,
         text: TEXT_SCHEMA,
       },
@@ -323,7 +329,7 @@ ids 就是投递记录前面的编号。`,
   {
     name: "list_rooms",
     description:
-      "这个设备订阅了哪些房间，以及每个房间的未读情况。想发消息前先看能发到哪。",
+      "你这组设备订阅了哪些房间、各自未读多少。想发消息前先看能发到哪（一行一台设备的视角）。",
     input: { type: "object", properties: {}, additionalProperties: false },
   },
   {

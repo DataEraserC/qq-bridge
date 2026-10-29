@@ -567,3 +567,155 @@ fn a_version_one_database_is_migrated_in_place() {
         "升级后新写的平台编号要查得到"
     );
 }
+
+/// 第 2 版 → 第 3 版：房间从「平台 + 房间号」改成「连接 + 路径」。
+///
+/// 只改名不搬数据，所以这里盯三件事：**老数据一条不丢、五张表都改到位、改完还能照常写**。
+/// 真实环境里跑着的就是第 2 版的库，这条路径翻车等于所有人一起失忆。
+#[test]
+fn a_version_two_database_is_migrated_in_place() {
+    let db = TempDb::new("migrate-v2");
+    if let Some(parent) = db.path().parent() {
+        std::fs::create_dir_all(parent).expect("建目录");
+    }
+
+    // 手搓第 2 版的库：五张表都还用 platform / room 这套列名。
+    {
+        let conn = rusqlite::Connection::open(db.path()).expect("能开");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE records (
+                platform TEXT NOT NULL,
+                room TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                event TEXT,
+                sender_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                at_self INTEGER NOT NULL,
+                reply_to_self INTEGER NOT NULL DEFAULT 0,
+                platform_id TEXT,
+                elements TEXT NOT NULL,
+                PRIMARY KEY (platform, room, record_id)
+            );
+            CREATE TABLE watermarks (
+                device TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                room TEXT NOT NULL,
+                watermark INTEGER NOT NULL,
+                PRIMARY KEY (device, platform, room)
+            );
+            CREATE TABLE acks (
+                device TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                room TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                PRIMARY KEY (device, platform, room, record_id)
+            );
+            CREATE TABLE deliveries (
+                device TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                room TEXT NOT NULL,
+                record_id INTEGER NOT NULL,
+                times INTEGER NOT NULL,
+                PRIMARY KEY (device, platform, room, record_id)
+            );
+            CREATE TABLE notes (
+                platform TEXT NOT NULL,
+                room TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                note_key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                label TEXT,
+                status TEXT,
+                corrected INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (platform, room, kind, note_key)
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+            "#,
+        )
+        .expect("建旧库");
+
+        conn.execute(
+            "INSERT INTO records
+             (platform, room, record_id, kind, event, sender_id, sender_name,
+              at, at_self, reply_to_self, platform_id, elements)
+             VALUES ('qq', 'group/1', 1, 'message', NULL, '323622442', '老王',
+                     ?1, 0, 1, 'm-1', ?2)",
+            rusqlite::params![AT, r#"[{"type":"text","text":"老消息"}]"#],
+        )
+        .expect("写旧流水");
+        conn.execute(
+            "INSERT INTO records
+             (platform, room, record_id, kind, event, sender_id, sender_name,
+              at, at_self, reply_to_self, platform_id, elements)
+             VALUES ('qq', 'group/1', 2, 'message', NULL, '323622442', '老王',
+                     ?1, 0, 0, 'm-2', ?2)",
+            rusqlite::params![AT, r#"[{"type":"text","text":"老消息二"}]"#],
+        )
+        .expect("写旧流水");
+        conn.execute(
+            "INSERT INTO records
+             (platform, room, record_id, kind, event, sender_id, sender_name,
+              at, at_self, reply_to_self, platform_id, elements)
+             VALUES ('qq', 'group/1', 3, 'message', NULL, '323622442', '老王',
+                     ?1, 0, 0, 'm-3', ?2)",
+            rusqlite::params![AT, r#"[{"type":"text","text":"老消息三"}]"#],
+        )
+        .expect("写旧流水");
+
+        // 水位 1、外加一条乱序确认（编号 3 先确认了）、一次投递计数、一条笔记。
+        conn.execute_batch(
+            r#"
+            INSERT INTO watermarks (device, platform, room, watermark)
+                VALUES ('main', 'qq', 'group/1', 1);
+            INSERT INTO acks (device, platform, room, record_id)
+                VALUES ('main', 'qq', 'group/1', 3);
+            INSERT INTO deliveries (device, platform, room, record_id, times)
+                VALUES ('main', 'qq', 'group/1', 1, 3);
+            INSERT INTO notes (platform, room, kind, note_key, value, label, status, corrected, updated_at)
+                VALUES ('qq', 'group/1', 'topic', '部署', '蓝绿发布', '运维', 'open', 1, 1793000000);
+            "#,
+        )
+        .expect("写旧账");
+    }
+
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("第 2 版的库应当能升上来");
+    let qq = room("qq:group/1");
+    let cursor = Cursor::new("main", qq.clone());
+
+    // 老数据还在，而且「这是在回我」这种老版本才有的信息也没丢。
+    let records = store.since(&qq, 0, 10).expect("老流水还得读得出来");
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].elements, vec![Element::text("老消息")]);
+    assert!(records[0].reply_to_self);
+    assert_eq!(records[0].platform_id.as_deref(), Some("m-1"));
+
+    // 四张按房间记账的表都改到了新列名，读得出来就是改对了。
+    assert_eq!(store.watermark(&cursor).expect("能读"), 1, "水位要留着");
+    assert_eq!(
+        unread(&store, &cursor, 100).expect("能读").len(),
+        2,
+        "水位 1 之后编号 2、3 还没读"
+    );
+    assert_eq!(
+        store.ack(&cursor, &[2]).expect("能确认"),
+        3,
+        "编号 3 在升级前就确认过，补上 2 就该一次推到 3"
+    );
+    let key = NoteKey::new(qq.clone(), NoteKind::Topic, "部署");
+    let note = store.note(&key).expect("能读").expect("笔记还在");
+    assert_eq!(note.value, "蓝绿发布");
+    assert_eq!(note.label.as_deref(), Some("运维"));
+    assert!(note.corrected, "「纠正过」这个标记要留着");
+
+    // 升完之后照常写：编号接着数，新记录带上原始路径结构。
+    let next = store
+        .append(message(&qq, "升级后的话"))
+        .expect("升级后能写");
+    assert_eq!(next.id, 4, "编号要接着数，不能从 1 重来");
+    assert_eq!(store.since(&qq, 0, 10).expect("能读").len(), 4);
+}

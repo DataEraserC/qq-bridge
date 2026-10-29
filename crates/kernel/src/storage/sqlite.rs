@@ -20,7 +20,9 @@ use super::{
 /// 这个程序认识的库结构版本。改表就加一。
 ///
 /// 1 → 2：`records` 加 `reply_to_self` 与 `platform_id`（引用回复的判定要用）。
-pub const SCHEMA_VERSION: i64 = 2;
+/// 2 → 3：房间从「平台 + 房间号」改成「连接 + 路径」——`platform` 列改叫 `connection`，
+///         `room` 列改叫 `room_key`，并留下 `room_json` 存原始路径结构。
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -30,8 +32,9 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS records (
-    platform    TEXT    NOT NULL,
-    room        TEXT    NOT NULL,
+    connection  TEXT    NOT NULL,   -- 连接名（哪个号在看这个房间）
+    room_key    TEXT    NOT NULL,   -- 房间路径，如 group/158296748
+    room_json   TEXT,               -- 路径的原始结构（JSON 数组），留着给以后换形状用
     record_id   INTEGER NOT NULL,
     kind        TEXT    NOT NULL,   -- message | event
     event       TEXT,               -- 仅 kind = event
@@ -42,38 +45,38 @@ CREATE TABLE IF NOT EXISTS records (
     reply_to_self INTEGER NOT NULL DEFAULT 0, -- 0 / 1，引用的是我发的消息
     platform_id TEXT,               -- 平台自己的消息编号，反查引用对象用
     elements    TEXT    NOT NULL,   -- 内容元素的 JSON 数组
-    PRIMARY KEY (platform, room, record_id)
+    PRIMARY KEY (connection, room_key, record_id)
 );
 
 CREATE TABLE IF NOT EXISTS watermarks (
-    device    TEXT    NOT NULL,
-    platform  TEXT    NOT NULL,
-    room      TEXT    NOT NULL,
-    watermark INTEGER NOT NULL,
-    PRIMARY KEY (device, platform, room)
+    device     TEXT    NOT NULL,
+    connection TEXT    NOT NULL,
+    room_key   TEXT    NOT NULL,
+    watermark  INTEGER NOT NULL,
+    PRIMARY KEY (device, connection, room_key)
 );
 
 -- 乱序确认：水位之上已经被确认、但前面还有缺口的那几条。
 CREATE TABLE IF NOT EXISTS acks (
-    device    TEXT    NOT NULL,
-    platform  TEXT    NOT NULL,
-    room      TEXT    NOT NULL,
-    record_id INTEGER NOT NULL,
-    PRIMARY KEY (device, platform, room, record_id)
+    device     TEXT    NOT NULL,
+    connection TEXT    NOT NULL,
+    room_key   TEXT    NOT NULL,
+    record_id  INTEGER NOT NULL,
+    PRIMARY KEY (device, connection, room_key, record_id)
 );
 
 CREATE TABLE IF NOT EXISTS deliveries (
-    device    TEXT    NOT NULL,
-    platform  TEXT    NOT NULL,
-    room      TEXT    NOT NULL,
-    record_id INTEGER NOT NULL,
-    times     INTEGER NOT NULL,
-    PRIMARY KEY (device, platform, room, record_id)
+    device     TEXT    NOT NULL,
+    connection TEXT    NOT NULL,
+    room_key   TEXT    NOT NULL,
+    record_id  INTEGER NOT NULL,
+    times      INTEGER NOT NULL,
+    PRIMARY KEY (device, connection, room_key, record_id)
 );
 
 CREATE TABLE IF NOT EXISTS notes (
-    platform   TEXT    NOT NULL,
-    room       TEXT    NOT NULL,
+    connection TEXT    NOT NULL,
+    room_key   TEXT    NOT NULL,
     kind       TEXT    NOT NULL,   -- term | member | topic
     note_key   TEXT    NOT NULL,
     value      TEXT    NOT NULL,
@@ -81,7 +84,7 @@ CREATE TABLE IF NOT EXISTS notes (
     status     TEXT,               -- open | closed，仅话题
     corrected  INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    PRIMARY KEY (platform, room, kind, note_key)
+    PRIMARY KEY (connection, room_key, kind, note_key)
 );
 "#;
 
@@ -184,6 +187,24 @@ impl SqliteStore {
             self.add_column_if_missing("records", "platform_id", "TEXT")?;
         }
 
+        // 2 → 3：房间从「平台 + 房间号」改成「连接 + 路径」。
+        //
+        // 只改名、不搬数据：老库里 `platform` 那一列本来就是连接名（以前叫平台名），
+        // `room` 那一列本来就是路径（以前叫房间号），语义没变，只是名字对上了。
+        // `room_json` 是新留的后路——以后房间要换成更自由的形状，原始结构还在这儿。
+        if version < 3 {
+            for table in ["records", "watermarks", "acks", "deliveries", "notes"] {
+                self.rename_column_if_needed(table, "platform", "connection")?;
+                self.rename_column_if_needed(table, "room", "room_key")?;
+            }
+            self.add_column_if_missing("records", "room_json", "TEXT")?;
+            // 第 1 版留下了 `records_platform_id`，改名之后它跟下面要建的索引完全重复。
+            // 留着只是白占写入开销，删掉。
+            self.conn
+                .execute_batch("DROP INDEX IF EXISTS records_platform_id;")
+                .map_err(|error| backend(format!("清理旧索引失败：{error}")))?;
+        }
+
         self.conn
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -194,11 +215,45 @@ impl SqliteStore {
 
         self.conn
             .execute_batch(
-                "CREATE INDEX IF NOT EXISTS records_platform_id
-                     ON records (platform, room, platform_id);",
+                "CREATE INDEX IF NOT EXISTS records_by_platform_id
+                     ON records (connection, room_key, platform_id);",
             )
             .map_err(|error| backend(format!("建索引失败：{error}")))?;
         Ok(())
+    }
+
+    /// 老列在才改名。新库建表时用的已经是新名字，这里就该什么都不做。
+    fn rename_column_if_needed(
+        &self,
+        table: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<(), StorageError> {
+        let names = self.columns_of(table)?;
+        if !names.iter().any(|name| name == old) {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {table} RENAME COLUMN {old} TO {new};"
+            ))
+            .map_err(|error| backend(format!("把 {table}.{old} 改名成 {new} 失败：{error}")))
+    }
+
+    /// 表里有哪些列。
+    fn columns_of(&self, table: &str) -> Result<Vec<String>, StorageError> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| backend(error.to_string()))?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| backend(error.to_string()))?;
+        let mut found = Vec::new();
+        for name in names {
+            found.push(name.map_err(|error| backend(error.to_string()))?);
+        }
+        Ok(found)
     }
 
     /// 列不存在才加。`ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，只能先问一嘴。
@@ -208,17 +263,9 @@ impl SqliteStore {
         column: &str,
         definition: &str,
     ) -> Result<(), StorageError> {
-        let mut statement = self
-            .conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(|error| backend(error.to_string()))?;
-        let names = statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|error| backend(error.to_string()))?;
-        for name in names {
-            if name.map_err(|error| backend(error.to_string()))? == column {
-                return Ok(());
-            }
+        let names = self.columns_of(table)?;
+        if names.iter().any(|name| name == column) {
+            return Ok(());
         }
         self.conn
             .execute_batch(&format!(
@@ -231,7 +278,7 @@ impl SqliteStore {
     pub fn counts(&self) -> Result<Counts, StorageError> {
         let records = self.count("SELECT COUNT(*) FROM records")?;
         let rooms =
-            self.count("SELECT COUNT(*) FROM (SELECT DISTINCT platform, room FROM records)")?;
+            self.count("SELECT COUNT(*) FROM (SELECT DISTINCT connection, room_key FROM records)")?;
         let notes = self.count("SELECT COUNT(*) FROM notes")?;
         Ok(Counts {
             records,
@@ -266,12 +313,17 @@ impl Transcript for SqliteStore {
         let elements = serde_json::to_string(&draft.elements)
             .map_err(|error| backend(format!("内容元素存不进库：{error}")))?;
 
+        // 路径的原始结构也存一份：以后房间要换成更自由的形状，原始数据还在，
+        // 重新算键是一次脚本的事，不用重导。
+        let room_json = serde_json::to_string(&draft.room.path)
+            .map_err(|error| backend(format!("房间路径存不进库：{error}")))?;
+
         let transaction = self.conn.transaction().map_err(io_error)?;
-        // 编号是「房间内」的：同一个房间接着往上数，不同平台同号互不相干。
+        // 编号是「房间内」的：同一个房间接着往上数，不同连接同号互不相干。
         let next: i64 = transaction
             .query_row(
-                "SELECT COALESCE(MAX(record_id), 0) + 1 FROM records WHERE platform = ?1 AND room = ?2",
-                params![draft.room.platform, draft.room.room],
+                "SELECT COALESCE(MAX(record_id), 0) + 1 FROM records WHERE connection = ?1 AND room_key = ?2",
+                params![draft.room.connection, draft.room.key()],
                 |row| row.get(0),
             )
             .map_err(io_error)?;
@@ -279,12 +331,13 @@ impl Transcript for SqliteStore {
         transaction
             .execute(
                 "INSERT INTO records
-                 (platform, room, record_id, kind, event, sender_id, sender_name, at, at_self,
-                  reply_to_self, platform_id, elements)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (connection, room_key, room_json, record_id, kind, event, sender_id, sender_name,
+                  at, at_self, reply_to_self, platform_id, elements)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
-                    draft.room.platform,
-                    draft.room.room,
+                    draft.room.connection,
+                    draft.room.key(),
+                    room_json,
                     next,
                     kind,
                     event,
@@ -323,7 +376,7 @@ impl Transcript for SqliteStore {
                 "SELECT record_id, kind, event, sender_id, sender_name, at, at_self,
                         reply_to_self, platform_id, elements
                  FROM records
-                 WHERE platform = ?1 AND room = ?2 AND record_id > ?3
+                 WHERE connection = ?1 AND room_key = ?2 AND record_id > ?3
                  ORDER BY record_id
                  LIMIT ?4",
             )
@@ -331,7 +384,7 @@ impl Transcript for SqliteStore {
 
         let rows = statement
             .query_map(
-                params![room.platform, room.room, after as i64, limit as i64],
+                params![room.connection, room.key(), after as i64, limit as i64],
                 |row| {
                     Ok(RawRow {
                         id: row.get::<_, i64>(0)?.max(0) as u64,
@@ -361,8 +414,8 @@ impl Transcript for SqliteStore {
         let max: Option<i64> = self
             .conn
             .query_row(
-                "SELECT MAX(record_id) FROM records WHERE platform = ?1 AND room = ?2",
-                params![room.platform, room.room],
+                "SELECT MAX(record_id) FROM records WHERE connection = ?1 AND room_key = ?2",
+                params![room.connection, room.key()],
                 |row| row.get(0),
             )
             .map_err(io_error)?;
@@ -372,7 +425,9 @@ impl Transcript for SqliteStore {
     fn rooms(&self) -> Result<Vec<RoomId>, StorageError> {
         let mut statement = self
             .conn
-            .prepare("SELECT DISTINCT platform, room FROM records ORDER BY platform, room")
+            .prepare(
+                "SELECT DISTINCT connection, room_key FROM records ORDER BY connection, room_key",
+            )
             .map_err(io_error)?;
         let rows = statement
             .query_map([], |row| {
@@ -382,9 +437,11 @@ impl Transcript for SqliteStore {
 
         let mut rooms = Vec::new();
         for row in rows {
-            let (platform, room) = row.map_err(io_error)?;
-            let room = RoomId::new(&platform, &room).map_err(|error| {
-                backend(format!("库里的房间读不懂：{platform}:{room}（{error}）"))
+            let (connection, room_key) = row.map_err(io_error)?;
+            let room = RoomId::new(&connection, &room_key).map_err(|error| {
+                backend(format!(
+                    "库里的房间读不懂：{connection}:{room_key}（{error}）"
+                ))
             })?;
             rooms.push(room);
         }
@@ -395,8 +452,8 @@ impl Transcript for SqliteStore {
         let value: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM records WHERE platform = ?1 AND room = ?2",
-                params![room.platform, room.room],
+                "SELECT COUNT(*) FROM records WHERE connection = ?1 AND room_key = ?2",
+                params![room.connection, room.key()],
                 |row| row.get(0),
             )
             .map_err(io_error)?;
@@ -410,10 +467,10 @@ impl Transcript for SqliteStore {
         self.conn
             .query_row(
                 "SELECT sender_id, sender_name FROM records
-                 WHERE platform = ?1 AND room = ?2 AND platform_id = ?3
+                 WHERE connection = ?1 AND room_key = ?2 AND platform_id = ?3
                  ORDER BY record_id DESC
                  LIMIT 1",
-                params![room.platform, room.room, platform_id],
+                params![room.connection, room.key(), platform_id],
                 |row| {
                     Ok(Sender {
                         id: row.get(0)?,
@@ -435,18 +492,18 @@ impl Transcript for SqliteStore {
         let deleted = transaction
             .execute(
                 "DELETE FROM records
-                 WHERE platform = ?1 AND room = ?2
+                 WHERE connection = ?1 AND room_key = ?2
                    AND record_id < ?3
                    AND (?4 IS NULL OR at < ?4)
                    AND record_id NOT IN (
                        SELECT record_id FROM records
-                       WHERE platform = ?1 AND room = ?2
+                       WHERE connection = ?1 AND room_key = ?2
                        ORDER BY record_id DESC
                        LIMIT ?5
                    )",
                 params![
-                    room.platform,
-                    room.room,
+                    room.connection,
+                    room.key(),
                     plan.below as i64,
                     plan.older_than,
                     keep
@@ -462,13 +519,13 @@ impl Transcript for SqliteStore {
                     .execute(
                         &format!(
                             "DELETE FROM {table}
-                             WHERE platform = ?1 AND room = ?2
+                             WHERE connection = ?1 AND room_key = ?2
                                AND record_id NOT IN (
                                    SELECT record_id FROM records
-                                   WHERE platform = ?1 AND room = ?2
+                                   WHERE connection = ?1 AND room_key = ?2
                                )"
                         ),
-                        params![room.platform, room.room],
+                        params![room.connection, room.key()],
                     )
                     .map_err(io_error)?;
             }
@@ -530,8 +587,8 @@ impl Watermarks for SqliteStore {
             .conn
             .query_row(
                 "SELECT watermark FROM watermarks
-                 WHERE device = ?1 AND platform = ?2 AND room = ?3",
-                params![cursor.device, cursor.room.platform, cursor.room.room],
+                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3",
+                params![cursor.device, cursor.room.connection, cursor.room.key()],
                 |row| row.get(0),
             )
             .optional()
@@ -544,8 +601,8 @@ impl Watermarks for SqliteStore {
         let current: Option<i64> = transaction
             .query_row(
                 "SELECT watermark FROM watermarks
-                 WHERE device = ?1 AND platform = ?2 AND room = ?3",
-                params![cursor.device, cursor.room.platform, cursor.room.room],
+                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3",
+                params![cursor.device, cursor.room.connection, cursor.room.key()],
                 |row| row.get(0),
             )
             .optional()
@@ -554,8 +611,8 @@ impl Watermarks for SqliteStore {
 
         let latest: Option<i64> = transaction
             .query_row(
-                "SELECT MAX(record_id) FROM records WHERE platform = ?1 AND room = ?2",
-                params![cursor.room.platform, cursor.room.room],
+                "SELECT MAX(record_id) FROM records WHERE connection = ?1 AND room_key = ?2",
+                params![cursor.room.connection, cursor.room.key()],
                 |row| row.get(0),
             )
             .map_err(io_error)?;
@@ -575,12 +632,12 @@ impl Watermarks for SqliteStore {
             if id > current {
                 transaction
                     .execute(
-                        "INSERT OR IGNORE INTO acks (device, platform, room, record_id)
+                        "INSERT OR IGNORE INTO acks (device, connection, room_key, record_id)
                          VALUES (?1, ?2, ?3, ?4)",
                         params![
                             cursor.device,
-                            cursor.room.platform,
-                            cursor.room.room,
+                            cursor.room.connection,
+                            cursor.room.key(),
                             id as i64
                         ],
                     )
@@ -595,11 +652,11 @@ impl Watermarks for SqliteStore {
             let present: Option<i64> = transaction
                 .query_row(
                     "SELECT record_id FROM acks
-                     WHERE device = ?1 AND platform = ?2 AND room = ?3 AND record_id = ?4",
+                     WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                     params![
                         cursor.device,
-                        cursor.room.platform,
-                        cursor.room.room,
+                        cursor.room.connection,
+                        cursor.room.key(),
                         next as i64
                     ],
                     |row| row.get(0),
@@ -612,11 +669,11 @@ impl Watermarks for SqliteStore {
             transaction
                 .execute(
                     "DELETE FROM acks
-                     WHERE device = ?1 AND platform = ?2 AND room = ?3 AND record_id = ?4",
+                     WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                     params![
                         cursor.device,
-                        cursor.room.platform,
-                        cursor.room.room,
+                        cursor.room.connection,
+                        cursor.room.key(),
                         next as i64
                     ],
                 )
@@ -626,13 +683,13 @@ impl Watermarks for SqliteStore {
 
         transaction
             .execute(
-                "INSERT INTO watermarks (device, platform, room, watermark)
+                "INSERT INTO watermarks (device, connection, room_key, watermark)
                  VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (device, platform, room) DO UPDATE SET watermark = excluded.watermark",
+                 ON CONFLICT (device, connection, room_key) DO UPDATE SET watermark = excluded.watermark",
                 params![
                     cursor.device,
-                    cursor.room.platform,
-                    cursor.room.room,
+                    cursor.room.connection,
+                    cursor.room.key(),
                     frontier as i64
                 ],
             )
@@ -649,8 +706,13 @@ impl Notes for SqliteStore {
             .conn
             .query_row(
                 "SELECT value, label, status, corrected, updated_at FROM notes
-                 WHERE platform = ?1 AND room = ?2 AND kind = ?3 AND note_key = ?4",
-                params![key.room.platform, key.room.room, key.kind.as_str(), key.key],
+                 WHERE connection = ?1 AND room_key = ?2 AND kind = ?3 AND note_key = ?4",
+                params![
+                    key.room.connection,
+                    key.room.key(),
+                    key.kind.as_str(),
+                    key.key
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -681,17 +743,17 @@ impl Notes for SqliteStore {
         self.conn
             .execute(
                 "INSERT INTO notes
-                 (platform, room, kind, note_key, value, label, status, corrected, updated_at)
+                 (connection, room_key, kind, note_key, value, label, status, corrected, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT (platform, room, kind, note_key) DO UPDATE SET
+                 ON CONFLICT (connection, room_key, kind, note_key) DO UPDATE SET
                      value = excluded.value,
                      label = excluded.label,
                      status = excluded.status,
                      corrected = excluded.corrected,
                      updated_at = excluded.updated_at",
                 params![
-                    note.key.room.platform,
-                    note.key.room.room,
+                    note.key.room.connection,
+                    note.key.room.key(),
                     note.key.kind.as_str(),
                     note.key.key,
                     note.value,
@@ -709,10 +771,10 @@ impl Notes for SqliteStore {
         let removed = self
             .conn
             .execute(
-                "DELETE FROM notes WHERE platform = ?1 AND room = ?2 AND kind = ?3 AND note_key = ?4",
+                "DELETE FROM notes WHERE connection = ?1 AND room_key = ?2 AND kind = ?3 AND note_key = ?4",
                 params![
-                    key.room.platform,
-                    key.room.room,
+                    key.room.connection,
+                    key.room.key(),
                     key.kind.as_str(),
                     key.key
                 ],
@@ -726,13 +788,13 @@ impl Notes for SqliteStore {
             .conn
             .prepare(
                 "SELECT kind, note_key, value, label, status, corrected, updated_at
-                 FROM notes WHERE platform = ?1 AND room = ?2
+                 FROM notes WHERE connection = ?1 AND room_key = ?2
                  ORDER BY kind, note_key",
             )
             .map_err(io_error)?;
 
         let rows = statement
-            .query_map(params![room.platform, room.room], |row| {
+            .query_map(params![room.connection, room.key()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -768,14 +830,14 @@ impl Deliveries for SqliteStore {
     fn count_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<u32, StorageError> {
         self.conn
             .execute(
-                "INSERT INTO deliveries (device, platform, room, record_id, times)
+                "INSERT INTO deliveries (device, connection, room_key, record_id, times)
                  VALUES (?1, ?2, ?3, ?4, 1)
-                 ON CONFLICT (device, platform, room, record_id)
+                 ON CONFLICT (device, connection, room_key, record_id)
                  DO UPDATE SET times = times + 1",
                 params![
                     cursor.device,
-                    cursor.room.platform,
-                    cursor.room.room,
+                    cursor.room.connection,
+                    cursor.room.key(),
                     id as i64
                 ],
             )
@@ -785,11 +847,11 @@ impl Deliveries for SqliteStore {
             .conn
             .query_row(
                 "SELECT times FROM deliveries
-                 WHERE device = ?1 AND platform = ?2 AND room = ?3 AND record_id = ?4",
+                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                 params![
                     cursor.device,
-                    cursor.room.platform,
-                    cursor.room.room,
+                    cursor.room.connection,
+                    cursor.room.key(),
                     id as i64
                 ],
                 |row| row.get(0),
@@ -802,11 +864,11 @@ impl Deliveries for SqliteStore {
         self.conn
             .execute(
                 "DELETE FROM deliveries
-                 WHERE device = ?1 AND platform = ?2 AND room = ?3 AND record_id = ?4",
+                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                 params![
                     cursor.device,
-                    cursor.room.platform,
-                    cursor.room.room,
+                    cursor.room.connection,
+                    cursor.room.key(),
                     id as i64
                 ],
             )

@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use acb_kernel::{Bridge, Config, RecordDraft, Store};
+use acb_kernel::{Bridge, RecordDraft, Store};
 use serde_json::Value;
 use tungstenite::error::Error as WsError;
 use tungstenite::{Message, WebSocket};
@@ -172,7 +172,7 @@ pub fn pump<S: Store>(
     mut ws: Ws,
     actions: Receiver<Action>,
     bridge: &Mutex<Bridge<S>>,
-    platform: &str,
+    connection: &str,
     shutdown: &AtomicBool,
 ) -> Result<(), LinkError> {
     let mut waiting: HashMap<String, Sender<Result<Value, LinkError>>> = HashMap::new();
@@ -204,7 +204,13 @@ pub fn pump<S: Store>(
         // 3. 读一帧。
         match ws.read() {
             Ok(Message::Text(text)) => {
-                handle_text(text.as_str(), bridge, platform, &mut waiting, &mut backlog);
+                handle_text(
+                    text.as_str(),
+                    bridge,
+                    connection,
+                    &mut waiting,
+                    &mut backlog,
+                );
             }
             // tungstenite 收到 ping 会自动回 pong，这里只兜一手。
             Ok(Message::Ping(payload)) => {
@@ -237,12 +243,12 @@ fn is_timeout(error: &std::io::Error) -> bool {
 fn handle_text<S: Store>(
     text: &str,
     bridge: &Mutex<Bridge<S>>,
-    platform: &str,
+    connection: &str,
     waiting: &mut HashMap<String, Sender<Result<Value, LinkError>>>,
     backlog: &mut VecDeque<RecordDraft>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
-        eprintln!("适配器 {platform}：收到一段不是 JSON 的内容，丢掉");
+        eprintln!("适配器 {connection}：收到一段不是 JSON 的内容，丢掉");
         return;
     };
 
@@ -254,7 +260,7 @@ fn handle_text<S: Store>(
         return;
     }
 
-    match event::parse(platform, &value) {
+    match event::parse(connection, &value) {
         Ok(Parsed::Record(draft)) => {
             backlog.push_back(draft);
             feed(bridge, backlog);
@@ -262,10 +268,10 @@ fn handle_text<S: Store>(
         Ok(Parsed::Ignored(reason)) => {
             // 心跳之类，不值得每次都打日志。
             if reason.starts_with("不认识") {
-                eprintln!("适配器 {platform}：{reason}");
+                eprintln!("适配器 {connection}：{reason}");
             }
         }
-        Err(error) => eprintln!("适配器 {platform}：这条事件读不懂：{error}"),
+        Err(error) => eprintln!("适配器 {connection}：这条事件读不懂：{error}"),
     }
 }
 
@@ -294,14 +300,14 @@ pub fn supervise<S: Store + Send + 'static>(
     slot: LinkSlot,
     url: String,
     token: Option<String>,
-    platform: String,
+    connection: String,
     bridge: Arc<Mutex<Bridge<S>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match connect(&url, token.as_deref(), READ_TICK) {
             Ok(ws) => {
-                eprintln!("适配器 {platform}：已连上 {url}");
+                eprintln!("适配器 {connection}：已连上 {url}");
                 let (sender, actions) = mpsc::channel();
                 slot.install(sender.clone());
 
@@ -310,24 +316,26 @@ pub fn supervise<S: Store + Send + 'static>(
                 {
                     let sender = sender.clone();
                     let bridge = Arc::clone(&bridge);
-                    let platform = platform.clone();
-                    std::thread::spawn(move || probe_login(&sender, &bridge, &platform));
+                    let connection = connection.clone();
+                    std::thread::spawn(move || probe_login(&sender, &bridge, &connection));
                 }
 
-                let outcome = pump(ws, actions, &bridge, &platform, &shutdown);
+                let outcome = pump(ws, actions, &bridge, &connection, &shutdown);
                 slot.clear();
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
                 match outcome {
-                    Ok(()) => eprintln!("适配器 {platform}：连接关了，{RECONNECT_DELAY:?} 后重连"),
+                    Ok(()) => {
+                        eprintln!("适配器 {connection}：连接关了，{RECONNECT_DELAY:?} 后重连")
+                    }
                     Err(error) => {
-                        eprintln!("适配器 {platform}：{error}，{RECONNECT_DELAY:?} 后重连")
+                        eprintln!("适配器 {connection}：{error}，{RECONNECT_DELAY:?} 后重连")
                     }
                 }
             }
             Err(error) => {
-                eprintln!("适配器 {platform}：{error}");
+                eprintln!("适配器 {connection}：{error}");
             }
         }
 
@@ -341,7 +349,7 @@ pub fn supervise<S: Store + Send + 'static>(
 }
 
 /// 问一下对面登录的是哪个号，顺手检查订阅里配的发送账号对不对。
-fn probe_login<S: Store>(sender: &Sender<Action>, bridge: &Mutex<Bridge<S>>, platform: &str) {
+fn probe_login<S: Store>(sender: &Sender<Action>, bridge: &Mutex<Bridge<S>>, connection: &str) {
     let (reply_tx, reply_rx) = mpsc::channel();
     let request = Action {
         body: serde_json::json!({"action": "get_login_info", "params": {}, "echo": "acb-probe"}),
@@ -352,7 +360,7 @@ fn probe_login<S: Store>(sender: &Sender<Action>, bridge: &Mutex<Bridge<S>>, pla
     }
 
     let Ok(Ok(value)) = reply_rx.recv_timeout(Duration::from_secs(5)) else {
-        eprintln!("适配器 {platform}：问不出登录账号（不影响收发）");
+        eprintln!("适配器 {connection}：问不出登录账号（不影响收发）");
         return;
     };
 
@@ -360,41 +368,32 @@ fn probe_login<S: Store>(sender: &Sender<Action>, bridge: &Mutex<Bridge<S>>, pla
         Some(Value::Number(number)) => number.to_string(),
         Some(Value::String(text)) => text.clone(),
         _ => {
-            eprintln!("适配器 {platform}：对面没说登录账号（不影响收发）");
+            eprintln!("适配器 {connection}：对面没说登录账号（不影响收发）");
             return;
         }
     };
-    eprintln!("适配器 {platform}：登录账号 {self_id}");
+    eprintln!("适配器 {connection}：登录账号 {self_id}");
 
-    let accounts = {
+    let configured = {
         let guard = bridge.lock().unwrap_or_else(|poison| poison.into_inner());
-        accounts_of(guard.config(), platform)
+        guard
+            .config()
+            .connection(connection)
+            .map(|connection| connection.account.clone())
+            .unwrap_or_default()
     };
-    if !accounts.is_empty() && !accounts.iter().any(|account| account == &self_id) {
+    if !configured.is_empty() && configured != self_id {
         eprintln!(
-            "注意：适配器 {platform} 登录的是 {self_id}，但订阅里配的发送账号是 {accounts:?}。\
-             这样自己发的消息会被当成别人说的，请把 send_account 改成 {self_id}"
+            "注意：连接 {connection} 登录的是 {self_id}，但配置里写的是 {configured}。\
+             这样自己发的消息会被当成别人说的，请把 account 改成 {self_id}"
         );
     }
-}
-
-/// 某个平台在订阅里用到的发送账号。
-fn accounts_of(config: &Config, platform: &str) -> Vec<String> {
-    let mut accounts: Vec<String> = config
-        .devices
-        .iter()
-        .flat_map(|device| device.subscriptions.iter())
-        .filter(|subscription| subscription.room.platform == platform)
-        .map(|subscription| subscription.send_account.clone())
-        .collect();
-    accounts.sort();
-    accounts.dedup();
-    accounts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acb_kernel::Config;
 
     #[test]
     fn endpoint_is_taken_from_the_url() {
@@ -463,9 +462,23 @@ mod tests {
     }
 
     #[test]
-    fn accounts_are_collected_for_the_matching_platform_only() {
+    fn the_configured_account_is_read_back_for_the_right_connection() {
         let config = Config::parse(
             r#"
+            [[connections]]
+            id = "qq"
+            platform = "qq"
+            kind = "onebot11"
+            url = "ws://127.0.0.1:3001"
+            account = "999"
+
+            [[connections]]
+            id = "qq2"
+            platform = "qq"
+            kind = "onebot11"
+            url = "ws://127.0.0.1:3002"
+            account = "888"
+
             [[devices]]
             id = "main"
             persona = "p"
@@ -473,17 +486,14 @@ mod tests {
             token = "t"
 
             [[devices.subscriptions]]
-            room = "qq:group/1"
-            send_account = "999"
-
-            [[devices.subscriptions]]
-            room = "discord:2"
-            send_account = "bot"
+            connection = "qq"
+            room = "group/1"
             "#,
         )
         .expect("配置合法");
 
-        assert_eq!(accounts_of(&config, "qq"), vec!["999".to_string()]);
-        assert!(accounts_of(&config, "kook").is_empty());
+        assert_eq!(config.connection("qq").expect("有").account, "999");
+        assert_eq!(config.connection("qq2").expect("有").account, "888");
+        assert!(config.connection("kook").is_none());
     }
 }

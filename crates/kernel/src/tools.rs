@@ -4,6 +4,9 @@
 //! 工具、把调用原样转发过来。参数形状统一用 snake_case 的 JSON 对象。
 //!
 //! 铁律：没有任何工具能发到订阅之外的房间；没有自由改配置或改水位的工具。
+//!
+//! 房间参数的写法一律是 `连接:段/段`（`qq:group/123`）。一次接入能碰的房间，等于这把
+//! 令牌背后那组设备订阅的并集（ADR-0002）——所以「发到别处」和「读别处」是一个边界。
 
 use serde::Deserialize;
 
@@ -30,8 +33,10 @@ pub struct SendArgs {
 #[derive(Debug, Deserialize)]
 pub struct SendToArgs {
     pub elements: Vec<acb_proto::Element>,
-    /// 目标房间，形如 `qq:123`。必须是本设备订阅过的房间。
+    /// 目标房间，形如 `qq:group/123`。必须落在本组设备订阅范围之内。
     pub to: String,
+    /// 用哪台设备的身份说。只在「同一个房间被本组多台设备订阅」时才必须。
+    pub device: Option<String>,
 }
 
 /// 确认这批消息处理完了。

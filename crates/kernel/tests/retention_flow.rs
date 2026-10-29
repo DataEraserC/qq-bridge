@@ -17,13 +17,7 @@ const DAY: i64 = 86_400_000;
 struct Sink;
 
 impl Outbound for Sink {
-    fn send(
-        &mut self,
-        _device: &str,
-        _room: &RoomId,
-        _account: &str,
-        _elements: &[Element],
-    ) -> Result<Sent, OutboundError> {
+    fn send(&mut self, _room: &RoomId, _elements: &[Element]) -> Result<Sent, OutboundError> {
         Ok(Sent {
             platform_id: "p-1".into(),
             at: AT,
@@ -34,6 +28,13 @@ impl Outbound for Sink {
 fn config(max_records: u64, max_days: u64) -> String {
     format!(
         r#"
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "bot"
+
         [[devices]]
         id = "main"
         persona = "p"
@@ -41,8 +42,8 @@ fn config(max_records: u64, max_days: u64) -> String {
         token = "t-main"
 
         [[devices.subscriptions]]
-        room = "qq:123"
-        send_account = "bot"
+        connection = "qq"
+        room = "group/123"
 
         [devices.subscriptions.wake]
         accumulate = 1
@@ -54,8 +55,8 @@ fn config(max_records: u64, max_days: u64) -> String {
         token = "t-helper"
 
         [[devices.subscriptions]]
-        room = "qq:123"
-        send_account = "bot"
+        connection = "qq"
+        room = "group/123"
 
         [devices.subscriptions.wake]
         accumulate = 1
@@ -76,7 +77,7 @@ fn bridge(max_records: u64, max_days: u64) -> Bridge<MemoryStore> {
 }
 
 fn room() -> RoomId {
-    RoomId::parse("qq:123").expect("房间合法")
+    RoomId::parse("qq:group/123").expect("房间合法")
 }
 
 fn message(text: &str, at: i64) -> RecordDraft {
@@ -95,12 +96,13 @@ fn message(text: &str, at: i64) -> RecordDraft {
 /// 让某个设备领一轮，并且把这些编号确认掉。走的是真工具调用，不是内部捷径。
 fn ack(bridge: &mut Bridge<MemoryStore>, device: &str, ids: &[u64]) {
     let delivery = bridge
-        .poll_turn_for(device)
+        .poll_turn_for(&[device.to_owned()])
         .expect("能取")
         .expect("该有活干");
     bridge
         .tool_call(
             &delivery.ticket,
+            &[device.to_owned()],
             "ack_messages",
             serde_json::json!({ "ids": ids }),
         )

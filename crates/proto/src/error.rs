@@ -7,12 +7,12 @@ use thiserror::Error;
 /// 构造协议类型时的错误。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProtoError {
-    #[error("平台名不能为空")]
-    EmptyPlatform,
-    #[error("房间号不能为空")]
-    EmptyRoom,
-    #[error("标识的这一段里不能有冒号：{0}")]
-    ColonInPart(String),
+    #[error("连接名不能为空")]
+    EmptyConnection,
+    #[error("房间路径不能为空（要写成 段/段，如 group/123）")]
+    EmptyPath,
+    #[error("连接名或路径段里不能有分隔符（: 与 /）：{0}")]
+    SeparatorInPart(String),
     #[error("回合票不能为空")]
     EmptyTicket,
     #[error("帧编码失败：{0}")]
@@ -38,8 +38,11 @@ mod tests {
 
     #[test]
     fn errors_render_readable_text() {
-        let error = ProtoError::EmptyRoom;
-        assert_eq!(error.to_string(), "房间号不能为空");
+        let error = ProtoError::EmptyPath;
+        assert_eq!(
+            error.to_string(),
+            "房间路径不能为空（要写成 段/段，如 group/123）"
+        );
 
         let decode = DecodeError::TooLarge { size: 9, max: 4 };
         assert!(decode.to_string().contains("9"));
