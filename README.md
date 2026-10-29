@@ -16,7 +16,7 @@
 | 协议（桥 ↔ harness） | 可用：握手、开轮、工具调用、收工，一行一帧 JSON |
 | 核心（订阅/唤醒/流水/水位/笔记/回合调度） | 可用：工具面 9 个工具，设备内严格串行 |
 | 接入点（harness 连进来） | 可用：TCP 长连接 + 每设备接入令牌 |
-| harness 适配器（opencode v2） | **真机整轮验过**（2026-10-29）：真 QQ 发消息 → 桥开轮 → opencode 模型收到 → 调 `send_message` 回话 → `ack_messages` 推水位；私聊和群各跑通一轮，重启 opencode 还能接上同一个会话。代码 23 个测试 |
+| harness 适配器（opencode v2） | **真机整轮验过**（2026-10-29）：真 QQ 发消息 → 桥开轮 → opencode 模型收到 → 调 `send_message` 回话 → `ack_messages` 推水位；私聊和群各跑通一轮，重启 opencode 还能接上同一个会话；引用机器人的消息也能叫醒。代码 25 个测试 |
 | harness 适配器（DSH / Trae / Codex…） | 没写，判断方法见 [docs/06](docs/06-harness-adapters.md) |
 | QQ 适配器（OneBot 11） | 可用：群与私聊收发、拍一拍、其它平台事件，断线自动重连 |
 | Discord / KOOK / Telegram | 没写 |
