@@ -16,7 +16,7 @@
 | 协议（桥 ↔ harness） | 可用：握手、开轮、工具调用、收工，一行一帧 JSON |
 | 核心（订阅/唤醒/流水/水位/笔记/回合调度） | 可用：工具面 9 个工具，设备内严格串行 |
 | 接入点（harness 连进来） | 可用：TCP 长连接 + 每设备接入令牌 |
-| harness 适配器（opencode v2） | 代码按 v2 插件 API 写完，协议层 + 插件逻辑共 23 个测试；**没在真 opencode 里跑完一轮**——opencode2 2.0.22 加载任何插件都段错误（上游 Bun bug） |
+| harness 适配器（opencode v2） | 代码按 v2 插件 API 写完，协议层 + 插件逻辑共 23 个测试；真机上**能加载、能握手、能绑设备**（2026-10-29 复测，昨晚的段错误没再出现），**整轮没跑通**——只差一条真 QQ 消息进来 |
 | harness 适配器（DSH / Trae / Codex…） | 没写，判断方法见 [docs/06](docs/06-harness-adapters.md) |
 | QQ 适配器（OneBot 11） | 可用：群与私聊收发、拍一拍、其它平台事件，断线自动重连 |
 | Discord / KOOK / Telegram | 没写 |
@@ -46,16 +46,23 @@ cargo run -p qqab-bridge --bin dev-harness -- --token <配置里设备的 token>
 第一次起桥会在工作目录建 `state/qqab.db`：流水、水位、笔记、「第几次投递」全在里面，
 重启接着用。删了等于失忆（但不会起不来）。细节见 [docs/07-storage.md](docs/07-storage.md)。
 
-要用真的 opencode 接进来（**只支持 v2**），把插件目录拷进去：
+要用真的 opencode 接进来（**只支持 v2**）。插件留在仓库里，配置文件指向它就行，不要拷贝
+（本机根目录是 tmpfs，拷出去的东西不保险）：
 
-```bash
-cp -r harnesses/opencode/plugin ~/.config/opencode/plugins/qqab
-export QQAB_TOKEN=<配置里设备的 token>
-opencode2
+```jsonc
+// ~/.config/opencode/opencode.json 或项目根的 opencode.jsonc
+{ "plugins": [ { "package": "<仓库绝对路径>/harnesses/opencode/plugin",
+                 "options": { "token": "<配置里设备的 token>" } } ] }
 ```
 
-注意：本机 opencode2 2.0.22 目前加载任何插件都会段错误（连 4 行空插件都崩，Bun 的 bug），
-所以这一条现在跑不通，原因与替代验证见 [docs/06](docs/06-harness-adapters.md)。
+```bash
+opencode2 --standalone     # 必须带 --standalone，后台 service 模式解析不到插件入口
+```
+
+现成能抄的那份在 [harnesses/opencode/opencode.jsonc.example](harnesses/opencode/opencode.jsonc.example)。
+实测：插件能加载、握手能成（stderr 会打 `[qqab] info 已接入桥，绑定设备 main`）；**整轮还没跑通**，
+只差有人从 QQ 发一句话（模型用的本机 openrouter 免费小模型，细节见
+[docs/06](docs/06-harness-adapters.md)）。
 
 不想装 opencode 也想看这一段通不通，用同一个协议客户端的探针：
 

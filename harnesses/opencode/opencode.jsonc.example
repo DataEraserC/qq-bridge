@@ -1,0 +1,19 @@
+// 把这一段贴进 opencode 的配置文件（全局 ~/.config/opencode/opencode.json，
+// 或某个项目根目录的 opencode.jsonc），opencode 启动时就会加载本仓库里的插件。
+//
+// 关键点：`package` 直接指向仓库里的目录，不要拷贝到 ~/.config/opencode/plugins/。
+// 本机是 NixOS（根目录是 tmpfs），只有仓库是可靠的持久位置。
+//
+// 令牌在 config.toml 的 [[devices]] 里，和设备那一节的 token 一致。
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/harnesses/opencode/plugin",
+      "options": {
+        "token": "<设备令牌，见 config.toml>",
+        "endpoint": "127.0.0.1:7700"
+      }
+    }
+  ]
+}

@@ -390,15 +390,19 @@ function readConfig(ctx) {
 function makeLogger(ctx) {
   const line = `[${SERVICE}]`
   return (level, message) => {
-    // 能走 opencode 的日志就走；不行就退到控制台，别为了日志把插件弄挂。
+    // 固定写一份到 stderr：实测 2.0.22 在 `serve --stdio` 下 `app.log` 不落盘
+    // （opencode.log 里搜不到任何 service= 的行），只靠它等于把诊断信息扔掉。
+    // stdout 一个字都不能碰——那是 RPC 通道，写进去会让 opencode 报 socket 意外关闭。
+    try {
+      console.error(`${line} ${level} ${message}`)
+    } catch {
+      // 连 stderr 都不可用就算了，日志绝不能把插件弄挂。
+    }
     const app = ctx?.app
     if (typeof app?.log === "function") {
       Promise.resolve(
         app.log({ body: { service: SERVICE, level, message } }),
       ).catch(() => {})
-      return
     }
-    const out = level === "error" ? console.error : console.log
-    out(`${line} ${level} ${message}`)
   }
 }

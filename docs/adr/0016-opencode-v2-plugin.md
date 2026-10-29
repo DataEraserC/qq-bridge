@@ -39,12 +39,17 @@
 - 插件里**不能 `console.log`**：`serve --stdio` 用 stdout 当 RPC 通道，写一行就把协议污染，
   表现是 opencode 报 `Transport: The socket connection was closed unexpectedly`。
   日志走 `ctx.app.log`，退路是 `console.error`。
-- **验证现状**：本机 `opencode2 2.0.22`（Bun 1.4.2）加载任何插件都会段错误
-  （`panic: Segmentation fault`，官方提示是 Bun 的 bug），4 行空插件同样崩。
-  所以「真 opencode 里跑完一轮」这条还没验过。替代方案是 `test/plugin.test.mjs` 里的
-  假宿主（照 v2 文档实现 `tool.transform` / `session` / `storage` / `app`），
-  能验工具注册、一轮的完整动作、会话复用与重建、错误透传、卸载关连接。
-- 等上游修好后，要补验两件：`prompt` 之后工具调用能否拿到票；`input` 的 JSON Schema
+- **验证现状（2026-10-29 更新）**：昨晚记录的是「加载任何插件都段错误」；今早同一台机器、
+  同一版本复测，**不再崩**，插件能加载（日志 `loading plugin … index.js`）并真的连上了桥
+  （`ESTAB …:7700` 对端是 `.opencode2-wrap`）。所以「真 opencode 里跑完一轮」只差模型这一环：
+  opencode 里得有一个它能认的模型，本机免费额度被限流、全局配置的 key 环境变量没设、
+  新配的自定义 provider 的模型它不注册（`model '…' not found`）。
+  插件逻辑本身仍由 `test/plugin.test.mjs` 的假宿主兜着（照 v2 文档实现
+  `tool.transform` / `session` / `storage` / `app`），验工具注册、一轮的完整动作、会话复用与重建、
+  错误透传、卸载关连接。
+- **要用 `--standalone` 起**：后台 service 模式下插件入口解析不到
+  （`PluginModule.LoadError: Plugin entrypoint not found`）。
+- 等模型这一环通了，要补验两件：`prompt` 之后工具调用能否拿到票；`input` 的 JSON Schema
   它是否照单接受。
 
 ## 参考

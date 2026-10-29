@@ -50,7 +50,7 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 
 | harness | 扩展点 | 轮次驱动 | 判断 |
 |---------|--------|----------|------|
-| opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，已按 v2 实现，见 `harnesses/opencode/plugin/`；真机跑到一半被 Bun 崩溃挡住 |
+| opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，已按 v2 实现，见 `harnesses/opencode/plugin/`；真机上能加载、能连桥，整轮差一个它能认的模型 |
 | DSH | 插件 | 待核实 | 用户说可以走插件，具体接口未看 |
 | WorkBuddy | 待核实 | 待核实 | 未看 |
 | Trae | 待核实 | 待核实 | 未看 |
@@ -63,21 +63,24 @@ opencode 有 v1 和 v2 两套插件 API，**写法不通用**。我们按 v2 写
 
 v2 的插件是一个目录：`index.js` 是入口，`qqab-wire.mjs` 是协议客户端（入口 import 它）。
 
-```bash
-# 整体拷进 opencode 的插件目录，目录名随便，这里叫 qqab
-cp -r harnesses/opencode/plugin ~/.config/opencode/plugins/qqab
-```
-
-配置两种给法，选项优先于环境变量：
+**不拷贝，直接指向本仓库的这个目录。** 本机根目录是 tmpfs，只有仓库是可靠的持久位置；
+拷到 `~/.config/opencode/plugins/` 的东西哪天就没了。配置文件里写绝对路径即可：
 
 ```jsonc
-// ~/.config/opencode/opencode.jsonc
+// 全局 ~/.config/opencode/opencode.json，或某个项目根的 opencode.jsonc
 {
   "plugins": [
-    { "package": "/home/me/.config/opencode/plugins/qqab", "options": { "token": "设备令牌" } }
+    {
+      "package": "/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/harnesses/opencode/plugin",
+      "options": { "token": "设备令牌" }
+    }
   ]
 }
 ```
+
+完整可抄的版本在 [`harnesses/opencode/opencode.jsonc.example`](../harnesses/opencode/opencode.jsonc.example)。
+
+也可以用环境变量，选项优先于环境变量：
 
 ```bash
 export QQAB_TOKEN=<设备令牌>         # 和 config.toml 里设备的 token 一致
@@ -85,6 +88,11 @@ export QQAB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 ```
 
 没给令牌时插件直接不启用，只写一条警告——不阻塞 opencode 启动。
+
+**要用 `--standalone` 起 opencode。** 后台 service 模式下插件解析不到入口，日志里是
+`PluginModule.LoadError: Plugin entrypoint not found: <插件目录>`（那个进程的工作目录和我们
+给的不是同一个）。`opencode2 --standalone` 正常加载，日志里能看到
+`loading plugin ... entrypoint=file:///…/index.js`。
 
 几个刻意的做法：
 
@@ -100,13 +108,14 @@ export QQAB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
   `turn_end` 或断连释放设备，不回就一直占着。
 - **断线自己重连**，退避 1 秒起、最长 10 秒。桥比 opencode 晚启动也能接上。
 
-### 写 v2 插件绕不过去的四个坑（都是实测）
+### 写 v2 插件绕不过去的几个坑（都是实测）
 
 | 现象 | 原因 / 做法 |
 |------|-------------|
 | 插件放进去没反应，日志里连「loading plugin」都没有 | `.opencode/plugins/` 只自动发现**直接的 `.js` / `.ts` 文件**和**插件目录**；`.mjs` 文件不认。入口用 `index.js` |
 | `Cannot find package '@opencode/plugin'` | 本地插件不自动带这个包。不用它就行：直接 `export default { id, setup }`，功能一样（`Plugin.define` 只是语法糖） |
 | 插件一加载，opencode 报 `Transport: The socket connection was closed unexpectedly` | 插件里 `console.log` 写到了 **stdout**，而 `serve --stdio` 用 stdout 当 RPC 通道，协议被污染。日志只能走 `ctx.app.log` 或 `console.error` |
+| 插件明明连上了，日志里却一个字都没有，查不到「已接入桥」 | 实测 2.0.22 在 `serve --stdio` 下 `ctx.app.log` **不落盘**（`~/.local/share/opencode/log/opencode.log` 里搜不到任何 `service=` 的行），所以日志必须**同时**写一份 `console.error`（stderr 安全，stdout 不行） |
 | 配置写 `"plugin": ["./qqab.js"]` 报 `configured plugin path must be a directory` | v2 的键叫 `plugins`（复数），且本地路径必须是**目录**，指向单个文件会被跳过 |
 
 ## 怎么验
@@ -123,34 +132,55 @@ node --test harnesses/opencode/test/plugin.test.mjs
 # 3. 对着真桥（不用 opencode）：握手成不成
 node harnesses/opencode/probe.mjs --token <设备令牌>
 
-# 4. 真链路：真 opencode + 真桥 + 真 QQ（目前被上游 bug 挡住，见下）
+# 4. 真链路：真 opencode 起得来、插件连上桥（已做到）；整轮还差一条真消息（见下）
 ```
 
 第 3 步里 `probe.mjs` 会把投递的内容打出来、回一句话、确认水位。它和插件用的是同一个
 协议客户端，所以这里看得到的，插件也看得到——区别只在「交给谁去思考」。
 
-## 卡在哪：opencode2 加载插件就段错误
+## 实测进度（2026-10-29）
 
-本机 `opencode2 2.0.22`（内嵌 Bun 1.4.2）只要加载插件，`serve --stdio` 进程就崩：
+**加载 → setup → 握手 → 绑定设备，四步都验过了。** 启动方式：
 
-```
-panic: Segmentation fault at address 0x...
-oh no: Bun has crashed. This indicates a bug in Bun, not your code.
-```
-
-最小复现是一个 4 行插件，什么都不做：
-
-```js
-// .opencode/plugins/x.js
-export default { id: "x", async setup() {} }
+```bash
+# 项目根的 opencode.jsonc 里 plugins 指向本仓库的 plugin 目录（见 opencode.jsonc.example）
+opencode2 --standalone
 ```
 
-同一个目录里没有插件时 `opencode2 run` 一切正常，放进去就崩。所以这不是我们的代码问题，
-是上游。等它修好，第 4 层才算验过；在那之前，插件逻辑靠第 2 层（假宿主）兜着。
+看到这两样就算接上了：
+
+```
+[qqab] info 已接入桥，绑定设备 main
+```
+```
+ESTAB 127.0.0.1:7700   127.0.0.1:44758  users:(("qqab-bridge",pid=17401,fd=7))
+ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=26))
+```
+
+昨晚 `opencode2 2.0.22` 加载任何插件都 `panic: Segmentation fault`（4 行空插件同样崩），
+今天同一台机器同一版本**不复现**。那一关过去了。
+
+## 还差一步：整轮
+
+要跑完整一轮（模型收到投递 → 调 `send_message` → 票能用），得凑齐三样：
+opencode 能起、插件连上（都有了）、**一个 opencode 认的模型**。第三样踩了很多坑：
+
+- `opencode2` 自带的免费额度被限流（`Free usage limit reached`）。
+- 全局配置里的 `agentrouter-openai` 要 `AGENTROUTER_API_KEY`，本机没这个变量，报 `未提供令牌`。
+- `1AgentRouter/gpt-6.1-sol` 这类 key 本身没问题：直接 curl `localhost:1100` 的
+  `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三条路都能出字。但 opencode 只认
+  自己从 models.dev 拉下来的目录：新增的自定义 provider **不注册模型**（模型名带不带斜杠、
+  写成 `modelID` 还是别名、项目级/全局级都试过，一律 `model '…' not found`）。
+  借它登记过的 provider id 去覆盖地址，请求是发出去了，但带的是别的凭据。这条属于 opencode
+  自己的模型目录规则，不是插件的事。
+- 最后用本机已有的 openrouter key + 免费模型 `liquid/lfm-2.5-2.6b:free`（支持工具调用）跑通
+  出字，插件也挂着它连上了桥。模型只有 2.6B，答得笨，但足够验链路。
+
+所以第 4 层现在停在最后一步：**等人从 QQ 发一句话**，看模型会不会把 `send_message` 调起来。
 
 ## 已知没验的地方
 
-- **真 opencode 里的整轮**：被上面的 Bun 崩溃挡住。具体没验到的是「`prompt` 之后工具调用
+- **真 opencode 里的整轮**：缺模型（见上）。具体没验到的是「`prompt` 之后工具调用
   是否真能拿到票」「工具 schema 它认不认」。假宿主能证明我们的顺序对，不能证明它的行为。
 - 内容段参数用宽松的 `items: { type: "object" }` 接，靠描述文字教模型写元素。宁松勿严：
   写错了桥那边会给出比 JSON Schema 更准的话。
