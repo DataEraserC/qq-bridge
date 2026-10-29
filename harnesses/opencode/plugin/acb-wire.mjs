@@ -252,7 +252,7 @@ export class BridgeLink {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.connect()
-        .then(() => this.log("info", `重连成功，重新绑定设备 ${this.devices.join("、")}`))
+        .then(() => this.log("info", `重连成功，重新绑定设备组 ${this.devices.join("、")}`))
         .catch((error) => this.log("error", `重连失败：${error.message}`))
     }, this.backoff)
     this.backoff = Math.min(this.backoff * 2, RECONNECT_MAX_MS)

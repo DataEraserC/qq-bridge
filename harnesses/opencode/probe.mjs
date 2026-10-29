@@ -57,7 +57,7 @@ try {
   process.exit(1)
 }
 
-console.log(`已绑定到设备 ${link.device}，等着开轮（Ctrl-C 退出）`)
+console.log(`已绑定到设备组 ${link.devices.join("、")}，等着开轮（Ctrl-C 退出）`)
 
 process.on("SIGINT", () => {
   link.close()
