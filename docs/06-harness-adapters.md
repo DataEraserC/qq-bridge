@@ -297,3 +297,23 @@ curl -u "opencode:$PW" -H 'Content-Type: application/json' \
 
 私有端口看 `ss -ltnp | grep opencode2-wrap`。`/api/session` 需要 basic 认证，
 用户名随便写（`opencode`），密码是进程环境里的 `OPENCODE_PASSWORD`。
+
+### 换成 1AgentRouter 之后的一轮实测（2026-10-29 下午）
+
+两个房间连着跑通，模型是 `arc/1AgentRouter/gpt-5.6-sol`：
+
+```
+群 qq:group/158296748（8 条积压）
+  → execute: await tools.send_message({…})   → {"id":29,"platform_id":"46552198"}
+  → execute: await tools.ack_messages({ids:[21..28]}) → {"watermark":29}
+私聊 qq:private/323622442（5 条积压）
+  → send_message → {"id":21,"platform_id":"548566431"}
+  → ack_messages({ids:[16..20]}) → {"watermark":21}
+```
+
+`platform_id` 是 OneBot 回的 message_id，有它就说明 QQ 那边真的收下了。
+水位从 20→29、15→21，下一轮不再重投。
+
+**代价是慢。** 单步 3–5 分钟：投递内容 130 KB 上下（≈35k token），模型自己还要想。
+小请求（几百字节）10 秒内就回，所以慢在「大上下文 + 长思考」，不是链路卡住。
+要快要从两头下手：投递时别把历史重复塞满（现在每次把未读全量重发），或者换更快的模型。
