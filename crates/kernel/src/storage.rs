@@ -165,20 +165,20 @@ pub trait Watermarks {
     fn ack(&mut self, cursor: &Cursor, ids: &[u64]) -> Result<u64, StorageError>;
 }
 
-/// 一条水位游标：哪个设备、哪个房间。
+/// 一条水位游标：哪个会话、哪个房间。
 ///
-/// 两个设备订同一个房间时各自推进、互不影响。这个键是存储层的，别和
-/// [`NoteKey`] 混——笔记按房间共享，不按设备分。
+/// 两个会话订同一个房间时各自推进、互不影响。这个键是存储层的，别和
+/// [`NoteKey`] 混——笔记按房间共享，不按会话分。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cursor {
-    pub device: String,
+    pub session: String,
     pub room: RoomId,
 }
 
 impl Cursor {
-    pub fn new(device: impl Into<String>, room: RoomId) -> Self {
+    pub fn new(session: impl Into<String>, room: RoomId) -> Self {
         Self {
-            device: device.into(),
+            session: session.into(),
             room,
         }
     }

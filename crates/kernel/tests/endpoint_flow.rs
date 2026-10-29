@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use acb_kernel::endpoint::{read_frame, reader_of};
 use acb_kernel::{
-    Bridge, Element, Frame, MemoryStore, Outbound, OutboundError, RecordDraft, RoomId, Sender,
-    Sent, Session, handshake, serve,
+    Bridge, Conn, Element, Frame, MemoryStore, Outbound, OutboundError, RecordDraft, RoomId,
+    Sender, Sent, handshake, serve,
 };
 use acb_proto::frame::{PROTOCOL_VERSION, encode};
 use serde_json::json;
@@ -48,13 +48,18 @@ fn config() -> &'static str {
         [endpoint]
         listen = "127.0.0.1:7700"
 
-        [[devices]]
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[sessions]]
         id = "main"
+        harness = "dsh"
         persona = "p"
-        memory = "m"
         token = "t-main"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/123"
     "#
@@ -98,15 +103,16 @@ fn bridge() -> Bridge<MemoryStore> {
 #[test]
 fn handshake_binds_the_connection_to_the_token_group() {
     let bridge = bridge();
-    let devices = handshake(
+    let sessions = handshake(
         &bridge,
         Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
             token: Some(TOKEN.into()),
         },
     )
     .expect("能握手");
-    assert_eq!(devices, vec!["main".to_owned()]);
+    assert_eq!(sessions, vec!["main".to_owned()]);
 }
 
 #[test]
@@ -117,6 +123,7 @@ fn handshake_rejects_bad_token_version_and_wrong_first_frame() {
         &bridge,
         Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
             token: Some("乱写".into()),
         },
     )
@@ -127,6 +134,7 @@ fn handshake_rejects_bad_token_version_and_wrong_first_frame() {
         &bridge,
         Frame::Hello {
             version: PROTOCOL_VERSION + 1,
+            harness: "dsh".into(),
             token: Some(TOKEN.into()),
         },
     )
@@ -140,6 +148,7 @@ fn handshake_rejects_bad_token_version_and_wrong_first_frame() {
         &bridge,
         Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
             token: None,
         },
     )
@@ -155,7 +164,7 @@ fn handshake_rejects_bad_token_version_and_wrong_first_frame() {
 fn session_refuses_a_ticket_it_did_not_receive() {
     let mut bridge = bridge();
     bridge.ingest(message("在吗")).expect("能记下来");
-    let mut session = Session::new(vec!["main".to_owned()]);
+    let mut session = Conn::new(vec!["main".to_owned()]);
 
     let delivery = session
         .take_delivery(&mut bridge)
@@ -189,7 +198,7 @@ fn session_refuses_a_ticket_it_did_not_receive() {
 fn session_answers_ping_and_ends_turns() {
     let mut bridge = bridge();
     bridge.ingest(message("在吗")).expect("能记下来");
-    let mut session = Session::new(vec!["main".to_owned()]);
+    let mut session = Conn::new(vec!["main".to_owned()]);
     let delivery = session
         .take_delivery(&mut bridge)
         .expect("能取活")
@@ -272,11 +281,12 @@ fn a_real_connection_carries_a_whole_turn() {
         &mut stream,
         &Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
             token: Some(TOKEN.into()),
         },
     );
     match read_frame(&mut reader).expect("能读到 ready") {
-        Frame::Ready { devices } => assert_eq!(devices, vec!["main".to_owned()]),
+        Frame::Ready { sessions } => assert_eq!(sessions, vec!["main".to_owned()]),
         other => panic!("应当是 ready，实际是 {}", other.kind()),
     }
 
@@ -292,7 +302,7 @@ fn a_real_connection_carries_a_whole_turn() {
         Frame::TurnStart { delivery } => delivery,
         other => panic!("应当是 turn_start，实际是 {}", other.kind()),
     };
-    assert_eq!(delivery.device, "main");
+    assert_eq!(delivery.session, "main");
     assert_eq!(delivery.records.len(), 1);
     let ticket = delivery.ticket;
 
@@ -344,7 +354,7 @@ fn a_real_connection_carries_a_whole_turn() {
     loop {
         let busy = {
             let guard = bridge.lock().expect("没被毒死");
-            guard.busy_devices()
+            guard.busy_sessions()
         };
         if busy.is_empty() {
             break;
@@ -373,6 +383,7 @@ fn redelivery_hint_rides_on_note_not_on_content() {
         &mut stream,
         &Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
             token: Some(TOKEN.into()),
         },
     );
@@ -446,6 +457,7 @@ fn a_bad_token_gets_no_ready() {
         &mut stream,
         &Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
             token: Some("偷来的".into()),
         },
     );
@@ -474,6 +486,7 @@ fn dropping_the_connection_mid_turn_releases_the_device() {
         &mut stream,
         &Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
             token: Some(TOKEN.into()),
         },
     );
@@ -499,7 +512,7 @@ fn dropping_the_connection_mid_turn_releases_the_device() {
     loop {
         let busy = {
             let guard = bridge.lock().expect("没被毒死");
-            guard.busy_devices()
+            guard.busy_sessions()
         };
         if busy.is_empty() {
             break;

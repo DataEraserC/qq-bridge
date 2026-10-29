@@ -1,17 +1,21 @@
-# 桥的示例配置。字段语义见 docs/01-vision.md 与 docs/adr/0002-subscription-model.md。
+# 桥的示例配置。字段语义见 docs/adr/0017-multi-agent-model.md 与 docs/adr/0002-subscription-model.md。
 #
-# 三层，从下往上：
-#   连接 = 一条通到平台的管道（适配器 + 连接方式 + 地址 + 登录账号）。一个账号一条，
-#          同一个平台可以有多条——两个 QQ 号就是两条连接。
-#   设备 = 虚拟订阅者：一个人格、一份记忆、一把接入令牌、一组订阅。
-#   订阅 = 连接 + 房间 + 唤醒策略。
+# 四层，从下往上（ADR-0017）：
+#   连接  = 一条通到平台的管道（适配器 + 连接方式 + 地址 + 登录账号）。一个账号一条，
+#           同一个平台可以有多条——两个 QQ 号就是两条连接。
+#   人格  = 一张纯文本人设卡（id + name + text）。只管「是谁、什么语气、什么不能漏」，
+#           不带记忆、不带订阅、不声明能力。
+#   记忆  = 一份长期知识，抽象接口（id + name + kind + location）。kind 目前只有 git。
+#   会话  = 一个串行单元（id + harness 名 + 人格 id + 记忆 ids 可空 + 订阅）。
+#           串行键 = harness 名 + 会话 id。
+#   订阅  = 连接 + 房间 + 唤醒策略。
 #
 # 房间写法是「连接名:段/段」。QQ 的群要写成 group/<群号>、私聊写成 private/<号码>，
 # 所以「连接 qq 上那个群 123」要写成 qq:group/123。
 # 第一段是**连接名**不是平台名：同一个号看同一个群只算一个房间，两个号看同一个群是两个。
 #
-# 令牌是 harness 连进来时用的身份：令牌对上哪几台设备，那条连接就代表这几台设备。
-# 别把示例里的令牌直接用在真环境里。
+# 令牌 + harness 名是 harness 连进来时报的身份：名字对上、令牌对上，那条连接就代表
+# 这个 harness 接管的那组会话。别把示例里的令牌直接用在真环境里。
 
 [endpoint]
 # harness 连这个地址。默认只听本机，外网连不上。
@@ -24,7 +28,7 @@ listen = "127.0.0.1:7700"
 path = "state/acb.db"
 
 [retention]
-# 旧流水什么时候可以删。只削**已经读过**的那一段：任何在册设备还没读到的记录，
+# 旧流水什么时候可以删。只削**已经读过**的那一段：任何在册会话还没读到的记录，
 # 一条都不删。两项写 0 就是不作任何清理（库只增不减）。
 # 每 5 分钟扫一次，删了什么会打一行「清理：… 删掉 N 条已读记录」。
 max_records_per_room = 5000
@@ -60,22 +64,53 @@ token = ""
 account = "10002"
 
 # ---------------------------------------------------------------------------
-# 设备
+# 人格
 # ---------------------------------------------------------------------------
+# 一张卡一份。text 是投递给模型的人设正文。能力（能不能 bash/git/用工具）不写在这里，
+# 由会话配置与 harness/适配器决定。
 
-[[devices]]
+[[personas]]
+id = "default"
+name = "默认人格"
+text = """
+你是谁、什么性格、什么语气，写在这里。
+只写「怎么说话」和「信息边界」（什么不能说、什么不能漏），
+不要写「你没有本地工具」这类能力声明——能力由会话配置和 harness 决定。
+"""
+
+# ---------------------------------------------------------------------------
+# 记忆
+# ---------------------------------------------------------------------------
+# 一份记忆一个 id。kind 目前只有 git，location 是仓库路径。
+# 桥只负责初始化 worktree 并告诉 harness「当前会话的 worktree 路径」，
+# 文件读写和 git 操作全部由 harness 直接做（桥不做提交/推送/建分支/改内容）。
+
+[[memories]]
+id = "main-memory"
+name = "主记忆"
+kind = "git"
+location = "/home/you/qqab-memories/main"
+
+# ---------------------------------------------------------------------------
+# 会话
+# ---------------------------------------------------------------------------
+# 一个会话 = 一个串行单元。harness 名 + 会话 id 是它的串行键。
+# memories 可空（空 = 不存长期记忆）；persona 必须指向上面定义的人格卡。
+
+[[sessions]]
 id = "main"
-persona = "默认人格"
-memory = "main-memory"
-# 接入令牌：harness 用它连进来。同一把令牌配给多台设备 = 一次接入代表这几台设备。
+harness = "dsh"
+persona = "default"
+memories = ["main-memory"]
+# 接入令牌：harness 连进来时报出 harness 名 + 这个令牌，桥据此绑定会话。
 token = "换成你自己的一长串随机字符"
 
 # QQ 群：@ 我、引用我的话、叫我名字、攒够 5 条就醒；被拍也醒。
-[[devices.subscriptions]]
+[[sessions.subscriptions]]
 connection = "qq"
 room = "group/123456789"
 
-[devices.subscriptions.wake]
+[sessions.subscriptions.wake]
 at_mention = true
 reply = true          # 引用我发的某条消息也算对我说话（QQ 的「回复」就是这种）
 name_mention = true
@@ -84,11 +119,11 @@ accumulate = 5
 poke = true
 
 # 第二个号的私聊：只在 @ 我或回复我时醒；那个人说话不叫醒（但照常记录）。
-[[devices.subscriptions]]
+[[sessions.subscriptions]]
 connection = "qq2"
 room = "private/987654321"
 
-[devices.subscriptions.wake]
+[sessions.subscriptions.wake]
 at_mention = true
 reply = true
 name_mention = false

@@ -3,7 +3,7 @@
 //! 真 harness（DSH / WorkBuddy / Trae）还没接进来之前，用它验「桥 ↔ 平台」这一段：
 //!
 //! ```text
-//! cargo run -p acb-bridge --bin dev-harness -- --endpoint 127.0.0.1:7700 --token 你的令牌
+//! cargo run -p acb-bridge --bin dev-harness -- --endpoint 127.0.0.1:7700 --harness dsh --token 你的令牌
 //! ```
 //!
 //! 它只做三件事：把投递过来的记录打出来、回一句固定的话、确认这些记录已处理。
@@ -40,12 +40,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &mut writer,
         &Frame::Hello {
             version: PROTOCOL_VERSION,
+            harness: options.harness.clone(),
             token: Some(options.token.clone()),
         },
     )?;
 
     match read(&mut reader)? {
-        Frame::Ready { devices } => println!("已绑定到设备组：{}", devices.join("、")),
+        Frame::Ready { sessions } => println!("已绑定到会话组：{}", sessions.join("、")),
         other => return Err(format!("握手失败：收到 {}", other.kind()).into()),
     }
 
@@ -200,6 +201,7 @@ fn read(reader: &mut BufReader<TcpStream>) -> std::io::Result<Frame> {
 
 struct Options {
     endpoint: String,
+    harness: String,
     token: String,
     reply: String,
     once: bool,
@@ -208,6 +210,7 @@ struct Options {
 impl Options {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, Box<dyn std::error::Error>> {
         let mut endpoint = "127.0.0.1:7700".to_owned();
+        let mut harness = String::new();
         let mut token = String::new();
         let mut reply = "收到".to_owned();
         let mut once = false;
@@ -216,13 +219,14 @@ impl Options {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--endpoint" => endpoint = args.next().ok_or("--endpoint 后面要跟地址")?,
+                "--harness" => harness = args.next().ok_or("--harness 后面要跟 harness 名")?,
                 "--token" => token = args.next().ok_or("--token 后面要跟令牌")?,
                 "--reply" => reply = args.next().ok_or("--reply 后面要跟内容")?,
                 "--once" => once = true,
                 "--help" | "-h" => {
                     println!(
-                        "用法：dev-harness --token 令牌 [--endpoint 127.0.0.1:7700] \
-                         [--reply 回复内容] [--once]"
+                        "用法：dev-harness --harness 名 --token 令牌 \
+                         [--endpoint 127.0.0.1:7700] [--reply 回复内容] [--once]"
                     );
                     std::process::exit(0);
                 }
@@ -230,12 +234,16 @@ impl Options {
             }
         }
 
+        if harness.trim().is_empty() {
+            return Err("必须给 --harness，跟配置里会话的 harness 名一致".into());
+        }
         if token.trim().is_empty() {
-            return Err("必须给 --token，跟配置里设备的 token 一致".into());
+            return Err("必须给 --token，跟配置里会话的 token 一致".into());
         }
 
         Ok(Self {
             endpoint,
+            harness,
             token,
             reply,
             once,

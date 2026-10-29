@@ -1,14 +1,16 @@
-//! 配置：连接、设备、订阅、三条策略。
+//! 配置：连接、人格、记忆、harness 会话、订阅、三条策略。
 //!
-//! 三层，从下往上：
+//! 四层，从下往上（ADR-0017 四对象模型）：
 //! 1. **连接**：一条通到平台的管道（适配器种类 + 连接信息 + 登录账号）。同一平台可以有
 //!    多条，每条一个账号——一个账号一条连接是平台的硬事实，不是我们的选择。
-//! 2. **设备**：虚拟订阅者。人格、记忆、接入令牌、一组订阅。同一把接入令牌的几台设备算
-//!    一组，由同一个 harness 会话代表（一次接入能替这组设备说话）。
-//! 3. **订阅**：连接 + 房间 + 唤醒策略。收发的合法目标全从这里查。
+//! 2. **人格**：一张纯文本人设卡（id + name + 正文）。只管「是谁、什么语气、什么不能漏」，
+//!    不带记忆、不带订阅、不声明能力（能力由会话配置与 harness/适配器决定）。
+//! 3. **记忆**：一份长期知识，抽象接口（id + name + type + 位置参数）。type 可扩展，
+//!    当前第一种是 git。可被多个会话共享，最终一致。
+//! 4. **harness 会话**：一个串行单元（id + harness 名 + 人格 id + 记忆 ids 可空 + 订阅）。
+//!    串行键 = harness 名 + 会话 id；同一会话内严格串行，不同会话并发。
 //!
-//! 配置从 TOML 读进来后**完全校验**：非法配置在这里就死，不会带病启动。唯一例外是
-//! 「几台设备共用一份记忆」——那是用户可以故意选的用法，只警告不动手（见 [`Config::warnings`]）。
+//! 配置从 TOML 读进来后**完全校验**：非法配置在这里就死，不会带病启动。
 
 use acb_proto::RoomId;
 use serde::Deserialize;
@@ -31,7 +33,12 @@ pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
 /// 整份配置。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    pub devices: Vec<Device>,
+    /// 人格列表。
+    pub personas: Vec<Persona>,
+    /// 记忆列表。
+    pub memories: Vec<Memory>,
+    /// harness 会话列表。
+    pub sessions: Vec<Session>,
     /// 接入点配置。没配就不监听——只跑内存里的桥（测试、嵌入式）。
     pub endpoint: Option<EndpointConfig>,
     /// 平台侧连接。一个账号一条，可以有多条。
@@ -136,6 +143,9 @@ pub struct Connection {
 /// 目前认识的适配器种类。加新适配器时在这里登记。
 pub const KNOWN_ADAPTERS: &[&str] = &["onebot11"];
 
+/// 目前认识的记忆存储形式。加新形式时在这里登记。
+pub const KNOWN_MEMORY_KINDS: &[&str] = &["git"];
+
 /// 接入点：harness 连进来的地址。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EndpointConfig {
@@ -143,14 +153,41 @@ pub struct EndpointConfig {
     pub listen: String,
 }
 
-/// 一个设备：虚拟订阅者。
+/// 一张人格卡：纯文本人设。
 #[derive(Debug, Clone, PartialEq)]
-pub struct Device {
+pub struct Persona {
     pub id: String,
+    /// 人设名，给人看的。
+    pub name: String,
+    /// 人设正文：「你是谁、什么性格、什么语气」，以及信息边界（什么不能漏）。
+    pub text: String,
+}
+
+/// 一份记忆：抽象接口。`type` 决定底层存储，当前第一种是 `git`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Memory {
+    pub id: String,
+    /// 记忆名，给人看的。
+    pub name: String,
+    /// 存储形式，如 `git`。可扩展。
+    pub kind: String,
+    /// 与 `kind` 对应的位置/参数。`git` 下是仓库路径。
+    pub location: String,
+}
+
+/// 一个 harness 会话：一个串行单元。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Session {
+    pub id: String,
+    /// 这个会话由哪个 harness 接管。串行键 = harness 名 + 会话 id。
+    pub harness: String,
+    /// 人格卡 id。
     pub persona: String,
-    pub memory: String,
-    /// 这个设备的接入令牌。同一把令牌的几台设备算一组，由同一次接入代表。
+    /// 引用的记忆 id 列表。可空（空 = 不存长期记忆）。
+    pub memories: Vec<String>,
+    /// 接入令牌。harness 握手时报出令牌与 harness 名，桥据此绑定会话。
     pub token: String,
+    /// 订阅列表。
     pub subscriptions: Vec<Subscription>,
 }
 
@@ -285,28 +322,48 @@ fn matches_any(names: &[String], text: &str) -> bool {
 pub enum ConfigError {
     #[error("配置读不懂：{detail}")]
     ParseFailed { detail: String },
-    #[error("设备 {device} 的 {field} 不能为空")]
-    EmptyField { device: String, field: &'static str },
-    #[error("设备 id 重复：{device}")]
-    DuplicateDevice { device: String },
-    #[error("设备 {device} 重复订阅了房间 {room}")]
-    DuplicateRoom { device: String, room: String },
-    #[error("设备 {device} 的房间标识不合法：{room}（{detail}）")]
+    #[error("会话 {session} 的 {field} 不能为空")]
+    EmptyField {
+        session: String,
+        field: &'static str,
+    },
+    #[error("会话 id 重复：{session}")]
+    DuplicateSession { session: String },
+    #[error("会话 {session} 重复订阅了房间 {room}")]
+    DuplicateRoom { session: String, room: String },
+    #[error("会话 {session} 的房间标识不合法：{room}（{detail}）")]
     BadRoom {
-        device: String,
+        session: String,
         room: String,
         detail: String,
     },
-    #[error("设备 {device} 订阅了 {room}，但没有名为 {connection} 的连接")]
+    #[error("会话 {session} 订阅了 {room}，但没有名为 {connection} 的连接")]
     UnknownConnection {
-        device: String,
+        session: String,
         room: String,
         connection: String,
     },
-    #[error("设备 {device} 的房间 {room} 的 accumulate 必须是正整数")]
-    BadAccumulate { device: String, room: String },
-    #[error("设备 {device} 的接入令牌不能为空")]
-    EmptyToken { device: String },
+    #[error("会话 {session} 的房间 {room} 的 accumulate 必须是正整数")]
+    BadAccumulate { session: String, room: String },
+    #[error("会话 {session} 的接入令牌不能为空")]
+    EmptyToken { session: String },
+    #[error("会话 {session} 引用了不存在的人格 {persona}")]
+    UnknownPersona { session: String, persona: String },
+    #[error("会话 {session} 引用了不存在的记忆 {memory}")]
+    UnknownMemory { session: String, memory: String },
+    #[error("人格 id 重复：{persona}")]
+    DuplicatePersona { persona: String },
+    #[error("人格 {persona} 的 {field} 不能为空")]
+    EmptyPersonaField {
+        persona: String,
+        field: &'static str,
+    },
+    #[error("记忆 id 重复：{memory}")]
+    DuplicateMemory { memory: String },
+    #[error("记忆 {memory} 的 {field} 不能为空")]
+    EmptyMemoryField { memory: String, field: &'static str },
+    #[error("记忆 {memory} 的种类不认识：{kind}（目前只有 git）")]
+    UnknownMemoryKind { memory: String, kind: String },
     #[error("接入点监听地址不合法：{address}（{detail}）")]
     BadListen { address: String, detail: String },
     #[error("连接名不能为空")]
@@ -392,38 +449,127 @@ impl Config {
             connections.push(connection);
         }
 
-        let mut devices = Vec::with_capacity(raw.devices.len());
-        let mut seen_devices: Vec<String> = Vec::new();
-
-        for raw_device in raw.devices {
-            let id = raw_device.id;
-            if seen_devices.iter().any(|seen| seen == &id) {
-                return Err(ConfigError::DuplicateDevice { device: id });
+        // 人格：一张卡一份，id 唯一。
+        let mut personas: Vec<Persona> = Vec::with_capacity(raw.personas.len());
+        for raw_persona in raw.personas {
+            let id = raw_persona.id.trim().to_owned();
+            if id.is_empty() {
+                return Err(ConfigError::EmptyPersonaField {
+                    persona: id,
+                    field: "id",
+                });
             }
-            seen_devices.push(id.clone());
+            if personas.iter().any(|seen| seen.id == id) {
+                return Err(ConfigError::DuplicatePersona { persona: id });
+            }
+            let name = raw_persona.name.trim().to_owned();
+            if name.is_empty() {
+                return Err(ConfigError::EmptyPersonaField {
+                    persona: id,
+                    field: "name",
+                });
+            }
+            let text = raw_persona.text.trim().to_owned();
+            if text.is_empty() {
+                return Err(ConfigError::EmptyPersonaField {
+                    persona: id,
+                    field: "text",
+                });
+            }
+            personas.push(Persona { id, name, text });
+        }
+
+        // 记忆：一份一个 id，kind 目前只有 git。
+        let mut memories: Vec<Memory> = Vec::with_capacity(raw.memories.len());
+        for raw_memory in raw.memories {
+            let id = raw_memory.id.trim().to_owned();
+            if id.is_empty() {
+                return Err(ConfigError::EmptyMemoryField {
+                    memory: id,
+                    field: "id",
+                });
+            }
+            if memories.iter().any(|seen| seen.id == id) {
+                return Err(ConfigError::DuplicateMemory { memory: id });
+            }
+            let name = raw_memory.name.trim().to_owned();
+            if name.is_empty() {
+                return Err(ConfigError::EmptyMemoryField {
+                    memory: id,
+                    field: "name",
+                });
+            }
+            let kind = raw_memory.kind.trim().to_owned();
+            if !KNOWN_MEMORY_KINDS.contains(&kind.as_str()) {
+                return Err(ConfigError::UnknownMemoryKind { memory: id, kind });
+            }
+            let location = raw_memory.location.trim().to_owned();
+            if location.is_empty() {
+                return Err(ConfigError::EmptyMemoryField {
+                    memory: id,
+                    field: "location",
+                });
+            }
+            memories.push(Memory {
+                id,
+                name,
+                kind,
+                location,
+            });
+        }
+
+        let mut sessions = Vec::with_capacity(raw.sessions.len());
+        let mut seen_sessions: Vec<String> = Vec::new();
+
+        for raw_session in raw.sessions {
+            let id = raw_session.id;
+            if seen_sessions.iter().any(|seen| seen == &id) {
+                return Err(ConfigError::DuplicateSession { session: id });
+            }
+            seen_sessions.push(id.clone());
 
             check_not_blank(&id, "id").map_err(|field| ConfigError::EmptyField {
-                device: id.clone(),
+                session: id.clone(),
                 field,
             })?;
-            check_not_blank(&raw_device.persona, "persona").map_err(|field| {
+            check_not_blank(&raw_session.harness, "harness").map_err(|field| {
                 ConfigError::EmptyField {
-                    device: id.clone(),
+                    session: id.clone(),
                     field,
                 }
             })?;
-            check_not_blank(&raw_device.memory, "memory").map_err(|field| {
+            check_not_blank(&raw_session.persona, "persona").map_err(|field| {
                 ConfigError::EmptyField {
-                    device: id.clone(),
+                    session: id.clone(),
                     field,
                 }
             })?;
-            check_not_blank(&raw_device.token, "token")
-                .map_err(|_| ConfigError::EmptyToken { device: id.clone() })?;
+            check_not_blank(&raw_session.token, "token").map_err(|_| ConfigError::EmptyToken {
+                session: id.clone(),
+            })?;
 
-            let mut subscriptions = Vec::with_capacity(raw_device.subscriptions.len());
+            // 引用的人格与记忆必须真的存在。
+            if !personas
+                .iter()
+                .any(|persona| persona.id == raw_session.persona)
+            {
+                return Err(ConfigError::UnknownPersona {
+                    session: id.clone(),
+                    persona: raw_session.persona.clone(),
+                });
+            }
+            for memory in &raw_session.memories {
+                if !memories.iter().any(|m| &m.id == memory) {
+                    return Err(ConfigError::UnknownMemory {
+                        session: id.clone(),
+                        memory: memory.clone(),
+                    });
+                }
+            }
+
+            let mut subscriptions = Vec::with_capacity(raw_session.subscriptions.len());
             let mut seen_rooms: Vec<RoomId> = Vec::new();
-            for raw_subscription in raw_device.subscriptions {
+            for raw_subscription in raw_session.subscriptions {
                 let subscription = build_subscription(&id, raw_subscription)?;
                 // 订阅连的连接必须真的存在，否则这个房间永远发不出去。
                 if !connections
@@ -431,14 +577,14 @@ impl Config {
                     .any(|connection| connection.id == subscription.room.connection)
                 {
                     return Err(ConfigError::UnknownConnection {
-                        device: id.clone(),
+                        session: id.clone(),
                         room: subscription.room.to_string(),
                         connection: subscription.room.connection.clone(),
                     });
                 }
                 if seen_rooms.iter().any(|room| room == &subscription.room) {
                     return Err(ConfigError::DuplicateRoom {
-                        device: id.clone(),
+                        session: id.clone(),
                         room: subscription.room.to_string(),
                     });
                 }
@@ -446,17 +592,20 @@ impl Config {
                 subscriptions.push(subscription);
             }
 
-            devices.push(Device {
+            sessions.push(Session {
                 id,
-                persona: raw_device.persona,
-                memory: raw_device.memory,
-                token: raw_device.token.trim().to_owned(),
+                harness: raw_session.harness.trim().to_owned(),
+                persona: raw_session.persona,
+                memories: raw_session.memories,
+                token: raw_session.token.trim().to_owned(),
                 subscriptions,
             });
         }
 
         Ok(Self {
-            devices,
+            personas,
+            memories,
+            sessions,
             endpoint,
             connections,
             storage,
@@ -471,27 +620,37 @@ impl Config {
             .find(|connection| connection.id == id)
     }
 
-    /// 找一台设备。
-    pub fn device(&self, id: &str) -> Option<&Device> {
-        self.devices.iter().find(|device| device.id == id)
+    /// 找一张人格卡。
+    pub fn persona(&self, id: &str) -> Option<&Persona> {
+        self.personas.iter().find(|persona| persona.id == id)
     }
 
-    /// 找设备的某条订阅。发送与工具鉴权都从这里查。
-    pub fn subscription(&self, device: &str, room: &RoomId) -> Option<&Subscription> {
-        self.devices
+    /// 找一份记忆。
+    pub fn memory(&self, id: &str) -> Option<&Memory> {
+        self.memories.iter().find(|memory| memory.id == id)
+    }
+
+    /// 找一个会话。
+    pub fn session(&self, id: &str) -> Option<&Session> {
+        self.sessions.iter().find(|session| session.id == id)
+    }
+
+    /// 找会话的某条订阅。发送与工具鉴权都从这里查。
+    pub fn subscription(&self, session: &str, room: &RoomId) -> Option<&Subscription> {
+        self.sessions
             .iter()
-            .find(|candidate| candidate.id == device)?
+            .find(|candidate| candidate.id == session)?
             .subscriptions
             .iter()
             .find(|subscription| &subscription.room == room)
     }
 
-    /// 哪台（哪几台）设备订阅了这个房间。
-    pub fn subscribers_of(&self, room: &RoomId) -> Vec<&Device> {
-        self.devices
+    /// 哪（几）个会话订阅了这个房间。
+    pub fn subscribers_of(&self, room: &RoomId) -> Vec<&Session> {
+        self.sessions
             .iter()
-            .filter(|device| {
-                device
+            .filter(|session| {
+                session
                     .subscriptions
                     .iter()
                     .any(|subscription| &subscription.room == room)
@@ -506,13 +665,12 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// 按接入令牌找设备组。握手时用：令牌对了，这条连接代表这几台设备。
-    ///
-    /// 同一把令牌配给多台设备是**允许**的：那表示它们由同一个 harness 会话代表。
-    pub fn devices_by_token(&self, token: &str) -> Vec<&Device> {
-        self.devices
+    /// 按 harness 名找它接管的会话。握手时用：harness 报出名字 + 令牌，
+    /// 令牌对上，这条连接就代表这个名字下它接管的那组会话。
+    pub fn sessions_by_harness(&self, harness: &str) -> Vec<&Session> {
+        self.sessions
             .iter()
-            .filter(|candidate| candidate.token == token)
+            .filter(|candidate| candidate.harness == harness)
             .collect()
     }
 
@@ -520,44 +678,23 @@ impl Config {
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
-        // 共用记忆：几台设备挤同一份记忆（同一个 agent 侧会话）。
-        let mut by_memory: Vec<(&str, Vec<&str>)> = Vec::new();
-        for device in &self.devices {
-            match by_memory
-                .iter_mut()
-                .find(|(memory, _)| *memory == device.memory.as_str())
-            {
-                Some((_, devices)) => devices.push(device.id.as_str()),
-                None => by_memory.push((device.memory.as_str(), vec![device.id.as_str()])),
-            }
-        }
-        for (memory, devices) in by_memory {
-            if devices.len() > 1 {
-                warnings.push(format!(
-                    "设备 {} 共用同一份记忆（{memory}）：它们的轮次会排队跑，\
-                     上下文也混在一起。这是你选的，那就按这样跑。",
-                    devices.join("、")
-                ));
-            }
-        }
-
-        // 同一房间被多台设备订阅：谁说话就说不准了，发消息时要指明设备。
+        // 同一房间被多个会话订阅：谁说话就说不准了，发消息时要指明会话。
         let mut rooms: Vec<(String, Vec<&str>)> = Vec::new();
-        for device in &self.devices {
-            for subscription in &device.subscriptions {
+        for session in &self.sessions {
+            for subscription in &session.subscriptions {
                 let name = subscription.room.to_string();
                 match rooms.iter_mut().find(|(room, _)| *room == name) {
-                    Some((_, devices)) => devices.push(device.id.as_str()),
-                    None => rooms.push((name, vec![device.id.as_str()])),
+                    Some((_, sessions)) => sessions.push(session.id.as_str()),
+                    None => rooms.push((name, vec![session.id.as_str()])),
                 }
             }
         }
-        for (room, devices) in rooms {
-            if devices.len() > 1 {
+        for (room, sessions) in rooms {
+            if sessions.len() > 1 {
                 warnings.push(format!(
-                    "房间 {room} 同时被设备 {} 订阅：两边各有各的水位，\
-                     发消息到这个房间时要用 device 指明是谁在说。",
-                    devices.join("、")
+                    "房间 {room} 同时被会话 {} 订阅：两边各有各的水位，\
+                     发消息到这个房间时要用 session 指明是谁在说。",
+                    sessions.join("、")
                 ));
             }
         }
@@ -627,27 +764,27 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
     })
 }
 
-fn build_subscription(device: &str, raw: RawSubscription) -> Result<Subscription, ConfigError> {
+fn build_subscription(session: &str, raw: RawSubscription) -> Result<Subscription, ConfigError> {
     let room = RoomId::new(raw.connection.trim(), raw.room.trim()).map_err(|error| {
         ConfigError::BadRoom {
-            device: device.to_owned(),
+            session: session.to_owned(),
             room: format!("{}:{}", raw.connection.trim(), raw.room.trim()),
             detail: error.to_string(),
         }
     })?;
 
-    let wake = build_wake(device, &room, raw.wake.unwrap_or_default())?;
+    let wake = build_wake(session, &room, raw.wake.unwrap_or_default())?;
 
     Ok(Subscription { room, wake })
 }
 
-fn build_wake(device: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, ConfigError> {
+fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, ConfigError> {
     let default = WakePolicy::default();
 
     if let Some(accumulate) = raw.accumulate {
         if accumulate == 0 {
             return Err(ConfigError::BadAccumulate {
-                device: device.to_owned(),
+                session: session.to_owned(),
                 room: room.to_string(),
             });
         }
@@ -680,12 +817,44 @@ fn check_not_blank(value: &str, field: &'static str) -> Result<(), &'static str>
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
-    devices: Vec<RawDevice>,
+    personas: Vec<RawPersona>,
+    #[serde(default)]
+    memories: Vec<RawMemory>,
+    #[serde(default)]
+    sessions: Vec<RawSession>,
     endpoint: Option<RawEndpoint>,
     #[serde(default)]
     connections: Vec<RawConnection>,
     storage: Option<RawStorage>,
     retention: Option<RawRetention>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPersona {
+    id: String,
+    name: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMemory {
+    id: String,
+    name: String,
+    kind: String,
+    location: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSession {
+    id: String,
+    harness: String,
+    persona: String,
+    #[serde(default)]
+    memories: Vec<String>,
+    /// 接入令牌。必填——没有令牌就没有身份，桥不知道该把这条连接绑到哪些会话。
+    token: String,
+    #[serde(default)]
+    subscriptions: Vec<RawSubscription>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,17 +891,6 @@ struct RawEndpoint {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawDevice {
-    id: String,
-    persona: String,
-    memory: String,
-    /// 接入令牌。必填——没有令牌就没有身份，桥不知道该把这条连接绑到哪些设备。
-    token: String,
-    #[serde(default)]
-    subscriptions: Vec<RawSubscription>,
-}
-
-#[derive(Debug, Deserialize)]
 struct RawSubscription {
     /// 走哪条连接收发。
     connection: String,
@@ -758,8 +916,8 @@ struct RawWake {
 mod tests {
     use super::*;
 
-    fn config_with(connections: &str, devices: &str) -> String {
-        format!("{connections}\n{devices}")
+    fn config_with(connections: &str, sessions: &str) -> String {
+        format!("{connections}\n{sessions}")
     }
 
     const ONE_CONNECTION: &str = r#"
@@ -771,22 +929,27 @@ mod tests {
         account = "10001"
     "#;
 
-    const ONE_DEVICE: &str = r#"
-        [[devices]]
+    const ONE_SESSION: &str = r#"
+        [[personas]]
+        id = "default"
+        name = "默认人格"
+        text = "你是桥。"
+
+        [[sessions]]
         id = "main"
+        harness = "dsh"
         persona = "default"
-        memory = "main-memory"
         token = "t-main"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/123"
     "#;
 
     #[test]
     fn minimal_config_uses_documented_defaults() {
-        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_DEVICE)).expect("应当能解析");
-        let subscription = &config.devices[0].subscriptions[0];
+        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("应当能解析");
+        let subscription = &config.sessions[0].subscriptions[0];
 
         assert_eq!(subscription.room.to_string(), "qq:group/123");
         assert!(subscription.wake.at_mention);
@@ -800,7 +963,7 @@ mod tests {
 
     #[test]
     fn transport_defaults_to_forward_websocket() {
-        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_DEVICE)).expect("能解析");
+        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
         assert_eq!(config.connections[0].transport.as_str(), "ws-client");
     }
 
@@ -811,7 +974,7 @@ mod tests {
             "kind = \"onebot11\"\ntransport = \"ws-server\"",
         );
         assert!(matches!(
-            Config::parse(&config_with(&text, ONE_DEVICE)),
+            Config::parse(&config_with(&text, ONE_SESSION)),
             Err(ConfigError::UnsupportedTransport { .. })
         ));
     }
@@ -824,7 +987,8 @@ mod tests {
                 .replace("id = \"qq\"", "id = \"qq2\"")
                 .replace("10001", "10002")
         );
-        let config = Config::parse(&config_with(&two, ONE_DEVICE)).expect("同一平台两条连接要允许");
+        let config =
+            Config::parse(&config_with(&two, ONE_SESSION)).expect("同一平台两条连接要允许");
         assert_eq!(config.connections.len(), 2);
         assert_eq!(config.connection("qq2").expect("有第二条").account, "10002");
     }
@@ -833,7 +997,7 @@ mod tests {
     fn duplicate_connection_id_is_rejected() {
         let twice = format!("{ONE_CONNECTION}\n{ONE_CONNECTION}");
         assert!(matches!(
-            Config::parse(&config_with(&twice, ONE_DEVICE)),
+            Config::parse(&config_with(&twice, ONE_SESSION)),
             Err(ConfigError::DuplicateConnection { .. })
         ));
     }
@@ -842,94 +1006,72 @@ mod tests {
     fn connection_needs_a_login_account() {
         let no_account = ONE_CONNECTION.replace("        account = \"10001\"", "");
         assert!(matches!(
-            Config::parse(&config_with(&no_account, ONE_DEVICE)),
+            Config::parse(&config_with(&no_account, ONE_SESSION)),
             Err(ConfigError::EmptyAccount { .. })
         ));
     }
 
     #[test]
     fn subscription_to_a_missing_connection_is_rejected() {
-        let device = ONE_DEVICE.replace("connection = \"qq\"", "connection = \"nope\"");
+        let session = ONE_SESSION.replace("connection = \"qq\"", "connection = \"nope\"");
         assert!(matches!(
-            Config::parse(&config_with(ONE_CONNECTION, &device)),
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
             Err(ConfigError::UnknownConnection { .. })
         ));
     }
 
     #[test]
-    fn same_room_twice_in_one_device_is_rejected() {
-        let device = format!(
-            "{ONE_DEVICE}\n{}",
+    fn same_room_twice_in_one_session_is_rejected() {
+        let session = format!(
+            "{ONE_SESSION}\n{}",
             r#"
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/123"
         "#
         );
         assert!(matches!(
-            Config::parse(&config_with(ONE_CONNECTION, &device)),
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
             Err(ConfigError::DuplicateRoom { .. })
         ));
     }
 
     #[test]
-    fn same_token_groups_devices_instead_of_erroring() {
-        let device = format!(
-            "{ONE_DEVICE}\n{}",
+    fn same_harness_groups_sessions() {
+        let session = format!(
+            "{ONE_SESSION}\n{}",
             r#"
-        [[devices]]
+        [[sessions]]
         id = "second"
-        persona = "another"
-        memory = "second-memory"
+        harness = "dsh"
+        persona = "default"
         token = "t-main"
         "#
         );
-        let config = Config::parse(&config_with(ONE_CONNECTION, &device)).expect("同令牌要算一组");
-        let group = config.devices_by_token("t-main");
+        let config =
+            Config::parse(&config_with(ONE_CONNECTION, &session)).expect("同 harness 要算一组");
+        let group = config.sessions_by_harness("dsh");
         assert_eq!(group.len(), 2);
         assert_eq!(group[1].id, "second");
     }
 
     #[test]
-    fn shared_memory_is_a_warning_not_an_error() {
-        let device = format!(
-            "{ONE_DEVICE}\n{}",
-            r#"
-        [[devices]]
-        id = "second"
-        persona = "another"
-        memory = "main-memory"
-        token = "t-second"
-        "#
-        );
-        let config =
-            Config::parse(&config_with(ONE_CONNECTION, &device)).expect("共用记忆要能启动");
-        let warnings = config.warnings();
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("共用同一份记忆")),
-            "应当提醒共用记忆：{warnings:?}"
-        );
-    }
-
-    #[test]
     fn shared_room_is_a_warning_naming_the_room() {
-        let device = format!(
-            "{ONE_DEVICE}\n{}",
+        let session = format!(
+            "{ONE_SESSION}\n{}",
             r#"
-        [[devices]]
+        [[sessions]]
         id = "second"
-        persona = "another"
-        memory = "second-memory"
+        harness = "dsh"
+        persona = "default"
         token = "t-second"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/123"
         "#
         );
-        let config = Config::parse(&config_with(ONE_CONNECTION, &device)).expect("能解析");
+        let config = Config::parse(&config_with(ONE_CONNECTION, &session)).expect("能解析");
         let warnings = config.warnings();
         assert!(
             warnings
@@ -941,31 +1083,70 @@ mod tests {
 
     #[test]
     fn empty_room_path_is_rejected() {
-        let device = ONE_DEVICE.replace("room = \"group/123\"", "room = \"  \"");
+        let session = ONE_SESSION.replace("room = \"group/123\"", "room = \"  \"");
         assert!(matches!(
-            Config::parse(&config_with(ONE_CONNECTION, &device)),
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
             Err(ConfigError::BadRoom { .. })
         ));
     }
 
     #[test]
     fn zero_accumulate_is_rejected() {
-        let device = ONE_DEVICE.replace(
+        let session = ONE_SESSION.replace(
             "room = \"group/123\"",
-            "room = \"group/123\"\n        [devices.subscriptions.wake]\n        accumulate = 0",
+            "room = \"group/123\"\n        [sessions.subscriptions.wake]\n        accumulate = 0",
         );
         assert!(matches!(
-            Config::parse(&config_with(ONE_CONNECTION, &device)),
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
             Err(ConfigError::BadAccumulate { .. })
         ));
     }
 
     #[test]
     fn empty_token_is_rejected() {
-        let device = ONE_DEVICE.replace("token = \"t-main\"", "token = \" \"");
+        let session = ONE_SESSION.replace("token = \"t-main\"", "token = \" \"");
         assert!(matches!(
-            Config::parse(&config_with(ONE_CONNECTION, &device)),
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
             Err(ConfigError::EmptyToken { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_persona_is_rejected() {
+        let session = ONE_SESSION.replace("persona = \"default\"", "persona = \"nope\"");
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
+            Err(ConfigError::UnknownPersona { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_memory_is_rejected() {
+        let session = ONE_SESSION.replace(
+            "persona = \"default\"",
+            "persona = \"default\"\n        memories = [\"nope\"]",
+        );
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
+            Err(ConfigError::UnknownMemory { .. })
+        ));
+    }
+
+    #[test]
+    fn memory_kind_is_checked() {
+        let session = format!(
+            "{ONE_SESSION}\n{}",
+            r#"
+        [[memories]]
+        id = "m1"
+        name = "记忆"
+        kind = "sqlite"
+        location = "/tmp/m.db"
+        "#
+        );
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &session)),
+            Err(ConfigError::UnknownMemoryKind { .. })
         ));
     }
 

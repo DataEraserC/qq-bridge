@@ -38,8 +38,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse(&text)?;
     print_summary(&config, &options.config);
 
-    // 有些配置是用户故意这么写的（两台设备共用一份记忆、两台设备订同一个房间）。
-    // 不拦，但要说清楚它意味着什么，并且停三秒——刚启动时人还在看屏幕。
+    // 有些配置是用户故意这么写的（两个会话订同一个房间）。不拦，但要说清楚它意味着什么，
+    // 并且停三秒——刚启动时人还在看屏幕。
     let warnings = config.warnings();
     if !warnings.is_empty() {
         for warning in &warnings {
@@ -207,16 +207,31 @@ fn print_summary(config: &Config, path: &str) {
         );
     }
 
-    for device in &config.devices {
+    println!("  人格：{} 张", config.personas.len());
+    for persona in &config.personas {
+        println!("    - {}（{}）", persona.id, persona.name);
+    }
+
+    println!("  记忆：{} 份", config.memories.len());
+    for memory in &config.memories {
         println!(
-            "  设备 {}：{} 条订阅，人格 {}，记忆 {}",
-            device.id,
-            device.subscriptions.len(),
-            device.persona,
-            device.memory
+            "    - {}（{}，{} @ {}）",
+            memory.id, memory.name, memory.kind, memory.location
         );
-        for subscription in &device.subscriptions {
-            println!("    - {}", subscription.room);
+    }
+
+    println!("  会话：{} 个", config.sessions.len());
+    for session in &config.sessions {
+        println!(
+            "    - {}（harness {}，人格 {}，记忆 {:?}，{} 条订阅）",
+            session.id,
+            session.harness,
+            session.persona,
+            session.memories,
+            session.subscriptions.len()
+        );
+        for subscription in &session.subscriptions {
+            println!("      - {}", subscription.room);
         }
     }
 

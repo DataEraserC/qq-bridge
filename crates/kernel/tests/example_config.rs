@@ -25,14 +25,16 @@ fn example_config_shows_two_connections_on_one_platform() {
         "一个账号一条连接"
     );
 
-    assert_eq!(config.devices.len(), 1);
-    assert_eq!(config.devices[0].subscriptions.len(), 2);
+    assert_eq!(config.personas.len(), 1);
+    assert_eq!(config.memories.len(), 1);
+    assert_eq!(config.sessions.len(), 1);
+    assert_eq!(config.sessions[0].subscriptions.len(), 2);
 }
 
 #[test]
 fn example_config_demonstrates_per_subscription_wake_rules() {
     let config = example();
-    let subscriptions = &config.devices[0].subscriptions;
+    let subscriptions = &config.sessions[0].subscriptions;
 
     let group = subscriptions
         .iter()
@@ -67,7 +69,7 @@ fn example_config_connects_qq_through_onebot_websocket() {
     }
 
     // QQ 房间要按适配器的写法来，否则适配器认不出是群还是私聊。
-    for subscription in &config.devices[0].subscriptions {
+    for subscription in &config.sessions[0].subscriptions {
         assert!(
             config.connection(&subscription.room.connection).is_some(),
             "订阅指向的连接必须在配置里存在：{}",

@@ -31,8 +31,8 @@ impl Outbound for Recorder {
     }
 }
 
-/// 一次接入代表的设备组（测试里就一台）。
-fn devices() -> Vec<String> {
+/// 一次接入代表的会话组（测试里就一个）。
+fn sessions() -> Vec<String> {
     vec!["main".to_owned()]
 }
 
@@ -52,21 +52,26 @@ fn config() -> &'static str {
         url = "ws://127.0.0.1:3002"
         account = "dc-bot"
 
-        [[devices]]
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[sessions]]
         id = "main"
+        harness = "dsh"
         persona = "p"
-        memory = "m"
         token = "t-main"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/123"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "dc"
         room = "channel/456"
 
-        [devices.subscriptions.wake]
+        [sessions.subscriptions.wake]
         at_mention = false
         name_mention = false
         poke = false
@@ -121,8 +126,8 @@ fn poke(room: &str, at_self: bool) -> RecordDraft {
     )
 }
 
-fn cursor(device: &str, room: &str) -> Cursor {
-    Cursor::new(device, room_of(room))
+fn cursor(session: &str, room: &str) -> Cursor {
+    Cursor::new(session, room_of(room))
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +152,7 @@ fn mention_wakes_then_reply_and_ack_advance_the_watermark() {
 
     // 2. 取到一轮，投的就是刚才那条。
     let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
-    assert_eq!(delivery.device, "main");
+    assert_eq!(delivery.session, "main");
     assert_eq!(delivery.room, room("qq:group/123"));
     assert_eq!(delivery.reason, TurnReason::Wake);
     assert_eq!(delivery.records.len(), 1);
@@ -160,7 +165,7 @@ fn mention_wakes_then_reply_and_ack_advance_the_watermark() {
     let result = bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "send_message",
             json!({"elements": [{"type": "text", "text": "在"}]}),
         )
@@ -184,7 +189,7 @@ fn mention_wakes_then_reply_and_ack_advance_the_watermark() {
 
     // 4. 确认收到的那条：水位推到 2（1 是收到的，2 是自己发的、已自动确认）。
     let acked = bridge
-        .tool_call(&ticket, &devices(), "ack_messages", json!({"ids": [1]}))
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1]}))
         .expect("能确认");
     assert_eq!(acked["watermark"], 2);
     assert_eq!(
@@ -217,7 +222,7 @@ fn own_messages_never_come_back_as_unread() {
     bridge
         .tool_call(
             &first,
-            &devices(),
+            &sessions(),
             "send_message",
             json!({"elements": [{"type": "text", "text": "在"}]}),
         )
@@ -433,7 +438,7 @@ fn send_message_to_is_fenced_by_subscriptions() {
     bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "send_message_to",
             json!({
                 "to": "dc:channel/456",
@@ -451,7 +456,7 @@ fn send_message_to_is_fenced_by_subscriptions() {
     let error = bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "send_message_to",
             json!({
                 "to": "tg:group/789",
@@ -476,13 +481,13 @@ fn ack_messages_refuses_ids_that_were_not_delivered() {
     // 这里直接确认一个跳到未来、根本没投过的编号。
     let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
     let error = bridge
-        .tool_call(&ticket, &devices(), "ack_messages", json!({"ids": [99]}))
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [99]}))
         .expect_err("没投过的编号不能确认");
     assert_eq!(error.code, ErrorCode::BadRequest);
 
     // 投过的那两条就能确认。
     bridge
-        .tool_call(&ticket, &devices(), "ack_messages", json!({"ids": [1, 2]}))
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1, 2]}))
         .expect("投过的能确认");
     assert_eq!(
         bridge
@@ -505,7 +510,7 @@ fn a_stale_ticket_is_rejected() {
     let error = bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "send_message",
             json!({"elements": [{"type": "text", "text": "迟到的"}]}),
         )
@@ -522,7 +527,12 @@ fn unknown_tools_are_refused() {
     let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
 
     let error = bridge
-        .tool_call(&ticket, &devices(), "run_shell", json!({"cmd": "rm -rf /"}))
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "run_shell",
+            json!({"cmd": "rm -rf /"}),
+        )
         .expect_err("没这个工具");
     assert_eq!(error.code, ErrorCode::ToolNotAllowed);
 }
@@ -541,19 +551,19 @@ fn history_and_events_read_from_the_transcript() {
     let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
 
     let history = bridge
-        .tool_call(&ticket, &devices(), "get_history", json!({}))
+        .tool_call(&ticket, &sessions(), "get_history", json!({}))
         .expect("能查");
     assert_eq!(history["records"].as_array().expect("是数组").len(), 2);
 
     let events = bridge
-        .tool_call(&ticket, &devices(), "get_platform_events", json!({}))
+        .tool_call(&ticket, &sessions(), "get_platform_events", json!({}))
         .expect("能查");
     let events = events["events"].as_array().expect("是数组");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["kind"]["event"], "poke");
 
     let rooms = bridge
-        .tool_call(&ticket, &devices(), "list_rooms", json!({}))
+        .tool_call(&ticket, &sessions(), "list_rooms", json!({}))
         .expect("能查");
     assert_eq!(rooms["rooms"].as_array().expect("是数组").len(), 2);
     assert_eq!(rooms["rooms"][0]["room"]["connection"], "qq");
@@ -570,21 +580,21 @@ fn notes_written_in_one_room_are_invisible_in_another() {
     bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "set_note",
             json!({"kind": "term", "key": "部署", "value": "蓝绿发布"}),
         )
         .expect("能写");
 
     let mine = bridge
-        .tool_call(&ticket, &devices(), "get_notes", json!({}))
+        .tool_call(&ticket, &sessions(), "get_notes", json!({}))
         .expect("能读");
     assert_eq!(mine["notes"].as_array().expect("是数组").len(), 1);
 
     let other = bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "get_notes",
             json!({"room": "dc:channel/456"}),
         )
@@ -640,13 +650,13 @@ fn quoting_my_message_wakes_without_a_mention() {
     bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "send_message",
             json!({"elements": [{"type": "text", "text": "在"}]}),
         )
         .expect("能发");
     bridge
-        .tool_call(&ticket, &devices(), "ack_messages", json!({"ids": [1]}))
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1]}))
         .expect("能确认");
     bridge.end_turn(&ticket).expect("能收尾");
 
@@ -742,33 +752,38 @@ fn group_config() -> &'static str {
         url = "ws://127.0.0.1:3001"
         account = "bot"
 
-        [[devices]]
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[sessions]]
         id = "main"
+        harness = "dsh"
         persona = "p"
-        memory = "m-main"
         token = "t-shared"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/1"
 
-        [devices.subscriptions.wake]
+        [sessions.subscriptions.wake]
         at_mention = true
         name_mention = false
         poke = false
         accumulate = 50
 
-        [[devices]]
+        [[sessions]]
         id = "helper"
+        harness = "dsh"
         persona = "p"
-        memory = "m-helper"
         token = "t-shared"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/2"
 
-        [devices.subscriptions.wake]
+        [sessions.subscriptions.wake]
         at_mention = true
         name_mention = false
         poke = false
@@ -788,38 +803,52 @@ fn group_bridge(config: &str) -> (Bridge<MemoryStore>, Sends) {
     (bridge, sends)
 }
 
-/// 一把令牌代表的两台设备。
+/// 一个 harness 接管的两个会话。
 fn group() -> Vec<String> {
     vec!["main".to_owned(), "helper".to_owned()]
 }
 
 #[test]
-fn one_token_can_speak_for_every_device_it_covers() {
+fn a_session_can_only_send_to_rooms_it_subscribes() {
     let (mut bridge, sends) = group_bridge(group_config());
 
-    // 主设备被叫醒，领到一轮。
+    // 主会话被叫醒，领到一轮。
     bridge
         .ingest(message("qq:group/1", "10001", "在吗", true))
         .expect("能记下来");
     let delivery = bridge.poll_turn_for(&group()).expect("能取").expect("有活");
-    assert_eq!(delivery.device, "main");
+    assert_eq!(delivery.session, "main");
 
-    // 用 to 发到助手那台设备订阅的群：这是「跨房间」，不是「跨身份」。
+    // 发到本会话订阅的群 1：可以。
     bridge
         .tool_call(
             &delivery.ticket,
             &group(),
             "send_message_to",
             json!({
-                "to": "qq:group/2",
-                "elements": [{"type": "text", "text": "去群里说一声"}]
+                "to": "qq:group/1",
+                "elements": [{"type": "text", "text": "接着说"}]
             }),
         )
-        .expect("本组订阅的房间能发");
+        .expect("本会话订阅的房间能发");
+
+    // 发到助手会话订阅的群 2：跨会话发送已砍，拒绝。
+    let error = bridge
+        .tool_call(
+            &delivery.ticket,
+            &group(),
+            "send_message_to",
+            json!({
+                "to": "qq:group/2",
+                "elements": [{"type": "text", "text": "去别的会话的群说"}]
+            }),
+        )
+        .expect_err("跨会话必须拒");
+    assert_eq!(error.code, ErrorCode::RoomNotSubscribed);
 
     let sends = sends.lock().expect("没被毒死");
     assert_eq!(sends.len(), 1);
-    assert_eq!(sends[0].0, room("qq:group/2"));
+    assert_eq!(sends[0].0, room("qq:group/1"));
 }
 
 #[test]
@@ -845,10 +874,10 @@ fn a_room_outside_the_group_is_still_refused() {
 }
 
 #[test]
-fn reading_another_devices_room_is_allowed_inside_the_group() {
+fn reading_another_sessions_room_is_allowed_inside_the_group() {
     let (mut bridge, _sends) = group_bridge(group_config());
 
-    // 助手那个群的流水：主设备这一轮里读得到（这就是「get from」）。
+    // 助手那个群的流水：主会话这一轮里读得到（「get from」——读可跨到组内别的房间）。
     bridge
         .ingest(message("qq:group/2", "10001", "另一边的消息", false))
         .expect("能记下来");
@@ -884,76 +913,23 @@ fn reading_another_devices_room_is_allowed_inside_the_group() {
 }
 
 #[test]
-fn one_room_two_devices_needs_an_explicit_sender() {
-    let config = group_config().replace(r#"room = "group/2""#, r#"room = "group/1""#);
-    let (mut bridge, _sends) = group_bridge(&config);
-
-    bridge
-        .ingest(message("qq:group/1", "10001", "在吗", true))
-        .expect("能记下来");
-    let ticket = bridge
-        .poll_turn_for(&group())
-        .expect("能取")
-        .expect("有活")
-        .ticket;
-
-    let ambiguous = bridge
-        .tool_call(
-            &ticket,
-            &group(),
-            "send_message_to",
-            json!({
-                "to": "qq:group/1",
-                "elements": [{"type": "text", "text": "谁在说"}]
-            }),
-        )
-        .expect_err("两台设备都在这个房间，得指明");
-    assert_eq!(ambiguous.code, ErrorCode::BadRequest);
-    assert!(
-        ambiguous.message.contains("device"),
-        "{}",
-        ambiguous.message
-    );
-
-    bridge
-        .tool_call(
-            &ticket,
-            &group(),
-            "send_message_to",
-            json!({
-                "to": "qq:group/1",
-                "device": "helper",
-                "elements": [{"type": "text", "text": "以助手的身份说"}]
-            }),
-        )
-        .expect("指明之后能发");
-}
-
-#[test]
-fn devices_sharing_one_memory_never_run_two_turns_at_once() {
-    // 同一个记忆 id：串行键是记忆，所以两台设备也得排队（用户裁定）。
-    let config = group_config().replace(r#"memory = "m-helper""#, r#"memory = "m-main""#);
-    let (mut bridge, _sends) = group_bridge(&config);
+fn different_sessions_run_turns_independently() {
+    // 串行键是「harness 名 + 会话 id」，两个会话各跑各的，不再因为共用记忆而排队。
+    let (mut bridge, _sends) = group_bridge(group_config());
 
     bridge
         .ingest(message("qq:group/1", "10001", "在吗", true))
         .expect("能记下来");
     let first = bridge.poll_turn_for(&group()).expect("能取").expect("有活");
-    assert_eq!(first.device, "main");
+    assert_eq!(first.session, "main");
 
-    // 另一台设备也有活，但那份记忆正忙——不能开第二轮。
+    // 另一个会话也有活，且主会话还没收工——不同会话能各自开轮，不排队。
     bridge
         .ingest(message("qq:group/2", "10001", "这边也有事", true))
         .expect("能记下来");
-    assert!(
-        bridge.poll_turn_for(&group()).expect("能取").is_none(),
-        "同一份记忆同一时刻只能跑一轮"
-    );
-
-    bridge.end_turn(&first.ticket).expect("能收工");
     let second = bridge
         .poll_turn_for(&group())
         .expect("能取")
-        .expect("排队的那轮现在能跑");
-    assert_eq!(second.device, "helper");
+        .expect("不同会话能并发开轮");
+    assert_eq!(second.session, "helper");
 }

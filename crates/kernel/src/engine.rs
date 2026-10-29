@@ -2,21 +2,15 @@
 //!
 //! 一条入站记录进来，走的是同一条路（ADR-0005）：
 //! 1. 写流水——永远发生，不管唤不唤醒；
-//! 2. 对每个订阅了这个房间的设备，按它的唤醒策略判定要不要叫醒；
-//! 3. 要叫醒就排进队列，**该记忆**闲下来就开一轮，把未读打包投给 harness。
+//! 2. 对每个订阅了这个房间的会话，按它的唤醒策略判定要不要叫醒；
+//! 3. 要叫醒就排进队列，**该会话**闲下来就开一轮，把未读打包投给 harness。
 //!
-//! 串行的单位是**记忆**，不是设备：记忆就是 agent 侧的那份会话。两台设备共用一份记忆时，
-//! 它们自动排队——同一时刻只有一轮在改这份记忆（用户裁定，ADR-0003）。默认一设备一记忆，
-//! 行为和「按设备排队」完全一样。
+//! 串行的单位是**会话**（harness 名 + 会话 id，ADR-0017）：同一会话同一时刻只有一轮，
+//! 不同会话各自并发。记忆不再当串行锁——一个会话引用多份记忆、多份记忆可被多个会话
+//! 共享，最终一致，互不排队。
 //!
-//! 一把接入令牌可以代表**一组设备**（同一把令牌配给多台设备）。这一组能说的话，就是这组
-//! 设备订阅的房间里最大的那个并集；越界就拒（用户裁定，ADR-0002）。
-//!
-//! 水位不在这里自动推——只有 agent 调 `ack_messages` 才推（ADR-0010）。唯一例外是自己
-//! 发出去的消息：它从来不算未读。这件事有两层保证，缺一不可：
-//! - 写进流水的同时就确认掉，否则它会挡住水位前沿；
-//! - 投递时按连接的登录账号过滤掉，否则当前面还有没确认的消息时，水位推不过去，
-//!   自己的话会被当成未读再投一遍。
+//! 一个 harness 连上来时声明「我是谁、接管哪些会话」。`send_message_to` 的可发目标 =
+//! 当前会话订阅的所有房间；**跨会话发送被砍掉**——一个会话不能替别的人格发言。
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::config::{Config, Device, WakeDecision, WakeInput, WakePolicy};
+use crate::config::{Config, Session, WakeDecision, WakeInput, WakePolicy};
 use crate::outbound::{Outbound, OutboundError};
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
@@ -59,9 +53,9 @@ pub enum BridgeError {
 /// 一条入站记录的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ingest {
-    /// 记下来了。`woke` 是被这条叫醒的设备（按配置顺序）。
+    /// 记下来了。`woke` 是被这条叫醒的会话（按配置顺序）。
     Recorded { id: u64, woke: Vec<String> },
-    /// 没有任何设备订阅这个房间——什么都不做，连流水都不写。
+    /// 没有任何会话订阅这个房间——什么都不做，连流水都不写。
     NotSubscribed { room: RoomId },
 }
 
@@ -75,19 +69,19 @@ pub struct Pruned {
     pub kept: u64,
 }
 
-/// 等着开轮次的（设备，房间）。
+/// 等着开轮次的（会话，房间）。
 #[derive(Debug, Clone)]
 struct Pending {
-    device: String,
+    session: String,
     room: RoomId,
     reason: TurnReason,
 }
 
-/// 正在跑的一轮。挂在记忆上：一份记忆同一时刻只有这一轮。
+/// 正在跑的一轮。挂在会话上：一个会话同一时刻只有这一轮。
 #[derive(Debug, Clone)]
 struct ActiveTurn {
-    /// 这一轮替哪台设备说话（决定水位、决定默认发到哪个身份）。
-    device: String,
+    /// 这一轮替哪个会话说话（决定水位、决定默认发到哪个身份）。
+    session: String,
     room: RoomId,
     /// 本轮投出去的编号。只有这些能被 `ack_messages` 确认。
     delivered: BTreeSet<u64>,
@@ -96,7 +90,7 @@ struct ActiveTurn {
 /// 某个房间的一个订阅者，判定唤醒时要的东西。
 #[derive(Debug, Clone)]
 struct Subscriber {
-    device: String,
+    session: String,
     /// 这条连接登录的账号：用来认出「这句是我自己说的」。
     account: String,
     wake: WakePolicy,
@@ -108,9 +102,9 @@ pub struct Bridge<S: Store> {
     store: S,
     outbound: Box<dyn Outbound>,
     pending: VecDeque<Pending>,
-    /// 键是记忆 id：一份记忆同时只跑一轮。
+    /// 键是会话 id：一个会话同时只跑一轮。
     active: HashMap<String, ActiveTurn>,
-    /// 票 → 记忆。票是开轮时签发的，收工作废。
+    /// 票 → 会话。票是开轮时签发的，收工作废。
     by_ticket: HashMap<Ticket, String>,
     ticket_seq: u64,
 }
@@ -137,22 +131,11 @@ impl<S: Store> Bridge<S> {
         &self.store
     }
 
-    /// 哪几份记忆正跑着轮次。
-    pub fn busy_memories(&self) -> Vec<String> {
-        let mut memories: Vec<String> = self.active.keys().cloned().collect();
-        memories.sort();
-        memories
-    }
-
-    /// 正在跑的轮次替哪些设备说话（给日志与测试看）。
-    pub fn busy_devices(&self) -> Vec<String> {
-        let mut devices: Vec<String> = self
-            .active
-            .values()
-            .map(|turn| turn.device.clone())
-            .collect();
-        devices.sort();
-        devices
+    /// 哪几个会话正跑着轮次。
+    pub fn busy_sessions(&self) -> Vec<String> {
+        let mut sessions: Vec<String> = self.active.keys().cloned().collect();
+        sessions.sort();
+        sessions
     }
 
     /// 队列里还压着几个待开轮次（给日志看，没人接的时候提醒用）。
@@ -182,20 +165,20 @@ impl<S: Store> Bridge<S> {
 
         let mut report = Vec::new();
         for room in self.store.rooms()? {
-            let devices: Vec<String> = self
+            let sessions: Vec<String> = self
                 .config
                 .subscribers_of(&room)
                 .into_iter()
-                .map(|device| device.id.clone())
+                .map(|session| session.id.clone())
                 .collect();
-            if devices.is_empty() {
+            if sessions.is_empty() {
                 continue;
             }
 
-            // 安全线：所有在册设备都已读到的那个位置。初值是「一条都没删」的边界。
+            // 安全线：所有在册会话都已读到的那个位置。初值是「一条都没删」的边界。
             let mut below = self.store.latest(&room)?.map_or(0, |latest| latest + 1);
-            for device in devices {
-                let cursor = Cursor::new(device, room.clone());
+            for session in sessions {
+                let cursor = Cursor::new(session, room.clone());
                 below = below.min(self.store.watermark(&cursor)?);
             }
             if below == 0 {
@@ -246,7 +229,7 @@ impl<S: Store> Bridge<S> {
 
         let mut woke = Vec::new();
         for subscriber in subscribers {
-            let cursor = Cursor::new(subscriber.device.clone(), room.clone());
+            let cursor = Cursor::new(subscriber.session.clone(), room.clone());
 
             // 平台把我们自己说的话回传回来：记下来，但不是未读，也不叫醒自己。
             if record.sender.id == subscriber.account {
@@ -255,7 +238,7 @@ impl<S: Store> Bridge<S> {
             }
 
             let pending = self
-                .pending_records(&subscriber.device, &room, &subscriber.account)?
+                .pending_records(&subscriber.session, &room, &subscriber.account)?
                 .len() as u32;
             let input = WakeInput {
                 sender_id: &record.sender.id,
@@ -266,8 +249,8 @@ impl<S: Store> Bridge<S> {
                 unread: pending,
             };
             if subscriber.wake.decide(&input) == WakeDecision::Wake {
-                woke.push(subscriber.device.clone());
-                self.enqueue(subscriber.device, room.clone(), TurnReason::Wake);
+                woke.push(subscriber.session.clone());
+                self.enqueue(subscriber.session, room.clone(), TurnReason::Wake);
             }
         }
 
@@ -301,12 +284,8 @@ impl<S: Store> Bridge<S> {
 
     /// 取下一轮，不管是谁的。没有就返回 `None`。
     pub fn poll_turn(&mut self) -> Result<Option<Delivery>, BridgeError> {
-        let index = (0..self.pending.len()).find(|&index| {
-            let pending = &self.pending[index];
-            !self
-                .memory_of(&pending.device)
-                .is_some_and(|memory| self.active.contains_key(memory))
-        });
+        let index = (0..self.pending.len())
+            .find(|&index| !self.active.contains_key(&self.pending[index].session));
         let Some(index) = index else {
             return Ok(None);
         };
@@ -314,16 +293,14 @@ impl<S: Store> Bridge<S> {
         self.open_turn(pending).map(Some)
     }
 
-    /// 只给这一组设备取活。接入点用这个——一条连接只代表它自己那组设备。
-    pub fn poll_turn_for(&mut self, devices: &[String]) -> Result<Option<Delivery>, BridgeError> {
+    /// 只给这一组会话取活。接入点用这个——一条连接只代表它自己那组会话。
+    pub fn poll_turn_for(&mut self, sessions: &[String]) -> Result<Option<Delivery>, BridgeError> {
         let index = (0..self.pending.len()).find(|&index| {
             let pending = &self.pending[index];
-            if !devices.iter().any(|device| device == &pending.device) {
+            if !sessions.iter().any(|session| session == &pending.session) {
                 return false;
             }
-            !self
-                .memory_of(&pending.device)
-                .is_some_and(|memory| self.active.contains_key(memory))
+            !self.active.contains_key(&pending.session)
         });
         let Some(index) = index else {
             return Ok(None);
@@ -332,37 +309,37 @@ impl<S: Store> Bridge<S> {
         self.open_turn(pending).map(Some)
     }
 
-    /// 一轮收工。票作废，记忆空出来。
+    /// 一轮收工。票作废，会话空出来。
     ///
     /// **不推水位**：没确认的消息仍然算未读，下一轮接着投。
     pub fn end_turn(&mut self, ticket: &Ticket) -> Result<(), BridgeError> {
-        let Some(memory) = self.by_ticket.remove(ticket) else {
+        let Some(session) = self.by_ticket.remove(ticket) else {
             return Err(BridgeError::UnknownTicket(ticket.to_string()));
         };
-        self.active.remove(&memory);
+        self.active.remove(&session);
         Ok(())
     }
 
     /// 调工具。
     ///
-    /// `devices` 是这次接入代表的设备组（同一把令牌）。发到哪儿、读哪儿的判据都从这里来：
-    /// 能碰的房间 = 这组设备订阅的并集，越界就拒。
+    /// `sessions` 是这次接入代表的会话组（同一 harness）。发到哪儿、读哪儿的判据都从这里来：
+    /// 能碰的房间 = 当前会话订阅的房间，越界就拒。跨会话发送被砍掉（ADR-0017）。
     pub fn tool_call(
         &mut self,
         ticket: &Ticket,
-        devices: &[String],
+        sessions: &[String],
         tool: &str,
         args: Value,
     ) -> Result<Value, ToolError> {
-        let memory = self
+        let session = self
             .by_ticket
             .get(ticket)
             .cloned()
             .ok_or_else(|| ToolError::new(ErrorCode::Unauthorized, "这张票无效或本轮已结束"))?;
-        let (device, room, delivered) = {
-            let turn = self.active.get(&memory).expect("有票就一定有活跃轮次");
+        let (turn_session, room, delivered) = {
+            let turn = self.active.get(&session).expect("有票就一定有活跃轮次");
             (
-                turn.device.clone(),
+                turn.session.clone(),
                 turn.room.clone(),
                 turn.delivered.clone(),
             )
@@ -379,39 +356,39 @@ impl<S: Store> Bridge<S> {
             // 不给目标：接着说当前这一轮的房间，用本轮的身份。
             "send_message" => {
                 let args: SendArgs = parse(args)?;
-                self.deliver_out(&device, &room, args.elements)
+                self.deliver_out(&turn_session, &room, args.elements)
             }
-            // 给了目标：在本组订阅范围里挑一台设备去说。撞车了要指明。
+            // 给了目标：只能落在当前会话订阅的房间范围内（跨会话发送已砍）。
             "send_message_to" => {
                 let args: SendToArgs = parse(args)?;
                 let target = resolve_room(&args.to)?;
-                let sender = self.pick_sender(devices, &target, args.device.as_deref())?;
-                self.deliver_out(&sender, &target, args.elements)
+                self.ensure_session_subscribes(&turn_session, &target)?;
+                self.deliver_out(&turn_session, &target, args.elements)
             }
             "ack_messages" => {
                 let args: AckArgs = parse(args)?;
-                self.ack(&device, &room, &delivered, args.ids)
+                self.ack(&turn_session, &room, &delivered, args.ids)
             }
             "get_history" => {
                 let args: HistoryArgs = parse(args)?;
-                self.history(devices, &room, args)
+                self.history(sessions, &room, args)
             }
-            "list_rooms" => self.list_rooms(devices),
+            "list_rooms" => self.list_rooms(sessions),
             "get_notes" => {
                 let args: NotesArgs = parse(args)?;
-                self.read_notes(devices, &room, args)
+                self.read_notes(sessions, &room, args)
             }
             "set_note" => {
                 let args: SetNoteArgs = parse(args)?;
-                self.write_note(devices, &room, args)
+                self.write_note(sessions, &room, args)
             }
             "del_note" => {
                 let args: DelNoteArgs = parse(args)?;
-                self.delete_note(devices, &room, args)
+                self.delete_note(sessions, &room, args)
             }
             "get_platform_events" => {
                 let args: EventsArgs = parse(args)?;
-                self.events(devices, &room, args)
+                self.events(sessions, &room, args)
             }
             other => Err(ToolError::new(
                 ErrorCode::ToolNotAllowed,
@@ -422,23 +399,14 @@ impl<S: Store> Bridge<S> {
 
     // ---- 内部 ----
 
-    /// 设备属于哪份记忆。
-    fn memory_of(&self, device: &str) -> Option<&str> {
-        self.config
-            .devices
-            .iter()
-            .find(|candidate| candidate.id == device)
-            .map(|candidate| candidate.memory.as_str())
-    }
-
-    /// 这个设备在这个房间里真正要处理的未读：水位之后、且不是自己说的。
+    /// 这个会话在这个房间里真正要处理的未读：水位之后、且不是自己说的。
     fn pending_records(
         &self,
-        device: &str,
+        session: &str,
         room: &RoomId,
         account: &str,
     ) -> Result<Vec<Record>, StorageError> {
-        let cursor = Cursor::new(device, room.clone());
+        let cursor = Cursor::new(session, room.clone());
         let mut records = unread(&self.store, &cursor, MAX_DELIVERY)?;
         records.retain(|record| record.sender.id != account);
         Ok(records)
@@ -447,15 +415,15 @@ impl<S: Store> Bridge<S> {
     fn subscribers_of(&self, room: &RoomId) -> Vec<Subscriber> {
         let account = self.config.account_of_room(room);
         self.config
-            .devices
+            .sessions
             .iter()
-            .filter_map(|device| {
-                device
+            .filter_map(|session| {
+                session
                     .subscriptions
                     .iter()
                     .find(|subscription| &subscription.room == room)
                     .map(|subscription| Subscriber {
-                        device: device.id.clone(),
+                        session: session.id.clone(),
                         account: account.clone(),
                         wake: subscription.wake.clone(),
                     })
@@ -464,13 +432,13 @@ impl<S: Store> Bridge<S> {
     }
 
     /// 这一组里，谁订了这个房间。
-    fn devices_subscribing(&self, devices: &[String], room: &RoomId) -> Vec<&Device> {
+    fn sessions_subscribing(&self, sessions: &[String], room: &RoomId) -> Vec<&Session> {
         self.config
-            .devices
+            .sessions
             .iter()
-            .filter(|device| devices.iter().any(|id| id == &device.id))
-            .filter(|device| {
-                device
+            .filter(|session| sessions.iter().any(|id| id == &session.id))
+            .filter(|session| {
+                session
                     .subscriptions
                     .iter()
                     .any(|subscription| &subscription.room == room)
@@ -478,86 +446,45 @@ impl<S: Store> Bridge<S> {
             .collect()
     }
 
-    /// 发到 `room` 时用哪个身份。同组多台设备都订了同一个房间，就得指明。
-    fn pick_sender(
-        &self,
-        devices: &[String],
-        room: &RoomId,
-        asked: Option<&str>,
-    ) -> Result<String, ToolError> {
-        let candidates = self.devices_subscribing(devices, room);
-        let names: Vec<&str> = candidates.iter().map(|device| device.id.as_str()).collect();
-
-        match asked {
-            Some(wanted) => {
-                if names.contains(&wanted) {
-                    Ok(wanted.to_owned())
-                } else {
-                    Err(ToolError::new(
-                        ErrorCode::RoomNotSubscribed,
-                        format!(
-                            "设备 {wanted} 在你这组里没有订阅 {room}；能发的是：{}",
-                            join_or_none(&names)
-                        ),
-                    ))
-                }
-            }
-            None => match names.as_slice() {
-                [] => Err(ToolError::new(
-                    ErrorCode::RoomNotSubscribed,
-                    format!(
-                        "你这组设备都没订阅 {room}；能发的是：{}",
-                        join_or_none(&self.readable_rooms(devices))
-                    ),
-                )),
-                [only] => Ok((*only).to_owned()),
-                many => Err(ToolError::new(
-                    ErrorCode::BadRequest,
-                    format!(
-                        "{room} 同时被这台设备的 {} 订阅，得用 device 指明谁来说",
-                        many.join("、")
-                    ),
-                )),
-            },
+    /// 当前会话是否订阅了这个房间。没订阅就拒——这是 `send_message_to` 的边界。
+    fn ensure_session_subscribes(&self, session: &str, room: &RoomId) -> Result<(), ToolError> {
+        let subscribed = self.config.session(session).is_some_and(|session| {
+            session
+                .subscriptions
+                .iter()
+                .any(|subscription| &subscription.room == room)
+        });
+        if subscribed {
+            Ok(())
+        } else {
+            Err(ToolError::new(
+                ErrorCode::RoomNotSubscribed,
+                format!("会话 {session} 没有订阅 {room}；只能发到本会话订阅的房间"),
+            ))
         }
     }
 
-    /// 这一组能碰的所有房间（给报错信息用）。
-    fn readable_rooms(&self, devices: &[String]) -> Vec<String> {
-        let mut rooms: Vec<String> = self
-            .config
-            .devices
-            .iter()
-            .filter(|device| devices.iter().any(|id| id == &device.id))
-            .flat_map(|device| device.subscriptions.iter())
-            .map(|subscription| subscription.room.to_string())
-            .collect();
-        rooms.sort();
-        rooms.dedup();
-        rooms
-    }
-
     /// 读的工具只要求「本组有人订了这个房间」。
-    fn ensure_readable(&self, devices: &[String], room: &RoomId) -> Result<(), ToolError> {
-        if self.devices_subscribing(devices, room).is_empty() {
+    fn ensure_readable(&self, sessions: &[String], room: &RoomId) -> Result<(), ToolError> {
+        if self.sessions_subscribing(sessions, room).is_empty() {
             return Err(ToolError::new(
                 ErrorCode::RoomNotSubscribed,
-                format!("你这组设备都没订阅 {room}"),
+                format!("你这组会话都没订阅 {room}"),
             ));
         }
         Ok(())
     }
 
-    fn enqueue(&mut self, device: String, room: RoomId, reason: TurnReason) {
+    fn enqueue(&mut self, session: String, room: RoomId, reason: TurnReason) {
         let already = self
             .pending
             .iter()
-            .any(|pending| pending.device == device && pending.room == room);
+            .any(|pending| pending.session == session && pending.room == room);
         if already {
             return;
         }
         self.pending.push_back(Pending {
-            device,
+            session,
             room,
             reason,
         });
@@ -565,10 +492,10 @@ impl<S: Store> Bridge<S> {
 
     fn open_turn(&mut self, pending: Pending) -> Result<Delivery, BridgeError> {
         let account = self.config.account_of_room(&pending.room);
-        let mut records = self.pending_records(&pending.device, &pending.room, &account)?;
+        let mut records = self.pending_records(&pending.session, &pending.room, &account)?;
 
         let mut delivered = BTreeSet::new();
-        let cursor = Cursor::new(pending.device.clone(), pending.room.clone());
+        let cursor = Cursor::new(pending.session.clone(), pending.room.clone());
         for record in &mut records {
             // 计数落在存储里：重启之后同一个 N 接着数，不然看着像从没投过。
             let count = self.store.count_delivery(&cursor, record.id)?;
@@ -588,20 +515,16 @@ impl<S: Store> Bridge<S> {
             delivered.insert(record.id);
         }
 
-        let memory = self
-            .memory_of(&pending.device)
-            .unwrap_or(&pending.device)
-            .to_owned();
-
         self.ticket_seq += 1;
         let ticket =
-            Ticket::new(format!("{}-{}", pending.device, self.ticket_seq)).expect("票面非空");
+            Ticket::new(format!("{}-{}", pending.session, self.ticket_seq)).expect("票面非空");
 
-        self.by_ticket.insert(ticket.clone(), memory.clone());
+        self.by_ticket
+            .insert(ticket.clone(), pending.session.clone());
         self.active.insert(
-            memory.clone(),
+            pending.session.clone(),
             ActiveTurn {
-                device: pending.device.clone(),
+                session: pending.session.clone(),
                 room: pending.room.clone(),
                 delivered,
             },
@@ -609,8 +532,7 @@ impl<S: Store> Bridge<S> {
 
         Ok(Delivery {
             ticket,
-            device: pending.device,
-            memory,
+            session: pending.session,
             room: pending.room,
             records,
             reason: pending.reason,
@@ -619,7 +541,7 @@ impl<S: Store> Bridge<S> {
 
     fn deliver_out(
         &mut self,
-        device: &str,
+        session: &str,
         room: &RoomId,
         elements: Vec<Element>,
     ) -> Result<Value, ToolError> {
@@ -658,7 +580,7 @@ impl<S: Store> Bridge<S> {
             .map_err(internal)?;
 
         // 自己说的话不是未读：写进流水的同时确认掉。
-        let cursor = Cursor::new(device, room.clone());
+        let cursor = Cursor::new(session, room.clone());
         let watermark = self.store.ack(&cursor, &[record.id]).map_err(internal)?;
 
         Ok(json!({
@@ -670,7 +592,7 @@ impl<S: Store> Bridge<S> {
 
     fn ack(
         &mut self,
-        device: &str,
+        session: &str,
         room: &RoomId,
         delivered: &BTreeSet<u64>,
         ids: Vec<u64>,
@@ -690,7 +612,7 @@ impl<S: Store> Bridge<S> {
             }
         }
 
-        let cursor = Cursor::new(device, room.clone());
+        let cursor = Cursor::new(session, room.clone());
         let watermark = self.store.ack(&cursor, &ids).map_err(internal)?;
         for id in &ids {
             self.store.forget_delivery(&cursor, *id).map_err(internal)?;
@@ -701,12 +623,12 @@ impl<S: Store> Bridge<S> {
 
     fn history(
         &self,
-        devices: &[String],
+        sessions: &[String],
         turn_room: &RoomId,
         args: HistoryArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(devices, &room)?;
+        self.ensure_readable(sessions, &room)?;
 
         let limit = args.limit.unwrap_or(DEFAULT_HISTORY).min(MAX_HISTORY);
         let mut records: Vec<Record> = self
@@ -722,16 +644,16 @@ impl<S: Store> Bridge<S> {
         Ok(json!({ "room": room, "records": records }))
     }
 
-    /// 这组设备订阅的所有房间，按（设备，房间）各列一行。
+    /// 这组会话订阅的所有房间，按（会话，房间）各列一行。
     ///
-    /// 两个设备订同一个房间时会出现两行——这是实话：水位本来就是各记各的。
-    fn list_rooms(&self, devices: &[String]) -> Result<Value, ToolError> {
+    /// 两个会话订同一个房间时会出现两行——这是实话：水位本来就是各记各的。
+    fn list_rooms(&self, sessions: &[String]) -> Result<Value, ToolError> {
         let mut rooms = Vec::new();
-        for id in devices {
-            let Some(device) = self.config.device(id) else {
+        for id in sessions {
+            let Some(session) = self.config.session(id) else {
                 continue;
             };
-            for subscription in &device.subscriptions {
+            for subscription in &session.subscriptions {
                 let room = &subscription.room;
                 let account = self.config.account_of_room(room);
                 let cursor = Cursor::new(id.clone(), room.clone());
@@ -742,7 +664,7 @@ impl<S: Store> Bridge<S> {
                     .len();
                 rooms.push(json!({
                     "room": room,
-                    "device": id,
+                    "session": id,
                     "watermark": watermark,
                     "unread": unread,
                 }));
@@ -753,12 +675,12 @@ impl<S: Store> Bridge<S> {
 
     fn read_notes(
         &self,
-        devices: &[String],
+        sessions: &[String],
         turn_room: &RoomId,
         args: NotesArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(devices, &room)?;
+        self.ensure_readable(sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => Some(parse_note_kind(text)?),
@@ -777,12 +699,12 @@ impl<S: Store> Bridge<S> {
 
     fn write_note(
         &mut self,
-        devices: &[String],
+        sessions: &[String],
         turn_room: &RoomId,
         args: SetNoteArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(devices, &room)?;
+        self.ensure_readable(sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => parse_note_kind(text)?,
@@ -822,12 +744,12 @@ impl<S: Store> Bridge<S> {
 
     fn delete_note(
         &mut self,
-        devices: &[String],
+        sessions: &[String],
         turn_room: &RoomId,
         args: DelNoteArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(devices, &room)?;
+        self.ensure_readable(sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => parse_note_kind(text)?,
@@ -840,12 +762,12 @@ impl<S: Store> Bridge<S> {
 
     fn events(
         &self,
-        devices: &[String],
+        sessions: &[String],
         turn_room: &RoomId,
         args: EventsArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(devices, &room)?;
+        self.ensure_readable(sessions, &room)?;
 
         let limit = args.limit.unwrap_or(DEFAULT_HISTORY).min(MAX_HISTORY);
         let mut records: Vec<Record> = self
@@ -867,18 +789,6 @@ impl<S: Store> Bridge<S> {
             Some(text) => resolve_room(text),
             None => Ok(turn_room.clone()),
         }
-    }
-}
-
-fn join_or_none<T: AsRef<str>>(names: &[T]) -> String {
-    if names.is_empty() {
-        "（一个都没有）".to_owned()
-    } else {
-        names
-            .iter()
-            .map(|name| name.as_ref())
-            .collect::<Vec<_>>()
-            .join("、")
     }
 }
 

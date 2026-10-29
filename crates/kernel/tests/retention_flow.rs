@@ -3,7 +3,7 @@
 //! 这一层验的是**判据**——谁算读过、什么时候可以删。存储层怎么执行判据在
 //! `storage.rs` 与 `sqlite_store.rs` 里各自验。
 //!
-//! 判据有一条最容易搞错、后果也最严重：一个房间有两个设备订阅时，安全线取两者水位的
+//! 判据有一条最容易搞错、后果也最严重：一个房间有两个会话订阅时，安全线取两者水位的
 //! **最小值**。任何一方没读到，这个房间就一条都不删——那几条还是人家下一轮的投递原料。
 
 use acb_kernel::{
@@ -35,30 +35,35 @@ fn config(max_records: u64, max_days: u64) -> String {
         url = "ws://127.0.0.1:3001"
         account = "bot"
 
-        [[devices]]
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[sessions]]
         id = "main"
+        harness = "dsh"
         persona = "p"
-        memory = "m"
         token = "t-main"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/123"
 
-        [devices.subscriptions.wake]
+        [sessions.subscriptions.wake]
         accumulate = 1
 
-        [[devices]]
+        [[sessions]]
         id = "helper"
+        harness = "dsh"
         persona = "p"
-        memory = "h"
         token = "t-helper"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "group/123"
 
-        [devices.subscriptions.wake]
+        [sessions.subscriptions.wake]
         accumulate = 1
 
         [retention]
@@ -93,16 +98,16 @@ fn message(text: &str, at: i64) -> RecordDraft {
     )
 }
 
-/// 让某个设备领一轮，并且把这些编号确认掉。走的是真工具调用，不是内部捷径。
-fn ack(bridge: &mut Bridge<MemoryStore>, device: &str, ids: &[u64]) {
+/// 让某个会话领一轮，并且把这些编号确认掉。走的是真工具调用，不是内部捷径。
+fn ack(bridge: &mut Bridge<MemoryStore>, session: &str, ids: &[u64]) {
     let delivery = bridge
-        .poll_turn_for(&[device.to_owned()])
+        .poll_turn_for(&[session.to_owned()])
         .expect("能取")
         .expect("该有活干");
     bridge
         .tool_call(
             &delivery.ticket,
-            &[device.to_owned()],
+            &[session.to_owned()],
             "ack_messages",
             serde_json::json!({ "ids": ids }),
         )

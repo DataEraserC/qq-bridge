@@ -22,7 +22,9 @@ use super::{
 /// 1 → 2：`records` 加 `reply_to_self` 与 `platform_id`（引用回复的判定要用）。
 /// 2 → 3：房间从「平台 + 房间号」改成「连接 + 路径」——`platform` 列改叫 `connection`，
 ///         `room` 列改叫 `room_key`，并留下 `room_json` 存原始路径结构。
-pub const SCHEMA_VERSION: i64 = 3;
+/// 3 → 4：device 概念升级为「harness 会话」——水位/投递计数/乱序确认三张表的 `device`
+///         列改叫 `session`（ADR-0017）。
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -49,29 +51,29 @@ CREATE TABLE IF NOT EXISTS records (
 );
 
 CREATE TABLE IF NOT EXISTS watermarks (
-    device     TEXT    NOT NULL,
+    session    TEXT    NOT NULL,
     connection TEXT    NOT NULL,
     room_key   TEXT    NOT NULL,
     watermark  INTEGER NOT NULL,
-    PRIMARY KEY (device, connection, room_key)
+    PRIMARY KEY (session, connection, room_key)
 );
 
 -- 乱序确认：水位之上已经被确认、但前面还有缺口的那几条。
 CREATE TABLE IF NOT EXISTS acks (
-    device     TEXT    NOT NULL,
+    session    TEXT    NOT NULL,
     connection TEXT    NOT NULL,
     room_key   TEXT    NOT NULL,
     record_id  INTEGER NOT NULL,
-    PRIMARY KEY (device, connection, room_key, record_id)
+    PRIMARY KEY (session, connection, room_key, record_id)
 );
 
 CREATE TABLE IF NOT EXISTS deliveries (
-    device     TEXT    NOT NULL,
+    session    TEXT    NOT NULL,
     connection TEXT    NOT NULL,
     room_key   TEXT    NOT NULL,
     record_id  INTEGER NOT NULL,
     times      INTEGER NOT NULL,
-    PRIMARY KEY (device, connection, room_key, record_id)
+    PRIMARY KEY (session, connection, room_key, record_id)
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -203,6 +205,14 @@ impl SqliteStore {
             self.conn
                 .execute_batch("DROP INDEX IF EXISTS records_platform_id;")
                 .map_err(|error| backend(format!("清理旧索引失败：{error}")))?;
+        }
+
+        // 3 → 4：device 概念升级为「harness 会话」。只改名不搬数据——`device` 那一列
+        // 本来就是「谁的水位/谁的重投计数」，语义没变，只是名字从设备换成会话。
+        if version < 4 {
+            for table in ["watermarks", "acks", "deliveries"] {
+                self.rename_column_if_needed(table, "device", "session")?;
+            }
         }
 
         self.conn
@@ -587,8 +597,8 @@ impl Watermarks for SqliteStore {
             .conn
             .query_row(
                 "SELECT watermark FROM watermarks
-                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3",
-                params![cursor.device, cursor.room.connection, cursor.room.key()],
+                 WHERE session = ?1 AND connection = ?2 AND room_key = ?3",
+                params![cursor.session, cursor.room.connection, cursor.room.key()],
                 |row| row.get(0),
             )
             .optional()
@@ -601,8 +611,8 @@ impl Watermarks for SqliteStore {
         let current: Option<i64> = transaction
             .query_row(
                 "SELECT watermark FROM watermarks
-                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3",
-                params![cursor.device, cursor.room.connection, cursor.room.key()],
+                 WHERE session = ?1 AND connection = ?2 AND room_key = ?3",
+                params![cursor.session, cursor.room.connection, cursor.room.key()],
                 |row| row.get(0),
             )
             .optional()
@@ -632,10 +642,10 @@ impl Watermarks for SqliteStore {
             if id > current {
                 transaction
                     .execute(
-                        "INSERT OR IGNORE INTO acks (device, connection, room_key, record_id)
+                        "INSERT OR IGNORE INTO acks (session, connection, room_key, record_id)
                          VALUES (?1, ?2, ?3, ?4)",
                         params![
-                            cursor.device,
+                            cursor.session,
                             cursor.room.connection,
                             cursor.room.key(),
                             id as i64
@@ -652,9 +662,9 @@ impl Watermarks for SqliteStore {
             let present: Option<i64> = transaction
                 .query_row(
                     "SELECT record_id FROM acks
-                     WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
+                     WHERE session = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                     params![
-                        cursor.device,
+                        cursor.session,
                         cursor.room.connection,
                         cursor.room.key(),
                         next as i64
@@ -669,9 +679,9 @@ impl Watermarks for SqliteStore {
             transaction
                 .execute(
                     "DELETE FROM acks
-                     WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
+                     WHERE session = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                     params![
-                        cursor.device,
+                        cursor.session,
                         cursor.room.connection,
                         cursor.room.key(),
                         next as i64
@@ -683,11 +693,11 @@ impl Watermarks for SqliteStore {
 
         transaction
             .execute(
-                "INSERT INTO watermarks (device, connection, room_key, watermark)
+                "INSERT INTO watermarks (session, connection, room_key, watermark)
                  VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (device, connection, room_key) DO UPDATE SET watermark = excluded.watermark",
+                 ON CONFLICT (session, connection, room_key) DO UPDATE SET watermark = excluded.watermark",
                 params![
-                    cursor.device,
+                    cursor.session,
                     cursor.room.connection,
                     cursor.room.key(),
                     frontier as i64
@@ -830,12 +840,12 @@ impl Deliveries for SqliteStore {
     fn count_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<u32, StorageError> {
         self.conn
             .execute(
-                "INSERT INTO deliveries (device, connection, room_key, record_id, times)
+                "INSERT INTO deliveries (session, connection, room_key, record_id, times)
                  VALUES (?1, ?2, ?3, ?4, 1)
-                 ON CONFLICT (device, connection, room_key, record_id)
+                 ON CONFLICT (session, connection, room_key, record_id)
                  DO UPDATE SET times = times + 1",
                 params![
-                    cursor.device,
+                    cursor.session,
                     cursor.room.connection,
                     cursor.room.key(),
                     id as i64
@@ -847,9 +857,9 @@ impl Deliveries for SqliteStore {
             .conn
             .query_row(
                 "SELECT times FROM deliveries
-                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
+                 WHERE session = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                 params![
-                    cursor.device,
+                    cursor.session,
                     cursor.room.connection,
                     cursor.room.key(),
                     id as i64
@@ -864,9 +874,9 @@ impl Deliveries for SqliteStore {
         self.conn
             .execute(
                 "DELETE FROM deliveries
-                 WHERE device = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
+                 WHERE session = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
                 params![
-                    cursor.device,
+                    cursor.session,
                     cursor.room.connection,
                     cursor.room.key(),
                     id as i64

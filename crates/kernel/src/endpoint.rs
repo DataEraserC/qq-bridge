@@ -1,11 +1,11 @@
 //! 接入点：harness 连进来的那一端。
 //!
 //! 一条 TCP 长连接，一行一帧 JSON（见 `docs/04-protocol.md`）。连上来先握手：harness 报
-//! 协议版本和接入令牌，令牌对上了，这条连接就绑到那把令牌背后**那一组设备**——之后这一端
-//! 只为这组设备取活、替这组设备说话（ADR-0002）。
+//! 协议版本、自己的名字（harness 名）和接入令牌，名字与令牌都对上，这条连接就绑到
+//! 这个 harness 接管的那组会话——之后这一端只为这组会话取活、替这组会话说话（ADR-0017）。
 //!
 //! 这里刻意分两层：
-//! - [`Session`] 是纯状态机，不碰 IO，测试可以直接把帧喂给它；
+//! - [`Conn`] 是纯状态机，不碰 IO，测试可以直接把帧喂给它；
 //! - [`run_connection`] 负责把状态机接到 socket 上：有活就发 `turn_start`，来帧就交给状态机。
 //!
 //! 并发模型：整个桥在一把锁后面。锁只在「读一格状态 / 执行一个动作」时拿，**绝不**在等
@@ -43,10 +43,14 @@ pub enum EndpointError {
     Bridge(#[from] BridgeError),
 }
 
-/// 握手：校验版本与令牌，返回这条连接代表的那组设备（配置顺序）。
+/// 握手：校验版本、harness 名与令牌，返回这条连接代表的会话（配置顺序）。
 pub fn handshake<S: Store>(bridge: &Bridge<S>, frame: Frame) -> Result<Vec<String>, EndpointError> {
-    let (version, token) = match frame {
-        Frame::Hello { version, token } => (version, token),
+    let (version, harness, token) = match frame {
+        Frame::Hello {
+            version,
+            harness,
+            token,
+        } => (version, harness, token),
         other => {
             return Err(EndpointError::Handshake(format!(
                 "第一帧必须是 hello，收到 {}",
@@ -60,41 +64,46 @@ pub fn handshake<S: Store>(bridge: &Bridge<S>, frame: Frame) -> Result<Vec<Strin
             acb_proto::frame::PROTOCOL_VERSION
         )));
     }
+    if harness.trim().is_empty() {
+        return Err(EndpointError::Handshake("没有报 harness 名".into()));
+    }
     let Some(token) = token else {
         return Err(EndpointError::Handshake("没有带接入令牌".into()));
     };
-    let devices: Vec<String> = bridge
+    // harness 名下的所有会话，再按令牌筛出「这次接入能代表的」。
+    let sessions: Vec<String> = bridge
         .config()
-        .devices_by_token(&token)
+        .sessions_by_harness(&harness)
         .into_iter()
-        .map(|device| device.id.clone())
+        .filter(|session| session.token == token)
+        .map(|session| session.id.clone())
         .collect();
-    if devices.is_empty() {
-        return Err(EndpointError::Handshake("接入令牌无效".into()));
+    if sessions.is_empty() {
+        return Err(EndpointError::Handshake("harness 名或接入令牌无效".into()));
     }
-    Ok(devices)
+    Ok(sessions)
 }
 
 /// 一条连接上的协议状态机。不碰 IO，喂帧就行。
 #[derive(Debug)]
-pub struct Session {
-    /// 这条连接代表的设备组（同一把令牌）。
-    devices: Vec<String>,
+pub struct Conn {
+    /// 这条连接代表的会话组（同一 harness + 令牌）。
+    sessions: Vec<String>,
     /// 正在跑的那一轮的票；有票说明 harness 正在跑一轮。
     ticket: Option<Ticket>,
 }
 
-impl Session {
-    pub fn new(devices: Vec<String>) -> Self {
+impl Conn {
+    pub fn new(sessions: Vec<String>) -> Self {
         Self {
-            devices,
+            sessions,
             ticket: None,
         }
     }
 
-    /// 这条连接代表的设备组。
-    pub fn devices(&self) -> &[String] {
-        &self.devices
+    /// 这条连接代表的会话组。
+    pub fn sessions(&self) -> &[String] {
+        &self.sessions
     }
 
     /// 正在跑的那一轮的票。
@@ -110,7 +119,7 @@ impl Session {
         if self.ticket.is_some() {
             return Ok(None);
         }
-        let Some(delivery) = bridge.poll_turn_for(&self.devices)? else {
+        let Some(delivery) = bridge.poll_turn_for(&self.sessions)? else {
             return Ok(None);
         };
         self.ticket = Some(delivery.ticket.clone());
@@ -134,7 +143,7 @@ impl Session {
             } => {
                 let reply = match &self.ticket {
                     Some(current) if current == &ticket => {
-                        match bridge.tool_call(&ticket, &self.devices, &tool, args) {
+                        match bridge.tool_call(&ticket, &self.sessions, &tool, args) {
                             Ok(result) => Frame::ToolResult {
                                 id,
                                 result: Some(result),
@@ -206,7 +215,7 @@ pub fn run_connection<S: Store>(
     let mut buffer: Vec<u8> = Vec::new();
 
     // 握手：第一帧必须是 hello。
-    let devices = {
+    let sessions = {
         let line = match read_line(&mut stream, &mut buffer, HANDSHAKE_TIMEOUT)? {
             Incoming::Line(line) => line,
             Incoming::Idle => return Err(EndpointError::Handshake("握手超时".into())),
@@ -219,20 +228,20 @@ pub fn run_connection<S: Store>(
     write_frame(
         &mut stream,
         &Frame::Ready {
-            devices: devices.clone(),
+            sessions: sessions.clone(),
         },
     )?;
 
     // 连上就吭一声：以后「它不理我」时，一眼能看出是不是这里断了。
     if let Ok(peer) = stream.peer_addr() {
         eprintln!(
-            "接入点：harness 已连上（{}），代表设备组 [{}]",
+            "接入点：harness 已连上（{}），代表会话组 [{}]",
             peer,
-            devices.join("、")
+            sessions.join("、")
         );
     }
 
-    let mut session = Session::new(devices);
+    let mut session = Conn::new(sessions);
 
     let outcome = 'conn: loop {
         // 1. 有活就发过去。
@@ -289,12 +298,12 @@ pub fn run_connection<S: Store>(
     // 顺带报一下队列：要是断的时候还压着活，就是「没人接了」，一眼能看出。
     match &outcome {
         Ok(()) => eprintln!(
-            "接入点：harness 断开（设备组 [{}]）；队列里还压着 {queued} 个待开轮次",
-            session.devices().join("、")
+            "接入点：harness 断开（会话组 [{}]）；队列里还压着 {queued} 个待开轮次",
+            session.sessions().join("、")
         ),
         Err(error) => eprintln!(
-            "接入点：harness 连接异常结束（设备组 [{}]）：{error}；队列里还压着 {queued} 个待开轮次",
-            session.devices().join("、")
+            "接入点：harness 连接异常结束（会话组 [{}]）：{error}；队列里还压着 {queued} 个待开轮次",
+            session.sessions().join("、")
         ),
     }
     outcome
@@ -399,7 +408,7 @@ fn read_line(
     }
 }
 
-/// 给测试用：把一端连好的 socket 包成 [`Session`] 的对手方，方便直接写帧。
+/// 给测试用：把一端连好的 socket 包成 [`Conn`] 的对手方，方便直接写帧。
 pub fn reader_of(stream: &TcpStream) -> std::io::BufReader<TcpStream> {
     std::io::BufReader::new(stream.try_clone().expect("能复制句柄"))
 }

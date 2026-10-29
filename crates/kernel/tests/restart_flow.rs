@@ -64,17 +64,22 @@ fn config() -> &'static str {
         url = "ws://127.0.0.1:3001"
         account = "3683924053"
 
-        [[devices]]
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[sessions]]
         id = "main"
+        harness = "dsh"
         persona = "p"
-        memory = "m"
         token = "t-main"
 
-        [[devices.subscriptions]]
+        [[sessions.subscriptions]]
         connection = "qq"
         room = "private/323622442"
 
-        [devices.subscriptions.wake]
+        [sessions.subscriptions.wake]
         at_mention = false
         name_mention = false
         poke = false
@@ -86,8 +91,8 @@ fn room() -> RoomId {
     RoomId::parse("qq:private/323622442").expect("房间合法")
 }
 
-/// 一次接入代表的设备组（测试里就一台）。
-fn devices() -> Vec<String> {
+/// 一次接入代表的会话组（测试里就一个）。
+fn sessions() -> Vec<String> {
     vec!["main".to_owned()]
 }
 
@@ -172,7 +177,7 @@ fn a_restart_continues_numbering_and_redelivery_counts() {
     let result = bridge
         .tool_call(
             &ticket,
-            &devices(),
+            &sessions(),
             "ack_messages",
             serde_json::json!({ "ids": [1, 2] }),
         )

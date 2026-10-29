@@ -12,10 +12,10 @@ pub mod tools;
 
 pub use config::{
     Config, Connection, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM, DEFAULT_STORAGE_PATH,
-    Device, EndpointConfig, KNOWN_ADAPTERS, RetentionConfig, StorageConfig, Subscription,
-    Transport, WakeDecision, WakeInput, WakePolicy,
+    EndpointConfig, KNOWN_ADAPTERS, KNOWN_MEMORY_KINDS, Memory, Persona, RetentionConfig, Session,
+    StorageConfig, Subscription, Transport, WakeDecision, WakeInput, WakePolicy,
 };
-pub use endpoint::{EndpointError, Session, handshake, run_connection, serve};
+pub use endpoint::{Conn, EndpointError, handshake, run_connection, serve};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY, Pruned};
 pub use outbound::{Outbound, OutboundError, Outbounds, Sent};
 pub use storage::{

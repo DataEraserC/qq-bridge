@@ -14,7 +14,9 @@ use crate::ticket::Ticket;
 ///
 /// 2：`ready` 从「绑一台设备」改成「绑一组设备」——一把接入令牌可以代表同一份记忆的
 /// 多台设备，`send_message_to` 因此才能跨设备发。这是改语义，不是加帧，所以要升版本。
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 3：device 概念升级为「harness 会话」——`hello` 加 `harness` 字段，`delivery` 的
+/// `device`/`memory` 合并成 `session`，串行键改成「harness 名 + 会话 id」（ADR-0017）。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 单帧上限：1 MiB。超了直接断连，不做截断。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -24,11 +26,8 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub struct Delivery {
     /// 本轮的票。
     pub ticket: Ticket,
-    /// 这一轮替哪台设备说话。
-    pub device: String,
-    /// 这台设备的记忆 id（agent 侧会话）。harness 按它找会话——两台设备共用一份记忆时，
-    /// 它们本该落在同一个会话里，串行也由那份记忆保证（ADR-0003）。
-    pub memory: String,
+    /// 本轮替哪个会话说话。
+    pub session: String,
     /// 本轮只涉及这一个房间。
     pub room: RoomId,
     /// 要投递的记录，可能为空（时钟策略的例行检查）。
@@ -99,13 +98,15 @@ pub enum Frame {
     /// harness → 桥：握手。
     Hello {
         version: u32,
+        /// harness 的名字。串行键 = harness 名 + 会话 id（ADR-0017）。
+        harness: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// 桥 → harness：握手成功，绑定到这组设备（同一把令牌对应的全部设备）。
+    /// 桥 → harness：握手成功，绑定到这个 harness 接管的一组会话。
     ///
-    /// 顺序即配置里的顺序。单设备时只有一个元素。
-    Ready { devices: Vec<String> },
+    /// 顺序即配置里的顺序。单会话时只有一个元素。
+    Ready { sessions: Vec<String> },
     /// 桥 → harness：开一轮。
     TurnStart { delivery: Delivery },
     /// harness → 桥：本轮收工。
@@ -210,8 +211,7 @@ mod tests {
     fn sample_delivery() -> Delivery {
         Delivery {
             ticket: Ticket::new("t-1").expect("合法"),
-            device: "main".into(),
-            memory: "main-memory".into(),
+            session: "main".into(),
             room: RoomId::new("qq", "group/123").expect("合法"),
             records: vec![Record {
                 id: 1,
@@ -237,10 +237,11 @@ mod tests {
         vec![
             Frame::Hello {
                 version: PROTOCOL_VERSION,
+                harness: "dsh".into(),
                 token: Some("secret".into()),
             },
             Frame::Ready {
-                devices: vec!["main".into(), "second".into()],
+                sessions: vec!["main".into(), "second".into()],
             },
             Frame::TurnStart {
                 delivery: sample_delivery(),
