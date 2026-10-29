@@ -50,7 +50,7 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 
 | harness | 扩展点 | 轮次驱动 | 判断 |
 |---------|--------|----------|------|
-| opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，已按 v2 实现，见 `harnesses/opencode/plugin/`；真机上能加载、能连桥，整轮差一个它能认的模型 |
+| opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册，模型经 `execute` 调 `tools.X`） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，见 `harnesses/opencode/plugin/`；真机整轮已验（私聊 + 群） |
 | DSH | 插件 | 待核实 | 用户说可以走插件，具体接口未看 |
 | WorkBuddy | 待核实 | 待核实 | 未看 |
 | Trae | 待核实 | 待核实 | 未看 |
@@ -116,6 +116,7 @@ export QQAB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 | `Cannot find package '@opencode/plugin'` | 本地插件不自动带这个包。不用它就行：直接 `export default { id, setup }`，功能一样（`Plugin.define` 只是语法糖） |
 | 插件一加载，opencode 报 `Transport: The socket connection was closed unexpectedly` | 插件里 `console.log` 写到了 **stdout**，而 `serve --stdio` 用 stdout 当 RPC 通道，协议被污染。日志只能走 `ctx.app.log` 或 `console.error` |
 | 插件明明连上了，日志里却一个字都没有，查不到「已接入桥」 | 实测 2.0.22 在 `serve --stdio` 下 `ctx.app.log` **不落盘**（`~/.local/share/opencode/log/opencode.log` 里搜不到任何 `service=` 的行），所以日志必须**同时**写一份 `console.error`（stderr 安全，stdout 不行） |
+| 模型照你说的直呼 `send_message`，报 `No tool named "send_message" is currently available` | v2 里插件注册的工具进的是「Code Mode」目录，**不在**模型的原生工具表里；必须用 `execute` 跑一行 JS：`await tools.send_message({ text: "…" })`。插件现在会在投递末尾附这条提示，免得模型白失败一次 |
 | 配置写 `"plugin": ["./qqab.js"]` 报 `configured plugin path must be a directory` | v2 的键叫 `plugins`（复数），且本地路径必须是**目录**，指向单个文件会被跳过 |
 
 ## 怎么验
@@ -132,7 +133,7 @@ node --test harnesses/opencode/test/plugin.test.mjs
 # 3. 对着真桥（不用 opencode）：握手成不成
 node harnesses/opencode/probe.mjs --token <设备令牌>
 
-# 4. 真链路：真 opencode 起得来、插件连上桥（已做到）；整轮还差一条真消息（见下）
+# 4. 真链路：真 opencode + 真桥 + 真 QQ，模型真的回话（已验，见下）
 ```
 
 第 3 步里 `probe.mjs` 会把投递的内容打出来、回一句话、确认水位。它和插件用的是同一个
@@ -160,10 +161,24 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
 昨晚 `opencode2 2.0.22` 加载任何插件都 `panic: Segmentation fault`（4 行空插件同样崩），
 今天同一台机器同一版本**不复现**。那一关过去了。
 
-## 还差一步：整轮
+## 整轮：验过了（2026-10-29，私聊和群都跑了）
 
-要跑完整一轮（模型收到投递 → 调 `send_message` → 票能用），得凑齐三样：
-opencode 能起、插件连上（都有了）、**一个 opencode 认的模型**。第三样踩了很多坑：
+链路全通，私聊和群各一轮：
+
+```
+真 QQ 发「在吗」
+  → 桥归档 #3、开轮（票 main-1）
+  → 插件渲染投递 → opencode 会话 qqab:main
+  → 模型用 execute 调 await tools.send_message({text:"你好！我在。…"})
+  → 桥 → OneBot → QQ 里真收到了
+  → 模型再调 await tools.ack_messages({ids:[…]})
+  → 水位推到 7，下一轮不再重投
+```
+
+群里那一轮（`@机器人 你是什么模型？`）同样走通，回答落在群里，不是私聊。
+另外重启 opencode 之后 `接上会话 ses_e7a5…（qqab:main）`——**会话就是设备记忆，重启接得上**。
+
+### 模型这一环，踩过的坑
 
 - `opencode2` 自带的免费额度被限流（`Free usage limit reached`）。
 - 全局配置里的 `agentrouter-openai` 要 `AGENTROUTER_API_KEY`，本机没这个变量，报 `未提供令牌`。
@@ -171,18 +186,15 @@ opencode 能起、插件连上（都有了）、**一个 opencode 认的模型**
   `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三条路都能出字。但 opencode 只认
   自己从 models.dev 拉下来的目录：新增的自定义 provider **不注册模型**（模型名带不带斜杠、
   写成 `modelID` 还是别名、项目级/全局级都试过，一律 `model '…' not found`）。
-  借它登记过的 provider id 去覆盖地址，请求是发出去了，但带的是别的凭据。这条属于 opencode
-  自己的模型目录规则，不是插件的事。
-- 最后用本机已有的 openrouter key + 免费模型 `liquid/lfm-2.5-2.6b:free`（支持工具调用）跑通
-  出字，插件也挂着它连上了桥。模型只有 2.6B，答得笨，但足够验链路。
-
-所以第 4 层现在停在最后一步：**等人从 QQ 发一句话**，看模型会不会把 `send_message` 调起来。
+- 最后用本机 openrouter key + 免费模型 `nvidia/nemotron-3-ultra-550b-a55b:free` 跑通。
+  另外 `liquid/lfm-2.5-2.6b:free` 也能接上，但它只会写思考、`finish=stop`，不肯调工具——
+  模型太小的时候，链路没错也会看着像坏。
 
 ## 已知没验的地方
 
-- **真 opencode 里的整轮**：缺模型（见上）。具体没验到的是「`prompt` 之后工具调用
-  是否真能拿到票」「工具 schema 它认不认」。假宿主能证明我们的顺序对，不能证明它的行为。
 - 内容段参数用宽松的 `items: { type: "object" }` 接，靠描述文字教模型写元素。宁松勿严：
   写错了桥那边会给出比 JSON Schema 更准的话。
 - `ctx.session.create` 的返回形状按文档写（`id`），另外兼容 `sessionID` / `session.id` /
   `data.id` 三种老形状；opencode 换版本改形状时，这里要跟着看。
+- 插件文件改动后 opencode 的 watcher 会热重载（日志里会再出现一次 `已接入桥`），旧连接自动断。
+  这个行为没写进任何文档，属于实测观察。

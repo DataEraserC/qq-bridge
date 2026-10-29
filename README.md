@@ -16,7 +16,7 @@
 | 协议（桥 ↔ harness） | 可用：握手、开轮、工具调用、收工，一行一帧 JSON |
 | 核心（订阅/唤醒/流水/水位/笔记/回合调度） | 可用：工具面 9 个工具，设备内严格串行 |
 | 接入点（harness 连进来） | 可用：TCP 长连接 + 每设备接入令牌 |
-| harness 适配器（opencode v2） | 代码按 v2 插件 API 写完，协议层 + 插件逻辑共 23 个测试；真机上**能加载、能握手、能绑设备**（2026-10-29 复测，昨晚的段错误没再出现），**整轮没跑通**——只差一条真 QQ 消息进来 |
+| harness 适配器（opencode v2） | **真机整轮验过**（2026-10-29）：真 QQ 发消息 → 桥开轮 → opencode 模型收到 → 调 `send_message` 回话 → `ack_messages` 推水位；私聊和群各跑通一轮，重启 opencode 还能接上同一个会话。代码 23 个测试 |
 | harness 适配器（DSH / Trae / Codex…） | 没写，判断方法见 [docs/06](docs/06-harness-adapters.md) |
 | QQ 适配器（OneBot 11） | 可用：群与私聊收发、拍一拍、其它平台事件，断线自动重连 |
 | Discord / KOOK / Telegram | 没写 |
@@ -60,9 +60,9 @@ opencode2 --standalone     # 必须带 --standalone，后台 service 模式解�
 ```
 
 现成能抄的那份在 [harnesses/opencode/opencode.jsonc.example](harnesses/opencode/opencode.jsonc.example)。
-实测：插件能加载、握手能成（stderr 会打 `[qqab] info 已接入桥，绑定设备 main`）；**整轮还没跑通**，
-只差有人从 QQ 发一句话（模型用的本机 openrouter 免费小模型，细节见
-[docs/06](docs/06-harness-adapters.md)）。
+接上之后 stderr 会打 `[qqab] info 已接入桥，绑定设备 main`；有人在 QQ 里说话，模型就会通过
+`execute` 调 `await tools.send_message({...})` 回过去（插件工具在 opencode 里走 Code Mode，
+不在原生工具表里——这条坑和整轮实测记录见 [docs/06](docs/06-harness-adapters.md)）。
 
 不想装 opencode 也想看这一段通不通，用同一个协议客户端的探针：
 

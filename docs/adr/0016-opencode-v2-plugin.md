@@ -1,4 +1,4 @@
-# ADR-0016 opencode 插件只做 v2：写法换了，验证被上游 bug 挡住
+# ADR-0016 opencode 插件只做 v2：写法换了，整轮已在真机上验过
 
 来源：实现默认（选哪套 API、怎么注册工具、会话 id 存哪，都是我定的，可以推翻；
 「v1 不支持」是实测结论，不是偏好）。
@@ -39,18 +39,22 @@
 - 插件里**不能 `console.log`**：`serve --stdio` 用 stdout 当 RPC 通道，写一行就把协议污染，
   表现是 opencode 报 `Transport: The socket connection was closed unexpectedly`。
   日志走 `ctx.app.log`，退路是 `console.error`。
-- **验证现状（2026-10-29 更新）**：昨晚记录的是「加载任何插件都段错误」；今早同一台机器、
-  同一版本复测，**不再崩**，插件能加载（日志 `loading plugin … index.js`）并真的连上了桥
-  （`ESTAB …:7700` 对端是 `.opencode2-wrap`）。所以「真 opencode 里跑完一轮」只差模型这一环：
-  opencode 里得有一个它能认的模型，本机免费额度被限流、全局配置的 key 环境变量没设、
-  新配的自定义 provider 的模型它不注册（`model '…' not found`）。
-  插件逻辑本身仍由 `test/plugin.test.mjs` 的假宿主兜着（照 v2 文档实现
-  `tool.transform` / `session` / `storage` / `app`），验工具注册、一轮的完整动作、会话复用与重建、
-  错误透传、卸载关连接。
+- **验证现状（2026-10-29 定稿）**：昨晚记录的是「加载任何插件都段错误」；今早同一台机器、
+  同一版本复测**不再崩**。之后拿到了能用的模型，**整轮在真机上跑通了**：
+  真 QQ 发消息 → 桥开轮发票 → 模型收到投递 → 用 `execute` 调 `await tools.send_message(...)`
+  → 桥转发到 QQ（对端真收到）→ 模型再调 `ack_messages`，水位推到 7，不再重投。
+  私聊和群各一轮（群那条是 @ 唤醒），重启 opencode 后 `接上会话 ses_e7a5…`，记忆按设备接得上。
+  「`prompt` 之后工具调用能拿到票」「`input` 的 JSON Schema 它照单接受」这两件，一并验掉了。
+  插件逻辑另有 `test/plugin.test.mjs` 的假宿主（照 v2 文档实现 `tool.transform` / `session` /
+  `storage` / `app`）兜底：工具注册、一轮的完整动作、会话复用与重建、错误透传、卸载关连接。
+- **工具调用走 Code Mode**：`ctx.tool.transform` 加进去的工具不在模型的原生工具表里，
+  而在 Code Mode 目录，模型必须 `execute` 一行 `await tools.send_message({...})` 才调得到。
+  直呼工具名会得到 `No tool named "send_message" is currently available`。
+  插件因此在投递末尾附了这条提示——否则每轮先白失败一次。
+- **日志必须同时写 stderr**：实测 2.0.22 在 `serve --stdio` 下 `ctx.app.log` 不落盘
+  （`opencode.log` 里没有任何 `service=` 行），只靠它等于把诊断信息扔掉；stdout 又不能碰。
 - **要用 `--standalone` 起**：后台 service 模式下插件入口解析不到
   （`PluginModule.LoadError: Plugin entrypoint not found`）。
-- 等模型这一环通了，要补验两件：`prompt` 之后工具调用能否拿到票；`input` 的 JSON Schema
-  它是否照单接受。
 
 ## 参考
 

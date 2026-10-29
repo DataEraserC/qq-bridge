@@ -77,6 +77,25 @@ export default {
 // 一轮：投递 → 提问 → 等它说完 → 收工
 // ---------------------------------------------------------------------------
 
+/**
+ * opencode v2 里插件注册的工具**不在**模型的原生工具列表里，而是进「Code Mode」目录，
+ * 模型得用 `execute` 工具跑一行 JS 才调得动：`await tools.send_message({ text: "..." })`。
+ *
+ * 实测（2026-10-29，nemotron-3-ultra）：模型看到投递里「回这个房间用 send_message」，
+ * 第一反应是直接调 `send_message`，得到
+ * `No tool named "send_message" is currently available`，第二次才想起来走 `execute`。
+ * 每轮白失败一次很浪费，所以在投递末尾把这条规矩直接说清楚。
+ * 这是 opencode 独有的，属于适配器的事，不往通用的 renderTurn 里塞。
+ */
+const CODE_MODE_HINT = [
+  "",
+  "---",
+  "（opencode 提示：上列工具不在原生工具列表里，要用 execute 跑一行 JS：",
+  '  发消息 `await tools.send_message({ text: "收到" })`；',
+  "  确认 `await tools.ack_messages({ ids: [1, 2] })`；",
+  "  先想清楚要发什么，再一次调用，别先用原生工具名硬调。）",
+].join("\n")
+
 class TurnDriver {
   constructor({ ctx, log, pinned }) {
     this.ctx = ctx
@@ -97,7 +116,7 @@ class TurnDriver {
     let failure = null
     try {
       const sessionID = await this.#session(delivery.device)
-      const text = renderTurn(delivery)
+      const text = renderTurn(delivery) + CODE_MODE_HINT
       this.log(
         "debug",
         `开轮 ${delivery.ticket}：${delivery.room.platform}:${delivery.room.room}，${delivery.records.length} 条`,

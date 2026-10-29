@@ -163,6 +163,11 @@ test("一轮走完：建会话 → 提问 → 等它说完 → 收工", async (t
   assert.equal(host.created[0].title, "qqab:main", "会话按设备一份")
   assert.equal(host.prompts[0].sessionID, host.created[0].id)
   assert.match(host.prompts[0].text, /在吗/, "投递的内容要进上下文")
+  assert.match(
+    host.prompts[0].text,
+    /tools\.send_message/,
+    "要顺带告诉模型这些工具得走 execute 才调得动（opencode 的 Code Mode）",
+  )
   assert.deepEqual(host.waits, [host.created[0].id], "prompt 之后要等这一轮说完")
 
   host.finishTurn()
