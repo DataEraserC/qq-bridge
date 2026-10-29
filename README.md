@@ -16,7 +16,7 @@
 | 协议（桥 ↔ harness） | 可用：握手、开轮、工具调用、收工，一行一帧 JSON |
 | 核心（连接/订阅/唤醒/流水/水位/笔记/回合调度） | 可用：工具面 9 个工具，同一份记忆的轮次严格串行 |
 | 接入点（harness 连进来） | 可用：TCP 长连接 + 接入令牌（一把令牌代表一组设备） |
-| harness 适配器（opencode v2） | **真机整轮验过**（2026-10-29）：真 QQ 发消息 → 桥开轮 → opencode 模型收到 → 调 `send_message` 回话 → `ack_messages` 推水位；私聊和群各跑通一轮，重启 opencode 还能接上同一个会话；引用机器人的消息也能叫醒。代码 25 个测试 |
+| harness 适配器（opencode v2） | **真机整轮验过**（2026-10-29 19:26，最后一轮 10 秒回话）：真 QQ 发消息 → 桥开轮 → 模型收到 → `execute` 里调 `send_message` 回话 → `ack_messages` 推水位。连接模型上线后重验过：会话按**记忆**开（`acb:main-memory`），出站消息存平台编号，所以引用机器人的话能叫醒。代码 28 个测试 |
 | harness 适配器（DSH / Trae / Codex…） | 没写，判断方法见 [docs/06](docs/06-harness-adapters.md) |
 | QQ 适配器（OneBot 11） | 可用：群与私聊收发、拍一拍、其它平台事件，断线自动重连 |
 | Discord / KOOK / Telegram | 没写 |
@@ -99,7 +99,7 @@ cargo test --workspace                    # 单元 + 调度 + 接入点
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 
-node --test harnesses/opencode/test/*.test.mjs   # harness 适配器：协议层 15 + 插件逻辑 8
+node --test harnesses/opencode/test/*.test.mjs   # harness 适配器：协议层 18 + 插件逻辑 10
 ```
 
 ## 许可证
