@@ -56,6 +56,30 @@ test("握手带上协议版本和令牌，拿到设备", async (t) => {
   assert.deepEqual(bridge.hello, { frame: "hello", version: 1, token: "t-main" })
 })
 
+test("桥断了会自己重连，重连成功后重新绑上设备", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const logs = []
+  const link = new BridgeLink({
+    endpoint: bridge.endpoint,
+    token: "t-main",
+    log: (level, message) => logs.push(`${level} ${message}`),
+  })
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+  await link.connect()
+
+  // 桥重启（改配置就得重启，实测里真的会遇到）
+  bridge.socket.destroy()
+
+  await waitFor(
+    () => logs.some((line) => line.includes("重连成功")),
+    "应该自己重连回来，日志是：" + logs.join(" | "),
+  )
+  assert.equal(link.device, "main", "重连之后设备要重新绑上，不然工具会一直 unauthorized")
+})
+
 test("开轮之后工具调用带着本轮的票，结果能对上号", async (t) => {
   const turns = []
   const { bridge, link } = await setup(t, {
