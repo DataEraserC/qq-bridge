@@ -223,6 +223,15 @@ pub fn run_connection<S: Store>(
         },
     )?;
 
+    // 连上就吭一声：以后「它不理我」时，一眼能看出是不是这里断了。
+    if let Ok(peer) = stream.peer_addr() {
+        eprintln!(
+            "接入点：harness 已连上（{}），代表设备组 [{}]",
+            peer,
+            devices.join("、")
+        );
+    }
+
     let mut session = Session::new(devices);
 
     let outcome = 'conn: loop {
@@ -270,9 +279,23 @@ pub fn run_connection<S: Store>(
     };
 
     // 无论怎么结束，都要把没跑完的轮次放掉。
-    {
+    let queued = {
         let mut guard = lock(bridge);
         session.abandon(&mut guard);
+        guard.queued_turns()
+    };
+
+    // 断开也说清楚为什么断的：正常收工、对端关了、还是网络出错。
+    // 顺带报一下队列：要是断的时候还压着活，就是「没人接了」，一眼能看出。
+    match &outcome {
+        Ok(()) => eprintln!(
+            "接入点：harness 断开（设备组 [{}]）；队列里还压着 {queued} 个待开轮次",
+            session.devices().join("、")
+        ),
+        Err(error) => eprintln!(
+            "接入点：harness 连接异常结束（设备组 [{}]）：{error}；队列里还压着 {queued} 个待开轮次",
+            session.devices().join("、")
+        ),
     }
     outcome
 }

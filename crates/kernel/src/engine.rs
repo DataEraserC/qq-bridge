@@ -155,6 +155,11 @@ impl<S: Store> Bridge<S> {
         devices
     }
 
+    /// 队列里还压着几个待开轮次（给日志看，没人接的时候提醒用）。
+    pub fn queued_turns(&self) -> usize {
+        self.pending.len()
+    }
+
     /// 清一次旧流水，返回真的删了东西的房间。
     ///
     /// `now` 是「现在」的 Unix 毫秒——传进来而不是自己取，是为了让测试能造出「很久以前」。

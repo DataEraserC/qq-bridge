@@ -64,6 +64,7 @@ export default {
 
     return async () => {
       link.close()
+      log("warn", "插件被卸载：已断开桥，不再重连。若进程还活着但不再收消息，多半是这里")
       try {
         await registration?.dispose?.()
       } catch {
