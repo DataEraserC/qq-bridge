@@ -15,6 +15,7 @@ class ControllableDsh {
   constructor() {
     this.prompts = []
     this.sessions = []
+    this.modelPicks = []
     this.lastFollow = null
   }
 
@@ -22,6 +23,11 @@ class ControllableDsh {
     const id = `session-${this.sessions.length + 1}`
     this.sessions.push(id)
     return id
+  }
+
+  async selectModel(sessionId, choice) {
+    this.modelPicks.push({ sessionId, ...choice })
+    return { selected: choice }
   }
 
   async prompt(sessionId, content) {
@@ -237,4 +243,88 @@ test("没有 ticket 时 callBridge 报 unauthorized", async (t) => {
     () => callBridge(link, "send_message", { text: "收到" }),
     /没有进行中的轮次|调不动/,
   )
+})
+
+// 为什么要有这条：dsh 把「上次用的模型」记在会话里，复用老会话时它优先于默认模型配置。
+// 只改配置、不调 selectModel，老会话会悄悄继续打旧渠道（我们踩过一次：网关日志里还是旧模型）。
+test("配了模型就给会话钉一次，同一会话不重复钉", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  const driver = new TurnDriver({
+    dsh,
+    log: () => {},
+    model: { provider: "trae", model: "deepseek-v4.1-flash", reasoningEffort: "high" },
+  })
+
+  const first = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
+  await first
+
+  assert.equal(dsh.modelPicks.length, 1, "第一轮应该钉一次模型")
+  assert.deepEqual(dsh.modelPicks[0], {
+    sessionId: "session-1",
+    provider: "trae",
+    model: "deepseek-v4.1-flash",
+    reasoningEffort: "high",
+  })
+
+  // 第二轮：同一会话，不该再钉一次。
+  const second = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 2, "第二轮 prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t2" } })
+  await second
+  assert.equal(dsh.modelPicks.length, 1, "同一会话只该钉一次")
+})
+
+test("没配模型就不碰会话的模型选择", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  // 只给 provider 不给 model：算没配全，不干预。
+  const driver = new TurnDriver({ dsh, log: () => {}, model: { provider: "trae", model: "" } })
+  const runPromise = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
+  await runPromise
+
+  assert.equal(dsh.modelPicks.length, 0, "没配模型就不该调 selectModel")
+})
+
+test("selectModel 失败不影响这一轮", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  dsh.selectModel = async () => {
+    throw new Error("provider not found")
+  }
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  const driver = new TurnDriver({
+    dsh,
+    log: () => {},
+    model: { provider: "trae", model: "deepseek-v4.1-flash" },
+  })
+  const runPromise = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "钉模型失败也得照常投话")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
+  await runPromise
+
+  const turnEnd = await nextTurnEnd(bridge)
+  assert.equal(turnEnd.frame, "turn_end")
+  assert.equal(turnEnd.error, undefined, "钉模型失败不该让整轮算失败")
 })

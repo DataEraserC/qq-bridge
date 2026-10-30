@@ -54,6 +54,14 @@ function readConfig() {
     preset: process.env.ACB_PRESET?.trim() || "",
     // 设了就起 streamable-http MCP（常驻进程模式，生产用）；不设走 stdio（兼容/测试）。
     mcpPort: process.env.ACB_MCP_PORT ? Number(process.env.ACB_MCP_PORT) : 0,
+    // 本进程要钉住的模型。dsh 把「上次用的模型」存在会话记录里，复用老会话时会盖住
+    // agent-default-model——只改补丁里的默认模型，老会话照样跑老模型。所以这里给了就
+    // 每个会话显式 selectModel 一次。留空 = 不干预，用会话当前选的那个。
+    model: {
+      provider: process.env.ACB_DSH_PROVIDER?.trim() || "",
+      model: process.env.ACB_DSH_MODEL?.trim() || "",
+      reasoningEffort: process.env.ACB_DSH_EFFORT?.trim() || "",
+    },
   }
 }
 
@@ -67,7 +75,13 @@ async function main() {
   const dsh = new DshClient({ baseUrl: config.dshBaseUrl, token: config.dshToken, log })
 
   // 轮次驱动：桥推 turn_start → dsh 投话 → 等 turn/end → turn_end。
-  const driver = new TurnDriver({ dsh, log, cwd: config.cwd, preset: config.preset })
+  const driver = new TurnDriver({
+    dsh,
+    log,
+    cwd: config.cwd,
+    preset: config.preset,
+    model: config.model,
+  })
 
   const link = new BridgeLink({
     endpoint: config.endpoint,
@@ -142,11 +156,15 @@ async function main() {
 // ---------------------------------------------------------------------------
 
 class TurnDriver {
-  constructor({ dsh, log, cwd = "", preset = "" }) {
+  constructor({ dsh, log, cwd = "", preset = "", model = null }) {
     this.dsh = dsh
     this.log = log
     this.cwd = cwd
     this.preset = preset
+    // 要钉住的模型 {provider, model, reasoningEffort}；provider/model 任一为空就不干预。
+    this.model = model && model.provider && model.model ? model : null
+    // 已经钉过模型的 dsh 会话。一个会话只调一次 selectModel，别每轮都发一遍。
+    this.modelPinned = new Set()
     // acb session id -> 固定的 dsh sessionId（`acb:<id>`）。用固定 id 而不是 dsh 造的
     // uuid，是为了持久化：进程重启后 createSession 传同一个 sessionId + cwd，
     // dsh 的 claim 逻辑会直接复用旧会话，不丢上下文。
@@ -202,6 +220,7 @@ class TurnDriver {
     let failure = null
     try {
       const sessionId = await this.#session(delivery.session, link)
+      await this.#pinModel(sessionId)
       const text = renderTurn(delivery)
       const info = delivery.session_info ?? {}
       const model = info.model ?? "(dsh 默认)"
@@ -245,6 +264,27 @@ class TurnDriver {
       if (this.sessions.has(map.session)) continue
       this.sessions.set(map.session, map.harness_session)
       this.log("info", `复用已存会话：${map.session} → ${map.harness_session}`)
+    }
+  }
+
+  /**
+   * 把这个会话的模型钉成本进程配置的那个（每个会话一次）。
+   *
+   * 为什么必须做：dsh 把「上次用的模型」记在会话里，复用老会话时它优先于
+   * agent-default-model。只改补丁里的默认模型，老会话会继续跑老模型——而且一点报错都没有，
+   * 只能靠看上游（网关）的日志才发现请求还在打旧渠道。
+   *
+   * 失败不阻断这一轮：钉不上就用会话当前的模型跑，只留一条 warn。
+   */
+  async #pinModel(sessionId) {
+    if (!this.model || this.modelPinned.has(sessionId)) return
+    const { provider, model, reasoningEffort } = this.model
+    try {
+      await this.dsh.selectModel(sessionId, { provider, model, reasoningEffort })
+      this.modelPinned.add(sessionId)
+      this.log("info", `会话 ${sessionId} 模型钉到 ${provider}/${model}${reasoningEffort ? `（${reasoningEffort}）` : ""}`)
+    } catch (error) {
+      this.log("warn", `给会话 ${sessionId} 选模型失败（这轮仍用会话当前模型）：${error?.message ?? error}`)
     }
   }
 

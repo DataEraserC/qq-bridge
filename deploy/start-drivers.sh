@@ -12,9 +12,30 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 CONFIG=$REPO/config.toml
 DRIVER=$REPO/harnesses/dsh/src/driver.mjs
+PATCH=$REPO/harnesses/dsh/dsh-mcp.patch.yml
 
 NODE=${NODE:-$(command -v node || echo /etc/profiles/per-user/nixos/bin/node)}
 [[ -x $NODE ]] || { echo "找不到 node：$NODE" >&2; exit 1; }
+
+# 模型：以 dsh-mcp.patch.yml 的 agent-default-model 为准，脚本不另存一份。
+# 为什么要传给驱动：dsh 把「上次用的模型」记在会话记录里，复用老会话时它优先于默认模型，
+# 所以光改补丁不生效——驱动得在每轮开始前对这个会话 selectModel 一次（见 driver.mjs）。
+patch_model() {
+  awk -v key="$1" '
+    /^- id: agent-default-model/ { f = 1; next }
+    f && /^- / { f = 0 }
+    f && $1 == key ":" { print $2; exit }
+  ' "$PATCH"
+}
+
+DSH_PROVIDER=$(patch_model provider)
+DSH_MODEL=$(patch_model model)
+DSH_EFFORT=$(patch_model reasoningEffort)
+if [[ -n $DSH_PROVIDER && -n $DSH_MODEL ]]; then
+  echo "模型：$DSH_PROVIDER/$DSH_MODEL${DSH_EFFORT:+（$DSH_EFFORT）}"
+else
+  echo "补丁里没读到 agent-default-model 的 provider/model，驱动不干预模型" >&2
+fi
 
 # dsh 每次重启都换 launch token（只打在它自己的启动输出里）。驱动不去猜它，
 # 走离线铸造 cookie（~/.dsh/.credentials.yaml 里的 browser-session 密钥），
@@ -53,6 +74,9 @@ for entry in "${SESSIONS[@]}"; do
     ACB_PRESET="$preset" \
     ACB_MCP_PORT="$port" \
     DSH_BASE_URL=http://127.0.0.1:3080 \
+    ACB_DSH_PROVIDER="$DSH_PROVIDER" \
+    ACB_DSH_MODEL="$DSH_MODEL" \
+    ACB_DSH_EFFORT="$DSH_EFFORT" \
     "$NODE" "$DRIVER" &
 done
 

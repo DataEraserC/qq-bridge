@@ -363,6 +363,25 @@ export class DshClient {
     })
   }
 
+  /**
+   * 给会话选模型（会话级）。
+   *
+   * 为什么必须显式调：dsh 把「上次用的模型」存在会话记录里（modelSelection.lastUsed），
+   * 复用一个老会话时它会盖住 agent-default-model。也就是说只改 dsh 的默认模型配置，
+   * 老会话照样跑老模型——换模型不生效多半就是这个原因。
+   */
+  async selectModel(sessionId, { provider, model, reasoningEffort } = {}) {
+    if (!sessionId || !provider || !model) {
+      throw new DshError("bad_args", "selectModel 要 sessionId + provider + model")
+    }
+    return this.callUnary("session/selectModel", {
+      sessionId,
+      provider,
+      model,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    })
+  }
+
 /**
  * 订阅一个会话的事件流，返回 async iterator。每一帧是
  * { type, data, sessionId }，其中 type 含 turn/start、turn/end 等。

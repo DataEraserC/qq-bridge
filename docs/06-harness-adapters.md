@@ -195,6 +195,11 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
   从那以后**所有房间都不回**了，包括私聊——额度是账号级的，不按房间分。
   教训有两条：热闹群的攒条数别设小（现在设 200，等于只认 @/名字/拍一拍）；
   以及「不回」先看模型额度，别急着怀疑桥。
+- **dsh 的模型是「会话级」记着的，改默认模型不会改老会话**。会话记录里有
+  `modelSelection.lastUsed`，复用老会话时它优先于 `agent-default-model`（那个只管新建会话）。
+  所以换模型后老会话会一声不响继续打旧渠道——桥这边不报错，只有看上游网关的日志才发现
+  请求还在打旧模型。现在驱动每轮开始前会 `session/selectModel` 钉一次（`TurnDriver#pinModel`），
+  模型值由 `deploy/start-drivers.sh` 从 `dsh-mcp.patch.yml` 的 `agent-default-model` 读出来传进去。
 
 ## 重启桥的代价：正在跑的那一轮作废（来源：实现默认）
 

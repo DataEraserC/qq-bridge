@@ -196,6 +196,14 @@ systemctl --user stop acb-drivers acb-bridge        # 停（顺序：驱动先�
 6. **待验证**：真实消息触发时，模型是否会自己调 `message.forward_content` 把转发正文读出来，
    以及平台特有方法（`platform_call`）这条通路在**模型手里**用不用得顺。
    （方法名/参数名已在真机上逐个探测过，桥侧校验与路由有测试覆盖；差的是「模型真的会去调」这一步。）
+7. **换 dsh 模型必须调 `session/selectModel`**（踩过一次）：dsh 把「上次用的模型」记在会话里
+   （`modelSelection.lastUsed`），复用老会话时它**优先于** `agent-default-model`。只改补丁里的默认
+   模型，老会话会一声不响继续打旧渠道——网关日志里还是旧模型，桥这边毫无报错。
+   现在 `deploy/start-drivers.sh` 从补丁读 `provider/model/reasoningEffort` 传给驱动，
+   驱动在每轮开始前对会话 `selectModel` 一次（`TurnDriver#pinModel`，失败只 warn 不阻断）。
+   手工改单个会话：`node harnesses/dsh/src/dsh-client.mjs` 里没有 CLI，用下面这段：
+   `dsh.selectModel(sessionId, { provider, model, reasoningEffort })`（`DshClient` 的方法）。
+   —— 顺带说明：`agent-default-model` 只影响**新建**的会话。
 
 ---
 
