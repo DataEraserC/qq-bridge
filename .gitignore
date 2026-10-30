@@ -22,6 +22,9 @@ config.toml
 # 记忆仓库路径写成 "~/xxx" 时 `~` 不会展开，会落在工作目录下这个字面目录里
 /~
 
+# 部署层密钥（deploy/acb.env.example 是模板，真值不入库）
+/deploy/acb.env
+
 # 编辑器与本地环境
 .direnv/
 .envrc

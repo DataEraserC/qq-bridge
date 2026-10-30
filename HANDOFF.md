@@ -127,15 +127,21 @@ core 迟早认识 QQ。
 | dsh harness 驱动 | `harnesses/dsh/src/driver.mjs`（+ dsh-client.mjs / mcp-server.mjs / mcp-http-server.mjs） |
 | opencode harness | `harnesses/opencode/plugin/`（acb-wire.mjs / index.js） |
 | 架构文档 | `docs/adr/`（0017 多 agent 模型、0018 会话映射、0019 并行会话等） |
-| 真机运行脚本 | `~/qqab-scratch/acb-up.sh`（起）/ `~/qqab-scratch/acb-down.sh`（停，带备份） |
-| 桥日志 | `~/qqab-scratch/oc-live/bridge.log` |
-| driver 日志 | `~/qqab-scratch/dsh-live/drivers-restart.log` |
+| 起停脚本 | `deploy/acb-up.sh`（起）/ `acb-down.sh`（停，带备份）/ `start-drivers.sh` |
+| dsh 部署层 overlay | `harnesses/dsh/dsh-mcp.patch.yml`（权威副本，原在 `~/qqab-scratch/dsh-live/web-acb-prod-v2.patch.yml`） |
+| dsh 的 API key | `deploy/acb.env`（**不入库**；模板 `deploy/acb.env.example`） |
+| 日志 | `~/qqab-scratch/logs/{dsh,bridge,drivers}.log`（scratch **不持久**，重启即清，别把东西存那儿） |
 
 ---
 
 ## 5. 怎么起停（真机）
 
-**一条命令：`~/qqab-scratch/acb-up.sh` 起，`~/qqab-scratch/acb-down.sh` 停。**
+**一条命令：`deploy/acb-up.sh` 起，`deploy/acb-down.sh` 停。**
+
+⚠️ **持久性边界（2026-10-30 确认）：** 根子卷 `/root` 重启即清空。持久的只有 `@persistent` 子卷下的
+`~/Documents`（本仓库）、`~/.dsh`、`~/.workbuddy`。**`~/qqab-scratch` 整个目录重启后不存在**——所以
+起停脚本、dsh overlay、密钥都放仓库 `deploy/`，scratch 只留日志。`~/qqab-scratch/acb-up.sh` 现在只是
+指向仓库的符号链接，重启后就没了，别把它当唯一入口。
 （down 会先自动备份库三件套，再按「驱动 → 桥」顺序停；up 按「桥 → 驱动」顺序起，并打印桥自述状态。）
 
 **为什么不用原来的 `run_in_background` 托管（重要，别再退回去）：**
@@ -160,9 +166,11 @@ systemctl --user stop acb-drivers acb-bridge        # 停（顺序：驱动先�
 - 桥和驱动**必须同批次**（协议版本严格相等），只换一边必 handshake fail。
 - 排「它不回话」三步：① 库里归档了吗、未读多少；② harness 会话有没有新 user/assistant；
   ③ `ss -tn | grep 7700` 有没有 ESTAB。
-- dsh 的 launch token 每次重启都变、只打在启动它的终端里，**别去改 `start-acb-drivers.sh` 里那个
-  硬编码 token**（早就失效了）。驱动走的是离线铸造 cookie（读 `~/.dsh/.credentials.yaml` 的
-  `client-connection/browser-session` 密钥），这条优先、且重启后自动跟着更新。
+- dsh 的 launch token 每次重启都变、只打在启动它的终端里。**新版 `deploy/start-drivers.sh` 根本不传
+  `DSH_TOKEN`**：驱动走离线铸造 cookie（读 `~/.dsh/.credentials.yaml` 的 `client-connection/browser-session`
+  密钥），`ensureAuth` 里铸造优先，所以重启后自动跟上，不需要人类抄 token。
+- 会话令牌也不再写死在脚本里：`deploy/start-drivers.sh` 从 `config.toml` 的 `[[sessions]]` 块里读，
+  改配置不用同步改脚本（两边一漂就握手失败）。
 - opencode 会卸载插件却不退出进程，桥对断连零日志，只能靠上面第③步发现。
 
 ---
