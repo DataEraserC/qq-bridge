@@ -13,6 +13,7 @@
 
 pub mod catalog;
 pub mod event;
+pub mod forward;
 pub mod link;
 pub mod outbound;
 pub mod segment;

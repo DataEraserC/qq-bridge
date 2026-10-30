@@ -10,6 +10,7 @@ use acb_kernel::{CallError, Element, MethodSpec, Outbound, OutboundError, RoomId
 use serde_json::{Value, json};
 
 use crate::catalog::{METHODS, ROUTES, Route, Target};
+use crate::forward;
 use crate::link::{Action, LinkError, LinkSlot};
 use crate::segment::to_onebot;
 
@@ -91,6 +92,11 @@ impl Outbound for OneBotOutbound {
             )));
         }
 
+        // 合并转发要一层层取，模型不该为这件事点三次（ADR-0024）。
+        if method == "message.forward_content" {
+            return self.forward_tree(params);
+        }
+
         let route = ROUTES
             .iter()
             .find(|route| route.method == method)
@@ -107,6 +113,43 @@ impl Outbound for OneBotOutbound {
 }
 
 impl OneBotOutbound {
+    /// 展开一条合并转发：按 `depth` / `max_nodes` 递归取，摊平成带路径的节点表。
+    ///
+    /// 递归放在适配器里，是因为「一次只给一层」是平台的规矩，不该让模型替我们跑循环。
+    fn forward_tree(&mut self, params: &Value) -> Result<Value, CallError> {
+        let id = params
+            .get("id")
+            .and_then(|value| match value {
+                Value::String(text) => Some(text.clone()),
+                Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            })
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                CallError::BadParams(
+                    "要 id：消息里 forward 段的 data.id（整段内容看起来像 [合并转发] 时用它）"
+                        .into(),
+                )
+            })?;
+
+        let depth = params
+            .get("depth")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(forward::DEFAULT_DEPTH);
+        let max_nodes = params
+            .get("max_nodes")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(forward::DEFAULT_MAX_NODES);
+
+        let mut fetch = |id: &str| {
+            let raw = self.dispatch("get_forward_msg", json!({ "id": id }))?;
+            parse_call_response("message.forward_content", raw)
+        };
+        forward::expand(&id, depth, max_nodes, &mut fetch)
+    }
+
     /// 塞一个动作进队列、等平台按 echo 回话。`send` 和 `call` 共用这一条通道。
     fn dispatch(&mut self, action: &str, params: Value) -> Result<Value, CallError> {
         let Some(sender) = self.slot.current() else {
@@ -535,6 +578,17 @@ mod tests {
         )
         .expect_err("1403 是没权限");
         assert!(matches!(denied, CallError::Forbidden(_)));
+    }
+
+    /// 合并转发不给 id：先说清楚要什么，别拿着空参数去平台上撞。
+    #[test]
+    fn forward_content_without_an_id_is_a_param_error() {
+        let mut outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
+        let room = RoomId::new("qq", "group/1").expect("合法");
+        let error = outbound
+            .call(&room, "message.forward_content", &json!({}))
+            .expect_err("要 id");
+        assert!(matches!(error, CallError::BadParams(_)), "{error:?}");
     }
 
     /// 在群里调 `group.*` 不用重复填群号。

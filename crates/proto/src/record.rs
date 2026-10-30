@@ -31,6 +31,20 @@ pub struct Sender {
     pub role: Option<SenderRole>,
 }
 
+/// 这条消息引用的是本房间里的哪条记录。
+///
+/// 平台只告诉引用对象自己的消息编号（`-1179324851` 这种），模型手上拿的是本房间的
+/// 水位编号（`#621`）。两者之间差一次反查——以前这次反查要模型自己做，做不了就瞎猜。
+/// 桥在投递/查询时补上（ADR-0024），**不落盘**：被引用那条可能后到，也可能早被清理。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuoteRef {
+    /// 平台自己的消息编号，就是引用段里的那个。
+    pub platform_id: String,
+    /// 本房间的水位编号；`None` = 这个房间里查不到（不在这轮历史里，或被清理了）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+}
+
 /// 这条记录是消息还是事件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -67,6 +81,9 @@ pub struct Record {
     /// 我们发出去的消息也带，所以「引用了我」才判得出来。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_id: Option<String>,
+    /// 这条消息引用了本房间里的哪条。桥算出来的，不落盘（见 [`QuoteRef`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_ref: Option<QuoteRef>,
     /// 非空表示「第 N 次投递」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redelivery: Option<u32>,
@@ -89,6 +106,17 @@ impl Record {
     pub fn is_event(&self, kind: &str) -> bool {
         matches!(&self.kind, RecordKind::Event { event } if event == kind)
     }
+
+    /// 这条消息引用的是哪条平台消息（取第一个引用段）。
+    ///
+    /// 一条消息里理论上可以有多个引用段，实际上平台只允许一个；取第一个就够了，
+    /// 剩下的照样留在 [`Record::elements`] 里，不丢。
+    pub fn quote_of(&self) -> Option<&str> {
+        self.elements.iter().find_map(|element| match element {
+            Element::Quote { message_id } if !message_id.is_empty() => Some(message_id.as_str()),
+            _ => None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +138,7 @@ mod tests {
             at_self: false,
             reply_to_self: false,
             platform_id: None,
+            quote_ref: None,
             redelivery: None,
             note: None,
         }
@@ -150,6 +179,47 @@ mod tests {
         let value = serde_json::to_value(sample()).expect("可序列化");
         assert!(value.get("redelivery").is_none());
         assert!(value.get("note").is_none(), "没有说明时不该出现 note 字段");
+        assert!(
+            value.get("quote_ref").is_none(),
+            "没有引用时不该出现 quote_ref 字段"
+        );
+    }
+
+    #[test]
+    fn quote_ref_carries_both_numbers_side_by_side() {
+        let mut record = sample();
+        record.elements = vec![
+            Element::Quote {
+                message_id: "-1179324851".into(),
+            },
+            Element::text("对的对的"),
+        ];
+        record.quote_ref = Some(QuoteRef {
+            platform_id: "-1179324851".into(),
+            id: Some(621),
+        });
+
+        assert_eq!(record.quote_of(), Some("-1179324851"));
+
+        let value = serde_json::to_value(&record).expect("可序列化");
+        assert_eq!(value["quote_ref"]["platform_id"], "-1179324851");
+        assert_eq!(value["quote_ref"]["id"], 621);
+    }
+
+    /// 查不到的引用也要说实话：`id` 缺省，不编一个 0 出来。
+    #[test]
+    fn unresolved_quote_ref_has_no_id() {
+        let mut record = sample();
+        record.quote_ref = Some(QuoteRef {
+            platform_id: "gone".into(),
+            id: None,
+        });
+        let value = serde_json::to_value(&record).expect("可序列化");
+        assert_eq!(value["quote_ref"]["platform_id"], "gone");
+        assert!(
+            value["quote_ref"].get("id").is_none(),
+            "查不到就不给 id，别让 0 冒充"
+        );
     }
 
     #[test]

@@ -308,6 +308,7 @@ mod tests {
                 at_self: true,
                 reply_to_self: false,
                 platform_id: None,
+                quote_ref: None,
                 redelivery: None,
                 note: None,
             }],

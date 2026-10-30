@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS records (
     PRIMARY KEY (connection, room_key, record_id)
 );
 
+
 CREATE TABLE IF NOT EXISTS watermarks (
     session    TEXT    NOT NULL,
     connection TEXT    NOT NULL,
@@ -189,7 +190,21 @@ impl SqliteStore {
 
         let store = Self { conn };
         store.check_version()?;
+        // 索引必须等结构补齐之后再建：第 1 版的库里还没有 `connection` / `platform_id`
+        // 这两列，先建索引会直接报「没有这一列」。
+        store.ensure_indexes()?;
         Ok(store)
+    }
+
+    /// 补索引。`IF NOT EXISTS` 所以每次打开都跑一遍也没成本；老库打开时自己就有。
+    fn ensure_indexes(&self) -> Result<(), StorageError> {
+        self.conn
+            .execute_batch(
+                // 引用对齐要按平台编号反查（ADR-0024）。没这个索引就得扫完整个房间。
+                "CREATE INDEX IF NOT EXISTS records_platform
+                     ON records (connection, room_key, platform_id);",
+            )
+            .map_err(|error| backend(format!("建索引失败：{error}")))
     }
 
     /// 把库升到 [`SCHEMA_VERSION`]。
@@ -419,6 +434,7 @@ impl Transcript for SqliteStore {
             at_self: draft.at_self,
             reply_to_self: draft.reply_to_self,
             platform_id: draft.platform_id,
+            quote_ref: None,
             // 流水里只有原话；重投的旁白由投递时补（见 engine::open_turn）。
             redelivery: None,
             note: None,
@@ -517,27 +533,46 @@ impl Transcript for SqliteStore {
         Ok(value.max(0) as u64)
     }
 
-    fn sender_of(&self, room: &RoomId, platform_id: &str) -> Result<Option<Sender>, StorageError> {
+    fn located(&self, room: &RoomId, platform_id: &str) -> Result<Option<Record>, StorageError> {
         if platform_id.is_empty() {
             return Ok(None);
         }
-        self.conn
+        let row = self
+            .conn
             .query_row(
-                "SELECT sender_id, sender_name FROM records
+                // 强制走 platform 索引：不指定的话 SQLite 会选主键索引（省掉排序），
+                // 于是引用一条很老的消息时要一条条往回扫。这里相等条件命中的通常只有
+                // 一行，多一次微小的排序换「不扫全房间」是划算的。
+                "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
+                        reply_to_self, platform_id, elements
+                 FROM records INDEXED BY records_platform
                  WHERE connection = ?1 AND room_key = ?2 AND platform_id = ?3
                  ORDER BY record_id DESC
                  LIMIT 1",
                 params![room.connection, room.key(), platform_id],
                 |row| {
-                    Ok(Sender {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        role: None,
+                    Ok(RawRow {
+                        id: row.get::<_, i64>(0)?.max(0) as u64,
+                        kind: row.get(1)?,
+                        event: row.get(2)?,
+                        sender_id: row.get(3)?,
+                        sender_name: row.get(4)?,
+                        sender_role: row.get(5)?,
+                        at: row.get(6)?,
+                        at_self: row.get::<_, i64>(7)? != 0,
+                        reply_to_self: row.get::<_, i64>(8)? != 0,
+                        platform_id: row.get(9)?,
+                        elements: row.get(10)?,
                     })
                 },
             )
             .optional()
-            .map_err(io_error)
+            .map_err(io_error)?;
+
+        match row {
+            Some(raw) => Ok(Some(raw.into_record(room)?)),
+            None => Ok(None),
+        }
     }
 
     fn prune(&mut self, room: &RoomId, plan: &PrunePlan) -> Result<u64, StorageError> {
@@ -654,6 +689,7 @@ impl RawRow {
             at_self: self.at_self,
             reply_to_self: self.reply_to_self,
             platform_id: self.platform_id,
+            quote_ref: None,
             redelivery: None,
             note: None,
         })

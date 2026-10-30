@@ -363,7 +363,7 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
     }
     const tail = marks.length ? `（${marks.join("、")}）` : ""
     lines.push(`#${record.id} ${when} ${who}(${record.sender.id})${tail}`)
-    lines.push(`  ${renderElements(record.elements ?? [])}`)
+    lines.push(`  ${renderElements(record.elements ?? [], { quoteRef: record.quote_ref })}`)
     // 桥的旁白不是对方说的话，单独一行，绝不拼进上面那行内容里。
     if (record.note) {
       lines.push(`  ※ ${record.note}`)
@@ -404,8 +404,13 @@ function formatTime(at, now) {
   return sameDay ? time : `${date.getMonth() + 1}/${date.getDate()} ${time}`
 }
 
-/** 元素数组 → 一行文本。平台特有内容原样摊给模型看，不替它下结论。 */
-export function renderElements(elements) {
+/**
+ * 元素数组 → 一行文本。平台特有内容原样摊给模型看，不替它下结论。
+ *
+ * `quoteRef` 是桥给的「这条引用的是本房间哪条」：平台只给引用对象自己的编号，
+ * 模型手上是本房间的 #编号，两者对不上就只能猜。桥算好了就并排显示。
+ */
+export function renderElements(elements, { quoteRef } = {}) {
   const parts = []
   for (const element of elements) {
     switch (element.type) {
@@ -415,9 +420,18 @@ export function renderElements(elements) {
       case "at":
         parts.push(element.all ? "@全体成员" : `@${element.target ?? "?"}`)
         break
-      case "quote":
-        parts.push(`[引用 #${element.message_id ?? "?"}]`)
+      case "quote": {
+        const ref = quoteRef && quoteRef.platform_id === element.message_id ? quoteRef : null
+        if (ref && ref.id != null) {
+          parts.push(`[引用 #${ref.id}]`)
+        } else if (ref) {
+          // 桥说这个房间里查不到——可能被清理了，也可能引的是别的房间的消息。
+          parts.push(`[引用 #${element.message_id ?? "?"}，本房间历史里没有这条]`)
+        } else {
+          parts.push(`[引用 #${element.message_id ?? "?"}]`)
+        }
         break
+      }
       case "image":
         parts.push(`[图片 ${element.url ?? ""}]`.trim())
         break

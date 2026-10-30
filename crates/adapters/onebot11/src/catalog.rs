@@ -515,10 +515,17 @@ pub static METHODS: &[MethodSpec] = &[
     ),
     m(
         "message.forward_content",
-        "读一条合并转发的正文。消息里只有一个转发 id 时用它展开",
+        "读一条合并转发的正文，一次给到最里层。返回摊平的节点表：每条的 path（如 1.0 表示\
+         第二条第 0 个回复）、depth（第几层）、sender、text；最外层还有 leaf_text 一句话\
+         概括全部内容。默认展开 3 层，最多 5 层。节点多到上限时 has_more 为真，\
+         把 depth 调大或按某个节点的 forward_id 再调一次即可",
         &[tags::FORWARD, tags::MESSAGE],
         Risk::Read,
-        &[req("id", "转发 id，就是消息里 forward 段的 data.id")],
+        &[
+            req("id", "转发 id，就是消息里 forward 段的 data.id"),
+            num("depth", "展开几层，默认 3、最多 5。只想要外层就给 1"),
+            num("max_nodes", "最多摊多少条节点，默认 200、最多 500"),
+        ],
     ),
     m(
         "message.image",

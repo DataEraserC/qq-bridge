@@ -133,7 +133,15 @@ pub trait Transcript {
     /// 用途只有一个：别人引用了一条消息时，反查被引用的是不是我们自己发的
     /// （见 [`Record::reply_to_self`]）。查不到给 `None`——可能被清理掉了，
     /// 也可能对面没给编号，两种情况都不能瞎猜。
-    fn sender_of(&self, room: &RoomId, platform_id: &str) -> Result<Option<Sender>, StorageError>;
+    fn sender_of(&self, room: &RoomId, platform_id: &str) -> Result<Option<Sender>, StorageError> {
+        Ok(self.located(room, platform_id)?.map(|record| record.sender))
+    }
+
+    /// 按平台消息编号找回那条记录（要它的水位编号，也要它的原话）。
+    ///
+    /// 两个用处：判「是不是在回我的话」，以及把引用里的平台编号翻成本房间编号
+    /// （ADR-0024）。同一编号出现两条时给最新的那条——平台会复用编号，取最近的才合理。
+    fn located(&self, room: &RoomId, platform_id: &str) -> Result<Option<Record>, StorageError>;
 }
 
 /// 一次清理的判据。三条**同时**成立才删——这是「宁可少删」的意思。
@@ -449,6 +457,8 @@ impl Transcript for MemoryStore {
             at_self: draft.at_self,
             reply_to_self: draft.reply_to_self,
             platform_id: draft.platform_id,
+            // 引用对齐是投递时算的（要查库），流水里只留事实本身。
+            quote_ref: None,
             redelivery: None,
             // 流水里存的是原话，旁白只在投递时由调度层补（见 engine::open_turn）。
             note: None,
@@ -533,6 +543,10 @@ impl Transcript for MemoryStore {
     }
 
     fn sender_of(&self, room: &RoomId, platform_id: &str) -> Result<Option<Sender>, StorageError> {
+        Ok(self.located(room, platform_id)?.map(|record| record.sender))
+    }
+
+    fn located(&self, room: &RoomId, platform_id: &str) -> Result<Option<Record>, StorageError> {
         if platform_id.is_empty() {
             return Ok(None);
         }
@@ -541,7 +555,7 @@ impl Transcript for MemoryStore {
                 .iter()
                 .rev()
                 .find(|record| record.platform_id.as_deref() == Some(platform_id))
-                .map(|record| record.sender.clone())
+                .cloned()
         }))
     }
 }

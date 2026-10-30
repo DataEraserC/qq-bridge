@@ -113,6 +113,50 @@ impl ParamSpec {
         }
         Value::Object(schema)
     }
+
+    /// 这个参数在样例里放什么。**填的是看得懂的假值**，不是 `<string>` 这种占位符——
+    /// 占位符还得让人翻译一遍，填好的号改一改就能跑。
+    pub fn sample(&self) -> Value {
+        // 有枚举就取第一个：那是这个参数唯一正确的取值范围。
+        if let Some(first) = self.values.first() {
+            return Value::String((*first).into());
+        }
+        match self.ty {
+            ParamType::Integer => serde_json::json!(10),
+            ParamType::Bool => serde_json::json!(false),
+            ParamType::StringList => serde_json::json!(["10000"]),
+            ParamType::Object => serde_json::json!({}),
+            // 形状不固定的那些：按名字猜最常见的样子。猜不准也没关系，
+            // 它是样例不是约束——参数表里写着真实形状。
+            ParamType::Any => match self.name {
+                "message" => serde_json::json!([{ "type": "text", "text": "你好" }]),
+                "messages" => serde_json::json!([{
+                    "type": "node",
+                    "data": {
+                        "name": "某人",
+                        "uin": "10000",
+                        "content": [{ "type": "text", "text": "你好" }],
+                    }
+                }]),
+                _ => serde_json::json!({}),
+            },
+            ParamType::String => Value::String(sample_string(self.name).to_owned()),
+        }
+    }
+}
+
+/// 字符串参数的样例值。按名字给最像真的那个：群号、QQ 号、文件地址。
+fn sample_string(name: &str) -> &'static str {
+    match name {
+        "group_id" | "group" => "123456",
+        "user_id" | "uin" | "qq" | "target" | "user" => "10000",
+        "file" | "url" | "image" => "https://example.com/a.png",
+        "text" | "message" => "你好",
+        "name" | "card" | "nickname" => "新名字",
+        "keyword" | "query" | "word" => "关键词",
+        _ if name == "id" || name.ends_with("_id") => "123456",
+        _ => "值",
+    }
 }
 
 /// 参数类型。只留模型真用得上、适配器真能转的几种。
@@ -313,6 +357,23 @@ impl MethodSpec {
             schema.insert("required".into(), Value::Array(required));
         }
         Value::Object(schema)
+    }
+
+    /// 一次**能直接照抄**的调用样例。
+    ///
+    /// 只有参数表的话，模型得自己把 Schema 翻译成一次调用——翻译错就得试一轮。
+    /// 这里照必填参数填好一张，改掉里面的号就能用（ADR-0024）。
+    ///
+    /// 只给必填参数：可选参数塞进去会让样例变长，反而不好抄。
+    pub fn example_call(&self) -> Value {
+        let mut params = serde_json::Map::new();
+        for param in self.params.iter().filter(|param| param.required) {
+            params.insert(param.name.to_owned(), param.sample());
+        }
+        serde_json::json!({
+            "method": self.name,
+            "params": Value::Object(params),
+        })
     }
 }
 

@@ -1345,3 +1345,119 @@ fn history_reports_total_and_how_to_go_further_back() {
     assert_eq!(older["total"], 3);
     assert_eq!(older["has_more"], false);
 }
+
+// ---------------------------------------------------------------------------
+// 引用对齐（ADR-0024）
+// ---------------------------------------------------------------------------
+
+/// 引用消息要把平台编号翻成本房间编号：两个号并排给，模型不用自己对齐。
+#[test]
+fn quotes_carry_the_local_watermark_number() {
+    let (mut bridge, _sends) = bridge();
+
+    // 第一条：原话，别人说的。第二条：引用它。
+    bridge
+        .ingest(message("qq:group/123", "10001", "只发子网", false).with_platform_id("p-100"))
+        .expect("能记下来");
+    let reply = RecordDraft::message(
+        room_of("qq:group/123"),
+        Sender {
+            id: "10002".to_owned(),
+            name: "小李".to_owned(),
+            role: None,
+        },
+        AT,
+        vec![
+            Element::Quote {
+                message_id: "p-100".to_owned(),
+            },
+            Element::text("对的对的"),
+        ],
+        true,
+    );
+    bridge
+        .ingest(reply.with_platform_id("p-101"))
+        .expect("能记下来");
+
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    assert_eq!(delivery.records.len(), 2);
+
+    let quoted = &delivery.records[1];
+    let quote_ref = quoted.quote_ref.as_ref().expect("引用了就该有 quote_ref");
+    assert_eq!(quote_ref.platform_id, "p-100");
+    assert_eq!(quote_ref.id, Some(1), "翻成的是本房间的 #1");
+    assert_eq!(quoted.quote_of(), Some("p-100"));
+}
+
+/// 引用一条本房间没有的消息（被清理了、或者别的房间的）：只能给平台编号，
+/// 不能编一个编号出来。
+#[test]
+fn a_quote_outside_the_room_has_no_local_id() {
+    let (mut bridge, _sends) = bridge();
+    let reply = RecordDraft::message(
+        room_of("qq:group/123"),
+        Sender {
+            id: "10002".to_owned(),
+            name: "小李".to_owned(),
+            role: None,
+        },
+        AT,
+        vec![Element::Quote {
+            message_id: "gone".to_owned(),
+        }],
+        true,
+    );
+    bridge
+        .ingest(reply.with_platform_id("p-1"))
+        .expect("能记下来");
+
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    let quote_ref = delivery.records[0]
+        .quote_ref
+        .as_ref()
+        .expect("查不到也要留个说法");
+    assert_eq!(quote_ref.platform_id, "gone");
+    assert_eq!(quote_ref.id, None);
+}
+
+/// get_history 里也能专门要这一列：不对齐的时候不用再手算。
+#[test]
+fn history_can_return_quote_ref_as_a_column() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "只发子网", false).with_platform_id("p-100"))
+        .expect("能记下来");
+    let reply = RecordDraft::message(
+        room_of("qq:group/123"),
+        Sender {
+            id: "10002".to_owned(),
+            name: "小李".to_owned(),
+            role: None,
+        },
+        AT,
+        vec![Element::Quote {
+            message_id: "p-100".to_owned(),
+        }],
+        true,
+    );
+    bridge
+        .ingest(reply.with_platform_id("p-101"))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let history = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "get_history",
+            json!({"columns": ["id", "quote_ref"]}),
+        )
+        .expect("能查");
+    let records = history["records"].as_array().expect("有记录");
+    assert_eq!(records[0]["quote_ref"], serde_json::Value::Null, "没引用就是空");
+    assert_eq!(records[1]["quote_ref"]["platform_id"], "p-100");
+    assert_eq!(records[1]["quote_ref"]["id"], 1);
+    // 状态表照样如实标：别的列这次没取。
+    assert_eq!(records[1]["columns"]["quote_ref"], true);
+    assert_eq!(records[1]["columns"]["elements"], false);
+}

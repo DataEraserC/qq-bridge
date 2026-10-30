@@ -214,6 +214,30 @@ test("引用我的话单独标出来，和 @ 分开说", () => {
   assert.ok(!text.includes("冲你来的"), `引用不是 @，别混着说：${text}`)
 })
 
+test("桥算好了引用对齐就并排显示，模型不用自己映射平台编号", () => {
+  const record = {
+    ...delivery().records[0],
+    id: 621,
+    at_self: true,
+    elements: [{ type: "quote", message_id: "-1179324851" }, { type: "text", text: "对的对的" }],
+    quote_ref: { platform_id: "-1179324851", id: 117 },
+  }
+  const text = renderTurn({ ...delivery(), records: [record] }, { now: Date.now() })
+  assert.match(text, /\[引用 #117\]/, `该用本房间编号：${text}`)
+  assert.ok(!text.includes("-1179324851"), `平台编号不该再出现在正文里：${text}`)
+})
+
+test("引用的是本房间没有的消息时要说实话，不能瞎给编号", () => {
+  const record = {
+    ...delivery().records[0],
+    id: 622,
+    elements: [{ type: "quote", message_id: "gone" }, { type: "text", text: "？" }],
+    quote_ref: { platform_id: "gone" },
+  }
+  const text = renderTurn({ ...delivery(), records: [record] }, { now: Date.now() })
+  assert.match(text, /\[引用 #gone，本房间历史里没有这条\]/)
+})
+
 test("桥的旁白单独一行，不拼进对方说的话里", () => {
   const record = {
     ...delivery().records[0],

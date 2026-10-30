@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
 use acb_proto::{
-    Delivery, Element, ErrorCode, MemoryInfo, Record, RecordKind, RoomId, Sender, SessionInfo,
-    Ticket, ToolError, TurnReason,
+    Delivery, Element, ErrorCode, MemoryInfo, QuoteRef, Record, RecordKind, RoomId, Sender,
+    SessionInfo, Ticket, ToolError, TurnReason,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -673,6 +673,28 @@ impl<S: Store> Bridge<S> {
         Ok(records)
     }
 
+    /// 把引用里的平台编号翻成本房间的水位编号（ADR-0024）。
+    ///
+    /// 平台给的是它自己的编号（`-1179324851`），模型手上是 `#621`。以前这一步得模型
+    /// 自己做，做不了就只能猜；现在两个号码并排给出来。
+    ///
+    /// 查不到也留一个 `id: None` 的 `quote_ref`——「这个房间里没有那条」本身就是信息
+    /// （被清理了，或者引用的是别的平台/别的房间的消息），比什么都不给强。
+    fn fill_quote_refs(&self, room: &RoomId, records: &mut [Record]) {
+        for record in records.iter_mut() {
+            let Some(platform_id) = record.quote_of().map(str::to_owned) else {
+                continue;
+            };
+            let id = self
+                .store
+                .located(room, &platform_id)
+                .ok()
+                .flatten()
+                .map(|found| found.id);
+            record.quote_ref = Some(QuoteRef { platform_id, id });
+        }
+    }
+
     fn subscribers_of(&self, room: &RoomId) -> Vec<Subscriber> {
         let account = self.config.account_of_room(room);
         self.config
@@ -801,6 +823,8 @@ impl<S: Store> Bridge<S> {
     fn open_turn(&mut self, pending: Pending) -> Result<Delivery, BridgeError> {
         let account = self.config.account_of_room(&pending.room);
         let mut records = self.pending_records(&pending.session, &pending.room, &account)?;
+        // 引用里的平台编号翻成本房间编号，跟平台编号并排放（ADR-0024）。
+        self.fill_quote_refs(&pending.room, &mut records);
 
         let mut delivered = BTreeSet::new();
         let cursor = Cursor::new(pending.session.clone(), pending.room.clone());
@@ -1059,6 +1083,7 @@ impl<S: Store> Bridge<S> {
         } else {
             None
         };
+        self.fill_quote_refs(&room, &mut records);
 
         let rendered: Vec<Value> = records.iter().map(|r| record_columns(r, &columns)).collect();
         Ok(json!({
@@ -1100,6 +1125,8 @@ impl<S: Store> Bridge<S> {
             .collect();
 
         // 找出没查到的编号，一起回给调用方，别让 agent 以为「那些 id 不存在」。
+        let mut records = records;
+        self.fill_quote_refs(&room, &mut records);
         let found: std::collections::BTreeSet<u64> = records.iter().map(|r| r.id).collect();
         let missing: Vec<u64> = wanted.difference(&found).copied().collect();
 
@@ -1339,6 +1366,7 @@ impl<S: Store> Bridge<S> {
             "total": methods.len(),
             "matched": hits.len(),
             "methods": hits.iter().map(|method| describe_method(method)).collect::<Vec<_>>(),
+            "hint": "每条都带一个 example：照它把 params 里的号/内容换掉，就能直接喂给 platform_call。",
         }))
     }
 
@@ -1840,6 +1868,7 @@ fn record_columns(record: &Record, columns: &[&str]) -> Value {
             "at" => json!(record.at),
             "elements" => json!(record.elements),
             "platform_id" => json!(record.platform_id),
+            "quote_ref" => json!(record.quote_ref),
             "at_self" => json!(record.at_self),
             "reply_to_self" => json!(record.reply_to_self),
             _ => continue,
@@ -2009,7 +2038,10 @@ fn describe_brief(spec: &MethodSpec) -> Value {
     item
 }
 
-/// 详情档的一条：多一张参数表（JSON Schema，模型最熟的形式）。
+/// 详情档的一条：多一张参数表（JSON Schema，模型最熟的形式）+ 一个能照抄的样例。
+///
+/// 参数表说「该填什么」，样例说「填好长这样」。只给前者，模型还得把 Schema 翻译成
+/// 一次调用；翻译错就要多试一轮，而试错正是反馈里最多的摩擦。
 fn describe_method(spec: &MethodSpec) -> Value {
     json!({
         "name": spec.name,
@@ -2018,6 +2050,7 @@ fn describe_method(spec: &MethodSpec) -> Value {
         "risk": spec.risk.as_str(),
         "scope": spec.scope.as_str(),
         "params": spec.params_schema(),
+        "example": spec.example_call(),
     })
 }
 

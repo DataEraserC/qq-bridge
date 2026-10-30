@@ -30,9 +30,11 @@ const ROOM_SCHEMA = {
 
 const COLUMNS_DOC = `只返回这些列，写成字符串数组。
 能查的列：id（水位编号）、room（房间）、kind（消息/事件）、sender（谁发的）、at（时间）、
-elements（内容）、platform_id（平台原生消息 id，quote 引用要用它）、at_self（是否冲我）、
+elements（内容）、platform_id（平台原生消息 id）、quote_ref（这条引用的是本房间哪条：
+platform_id + id 两个号并排，查不到时只有 platform_id）、at_self（是否冲我）、
 reply_to_self（是否回我）。
 不填默认返回 id/at/sender/elements。填了非法列名会报错并列出合法列名。`
+
 
 const COLUMNS_SCHEMA = {
   type: "array",
@@ -95,7 +97,8 @@ to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/32362244
     name: "get_history",
     description: `翻这个房间过去的记录（含平台事件），用来补上下文。
 返回里有 total（符合条件的总数）、returned（这次给了几条）、has_more；
-要更早的，把 next_before 当 before 再调一次。`,
+要更早的，把 next_before 当 before 再调一次。
+引用对不上时把 quote_ref 加进 columns：它把引用里的平台编号翻成本房间的 #编号。`,
     schema: {
       type: "object",
       properties: {

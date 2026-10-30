@@ -105,6 +105,7 @@ pub const RECORD_COLUMNS: &[&str] = &[
     "at",
     "elements",
     "platform_id",
+    "quote_ref",
     "at_self",
     "reply_to_self",
 ];

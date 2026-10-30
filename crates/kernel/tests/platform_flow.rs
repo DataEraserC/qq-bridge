@@ -778,3 +778,51 @@ fn bad_query_field_lists_the_real_ones() {
     assert!(error.message.contains("[bad_field]"), "{}", error.message);
     assert!(error.message.contains("role"), "{}", error.message);
 }
+
+/// 详情档要给能照抄的样例：参数表说「填什么」，样例说「填好长这样」。
+#[test]
+fn catalog_details_carry_a_copyable_example() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"group": "forward"}),
+        )
+        .expect("能查这一组");
+
+    let example = &result["methods"][0]["example"];
+    assert_eq!(example["method"], "forward.get_content", "样例要能直接喂给 platform_call");
+    assert_eq!(example["params"]["id"], "123456");
+    assert!(result["hint"].as_str().expect("有说明").contains("example"));
+
+    // 清单档不带样例：五十来条都塞一遍，清单就没法看了。
+    let list = bridge
+        .tool_call(&ticket, &sessions(), "platform_methods", json!({}))
+        .expect("能查清单");
+    assert!(list["methods"][0].get("example").is_none());
+}
+
+/// 样例里的值是「改一改就能跑」的，不是 `<string>` 这种还得翻译一遍的占位符。
+#[test]
+fn example_values_look_real() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(&ticket, &sessions(), "platform_methods", json!({"tag": "send"}))
+        .expect("能查");
+
+    let methods = result["methods"].as_array().expect("有方法");
+    let send = methods
+        .iter()
+        .find(|method| method["name"] == "message.send_image")
+        .expect("有发图的方法");
+    assert_eq!(
+        send["example"]["params"]["file"], "https://example.com/a.png",
+        "文件参数给一个真的地址，照着改就行"
+    );
+}

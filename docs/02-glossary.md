@@ -52,13 +52,13 @@
 |------|------|------|
 | `send_message` | elements（或 text） | 发到**当前轮次**的房间。回执 `ok` / `platform_id` / `at` / `room`，失败直接报错 |
 | `send_message_to` | elements, to | 发到别的房间。`to` 的可选目标 = **本会话订阅的房间**，越界拒绝；跨会话发送已砍（ADR-0017） |
-| `get_history` | room, before, limit, columns | 查房间的流水。带 `total` / `has_more` / `next_before` |
+| `get_history` | room, before, limit, columns | 查房间的流水。带 `total` / `has_more` / `next_before`；`columns` 里有 `quote_ref`（引用对到本房间编号，ADR-0024） |
 | `fetch_records` | room, ids, columns | 按水位编号精确查一批（补投递被截断的部分） |
 | `list_rooms` | — | 列出本会话订阅了哪些房间、各自未读多少 |
 | `get_notes` / `set_note` / `del_note` | room, kind, key, value | 房间级笔记（term / member / topic） |
 | `get_platform_events` | room, limit, offset | 查平台事件，带 `total` / `has_more` |
-| `platform_methods` | group, tag, query | 平台能力目录：不给条件给清单，给条件连参数表（JSON Schema） |
-| `platform_call` | method, params, limit, offset, where, fields, order_by, group_by | 调平台方法。分页与查询都在桥这层做（ADR-0022 / 0023） |
+| `platform_methods` | group, tag, query | 平台能力目录：不给条件给清单，给条件连参数表（JSON Schema）+ 可照抄的 `example`（ADR-0024） |
+| `platform_call` | method, params, limit, offset, where, fields, order_by, group_by | 调平台方法。分页与查询都在桥这层做（ADR-0022 / 0023）；合并转发在适配器里递归摊平（ADR-0024） |
 | `report_feedback` | text, refs, count, kind, severity, suggestion | 写一条反馈（ADR-0021）：哪一步卡住、出处编号、撞了几次 |
 | `ack_messages` | ids | 确认消息处理完毕，水位前推。**幂等**；未确认的下轮重投（ADR-0010 修订） |
 | `memory_*` | memory, path, needle, … | 记忆仓库的文件与 git 操作（12 个） |
