@@ -36,6 +36,9 @@ pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
 /// 超过这个数就只投前这么多条，末尾提示「还有 N 条，用 fetch_records 抓」。
 pub const DEFAULT_DELIVERY_LIMIT: usize = 30;
 
+/// `[file_relay].dir` 不写时的默认值。跟 [storage].path 一样相对启动目录。
+pub const DEFAULT_RELAY_DIR: &str = "state/relay";
+
 /// 没配 worktree 根目录时的默认值：工作目录下的 `state/worktrees`。
 /// 来源：实现默认。放 `state/` 是因为那里已经在 .gitignore 里。
 /// 每个「会话 × 记忆」的 worktree 按 `根/记忆id/会话id` 分层，路径固定才谈得上幂等。
@@ -56,6 +59,8 @@ pub struct Config {
     pub endpoint: Option<EndpointConfig>,
     /// 控制台配置。没配就不起控制台（ADR-0018）。
     pub console: Option<ConsoleConfig>,
+    /// 文件中继配置。没配就不起文件服务，本机路径原样透传（ADR-0025）。
+    pub file_relay: Option<FileRelayConfig>,
     /// 平台侧连接。一个账号一条，可以有多条。
     pub connections: Vec<Connection>,
     /// 状态存哪。流水、水位、笔记、投递计数都在这里，重启不改。
@@ -232,6 +237,19 @@ pub struct ConsoleConfig {
     pub listen: String,
     /// 鉴权 token。所有请求都要带（`Authorization: Bearer <token>`）。
     pub token: String,
+}
+
+/// 文件中继（ADR-0025）。agent 和平台不共用文件系统时，桥把本机文件收下来
+/// 换成平台取得到的 URL。没配就不起文件服务，本机路径原样透传。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileRelayConfig {
+    /// 监听地址，如 `0.0.0.0:3131`。
+    pub listen: String,
+    /// 平台那边访问桥用的基地址（不含尾斜杠），如 `http://10.89.0.1:3131`。
+    /// 平台在容器里时通常写宿主网关地址。
+    pub public_base: String,
+    /// 收下的文件落盘位置。
+    pub dir: String,
 }
 
 /// 一张人格卡：纯文本人设。
@@ -585,6 +603,33 @@ impl Config {
             None => None,
         };
 
+        let file_relay = match raw.file_relay {
+            Some(raw) => {
+                let address = raw.listen.trim().to_owned();
+                if address.parse::<std::net::SocketAddr>().is_err() {
+                    return Err(ConfigError::BadListen {
+                        address,
+                        detail: "文件中继要写成 主机:端口，如 0.0.0.0:3131".into(),
+                    });
+                }
+                let public_base = raw.public_base.trim().trim_end_matches('/').to_owned();
+                if !public_base.starts_with("http://") && !public_base.starts_with("https://") {
+                    return Err(ConfigError::BadListen {
+                        address,
+                        detail: "file_relay.public_base 要写平台那边访问桥的完整地址，\
+                                 如 http://10.89.0.1:3131（平台在容器里时通常是宿主网关）"
+                            .into(),
+                    });
+                }
+                Some(FileRelayConfig {
+                    listen: address,
+                    public_base,
+                    dir: raw.dir.unwrap_or_else(|| DEFAULT_RELAY_DIR.to_owned()),
+                })
+            }
+            None => None,
+        };
+
         let mut connections: Vec<Connection> = Vec::with_capacity(raw.connections.len());
         for raw_connection in raw.connections {
             let connection = build_connection(raw_connection)?;
@@ -814,6 +859,7 @@ impl Config {
             sessions,
             endpoint,
             console,
+            file_relay,
             connections,
             storage,
             retention,
@@ -1096,6 +1142,7 @@ struct RawConfig {
     sessions: Vec<RawSession>,
     endpoint: Option<RawEndpoint>,
     console: Option<RawConsole>,
+    file_relay: Option<RawFileRelay>,
     #[serde(default)]
     connections: Vec<RawConnection>,
     storage: Option<RawStorage>,
@@ -1225,6 +1272,13 @@ struct RawEndpoint {
 struct RawConsole {
     listen: String,
     token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFileRelay {
+    listen: String,
+    public_base: String,
+    dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

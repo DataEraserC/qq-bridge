@@ -826,3 +826,117 @@ fn example_values_look_real() {
         "文件参数给一个真的地址，照着改就行"
     );
 }
+
+// ── 文件中继（ADR-0025）────────────────────────────────────────────────
+
+/// 测试用临时目录，Drop 时整个删掉。
+struct TempRelayDir(std::path::PathBuf);
+
+impl TempRelayDir {
+    fn new(name: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("时间正常")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "acb-relay-{}-{name}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("能建临时目录");
+        Self(dir)
+    }
+}
+
+impl Drop for TempRelayDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn 平台调用的params里本机文件换成中继URL() {
+    let temp = TempRelayDir::new("platform-call");
+    let source = temp.0.join("upload.bin");
+    std::fs::write(&source, b"file-bytes").expect("能写源文件");
+
+    // [file_relay] 是根级表，追加在配置末尾是合法 TOML。
+    let text = format!(
+        "{}\n[file_relay]\nlisten = \"127.0.0.1:0\"\npublic_base = \"http://10.89.0.1:3131\"\ndir = \"{}\"",
+        config(),
+        temp.0.join("relay").display()
+    );
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let mut bridge = Bridge::new(
+        acb_kernel::Config::parse(&text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Platformy {
+            calls: calls.clone(),
+        }),
+    );
+    let ticket = open_turn(&mut bridge);
+
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({
+                "method": "group.get_member_info",
+                "params": {"user_id": "10001", "group_id": source.display().to_string()},
+            }),
+        )
+        .expect("能调");
+
+    let calls = calls.lock().expect("没被毒死");
+    let (method, params) = &calls[0];
+    assert_eq!(method, "group.get_member_info");
+    let file = params["group_id"].as_str().expect("group_id 还是字符串");
+    assert!(
+        file.starts_with("http://10.89.0.1:3131/f/"),
+        "本机路径应该换成中继 URL，实际是 {file}"
+    );
+    assert_eq!(params["user_id"], json!("10001"), "别的参数不动");
+    let rest = file.strip_prefix("http://10.89.0.1:3131/f/").expect("前缀对");
+    assert!(
+        temp.0.join("relay").join(rest).is_file(),
+        "文件应该真的落在中继目录里"
+    );
+}
+
+#[test]
+fn 平台调用的http路径原样透传() {
+    let temp = TempRelayDir::new("platform-http");
+    let text = format!(
+        "{}\n[file_relay]\nlisten = \"127.0.0.1:0\"\npublic_base = \"http://10.89.0.1:3131\"\ndir = \"{}\"",
+        config(),
+        temp.0.join("relay").display()
+    );
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let mut bridge = Bridge::new(
+        acb_kernel::Config::parse(&text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Platformy {
+            calls: calls.clone(),
+        }),
+    );
+    let ticket = open_turn(&mut bridge);
+
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({
+                "method": "group.get_member_info",
+                "params": {"user_id": "10001", "group_id": "https://elsewhere.example/a.png"},
+            }),
+        )
+        .expect("能调");
+
+    let calls = calls.lock().expect("没被毒死");
+    assert_eq!(
+        calls[0].1["group_id"],
+        json!("https://elsewhere.example/a.png"),
+        "http(s) 路径不依赖本地命名空间，不该动"
+    );
+}

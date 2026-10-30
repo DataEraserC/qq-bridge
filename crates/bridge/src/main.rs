@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use acb_adapter_onebot11::{LinkSlot, OneBotOutbound, supervise};
-use acb_kernel::{Bridge, Config, ControlRegistry, Outbounds, SqliteStore, serve};
+use acb_kernel::{
+    Bridge, Config, ControlRegistry, FileRelay, Outbounds, SqliteStore, serve,
+};
 
 mod console;
 use console::Console;
@@ -137,6 +139,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("控制台已监听 {}（token 鉴权）", console.listen);
         }
         None => println!("没有配 [console]，控制台不起"),
+    }
+
+    // 文件中继：平台在别的文件系统命名空间里时（典型：平台在容器、agent 在宿主机），
+    // 桥替 agent 把本机文件收下来换成平台取得到的 URL（ADR-0025）。
+    // 发布（写文件）在 Bridge 里做，这里只起取文件的 HTTP 服务——
+    // 两边各持一个 FileRelay 实例，共享同一个目录，token 目录就是事实来源。
+    match &config.file_relay {
+        Some(relay_config) => {
+            let relay = Arc::new(FileRelay::new(&relay_config.dir, &relay_config.public_base));
+            relay.sweep_expired();
+            let listener = std::net::TcpListener::bind(&relay_config.listen)?;
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || FileRelay::serve(listener, relay, shutdown));
+            println!(
+                "文件中继已监听 {}，平台从 {} 取文件（存 {}）",
+                relay_config.listen, relay_config.public_base, relay_config.dir
+            );
+        }
+        None => println!("没有配 [file_relay]，本机文件路径原样透传"),
     }
 
     {

@@ -9,6 +9,7 @@ pub mod engine;
 pub mod memory;
 pub mod outbound;
 pub mod query;
+pub mod relay;
 pub mod render;
 pub mod sanitize;
 pub mod storage;
@@ -21,6 +22,7 @@ pub use config::{
     Transport, WakeDecision, WakeInput, WakePolicy,
 };
 pub use endpoint::{Conn, ControlRegistry, EndpointError, handshake, run_connection, serve};
+pub use relay::{FileRelay, RelayError};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY, Pruned};
 pub use outbound::{
     CallError, MethodSpec, Outbound, OutboundError, Outbounds, ParamSpec, ParamType, Risk, Scope, Sent,

@@ -153,11 +153,18 @@ pub struct Bridge<S: Store> {
     ticket_seq: u64,
     /// 记忆仓库管理器：负责裸仓库 init 与 worktree checkout。
     memory: MemoryRepo,
+    /// 文件中继。配了 `[file_relay]` 才有：发送/平台调用里的本机文件
+    /// 换成平台取得到的 URL（ADR-0025）。
+    relay: Option<crate::relay::FileRelay>,
 }
 
 impl<S: Store> Bridge<S> {
     pub fn new(config: Config, store: S, outbound: Box<dyn Outbound>) -> Self {
         let memory = MemoryRepo::new(config.worktrees_root.clone());
+        let relay = config
+            .file_relay
+            .as_ref()
+            .map(|cfg| crate::relay::FileRelay::new(&cfg.dir, &cfg.public_base));
         Self {
             config,
             store,
@@ -168,6 +175,7 @@ impl<S: Store> Bridge<S> {
             ended: HashMap::new(),
             ticket_seq: 0,
             memory,
+            relay,
         }
     }
 
@@ -949,6 +957,11 @@ impl<S: Store> Bridge<S> {
                 },
             ));
         }
+
+        // 本机文件换成平台取得到的 URL（ADR-0025）。配了 [file_relay] 才有动作；
+        // 没配、或路径不是本机存在的文件，就原样透传——平台侧路径（共享卷等）不受影响。
+        let relayed = self.relay_elements(&mut elements)?;
+
         let account = self.config.account_of_room(room);
         if account.is_empty() {
             return Err(ToolError::new(
@@ -1005,7 +1018,107 @@ impl<S: Store> Bridge<S> {
                  那串东西是解析工具调用时漏进来的，不是正文；要传的参数放各自字段里，别写进 text。"
             );
         }
+        if !relayed.is_empty() {
+            // 也必须说：模型给的是本机路径，实际发出去的是中继 URL。
+            receipt["relayed"] = json!(relayed
+                .iter()
+                .map(|(from, to)| json!({"from": from, "to": to}))
+                .collect::<Vec<_>>());
+        }
         Ok(receipt)
+    }
+
+    /// 把元素里的本机文件收进中继，换成平台取得到的 URL。返回 (原路径, URL) 列表。
+    ///
+    /// 只动「本机真实存在」的路径：本机没有的路径可能是平台那边才存在的
+    /// （共享卷、平台自己的缓存），动它反而弄坏原本能用的写法。
+    fn relay_elements(
+        &mut self,
+        elements: &mut [Element],
+    ) -> Result<Vec<(String, String)>, ToolError> {
+        let Some(relay) = &self.relay else {
+            return Ok(Vec::new());
+        };
+        let mut relayed = Vec::new();
+        for element in elements.iter_mut() {
+            let url = match element {
+                Element::Image { url, .. } | Element::Audio { url } | Element::Video { url } => url,
+                Element::File { url, .. } => url,
+                _ => continue,
+            };
+            let Some(local) = crate::relay::local_path(url) else {
+                continue;
+            };
+            if !local.is_file() {
+                continue;
+            }
+            match relay.publish(&local) {
+                Ok(published) => {
+                    relayed.push((url.clone(), published.clone()));
+                    *url = published;
+                }
+                Err(error) => {
+                    return Err(ToolError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "[bad_params] 文件 {} 本机存在，但桥收不下来：{error}。\
+                             平台拿不到这个文件。先看 [file_relay].dir 能不能写；\
+                             小文件（base64 后 1 MiB 内）也可以把 url 写成 base64://… 内联。",
+                            local.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(relayed)
+    }
+
+    /// 把 params 里的本机文件路径换成中继 URL（ADR-0025）。
+    ///
+    /// 平台调用（upload_file 这类）的文件路径在 params 里，不在元素里，是同一个断层。
+    /// 递归遍历，只动「本机真实存在」的绝对路径，其余字符串原样保留。
+    fn relay_params(&self, params: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+        fn walk(
+            relay: &crate::relay::FileRelay,
+            value: serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
+            match value {
+                serde_json::Value::String(text) => {
+                    let Some(local) = crate::relay::local_path(&text) else {
+                        return Ok(serde_json::Value::String(text));
+                    };
+                    if !local.is_file() {
+                        return Ok(serde_json::Value::String(text));
+                    }
+                    relay.publish(&local).map(serde_json::Value::String).map_err(|error| {
+                        ToolError::new(
+                            ErrorCode::BadRequest,
+                            format!(
+                                "[bad_params] params 里的文件 {} 本机存在，\
+                                 但桥收不下来：{error}。小文件可以改用 base64:// 内联。",
+                                local.display()
+                            ),
+                        )
+                    })
+                }
+                serde_json::Value::Array(items) => items
+                    .into_iter()
+                    .map(|item| walk(relay, item))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(serde_json::Value::Array),
+                serde_json::Value::Object(map) => map
+                    .into_iter()
+                    .map(|(key, value)| walk(relay, value).map(|value| (key, value)))
+                    .collect::<Result<serde_json::Map<_, _>, _>>()
+                    .map(serde_json::Value::Object),
+                other => Ok(other),
+            }
+        }
+
+        match &self.relay {
+            Some(relay) => walk(relay, params),
+            None => Ok(params),
+        }
     }
 
     /// 确认一批记录。
@@ -1449,9 +1562,13 @@ impl<S: Store> Bridge<S> {
 
         check_params(spec, &args.params)?;
 
+        // params 里的本机文件路径同样换成中继 URL（ADR-0025）——upload_file 这类
+        // 平台方法拿的是 params 里的路径，跟 send_message 的元素是同一个断层。
+        let params = self.relay_params(args.params)?;
+
         let result = self
             .outbound
-            .call(&room, spec.name, &args.params)
+            .call(&room, spec.name, &params)
             .map_err(call_error)?;
 
         // 查询在**分页之前**做：先过滤/分组，再切页——否则 `_page.total` 给的是过滤前的数，
@@ -1959,9 +2076,15 @@ fn internal(error: impl std::fmt::Display) -> ToolError {
 
 fn outbound_error(error: OutboundError) -> ToolError {
     match error {
-        OutboundError::Rejected(detail) => ToolError::new(ErrorCode::Internal, detail),
-        OutboundError::Unsupported(detail) => ToolError::new(ErrorCode::BadRequest, detail),
-        OutboundError::Unavailable(detail) => ToolError::new(ErrorCode::Internal, detail),
+        OutboundError::Rejected(detail) => {
+            ToolError::new(ErrorCode::Internal, with_file_hint(detail))
+        }
+        OutboundError::Unsupported(detail) => {
+            ToolError::new(ErrorCode::BadRequest, with_file_hint(detail))
+        }
+        OutboundError::Unavailable(detail) => {
+            ToolError::new(ErrorCode::Internal, with_file_hint(detail))
+        }
     }
 }
 
@@ -2274,5 +2397,28 @@ fn call_error(error: CallError) -> ToolError {
         CallError::Forbidden(_) => (ErrorCode::ToolNotAllowed, "forbidden"),
         CallError::Unavailable(_) => (ErrorCode::Internal, "unavailable"),
     };
-    ToolError::new(code, format!("[{kind}] {error}"))
+    ToolError::new(code, with_file_hint(format!("[{kind}] {error}")))
+}
+
+/// 平台说「文件没有」时，多半不是路径写错：agent 和平台常常不在同一个文件系统
+/// 命名空间里（平台在容器里），同一个文件两边看到的路径不一样。裸 ENOENT 会把
+/// 排查方向带偏到拼写/权限/软链上——把三条出路附在错误后面。
+fn with_file_hint(detail: String) -> String {
+    let lower = detail.to_ascii_lowercase();
+    let missing = lower.contains("enoent")
+        || lower.contains("no such file")
+        || lower.contains("realpath")
+        || lower.contains("image not found")
+        || lower.contains("file not found")
+        || lower.contains("not found in cache");
+    if !missing {
+        return detail;
+    }
+    format!(
+        "{detail}\n[文件问题?] 平台说的「没有」很可能不是路径写错：agent 和平台常常不在\
+         同一个文件系统命名空间（平台在容器里）。三条出路：\
+         ① 配好 [file_relay] 后重试，本机存在的文件桥会自动收下换成 URL；\
+         ② 小文件（原始内容 750 KB 内，单帧上限 1 MiB）把元素的 url 写成 base64://…；\
+         ③ 放到两边都挂载了的共享目录，传平台那边的路径。别先去查路径拼写和权限。"
+    )
 }

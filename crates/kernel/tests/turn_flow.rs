@@ -1597,3 +1597,126 @@ fn history_can_return_quote_ref_as_a_column() {
     assert_eq!(records[1]["columns"]["quote_ref"], true);
     assert_eq!(records[1]["columns"]["elements"], false);
 }
+
+// ── 文件中继（ADR-0025）────────────────────────────────────────────────
+
+/// 测试用临时目录，Drop 时整个删掉。
+struct TempRelayDir(std::path::PathBuf);
+
+impl TempRelayDir {
+    fn new(name: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("时间正常")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "acb-relay-{}-{name}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("能建临时目录");
+        Self(dir)
+    }
+}
+
+impl Drop for TempRelayDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn 发送时本机文件换成中继URL_别的路径不动() {
+    let temp = TempRelayDir::new("send");
+    let source = temp.0.join("截图 01.png");
+    std::fs::write(&source, b"png-bytes").expect("能写源文件");
+
+    // [file_relay] 是根级表，追加在配置末尾是合法 TOML。
+    let text = format!(
+        "{}\n[file_relay]\nlisten = \"127.0.0.1:0\"\npublic_base = \"http://10.89.0.1:3131\"\ndir = \"{}\"",
+        config(),
+        temp.0.join("relay").display()
+    );
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let mut bridge = Bridge::new(
+        acb_kernel::Config::parse(&text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder {
+            sends: sends.clone(),
+        }),
+    );
+
+    bridge
+        .ingest(message("qq:group/123", "10001", "发个图", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let receipt = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message",
+            json!({
+                "elements": [
+                    {"type": "image", "url": source.display().to_string()},
+                    {"type": "image", "url": "http://elsewhere.example/a.png"},
+                    {"type": "text", "text": "看图"},
+                ],
+            }),
+        )
+        .expect("能发");
+
+    assert_eq!(receipt["ok"], json!(true));
+    let relayed = receipt["relayed"].as_array().expect("回执里有 relayed");
+    assert_eq!(relayed.len(), 1, "只换本机存在的那一个");
+    assert_eq!(relayed[0]["from"], json!(source.display().to_string()));
+    let to = relayed[0]["to"].as_str().expect("有 to").to_owned();
+    assert!(to.starts_with("http://10.89.0.1:3131/f/"), "{to}");
+
+    let all = sends.lock().expect("没被毒死");
+    let (_, elements) = &all[0];
+    assert!(
+        matches!(&elements[0], Element::Image { url, .. } if url.starts_with("http://10.89.0.1:3131/f/")),
+        "发出去的应该是中继 URL"
+    );
+    assert!(
+        matches!(&elements[1], Element::Image { url, .. } if url == "http://elsewhere.example/a.png"),
+        "http 路径原样透传"
+    );
+    assert!(matches!(&elements[2], Element::Text { .. }));
+
+    // 收下的文件真的落盘了，URL 里的两段就是目录名/文件名。
+    let rest = to.strip_prefix("http://10.89.0.1:3131/f/").expect("前缀对");
+    assert!(
+        temp.0.join("relay").join(rest).is_file(),
+        "文件应落在 {rest}"
+    );
+}
+
+#[test]
+fn 没配文件中继时本机路径原样透传() {
+    let (mut bridge, sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "发个图", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message",
+            json!({
+                "elements": [
+                    {"type": "image", "url": "/home/nixos/ somewhere/a.png"},
+                ],
+            }),
+        )
+        .expect("能发");
+
+    let all = sends.lock().expect("没被毒死");
+    let (_, elements) = &all[0];
+    assert!(
+        matches!(&elements[0], Element::Image { url, .. } if url == "/home/nixos/ somewhere/a.png"),
+        "没配 [file_relay] 就不碰路径——行为跟没有这个功能时完全一样"
+    );
+}
