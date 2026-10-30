@@ -118,6 +118,7 @@ export ACB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 | 插件明明连上了，日志里却一个字都没有，查不到「已接入桥」 | 实测 2.0.22 在 `serve --stdio` 下 `ctx.app.log` **不落盘**（`~/.local/share/opencode/log/opencode.log` 里搜不到任何 `service=` 的行），所以日志必须**同时**写一份 `console.error`（stderr 安全，stdout 不行） |
 | 模型照你说的直呼 `send_message`，报 `No tool named "send_message" is currently available` | v2 里插件注册的工具进的是「Code Mode」目录，**不在**模型的原生工具表里；必须用 `execute` 跑一行 JS：`await tools.send_message({ text: "…" })`。插件现在会在投递末尾附这条提示，免得模型白失败一次 |
 | 配置写 `"plugin": ["./acb.js"]` 报 `configured plugin path must be a directory` | v2 的键叫 `plugins`（复数），且本地路径必须是**目录**，指向单个文件会被跳过 |
+| 模型能绕过桥直接 `fetch` 平台端口：不校验订阅、不记水位、不进归档，桥一声不知道 | `execute` 的运行时**提供 `fetch`**（官方原文 "It provides fetch for HTTP requests"）——这是 Code Mode 的设计，不是漏配。桥在另一个进程，拦不住。做法：投递末尾把 `platform_methods` / `platform_call` 指给它，并说清绕过去之后「消息不归档，下一轮对这段对话就失忆」。真要堵死只能走网络层（平台端口只监听本机 / 配 access_token）或 harness 侧权限规则 |
 
 ## 怎么验
 
@@ -220,6 +221,9 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
   `data.id` 三种老形状；opencode 换版本改形状时，这里要跟着看。
 - 插件文件改动后 opencode 的 watcher 会热重载（日志里会再出现一次 `已接入桥`），旧连接自动断。
   这个行为没写进任何文档，属于实测观察。
+- **Code Mode 的目录预算是 2000 token，acb 的 25 个工具塞不塞得下没量过**（来自官方文档，未实测）。
+  塞不下的会靠 `$codemode.search` 按需查，理论上仍能发现 `platform_call`；但如果模型压根不去搜，
+  就会退化成「只有提示里提到的那几个工具可用」。要确认得装一台能跑插件的 opencode 看目录实际内容。
 
 ## 换成 1AgentRouter：卡住的两个真坑（2026-10-29 下午）
 

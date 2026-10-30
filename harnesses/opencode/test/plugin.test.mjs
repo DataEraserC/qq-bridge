@@ -169,6 +169,22 @@ test("一轮走完：建会话 → 提问 → 等它说完 → 收工", async (t
   assert.deepEqual(await bridge.next(), { frame: "turn_end", ticket: TICKET })
 })
 
+// opencode 的 execute 里带 fetch（官方文档明说 "It provides fetch for HTTP requests"）。
+// 也就是说模型随时能绕过桥直连平台端口：不校验订阅、不记水位、不进归档，桥一声不知道。
+// 拦不住，只能在给它看的话里把「有正经出口」和「绕道的代价」说清楚。
+test("投递里要把平台能力指给模型看，并说清绕过桥的代价", async (t) => {
+  const { bridge, host } = await boot(t)
+  await openTurn(bridge, host)
+
+  const text = host.prompts[0].text
+  assert.match(text, /tools\.platform_methods/, "不指路，模型不知道有这本事，转头自己去 fetch")
+  assert.match(text, /tools\.platform_call/, "光给目录不够，得给调用口")
+  assert.match(text, /fetch/, "要明说别用 fetch 直连端口")
+  assert.match(text, /水位|归档/, "光说「不许」没用，得说清绕过去之后消息不归档、下一轮就失忆")
+
+  host.finishTurn()
+})
+
 test("同一设备第二轮接着用同一个会话，不新建", async (t) => {
   const { bridge, host } = await boot(t)
 
