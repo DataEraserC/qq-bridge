@@ -50,7 +50,7 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 
 | harness | 扩展点 | 轮次驱动 | 判断 |
 |---------|--------|----------|------|
-| opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册，模型经 `execute` 调 `tools.X`） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，见 `harnesses/opencode/plugin/`；真机整轮已验（私聊 + 群） |
+| opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册，模型经 `execute` 调 `tools.X`） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，见 `harnesses/opencode/plugin/`；真机整轮已验（私聊 + 群）；2026-10-31 在 opencode2 2.0.22 上复验：插件加载正常、模型一次答全 25 个工具名 |
 | DSH | MCP（`dsh-mcp-client`，工具名 `mcp__acb__*`） | 进程外：驱动器调 webui HTTP/WS API（`session/prompt` + `session/follow` 等 `turn/end`） | 进程外 + MCP，见 `harnesses/dsh/`；协议层真机已验，模型真回话待配模型 |
 | WorkBuddy | 待核实 | 待核实 | 未看 |
 | Trae | 待核实 | 待核实 | 未看 |
@@ -118,7 +118,7 @@ export ACB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 | 插件明明连上了，日志里却一个字都没有，查不到「已接入桥」 | 实测 2.0.22 在 `serve --stdio` 下 `ctx.app.log` **不落盘**（`~/.local/share/opencode/log/opencode.log` 里搜不到任何 `service=` 的行），所以日志必须**同时**写一份 `console.error`（stderr 安全，stdout 不行） |
 | 模型照你说的直呼 `send_message`，报 `No tool named "send_message" is currently available` | v2 里插件注册的工具进的是「Code Mode」目录，**不在**模型的原生工具表里；必须用 `execute` 跑一行 JS：`await tools.send_message({ text: "…" })`。插件现在会在投递末尾附这条提示，免得模型白失败一次 |
 | 配置写 `"plugin": ["./acb.js"]` 报 `configured plugin path must be a directory` | v2 的键叫 `plugins`（复数），且本地路径必须是**目录**，指向单个文件会被跳过 |
-| 模型能绕过桥直接 `fetch` 平台端口：不校验订阅、不记水位、不进归档，桥一声不知道 | `execute` 的运行时**提供 `fetch`**（官方原文 "It provides fetch for HTTP requests"）——这是 Code Mode 的设计，不是漏配。桥在另一个进程，拦不住。做法：投递末尾把 `platform_methods` / `platform_call` 指给它，并说清绕过去之后「消息不归档，下一轮对这段对话就失忆」。真要堵死只能走网络层（平台端口只监听本机 / 配 access_token）或 harness 侧权限规则 |
+| 模型能绕过桥直接 `fetch` 平台端口：不校验订阅、不记水位、不进归档，桥一声不知道 | `execute` 的运行时**提供 `fetch`**（官方原文 "It provides fetch for HTTP requests"）——这是 Code Mode 的设计，不是漏配。桥在另一个进程，拦不住。做法：投递末尾把 `platform_methods` / `platform_call` 指给它，并说清绕过去之后「消息不归档，下一轮对这段对话就失忆」。真要堵死只能走网络层（平台端口只监听本机 / 配 access_token）或 harness 侧权限规则。**已实测（2026-10-31，opencode2 2.0.22）**：execute 里 `fetch("http://127.0.0.1:4097/")` 返回 `200\|<!doctype html>`，本机端口随便敲；敲 53000 拿到 `unauthorized`（401），说明连得通、只是缺 token |
 
 ## 怎么验
 
@@ -139,6 +139,40 @@ node harnesses/opencode/probe.mjs --token <设备令牌>
 
 第 3 步里 `probe.mjs` 会把投递的内容打出来、回一句话、确认水位。它和插件用的是同一个
 协议客户端，所以这里看得到的，插件也看得到——区别只在「交给谁去思考」。
+
+### 没有 TUI 时怎么驱动它（2026-10-31 摸出来的）
+
+在 AI 会话/脚本里跑不了交互界面，这两条路都不通，别浪费时间：
+
+- `opencode2 run --standalone`：卡死在内部的 `serve --stdio`，日志只到「spawning process」，
+  然后一直没输出（两次实测，100 秒零进展）。
+- `opencode2 service start` + `run`：服务进程在会话沙箱里起不来，CLI 报
+  `Transport: Unable to connect`——就是老问题，常驻进程不能挂在会话里。
+
+能走通的是让 systemd 托管一个 HTTP 服务，再用 API 驱动：
+
+```bash
+# 1. 后台起服务（脱离会话沙箱；WorkingDirectory 必须是放了 opencode.json 的目录）
+systemd-run --user --unit=oc-test --collect \
+  -p WorkingDirectory=/home/nixos/qqab-scratch/oc-live \
+  --setenv=OPENCODE_PASSWORD=<自己定一个> \
+  /bin/sh -c 'env -u HTTP_PROXY -u HTTPS_PROXY NODE_EXTRA_CA_CERTS=$PWD/ca.pem \
+    opencode2 serve --hostname 127.0.0.1 --port 4097'
+
+# 2. 建会话 → 发话 → 读回复（全部 basic auth，用户名随便写）
+curl -u "opencode:<密码>" -H 'Content-Type: application/json' \
+  -X POST http://127.0.0.1:4097/api/session -d '{}'
+curl -u "opencode:<密码>" -H 'Content-Type: application/json' \
+  -X POST http://127.0.0.1:4097/api/session/<会话id>/prompt -d '{"text":"…"}'
+curl -u "opencode:<密码>" http://127.0.0.1:4097/api/session/<会话id>/message
+
+# 3. 收工
+systemctl --user stop oc-test
+```
+
+`prompt` 是**异步**的：调用只把话排进去，回复要过几秒再拉 `/message` 才有。消息列表里
+`type=assistant` 的 `content[]` 才是模型说的话，`type=reasoning` 是它的思考，`type=tool` 是
+工具调用（带 `state.status`，卡在 `running` 就是没人批准权限）。
 
 ## 实测进度（2026-10-29）
 
@@ -221,9 +255,12 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
   `data.id` 三种老形状；opencode 换版本改形状时，这里要跟着看。
 - 插件文件改动后 opencode 的 watcher 会热重载（日志里会再出现一次 `已接入桥`），旧连接自动断。
   这个行为没写进任何文档，属于实测观察。
-- **Code Mode 的目录预算是 2000 token，acb 的 25 个工具塞不塞得下没量过**（来自官方文档，未实测）。
-  塞不下的会靠 `$codemode.search` 按需查，理论上仍能发现 `platform_call`；但如果模型压根不去搜，
-  就会退化成「只有提示里提到的那几个工具可用」。要确认得装一台能跑插件的 opencode 看目录实际内容。
+- ~~Code Mode 的目录预算是 2000 token，acb 的 25 个工具塞不塞得下没量过~~ → **已验（2026-10-31）**：
+  实测让模型「把这类工具名全部列出来」，它一次列了 25 个、一个不差（`send_message` … `set_note`）。
+  目录装得下，不用靠 `$codemode.search` 兜。
+- **原生工具调用要过权限**（实测）：让模型用原生 `read` 读 `config.toml`，工具停在 `status: "running"`、
+  没执行——`serve` 模式没人批准就不动。但 `execute` 里的 `fetch` **不受这道门管**（它不是工具）。
+  所以「读 token」这一步有阻力，「用 token 敲端口」这一步没有。开 `--auto` 时前者也没了。
 
 ## 换成 1AgentRouter：卡住的两个真坑（2026-10-29 下午）
 
