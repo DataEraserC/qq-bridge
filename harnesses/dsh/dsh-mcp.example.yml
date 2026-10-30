@@ -1,48 +1,68 @@
-# dsh 侧配置示例：每个 acb 会话一个 agent preset，每个 preset 只挂它自己的 MCP。
+# dsh 侧部署说明：每个 acb 会话一个 agent preset，每个 preset 只挂它自己的 MCP。
+#
+# ⚠️ 这个文件是**说明**，不是可直接 --patch 的文件。
+#    真正能用的 patch 在 `dsh-mcp.patch.yml`（同目录），启动时把那个传给 dsh-real。
 #
 # 为什么这样配（见 ADR-0019）：
 #   dsh 的 MCP 工具调用 tools/call 不带「来自哪个 session」，单进程没法路由到正确会话。
 #   正确做法是「每会话一个 preset、每 preset 挂自己的 MCP」——模型在某个 dsh session 里
-#   只会看到那一套工具（mcp__acb__*），不会再拿到「另一套没票的工具」去试错。
+#   只会看到那一套工具（mcp__acb__*），不会拿到「另一套没票的工具」去试错。
 #
 # 配套的 driver.mjs 用 streamable-http 常驻模式（ACB_MCP_PORT 指定端口），每个 acb 会话
 # 一个独立 driver 进程 + 一个独立端口。dsh 的 MCP client 用 streamable-http 连它，
 # 没有「driver 靠 dsh 拉起、dsh 靠 driver 建 session」的死结。
 #
-# 下面以两个 acb 会话（dsh + dsh-group2）为例。
-
-- id: agent-preset-registry
-  name: '@deepseek-ai/dsh-agent-preset-registry'
-  config:
-    default: acb-dsh
-
-# 会话一（acb 的 dsh 会话）：挂它自己的 MCP（连 3101 那个 driver 进程）。
-- id: preset-acb-dsh
-  name: '@deepseek-ai/dsh-agent-preset'
-  config:
-    id: acb-dsh
-    plugins:
-      - id: mcp-acb-dsh
-        name: '@deepseek-ai/dsh-mcp-client'
-        config:
-          transport: streamable-http
-          serverName: acb
-          url: http://127.0.0.1:3101/mcp
-
-# 会话二（acb 的 dsh-group2 会话）：挂它自己的 MCP（连 3102 那个 driver 进程）。
-- id: preset-acb-dsh-group2
-  name: '@deepseek-ai/dsh-agent-preset'
-  config:
-    id: acb-dsh-group2
-    plugins:
-      - id: mcp-acb-dsh-group2
-        name: '@deepseek-ai/dsh-mcp-client'
-        config:
-          transport: streamable-http
-          serverName: acb
-          url: http://127.0.0.1:3102/mcp
-
-# 两个 driver 进程（常驻，不是 dsh spawn），各自连桥 + 各自端口：
+# ---------------------------------------------------------------------------
+# 怎么部署（临时测试用，不改 nix 配置、不动会被还原的 managed profile）
+# ---------------------------------------------------------------------------
+#
+#   dsh-real --profile nix-web-acb \
+#     --patch /home/nixos/.dsh/profiles/web/cordis.patch.yml \
+#     --patch <仓库>/harnesses/dsh/dsh-mcp.patch.yml \
+#     --no-open --port 3080
+#
+# 两个 patch 缺一不可：
+#   ① web 的 patch 提供 LLM provider（含 apiKey，环境相关，**不进仓库**）。
+#      缺它会报 no adapter registered for provider "new-api-..."（NO_ADAPTER）。
+#   ② 仓库的 patch 提供 agent preset。
+#      缺它会报 Unknown agent preset: acb-dsh，session 连 resume 都做不到。
+#
+# 必须用 `dsh-real` 而不是 PATH 里的 `dsh`：后者是 dsh-seed-profile 的包装器，
+# 会按模板重建 profile，把 --patch 注入的东西洗掉。
+#
+# 日常起停直接跑 `~/qqab-scratch/acb-up.sh` / `acb-down.sh`，里面已经封装好这些。
+#
+# ---------------------------------------------------------------------------
+# patch 语法要点（踩过，务必记住）
+# ---------------------------------------------------------------------------
+#
+# dsh 的 patch 默认语义是「**改**已有条目」：
+#
+#   - id: agent-preset-registry          # 改已有条目，这样写没问题
+#     config:
+#       default: acb-dsh
+#
+# 但**新增**条目不能这么写。只写 - id: preset-acb-dsh 而该条目不存在时，dsh 会报
+#   patch: entry "preset-acb-dsh" not found
+# 然后**静默忽略**这一条——看起来 patch 成功了，实际什么都没加。
+#
+# 新增必须写成没有 id 的 insert，insert 的值就是新条目列表：
+#
+#   - insert:
+#       - id: preset-acb-dsh
+#         name: '@deepseek-ai/dsh-agent-preset'
+#         config:
+#           id: acb-dsh
+#           order: 10
+#           plugins: [...]
+#
+# 验证 patch 是否正确，用 --dump-config 空跑（只打印组合后的配置树，不启动服务）：
+#
+#   dsh-real --profile nix-web-acb --patch <文件> --dump-config | grep preset-acb-dsh
+#
+# ---------------------------------------------------------------------------
+# 两个 driver 进程（常驻，不是 dsh spawn），各自连桥 + 各自端口
+# ---------------------------------------------------------------------------
 #
 #   # 会话一（token = config.toml 里 dsh 会话的 token）
 #   ACB_ENDPOINT=127.0.0.1:7700 ACB_TOKEN=ea0e40... ACB_HARNESS=dsh \

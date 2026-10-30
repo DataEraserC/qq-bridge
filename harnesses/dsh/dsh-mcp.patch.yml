@@ -1,0 +1,76 @@
+# dsh 侧部署层：给每个 acb 会话注册一个 agent preset，每个 preset 只挂它自己的 MCP。
+#
+# 为什么这样配（ADR-0019）：
+#   dsh 的 MCP 工具调用 tools/call 不带「来自哪个 session」，单进程没法路由到正确会话。
+#   正确做法是「每会话一个 preset、每 preset 挂自己的 MCP」——模型在某个 dsh session 里
+#   只会看到那一套工具（mcp__acb__*），不会拿到「另一套没票的工具」去试错。
+#
+# 怎么用（临时部署，不改 nix 配置、不动会被还原的 managed profile）：
+#
+#   dsh-real --profile nix-web-acb --patch <这个文件> --no-open --port 3080
+#
+#   必须用 dsh-real，不能用 dsh：`dsh` 是 dsh-seed-profile 的包装器，会按模板重建 profile，
+#   把这里注入的东西洗掉。dsh-real 是直连二进制。
+#
+# 语法要点（踩过的坑）：
+#   patch 默认语义是「改已有条目」，只写 - id: xxx 而该条目不存在会报
+#   `patch: entry "xxx" not found` 并被忽略。要**新增**条目必须写成没有 id 的
+#   `- insert: [ ... ]`，insert 的值就是新条目列表（见下面两个 preset）。
+#
+# 每个 acb 会话一个 preset，acb 会话的 preset 名由 driver 的 ACB_PRESET 决定：
+#   - acb 会话 dsh         → acb-dsh         → 只看到 3101 那套工具
+#   - acb 会话 dsh-group2  → acb-dsh-group2  → 只看到 3102 那套工具
+
+# preset 本体骨架照 @deepseek-ai/dsh-agent-preset 的最小可用形状来：id / order / plugins。
+# 这里刻意只挂 persona + mcp-client：
+#   - 人格卡由桥按会话注入到投递文本里，preset 里的 prefix 只是兜底；
+#   - 文件/bash 之类工具 acb 会话用不到，给了反而增加模型误用的机会。
+- insert:
+    - id: preset-acb-dsh
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: acb-dsh
+        order: 10
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a helpful assistant in a chat room.
+              complete: true
+              includeRuntimeContext: false
+          - id: mcp-acb-dsh
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              transport: streamable-http
+              serverName: acb
+              url: http://127.0.0.1:3101/mcp
+
+    - id: preset-acb-dsh-group2
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: acb-dsh-group2
+        order: 11
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a helpful assistant in a chat room.
+              complete: true
+              includeRuntimeContext: false
+          - id: mcp-acb-dsh-group2
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              transport: streamable-http
+              serverName: acb
+              url: http://127.0.0.1:3102/mcp
+
+# 注意：这里**没有**把 agent-preset-registry 的 default 改成 acb-dsh。
+# default 只影响「没显式指定 preset 的会话」（比如你在 dsh UI 里新建的）。
+# acb 的会话都由 driver 显式传 agentPreset，不需要动 default——改了会让 UI 里
+# 新建的会话也跑进 acb preset（没有文件工具，很怪）。
+#
+# 真要改的话，这一行是（agent-preset-registry 是已有条目，走「改」的语法）：
+#
+#   - id: agent-preset-registry
+#     config:
+#       default: acb-dsh
