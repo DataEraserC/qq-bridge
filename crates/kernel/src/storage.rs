@@ -310,10 +310,105 @@ pub trait SessionMaps {
     fn session_maps(&self) -> Result<Vec<SessionMap>, StorageError>;
 }
 
-/// 五样东西合起来。桥只依赖这一个约束，换后端只换实现。
-pub trait Store: Transcript + Watermarks + Notes + Deliveries + SessionMaps {}
+/// 一条来自 agent 的反馈（ADR-0021）。
+///
+/// 形状刻意**不像表单**：一个正文（想说多少说多少）+ 出处编号 + 自称发生次数。
+/// 结构化字段都有缺省值，agent 只写正文也能入库；写得越细，看的人越省事。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Feedback {
+    pub id: i64,
+    /// 正文第一行，给人扫列表用。
+    pub title: String,
+    /// 完整正文。
+    pub body: String,
+    /// 建议怎么改（可空）。
+    pub suggestion: Option<String>,
+    /// 类型：bug / gap / friction / idea。
+    pub kind: String,
+    /// 影响：blocker / major / minor。
+    pub severity: String,
+    /// 出处：水位编号（`#620`）、工具名、接口名、错误码，原样存。
+    pub refs: Vec<String>,
+    /// agent 自己说撞了几次（每次报告相加）。
+    pub occurrences: u32,
+    /// 被报告了几次（桥自己数的：同一条指纹去重后累加）。
+    pub repeats: u32,
+    pub tool: Option<String>,
+    pub session: String,
+    pub harness: Option<String>,
+    pub room: Option<String>,
+    /// 出事时的现场：票、模型、时间。看的人据此复现。
+    pub context: serde_json::Value,
+    /// open / acked / resolved / wontfix。
+    pub status: String,
+    /// 处理备注（人写的）。
+    pub note: Option<String>,
+    pub first_at: i64,
+    pub last_at: i64,
+}
 
-impl<T> Store for T where T: Transcript + Watermarks + Notes + Deliveries + SessionMaps {}
+/// 写一条反馈要的东西。指纹相同的会被合并（见 [`Feedbacks::record_feedback`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeedbackDraft {
+    /// 去重指纹：同一件事写了两遍，合成一条、次数加一。
+    pub fingerprint: String,
+    pub title: String,
+    pub body: String,
+    pub suggestion: Option<String>,
+    pub kind: String,
+    pub severity: String,
+    pub refs: Vec<String>,
+    /// 这次报告自称发生了几次。
+    pub occurrences: u32,
+    pub tool: Option<String>,
+    pub session: String,
+    pub harness: Option<String>,
+    pub room: Option<String>,
+    pub context: serde_json::Value,
+    pub at: i64,
+}
+
+/// 记完一条之后回给调用方的话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    pub id: i64,
+    /// 这是第几次被报告（1 = 第一次）。
+    pub repeats: u32,
+    /// 累计自称发生次数。
+    pub occurrences: u32,
+    /// 是不是合并到已有的一条里了。
+    pub duplicate: bool,
+}
+
+/// 反馈库。条数有上限（[`FEEDBACK_CAP`]），满了先删最久没被提过的。
+pub trait Feedbacks {
+    /// 记一条。指纹已存在就合并：报告次数 +1、发生次数相加、`last_at` 刷新，
+    /// 如果原来是 resolved / wontfix，重新打开（它又出现了，说明没修好）。
+    fn record_feedback(&mut self, draft: FeedbackDraft) -> Result<Recorded, StorageError>;
+
+    /// 列反馈，按最近一次被提的时间倒序。`status` 给了就只列那个状态。
+    fn feedback(&self, status: Option<&str>, limit: usize) -> Result<Vec<Feedback>, StorageError>;
+
+    /// 改状态 + 备注。`id` 不存在返回 `false`。
+    fn set_feedback_status(
+        &mut self,
+        id: i64,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<bool, StorageError>;
+}
+
+/// 反馈最多留多少条。一条最多几 KB，五千条是十几 MB 的量级——够留很久，也不至于失控。
+/// 来源：实现默认。
+pub const FEEDBACK_CAP: usize = 5000;
+
+/// 六样东西合起来。桥只依赖这一个约束，换后端只换实现。
+pub trait Store: Transcript + Watermarks + Notes + Deliveries + SessionMaps + Feedbacks {}
+
+impl<T> Store for T where
+    T: Transcript + Watermarks + Notes + Deliveries + SessionMaps + Feedbacks
+{
+}
 
 mod sqlite;
 
@@ -329,6 +424,10 @@ pub struct MemoryStore {
     notes: BTreeMap<NoteKey, Note>,
     deliveries: HashMap<(Cursor, u64), u32>,
     session_maps: HashMap<String, SessionMap>,
+    feedback: Vec<Feedback>,
+    /// 反馈 id → 去重指纹。只给内存实现用：合并时得知道哪条是同一条。
+    feedback_keys: HashMap<i64, String>,
+    next_feedback: i64,
 }
 
 impl MemoryStore {
@@ -533,6 +632,112 @@ impl SessionMaps for MemoryStore {
         let mut maps: Vec<SessionMap> = self.session_maps.values().cloned().collect();
         maps.sort_by(|a, b| a.session.cmp(&b.session));
         Ok(maps)
+    }
+}
+
+impl Feedbacks for MemoryStore {
+    fn record_feedback(&mut self, draft: FeedbackDraft) -> Result<Recorded, StorageError> {
+        let known = self
+            .feedback_keys
+            .iter()
+            .find(|(_, fingerprint)| **fingerprint == draft.fingerprint)
+            .map(|(id, _)| *id);
+        if let Some(id) = known {
+            let existing = self
+                .feedback
+                .iter_mut()
+                .find(|item| item.id == id)
+                .expect("指纹表里有的 id 一定在向量里");
+            existing.repeats += 1;
+            existing.occurrences = existing.occurrences.saturating_add(draft.occurrences);
+            existing.last_at = draft.at;
+            // 又出现了：原来是「已修/不修」，说明没修好，重新打开。
+            if existing.status == "resolved" || existing.status == "wontfix" {
+                existing.status = "open".to_owned();
+            }
+            return Ok(Recorded {
+                id: existing.id,
+                repeats: existing.repeats,
+                occurrences: existing.occurrences,
+                duplicate: true,
+            });
+        }
+
+        self.next_feedback += 1;
+        let feedback = Feedback {
+            id: self.next_feedback,
+            title: draft.title,
+            body: draft.body,
+            suggestion: draft.suggestion,
+            kind: draft.kind,
+            severity: draft.severity,
+            refs: draft.refs,
+            occurrences: draft.occurrences,
+            repeats: 1,
+            tool: draft.tool,
+            session: draft.session,
+            harness: draft.harness,
+            room: draft.room,
+            context: draft.context,
+            status: "open".to_owned(),
+            note: None,
+            first_at: draft.at,
+            last_at: draft.at,
+        };
+        // 满了就先扔最久没被提过的（保留 id 递增，编号不复用）。
+        while self.feedback.len() >= FEEDBACK_CAP {
+            let oldest = self
+                .feedback
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, item)| item.last_at)
+                .map(|(index, _)| index);
+            match oldest {
+                Some(index) => {
+                    let gone = self.feedback.remove(index);
+                    self.feedback_keys.remove(&gone.id);
+                }
+                None => break,
+            }
+        }
+        let recorded = Recorded {
+            id: feedback.id,
+            repeats: 1,
+            occurrences: feedback.occurrences,
+            duplicate: false,
+        };
+        self.feedback_keys
+            .insert(feedback.id, draft.fingerprint.clone());
+        self.feedback.push(feedback);
+        Ok(recorded)
+    }
+
+    fn feedback(&self, status: Option<&str>, limit: usize) -> Result<Vec<Feedback>, StorageError> {
+        let mut items: Vec<Feedback> = self
+            .feedback
+            .iter()
+            .filter(|item| status.is_none_or(|wanted| item.status == wanted))
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| b.last_at.cmp(&a.last_at));
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    fn set_feedback_status(
+        &mut self,
+        id: i64,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let Some(item) = self.feedback.iter_mut().find(|item| item.id == id) else {
+            return Ok(false);
+        };
+        item.status = status.to_owned();
+        if let Some(note) = note {
+            item.note = Some(note.to_owned());
+        }
+        Ok(true)
     }
 }
 

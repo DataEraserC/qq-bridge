@@ -25,6 +25,8 @@ pub const TOOL_NAMES: &[&str] = &[
     // 平台能力：一个目录 + 一个通用调用口（ADR-0020）。core 不认识任何方法名。
     "platform_methods",
     "platform_call",
+    // 反馈：把「哪里卡住了」写回桥里（ADR-0021）。活干不下去时用它，不要直接摸平台端口。
+    "report_feedback",
     // 记忆：文件层
     "memory_read",
     "memory_write",
@@ -155,7 +157,18 @@ pub struct EventsArgs {
     pub room: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// 从第几条开始给（按时间正序数，翻页用上一次返回的 `next_offset`）。
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
+
+/// 分页默认值：一次给多少条。来源：实现默认。
+///
+/// 100 条对绝大多数平台列表（群成员、好友、群列表）够用；大群才需要翻页。
+pub const DEFAULT_PAGE_LIMIT: usize = 100;
+
+/// 分页上限：一次最多给多少条。再大就该翻页，而不是硬塞进上下文。
+pub const MAX_PAGE_LIMIT: usize = 500;
 
 /// 查平台能力目录（ADR-0020）。
 ///
@@ -177,6 +190,13 @@ pub struct PlatformMethodsArgs {
 }
 
 /// 调一个平台方法。`params` 是任意 map，core 不认识里面任何字段，原样转给适配器。
+///
+/// `limit` / `offset` 是**桥这一层**的分页：平台照旧一次给全，桥切片后再交出去。
+/// 这样不用为了分页去改五十个方法的签名，大群的大列表也不会因为「一次给不完」被写死。
+///
+/// `where` / `fields` / `order_by` / `group_by` 也是桥这一层的事（ADR-0023）：
+/// 平台不认识它们，桥在结果上做过滤、投影、排序、分组计数。字段名靠看数据得出，
+/// 传错会报 `bad_field` 并列出真实可用的字段。
 #[derive(Debug, Default, Deserialize)]
 pub struct PlatformCallArgs {
     #[serde(default)]
@@ -184,6 +204,44 @@ pub struct PlatformCallArgs {
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    /// 结果里的主数组最多给几条。默认 [`DEFAULT_PAGE_LIMIT`]，上限 [`MAX_PAGE_LIMIT`]。
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// 从第几条开始给（翻页用，值取上一次返回的 `_page.next_offset`）。
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// 过滤 / 投影 / 排序 / 分组。四个都不给就是平台原样的结果。
+    #[serde(flatten)]
+    pub query: crate::query::Query,
+}
+
+/// 一条反馈（ADR-0021）。
+///
+/// 刻意做成「写建议」而不是「填表」：正文一个字段，想写多长写多长；
+/// 出处编号、发生次数这些用来让看的人省事，但都有缺省——只写正文也能入库。
+#[derive(Debug, Default, Deserialize)]
+pub struct FeedbackArgs {
+    /// 正文。第一行会被当成标题；多写几行没关系（上限 4000 字，超出会截断并告知）。
+    pub text: String,
+    /// 这个坑撞了几次。默认 1；说清楚次数，排序才有意义。
+    #[serde(default)]
+    pub count: Option<u32>,
+    /// 出处：水位编号（`#620`）、平台消息 id、工具名、错误码、接口名，随便贴。
+    #[serde(default)]
+    pub refs: Vec<String>,
+    /// 类型：`bug`（坏了）/ `gap`（缺能力）/ `friction`（能用但别扭）/ `idea`（想要什么）。
+    /// 缺省 `friction`。
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// 影响：`blocker`（活干不下去）/ `major` / `minor`。缺省按类型推。
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// 建议怎么改（可空）。有就给，没有也行。
+    #[serde(default)]
+    pub suggestion: Option<String>,
+    /// 出事时在调哪个桥工具（如 `platform_call`）。缺省取当前正在执行的工具。
+    #[serde(default)]
+    pub tool: Option<String>,
 }
 
 /// 记忆工具公共参数：操作哪个记忆 + worktree 内的相对路径。
@@ -205,13 +263,30 @@ pub struct MemoryWriteArgs {
     pub content: String,
 }
 
-/// 搜索：`path`（搜索起点）+ `needle`（关键字）。
-#[derive(Debug, Deserialize)]
+/// 列目录：`path` + 分页。
+#[derive(Debug, Default, Deserialize)]
+pub struct MemoryListArgs {
+    pub memory: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// 搜索：`path`（搜索起点）+ `needle`（关键字）+ 分页。
+#[derive(Debug, Default, Deserialize)]
 pub struct MemorySearchArgs {
     pub memory: String,
     #[serde(default)]
     pub path: String,
     pub needle: String,
+    /// 最多给多少条命中。默认 100，上限 500——搜出一万行对谁都没用。
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 /// git log：`limit` 条。

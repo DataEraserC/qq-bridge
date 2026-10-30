@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use acb_kernel::{
-    Cursor, Deliveries, Element, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft, RoomId,
-    Sender, StorageError, Store, TopicStatus, Transcript, Watermarks, unread,
+    Cursor, Deliveries, Element, Feedbacks, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft,
+    RoomId, Sender, StorageError, Store, TopicStatus, Transcript, Watermarks, unread,
 };
 
 const AT: i64 = 1_793_000_000_000;
@@ -723,4 +723,61 @@ fn a_version_two_database_is_migrated_in_place() {
         .expect("升级后能写");
     assert_eq!(next.id, 4, "编号要接着数，不能从 1 重来");
     assert_eq!(store.since(&qq, 0, 10).expect("能读").len(), 4);
+}
+
+/// 反馈要落盘、要能按指纹合并、要能改状态。重启后还在——它是给人处理的工作队列，
+/// 不是一趟性的日志。
+#[test]
+fn feedback_survives_a_restart_and_merges_by_fingerprint() {
+    let db = TempDb::new("feedback");
+    let draft = |at: i64, occurrences: u32| acb_kernel::FeedbackDraft {
+        fingerprint: "abc123".to_owned(),
+        title: "列表没有 total".to_owned(),
+        body: "群成员列表只回来 16 个".to_owned(),
+        suggestion: Some("带 total".to_owned()),
+        kind: "gap".to_owned(),
+        severity: "major".to_owned(),
+        refs: vec!["#620".to_owned()],
+        occurrences,
+        tool: Some("platform_call".to_owned()),
+        session: "main".to_owned(),
+        harness: Some("dsh".to_owned()),
+        room: Some("qq:group/123".to_owned()),
+        context: serde_json::json!({"ticket": "main-1"}),
+        at,
+    };
+
+    {
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能开库");
+        let first = store.record_feedback(draft(AT, 3)).expect("能写");
+        assert_eq!(first.repeats, 1);
+        assert_eq!(first.occurrences, 3);
+
+        let again = store.record_feedback(draft(AT + 1, 2)).expect("能再写");
+        assert!(again.duplicate, "同一个指纹要合并");
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.repeats, 2);
+        assert_eq!(again.occurrences, 5);
+    }
+
+    {
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("重启能开");
+        let items = store.feedback(None, 10).expect("能读");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "列表没有 total");
+        assert_eq!(items[0].refs, vec!["#620"]);
+        assert_eq!(items[0].occurrences, 5);
+        assert_eq!(items[0].status, "open");
+
+        assert!(store
+            .set_feedback_status(items[0].id, "resolved", Some("已按 ADR-0022 修"))
+            .expect("能改"));
+        // 又出现了：合并时要把 resolved 退回 open——复发是事实，不用人再点一次。
+        let back = store.record_feedback(draft(AT + 2, 1)).expect("能写");
+        assert_eq!(back.repeats, 3);
+        let items = store.feedback(Some("open"), 10).expect("能读");
+        assert_eq!(items.len(), 1, "复发要重新打开");
+        assert_eq!(items[0].note.as_deref(), Some("已按 ADR-0022 修"), "备注留着");
+        assert!(store.feedback(Some("resolved"), 10).expect("能读").is_empty());
+    }
 }

@@ -41,24 +41,27 @@
 | **harness 适配器** | harness adapter | 和上面那个不是一回事：桥**外面**那一半，活在 harness 里。干两件事——把桥的工具挂进 harness（工具面），把推来的一轮变成 harness 里的一次对话并知道什么时候结束（轮次驱动）。这两件事可以分开缺席（见 [06](06-harness-adapters.md)） |
 | **harness** | harness | 承载 agent 的运行环境（DSH、WorkBuddy、Trae、Codex……）。桥不实现 agent，只接 harness |
 | **接入点** | endpoint | harness 连接桥的通道（本机套接字 / TCP + 接入令牌） |
+| **反馈** | feedback | agent 写给做桥的人的一条建议：正文 + 出处编号 + 自称撞了几次。桥自己补现场（会话/房间/模型/票），同标题合并累加（ADR-0021） |
 | **接入令牌** | token | harness 握手时出示。令牌对上哪几台设备，那条连接就代表这几台（同令牌 = 一组）；令牌不对直接断开 |
 
 ## 工具面
 
-来源：用户裁定——不止有 send，还要有 get 等读取类工具。下表是提案，等用户圈定第一版范围。
+来源：用户裁定——不止有 send，还要有 get 等读取类工具。下表是**现状**（ADR-0017 之后、ADR-0020～0023 之后），不再是提案。
 
 | 工具 | 参数 | 行为 |
 |------|------|------|
-| `send_message` | elements | 发到**当前轮次**的房间 |
-| `send_message_to` | elements, to, device | 发到别的房间。`to` 的可选目标 = **本组设备订阅的并集**，越界拒绝；同一个房间被组内两台设备都订了时，`device` 必填 |
-| `get_history` | room, before, limit | 查房间的流水（读本组订阅的房间，这就是「get from」） |
-| `list_rooms` | — | 列出本组设备订阅了哪些房间、各自未读多少（发 `send_message_to` 前知道自己能选哪） |
-| `get_notes` | room | 读设备在某个房间的笔记 |
-| `set_note` | room, key, value | 写一条笔记 |
-| `del_note` | room, key | 删一条笔记 |
-| `get_platform_events` | room, limit | 查最近记录的平台事件 |
-| `wait_message` | room, timeout | 阻塞等该房间的新未读，等到作为结果返回并自动确认；超时返回空 |
-| `ack_messages` | ids | 确认消息处理完毕，水位前推；未确认的下轮重投 |
+| `send_message` | elements（或 text） | 发到**当前轮次**的房间。回执 `ok` / `platform_id` / `at` / `room`，失败直接报错 |
+| `send_message_to` | elements, to | 发到别的房间。`to` 的可选目标 = **本会话订阅的房间**，越界拒绝；跨会话发送已砍（ADR-0017） |
+| `get_history` | room, before, limit, columns | 查房间的流水。带 `total` / `has_more` / `next_before` |
+| `fetch_records` | room, ids, columns | 按水位编号精确查一批（补投递被截断的部分） |
+| `list_rooms` | — | 列出本会话订阅了哪些房间、各自未读多少 |
+| `get_notes` / `set_note` / `del_note` | room, kind, key, value | 房间级笔记（term / member / topic） |
+| `get_platform_events` | room, limit, offset | 查平台事件，带 `total` / `has_more` |
+| `platform_methods` | group, tag, query | 平台能力目录：不给条件给清单，给条件连参数表（JSON Schema） |
+| `platform_call` | method, params, limit, offset, where, fields, order_by, group_by | 调平台方法。分页与查询都在桥这层做（ADR-0022 / 0023） |
+| `report_feedback` | text, refs, count, kind, severity, suggestion | 写一条反馈（ADR-0021）：哪一步卡住、出处编号、撞了几次 |
+| `ack_messages` | ids | 确认消息处理完毕，水位前推。**幂等**；未确认的下轮重投（ADR-0010 修订） |
+| `memory_*` | memory, path, needle, … | 记忆仓库的文件与 git 操作（12 个） |
 
 ## 旧词 → 新词对照
 

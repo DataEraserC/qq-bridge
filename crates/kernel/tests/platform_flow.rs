@@ -79,6 +79,14 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: KICK_PARAMS,
     },
+    MethodSpec {
+        name: "group.get_member_list",
+        summary: "群成员列表（不带分页，一次给全）",
+        tags: &[tags::MEMBER, tags::GROUP],
+        risk: Risk::Read,
+        scope: Scope::Room,
+        params: &[],
+    },
     // 跟房间无关的那一类：查的是这个号本身有什么，不是房间里发生了什么。
     MethodSpec {
         name: "friend.list",
@@ -121,6 +129,19 @@ impl Outbound for Platformy {
             "group.get_member_info" => Ok(json!({"nickname": "老王", "role": "member"})),
             "group.kick" | "group.ban" => Ok(json!({"done": true})),
             "friend.list" => Ok(json!({"friends": [{"user_id": "10001", "nickname": "老王"}]})),
+            // 213 人的群：7 个管理员、206 个普通成员。用来验分页和分组计数。
+            "group.get_member_list" => {
+                let members: Vec<Value> = (1..=213)
+                    .map(|index| {
+                        json!({
+                            "user_id": index,
+                            "nickname": format!("成员{index}"),
+                            "role": if index <= 7 { "admin" } else { "member" },
+                        })
+                    })
+                    .collect();
+                Ok(json!({"retcode": 0, "data": members}))
+            }
             other => Err(CallError::NotImplemented(other.to_owned())),
         }
     }
@@ -237,10 +258,10 @@ fn catalog_lists_every_method_without_dumping_params() {
         .expect("能查目录");
 
     assert_eq!(result["platform"], "qq");
-    assert_eq!(result["total"], 7);
+    assert_eq!(result["total"], 8);
 
     let methods = result["methods"].as_array().expect("有清单");
-    assert_eq!(methods.len(), 7);
+    assert_eq!(methods.len(), 8);
     assert_eq!(methods[0]["name"], "forward.get_content");
     assert_eq!(methods[0]["tags"][0], "forward");
     assert_eq!(methods[2]["risk"], "write");
@@ -638,4 +659,122 @@ fn catalog_marks_only_connection_scoped_methods() {
         .find(|item| item["name"] == "forward.get_content")
         .expect("有转发");
     assert!(forward.get("scope").is_none(), "房间级是默认，不用写出来");
+}
+
+// ── 分页与查询（ADR-0022 / ADR-0023）───────────────────────────────────
+
+/// 大列表必须给总数，而且能接着翻。以前是「超过 8000 字符就砍成半截字符串」，
+/// 模型既数不出总数，也没法继续取。
+#[test]
+fn big_lists_page_with_a_total_instead_of_truncating() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let first = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "group.get_member_list", "limit": 50}),
+        )
+        .expect("能调");
+
+    assert_eq!(first["_page"]["total"], 213, "总数是真的总数");
+    assert_eq!(first["_page"]["returned"], 50);
+    assert_eq!(first["_page"]["has_more"], true);
+    assert_eq!(first["retcode"], 0, "外壳字段不能丢");
+    assert_eq!(first["data"].as_array().expect("还是数组").len(), 50);
+    assert!(
+        serde_json::to_vec(&first).expect("可序列化").len() <= 24 * 1024,
+        "整页结果要装得进预算"
+    );
+
+    let next = first["_page"]["next_offset"].as_u64().expect("有下一页");
+    let second = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "group.get_member_list", "limit": 50, "offset": next}),
+        )
+        .expect("能翻页");
+    assert_eq!(second["data"][0]["user_id"], 51);
+    assert_eq!(second["_page"]["offset"], 50);
+}
+
+/// 「群里几个管理员」不该需要拉全表：group_by 一次给答案。
+#[test]
+fn group_by_answers_counting_questions_without_the_whole_list() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "group.get_member_list", "group_by": "role"}),
+        )
+        .expect("能分组");
+
+    assert_eq!(result["matched"], 213);
+    let groups = result["groups"].as_array().expect("有分组");
+    assert_eq!(groups[0]["key"], "member");
+    assert_eq!(groups[0]["count"], 206);
+    assert_eq!(groups[1]["key"], "admin");
+    assert_eq!(groups[1]["count"], 7);
+    // 分组结果里没有明细，也没有分页信封——这是另一个形状，不是被截断的列表。
+    assert!(result.get("_page").is_none());
+    assert!(result.get("data").is_none());
+}
+
+/// 过滤要在分页之前做：否则 `_page.total` 给的是过滤前的数。
+#[test]
+fn where_filter_projection_run_before_paging() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({
+                "method": "group.get_member_list",
+                "where": [{"field": "role", "op": "eq", "value": "admin"}],
+                "fields": ["user_id"],
+                "order_by": "user_id desc",
+                "limit": 10,
+            }),
+        )
+        .expect("能查");
+
+    assert_eq!(result["matched"], 7, "过滤后的总数");
+    let data = result["data"].as_array().expect("还是数组");
+    assert_eq!(data.len(), 7);
+    assert_eq!(data[0], json!({"user_id": 7}), "降序且只留 user_id");
+    assert_eq!(result["_page"]["total"], 7, "分页信封跟着过滤后的数");
+    assert_eq!(result["_page"]["has_more"], false);
+}
+
+/// 字段写错要报错，并把真实字段列出来——不然只能猜着改。
+#[test]
+fn bad_query_field_lists_the_real_ones() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let error = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({
+                "method": "group.get_member_list",
+                "where": [{"field": "rol", "op": "eq", "value": "admin"}],
+            }),
+        )
+        .expect_err("字段写错就该报错");
+    assert_eq!(error.code, acb_kernel::ErrorCode::BadRequest);
+    assert!(error.message.contains("[bad_field]"), "{}", error.message);
+    assert!(error.message.contains("role"), "{}", error.message);
 }

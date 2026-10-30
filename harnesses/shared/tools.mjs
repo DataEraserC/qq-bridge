@@ -46,7 +46,10 @@ export const TOOLS = [
     name: "send_message",
     description: `在当前轮次的房间发一条消息（谁问你就回哪儿）。
 ${ELEMENTS_DOC}
-只发一段纯文本时可以只给 text。`,
+只发一段纯文本时可以只给 text。
+
+回执是真的回执：只有返回里 ok=true 才算发出去了，那时才有 platform_id 和 at。
+失败了会直接给你 error——**不要**在失败之后跟群里说「已经发了」。`,
     schema: {
       type: "object",
       properties: { elements: ELEMENTS_SCHEMA, text: TEXT_SCHEMA },
@@ -72,9 +75,9 @@ to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/32362244
   },
   {
     name: "ack_messages",
-    description: `确认这批记录处理完了，水位才会往前推。
+    description: `确认这批记录处理完了，水位才会往前推。ids 就是投递记录前面的编号。
 不确认就一直算未读，下一轮还会再投一次（投递里会写「第 N 次投递」）。
-ids 就是投递记录前面的编号。`,
+确认是幂等的：重复确认已经确认过的编号不算错，会回 already。轮次结束后 60 秒内也还能补确认。`,
     schema: {
       type: "object",
       properties: {
@@ -90,7 +93,9 @@ ids 就是投递记录前面的编号。`,
   },
   {
     name: "get_history",
-    description: "翻这个房间过去的记录（含平台事件），用来补上下文。",
+    description: `翻这个房间过去的记录（含平台事件），用来补上下文。
+返回里有 total（符合条件的总数）、returned（这次给了几条）、has_more；
+要更早的，把 next_before 当 before 再调一次。`,
     schema: {
       type: "object",
       properties: {
@@ -175,12 +180,14 @@ false 是「这次没查」，不是「这条没这个值」，要的话把它�
   },
   {
     name: "get_platform_events",
-    description: "查平台事件（进群、退群、拍一拍之类），消息之外的那些动静。",
+    description: `查平台事件（进群、退群、拍一拍之类），消息之外的那些动静。
+返回里有 total / returned / has_more / next_offset，多了就按 next_offset 翻。`,
     schema: {
       type: "object",
       properties: {
         room: ROOM_SCHEMA,
         limit: { type: "number", description: "最多几条，默认 20" },
+        offset: { type: "number", description: "从第几条开始给（翻页用）" },
       },
       additionalProperties: false,
     },
@@ -226,6 +233,14 @@ room 怎么给，看方法的 scope：
 只能调这个连接声明过的方法。踢人、禁言、改群名这类破坏性操作默认不开放（报 forbidden）；
 连接配置里开了就会真的执行，这时候你就是在替这个人操作，想清楚再调。
 
+**查列表别拉全表再自己数**：结果里的列表可以在桥这边先过滤、只取几列、排序、分组计数。
+- where: [{"field":"role","op":"eq","value":"admin"}]   op 是 eq/ne/in/gt/gte/lt/lte/contains/not_null
+- fields: ["user_id","nickname"]                         只要这几列（省上下文）
+- order_by: "at desc"                                    按字段排
+- group_by: "role"                                       分组计数，回答「几个管理员」这种问题
+字段名写错会报 [bad_field] 并把这批数据真实有的字段列出来。
+- limit / offset: 分页，默认 100 条。返回的 _page 里有 total / returned / has_more / next_offset。
+
 报错会带上分类：unknown_method（名字错了，会给你近似的）、bad_params（参数不对，
 会说哪个字段）、unsupported_platform（这平台没这能力）、not_implemented（平台有但我们
 还没写）、forbidden（没权限或没开）。照着改就行，别重复调同一个错的。`,
@@ -239,8 +254,97 @@ room 怎么给，看方法的 scope：
           description: "方法参数。照 platform_methods 给的参数表填",
           additionalProperties: true,
         },
+        limit: {
+          type: "number",
+          description:
+            "结果里的列表最多给几条，默认 100、上限 500。返回里的 _page 会告诉你总数（total）、给了几条（returned）、还有没有（has_more）",
+        },
+        offset: {
+          type: "number",
+          description: "从第几条开始给。翻页时填上一次返回的 _page.next_offset",
+        },
+        where: {
+          type: "array",
+          description: "过滤条件（全部满足才留下），如 [{\"field\":\"role\",\"op\":\"eq\",\"value\":\"admin\"}]",
+          items: {
+            type: "object",
+            properties: {
+              field: { type: "string", description: "字段名，支持 sender.id 这样的路径" },
+              op: {
+                type: "string",
+                description: "eq / ne / in / gt / gte / lt / lte / contains / not_null，默认 eq",
+              },
+              value: { description: "比较值；in 要给数组，not_null 不用给" },
+            },
+            required: ["field"],
+            additionalProperties: false,
+          },
+        },
+        fields: {
+          type: "array",
+          items: { type: "string" },
+          description: "只要这几列，如 [\"user_id\",\"nickname\",\"role\"]",
+        },
+        order_by: {
+          type: "string",
+          description: "排序，如 \"at desc\"（默认升序）；空值永远排最后",
+        },
+        group_by: {
+          type: "string",
+          description: "按这个字段分组计数，返回 groups:[{key,count}]——「几个管理员」问它就够了，不用拉全表",
+        },
       },
       required: ["method"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "report_feedback",
+    description: `把「你被什么卡住了」写回桥里——这是你唯一正式的抱怨出口。
+
+什么时候用：
+- 某个接口给不了你要的结果，你只能靠猜或靠绕（比如自己拼限流、自己去翻平台端口）；
+- 你撞了同一个坑好几次，或者看到别的会话也在撞；
+- 你想让做桥的人知道「这里应该有 X」。
+
+怎么写（像写一条建议，不是填表）：
+- text 是正文，第一行当标题，想写多长写多长（上限 4000 字，超了会截断并告诉你）。
+- refs 贴出处：水位编号（#620）、平台消息 id、工具名、错误码、接口名，能贴就贴。
+  有编号的反馈才能被复现，没编号的只能被当成印象。
+- count 说你撞了几次（默认 1）。同一个坑撞 6 次就说 6，别写成一条「有时候会…」。
+- suggestion 写你建议怎么改（可空）。
+
+不用填的：你是谁、在哪个房间、哪个会话、用的什么模型——桥自己会补。
+也别为了写反馈而耽误正事：一处写一句就够，写完接着干活。
+同一条重复提不会新建，只会把次数加上去。`,
+    schema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: "正文。第一行会被当成标题；可以分几段写清楚「哪一步卡住、期望什么」",
+        },
+        count: {
+          type: "number",
+          description: "这个坑你撞了几次，默认 1。撞了几次就写几，排序要靠它",
+        },
+        refs: {
+          type: "array",
+          items: { type: "string" },
+          description: "出处：如 \"#620\"、\"platform_call\"、\"[no_active_round]\"、\"group.get_member_list\"",
+        },
+        kind: {
+          type: "string",
+          description: "bug（坏了）/ gap（缺能力）/ friction（能用但别扭）/ idea（想要什么），默认 friction",
+        },
+        severity: {
+          type: "string",
+          description: "blocker（活干不下去）/ major / minor，默认按 kind 推",
+        },
+        suggestion: { type: "string", description: "建议怎么改，可空" },
+        tool: { type: "string", description: "出事时你在调哪个桥工具，如 platform_call" },
+      },
+      required: ["text"],
       additionalProperties: false,
     },
   },
@@ -275,12 +379,15 @@ content 是内容。父目录不存在会自动建。`,
   },
   {
     name: "memory_list",
-    description: "列记忆仓库里某个目录下的条目。memory 是记忆 id，path 默认仓库根。",
+    description: `列记忆仓库里某个目录下的条目。memory 是记忆 id，path 默认仓库根。
+返回里有 total / has_more / next_offset：目录很大时按 next_offset 翻页，不会只给你看半截。`,
     schema: {
       type: "object",
       properties: {
         memory: { type: "string", description: "记忆 id" },
         path: { type: "string", description: "相对路径，默认根" },
+        limit: { type: "number", description: "最多几条，默认 100" },
+        offset: { type: "number", description: "从第几条开始给（翻页用）" },
       },
       required: ["memory"],
       additionalProperties: false,
@@ -288,13 +395,16 @@ content 是内容。父目录不存在会自动建。`,
   },
   {
     name: "memory_search",
-    description: "在记忆仓库里搜文本（grep）。返回命中行「文件:行号:内容」。",
+    description: `在记忆仓库里搜文本（grep）。返回命中行「文件:行号:内容」。
+返回里有 total / has_more / next_offset——命中很多时先看总数，再决定要不要翻。`,
     schema: {
       type: "object",
       properties: {
         memory: { type: "string", description: "记忆 id" },
         path: { type: "string", description: "搜索起点，默认仓库根" },
         needle: { type: "string", description: "要搜的关键字" },
+        limit: { type: "number", description: "最多几条，默认 100" },
+        offset: { type: "number", description: "从第几条开始给（翻页用）" },
       },
       required: ["memory", "needle"],
       additionalProperties: false,

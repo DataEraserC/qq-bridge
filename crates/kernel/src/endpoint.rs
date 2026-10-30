@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use acb_proto::frame::{decode, encode};
-use acb_proto::{Delivery, ErrorCode, Frame, LogLevel, Ticket, ToolError};
+use acb_proto::{Delivery, Frame, LogLevel, Ticket};
 use thiserror::Error;
 
 use crate::engine::{Bridge, BridgeError};
@@ -198,28 +198,20 @@ impl Conn {
                 tool,
                 args,
             } => {
-                let reply = if self.tickets.values().any(|t| t == &ticket) {
-                    match bridge.tool_call(&ticket, &self.sessions, &tool, args) {
-                        Ok(result) => Frame::ToolResult {
-                            id,
-                            result: Some(result),
-                            error: None,
-                        },
-                        Err(error) => Frame::ToolResult {
-                            id,
-                            result: None,
-                            error: Some(error),
-                        },
-                    }
-                } else {
-                    Frame::ToolResult {
+                // 票的校验全在引擎里：它才知道哪些轮次刚收工、宽限窗还剩多久。
+                // 这里以前先按「手上有没有这张票」挡一道，结果「轮次结束」和「桥坏了」
+                // 报的是同一句话，agent 分不清，就一直重试。
+                let reply = match bridge.tool_call(&ticket, &self.sessions, &tool, args) {
+                    Ok(result) => Frame::ToolResult {
+                        id,
+                        result: Some(result),
+                        error: None,
+                    },
+                    Err(error) => Frame::ToolResult {
                         id,
                         result: None,
-                        error: Some(ToolError::new(
-                            ErrorCode::Unauthorized,
-                            "这张票不是本轮签发的",
-                        )),
-                    }
+                        error: Some(error),
+                    },
                 };
                 Ok(vec![reply])
             }

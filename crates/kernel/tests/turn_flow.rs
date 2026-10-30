@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
-    Bridge, Cursor, Element, ErrorCode, Ingest, MemoryStore, NoteKey, NoteKind, Notes, Outbound,
+    Bridge, Cursor, Element, ErrorCode, Feedbacks, Ingest, MemoryStore, NoteKey, NoteKind, Notes, Outbound,
     OutboundError, RecordDraft, RoomId, Sender, Sent, Transcript, TurnReason, Watermarks, unread,
 };
 use serde_json::json;
@@ -1105,4 +1105,243 @@ fn turn_failure_prefers_session_override_over_default() {
     let sends = sends.lock().expect("没被毒死");
     assert_eq!(sends.len(), 1, "只发会话自己配的那一个");
     assert_eq!(sends[0].0, room("qq:group/own"), "会话级配置优先");
+}
+
+// ---------------------------------------------------------------------------
+// 确认要幂等、票不能一收工就死（ADR-0010 修订）、反馈通道（ADR-0021）
+// ---------------------------------------------------------------------------
+
+/// 重复确认不算错。以前它会报 bad_request，模型以为「确认失败」，于是不再确认，
+/// 那几条就被每轮重投一遍——真机上同一条消息被投了 6 次。
+#[test]
+fn acking_twice_is_not_an_error() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let first = bridge
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1]}))
+        .expect("第一次确认");
+    assert_eq!(first["watermark"], 1);
+    assert_eq!(first["acked"], json!([1]));
+
+    let again = bridge
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1]}))
+        .expect("重复确认不该报错");
+    assert_eq!(again["watermark"], 1);
+    assert_eq!(again["acked"], json!([]));
+    assert_eq!(again["already"], json!([1]));
+}
+
+/// 收工之后的 60 秒内还能补确认——模型经常在轮末才想起来。
+#[test]
+fn ack_still_works_right_after_the_turn_ends() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+    bridge.end_turn(&ticket, None).expect("能收工");
+
+    let result = bridge
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1]}))
+        .expect("宽限窗内应当能确认");
+    assert_eq!(result["watermark"], 1);
+    assert_eq!(
+        bridge
+            .store()
+            .watermark(&cursor("main", "qq:group/123"))
+            .expect("可读"),
+        1
+    );
+}
+
+/// 收工后调别的工具：错误信息必须说清「这一轮不会再有工具可用，请结束本轮」。
+#[test]
+fn tools_after_the_turn_say_the_round_is_over() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+    bridge.end_turn(&ticket, None).expect("能收工");
+
+    let error = bridge
+        .tool_call(&ticket, &sessions(), "get_history", json!({}))
+        .expect_err("轮次结束就不该再开工具");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert!(error.message.contains("[no_active_round]"), "{}", error.message);
+    assert!(
+        error.message.contains("请结束本轮"),
+        "要让 agent 收手：{}",
+        error.message
+    );
+}
+
+/// 发消息的回执要像回执：ok / at / room 都在，failed 时根本拿不到这些字段。
+#[test]
+fn send_receipt_says_ok_and_when() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let receipt = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message",
+            json!({"elements": [{"type": "text", "text": "在的"}]}),
+        )
+        .expect("能发");
+    assert_eq!(receipt["ok"], json!(true));
+    assert_eq!(receipt["room"], "qq:group/123");
+    assert!(receipt["platform_id"].as_str().is_some());
+    assert!(receipt["at"].as_i64().is_some());
+}
+
+/// 反馈：正文一段、贴出处、标次数。重复提不会新建，只把次数加上去。
+#[test]
+fn feedback_is_recorded_counted_and_deduped() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let first = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({
+                "text": "群成员列表只回来 16 个，没有 total，我数不出 15 个管理员是不是全部\n真正的群里 24 人。",
+                "refs": ["#620", "group.get_member_list"],
+                "count": 3,
+                "kind": "gap",
+                "suggestion": "列表统一带 total / has_more",
+            }),
+        )
+        .expect("能记反馈");
+    assert_eq!(first["ok"], json!(true));
+    assert_eq!(first["duplicate"], json!(false));
+    assert_eq!(first["occurrences"], 3);
+    let id = first["id"].as_i64().expect("有编号");
+
+    let again = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({
+                "text": "群成员列表只回来 16 个，没有 total，我数不出 15 个管理员是不是全部\n又撞到了。",
+                "count": 2,
+            }),
+        )
+        .expect("能再记一次");
+    assert_eq!(again["duplicate"], json!(true), "同一个标题算同一条");
+    assert_eq!(again["id"].as_i64(), Some(id), "id 不变");
+    assert_eq!(again["repeats"], 2);
+    assert_eq!(again["occurrences"], 5, "自称次数相加");
+
+    let stored = bridge.store().feedback(None, 10).expect("能读");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].title, "群成员列表只回来 16 个，没有 total，我数不出 15 个管理员是不是全部");
+    assert_eq!(stored[0].refs, vec!["#620", "group.get_member_list"]);
+    assert_eq!(stored[0].kind, "gap");
+    assert_eq!(stored[0].severity, "major", "gap 默认 major");
+    assert_eq!(stored[0].session, "main");
+    assert_eq!(stored[0].harness.as_deref(), Some("dsh"));
+    assert_eq!(stored[0].room.as_deref(), Some("qq:group/123"));
+    assert_eq!(stored[0].status, "open");
+    assert_eq!(stored[0].context["turn_running"], true);
+}
+
+/// 收工后还能写反馈：最想说话的时刻，往往就是「这一轮什么都干不成」之后。
+#[test]
+fn feedback_survives_the_turn_end() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+    bridge.end_turn(&ticket, None).expect("能收工");
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({"text": "这一轮什么工具都调不动，只能干看着", "count": 6}),
+        )
+        .expect("收工后也该能写反馈");
+    assert_eq!(result["ok"], json!(true));
+    let stored = bridge.store().feedback(Some("open"), 10).expect("能读");
+    assert_eq!(stored[0].occurrences, 6);
+    assert_eq!(stored[0].context["turn_running"], false);
+}
+
+/// 空正文要拒；写错的 kind 要指出合法值。
+#[test]
+fn feedback_rejects_empty_text_and_unknown_kind() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let empty = bridge
+        .tool_call(&ticket, &sessions(), "report_feedback", json!({"text": "   "}))
+        .expect_err("空正文要拒");
+    assert_eq!(empty.code, ErrorCode::BadRequest);
+
+    let bad = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({"text": "x", "kind": "complaint"}),
+        )
+        .expect_err("不认识的类型要拒");
+    assert!(bad.message.contains("friction"), "{}", bad.message);
+}
+
+/// 查历史要给总数：不然「还有没有更早的」只能靠猜。
+#[test]
+fn history_reports_total_and_how_to_go_further_back() {
+    let (mut bridge, _sends) = bridge();
+    for index in 0..5 {
+        bridge
+            .ingest(message(
+                "qq:group/123",
+                "10001",
+                &format!("第 {index} 条"),
+                true,
+            ))
+            .expect("能记下来");
+    }
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let history = bridge
+        .tool_call(&ticket, &sessions(), "get_history", json!({"limit": 2}))
+        .expect("能查");
+    assert_eq!(history["total"], 5);
+    assert_eq!(history["returned"], 2);
+    assert_eq!(history["has_more"], true);
+    let next_before = history["next_before"].as_u64().expect("给往回翻的锚点");
+    assert_eq!(next_before, 4, "最新两条是 4、5");
+
+    let older = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "get_history",
+            json!({"limit": 10, "before": next_before}),
+        )
+        .expect("能接着往前翻");
+    assert_eq!(older["total"], 3);
+    assert_eq!(older["has_more"], false);
 }

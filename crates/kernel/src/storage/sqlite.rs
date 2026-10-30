@@ -13,8 +13,9 @@ use acb_proto::{Element, Record, RecordKind, RoomId, Sender, SenderRole};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    Cursor, Deliveries, MIN_KEPT, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft,
-    SessionMap, SessionMaps, StorageError, TopicStatus, Transcript, Watermarks,
+    Cursor, Deliveries, FEEDBACK_CAP, Feedback, FeedbackDraft, Feedbacks, MIN_KEPT, Note, NoteKey,
+    NoteKind, Notes, PrunePlan, RecordDraft, Recorded, SessionMap, SessionMaps, StorageError,
+    TopicStatus, Transcript, Watermarks,
 };
 
 /// 这个程序认识的库结构版本。改表就加一。
@@ -28,7 +29,8 @@ use super::{
 ///         （ADR-0018）。
 /// 5 → 6：`records` 加 `sender_role` 列——发送者身份（系统管理员/群主/群管理员），
 ///         适配器判得出来才填，判不出留空。
-pub const SCHEMA_VERSION: i64 = 6;
+/// 6 → 7：加 `feedback` 表——agent 的反馈通道（ADR-0021）。新表由建表语句建，不用搬数据。
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -101,6 +103,31 @@ CREATE TABLE IF NOT EXISTS session_maps (
     updated_at      INTEGER NOT NULL,
     PRIMARY KEY (session)
 );
+
+-- agent 的反馈（ADR-0021）。指纹相同的合并成一条，次数累加。
+CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT    NOT NULL UNIQUE,  -- 去重指纹（类型 + 标题归一化）
+    title       TEXT    NOT NULL,         -- 正文第一行，列表里扫这个
+    body        TEXT    NOT NULL,         -- 完整正文
+    suggestion  TEXT,                     -- 建议怎么改
+    kind        TEXT    NOT NULL,         -- bug | gap | friction | idea
+    severity    TEXT    NOT NULL,         -- blocker | major | minor
+    refs        TEXT    NOT NULL,         -- JSON 数组：水位编号、工具名、错误码
+    occurrences INTEGER NOT NULL,         -- agent 自称发生了多少次
+    repeats     INTEGER NOT NULL,         -- 被报告了几次
+    tool        TEXT,                     -- 出事时在调哪个桥工具
+    session     TEXT    NOT NULL,
+    harness     TEXT,
+    room        TEXT,
+    context     TEXT    NOT NULL,         -- 现场 JSON：票、模型、时间
+    status      TEXT    NOT NULL,         -- open | acked | resolved | wontfix
+    note        TEXT,
+    first_at    INTEGER NOT NULL,
+    last_at     INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS feedback_by_status ON feedback (status, last_at DESC);
 "#;
 
 /// 库里的家底，启动时打给人看。
@@ -1017,6 +1044,196 @@ impl SessionMaps for SqliteStore {
             });
         }
         Ok(maps)
+    }
+}
+
+impl Feedbacks for SqliteStore {
+    fn record_feedback(&mut self, draft: FeedbackDraft) -> Result<Recorded, StorageError> {
+        let refs = serde_json::to_string(&draft.refs)
+            .map_err(|error| backend(format!("反馈的出处存不进库：{error}")))?;
+        let context = serde_json::to_string(&draft.context)
+            .map_err(|error| backend(format!("反馈的现场存不进库：{error}")))?;
+
+        // 先看指纹在不在。在就合并，不在就新建——比 upsert 多一次查询，但两种情况的
+        // 返回不一样（新建要给新 id，合并要给累计次数），分开写更好读。
+        let existing: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT id, occurrences FROM feedback WHERE fingerprint = ?1",
+                params![draft.fingerprint],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(io_error)?;
+
+        if let Some((id, occurrences)) = existing {
+            self.conn
+                .execute(
+                    "UPDATE feedback
+                        SET repeats = repeats + 1,
+                            occurrences = ?2,
+                            last_at = ?3,
+                            -- 又出现了：原来标了已修/不修说明没修好，重新打开。
+                            status = CASE WHEN status IN ('resolved','wontfix') THEN 'open' ELSE status END
+                      WHERE id = ?1",
+                    params![id, occurrences + draft.occurrences as i64, draft.at],
+                )
+                .map_err(io_error)?;
+            let (repeats, occurrences): (i64, i64) = self
+                .conn
+                .query_row(
+                    "SELECT repeats, occurrences FROM feedback WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(io_error)?;
+            return Ok(Recorded {
+                id,
+                repeats: repeats as u32,
+                occurrences: occurrences as u32,
+                duplicate: true,
+            });
+        }
+
+        self.conn
+            .execute(
+                "INSERT INTO feedback
+                    (fingerprint, title, body, suggestion, kind, severity, refs,
+                     occurrences, repeats, tool, session, harness, room, context,
+                     status, note, first_at, last_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13,
+                         'open', NULL, ?14, ?14)",
+                params![
+                    draft.fingerprint,
+                    draft.title,
+                    draft.body,
+                    draft.suggestion,
+                    draft.kind,
+                    draft.severity,
+                    refs,
+                    draft.occurrences as i64,
+                    draft.tool,
+                    draft.session,
+                    draft.harness,
+                    draft.room,
+                    context,
+                    draft.at,
+                ],
+            )
+            .map_err(io_error)?;
+
+        let id = self.conn.last_insert_rowid();
+        self.cap_feedback()?;
+        Ok(Recorded {
+            id,
+            repeats: 1,
+            occurrences: draft.occurrences,
+            duplicate: false,
+        })
+    }
+
+    fn feedback(&self, status: Option<&str>, limit: usize) -> Result<Vec<Feedback>, StorageError> {
+        // 不筛状态时把 `?1` 绑成空串，条件恒真——比按条件拼两条 SQL 更容易看出差别在哪。
+        let filter = status.unwrap_or("");
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, title, body, suggestion, kind, severity, refs, occurrences, repeats,
+                        tool, session, harness, room, context, status, note, first_at, last_at
+                   FROM feedback
+                  WHERE (?1 = '' OR status = ?1)
+                  ORDER BY last_at DESC
+                  LIMIT ?2",
+            )
+            .map_err(io_error)?;
+        let rows = statement
+            .query_map(params![filter, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, i64>(17)?,
+                ))
+            })
+            .map_err(io_error)?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            let row = row.map_err(io_error)?;
+            items.push(Feedback {
+                id: row.0,
+                title: row.1,
+                body: row.2,
+                suggestion: row.3,
+                kind: row.4,
+                severity: row.5,
+                refs: serde_json::from_str(&row.6).unwrap_or_default(),
+                occurrences: row.7.max(0) as u32,
+                repeats: row.8.max(0) as u32,
+                tool: row.9,
+                session: row.10,
+                harness: row.11,
+                room: row.12,
+                context: serde_json::from_str(&row.13).unwrap_or(serde_json::Value::Null),
+                status: row.14,
+                note: row.15,
+                first_at: row.16,
+                last_at: row.17,
+            });
+        }
+        Ok(items)
+    }
+
+    fn set_feedback_status(
+        &mut self,
+        id: i64,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE feedback SET status = ?2, note = COALESCE(?3, note) WHERE id = ?1",
+                params![id, status, note],
+            )
+            .map_err(io_error)?;
+        Ok(changed > 0)
+    }
+}
+
+impl SqliteStore {
+    /// 反馈条数别无限长：超了先扔最久没被提过的。
+    fn cap_feedback(&self) -> Result<(), StorageError> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM feedback", [], |row| row.get(0))
+            .map_err(io_error)?;
+        if total <= FEEDBACK_CAP as i64 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "DELETE FROM feedback WHERE id IN (
+                     SELECT id FROM feedback ORDER BY last_at ASC LIMIT ?1
+                 )",
+                params![total - FEEDBACK_CAP as i64],
+            )
+            .map_err(io_error)?;
+        Ok(())
     }
 }
 

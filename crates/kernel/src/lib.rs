@@ -8,6 +8,8 @@ pub mod endpoint;
 pub mod engine;
 pub mod memory;
 pub mod outbound;
+pub mod query;
+pub mod render;
 pub mod storage;
 pub mod tools;
 
@@ -23,9 +25,10 @@ pub use outbound::{
     CallError, MethodSpec, Outbound, OutboundError, Outbounds, ParamSpec, ParamType, Risk, Scope, Sent,
 };
 pub use storage::{
-    Counts, Cursor, Deliveries, MIN_KEPT, MemoryStore, Note, NoteKey, NoteKind, Notes, PrunePlan,
-    RecordDraft, SCHEMA_VERSION, SessionMap, SessionMaps, SqliteStore, StorageError, Store,
-    TopicStatus, Transcript, Watermarks, unread,
+    Counts, Cursor, Deliveries, FEEDBACK_CAP, Feedback, FeedbackDraft, Feedbacks, MIN_KEPT,
+    MemoryStore, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft, Recorded, SCHEMA_VERSION,
+    SessionMap, SessionMaps, SqliteStore, StorageError, Store, TopicStatus, Transcript, Watermarks,
+    unread,
 };
 pub use tools::TOOL_NAMES;
 

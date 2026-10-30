@@ -13,7 +13,7 @@
 //! 当前会话订阅的所有房间；**跨会话发送被砍掉**——一个会话不能替别的人格发言。
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
 use acb_proto::{
@@ -30,23 +30,40 @@ use crate::memory::{
     git_status, list_dir, read_file, search, write_file,
 };
 use crate::outbound::{CallError, MethodSpec, Outbound, OutboundError, Risk, Scope, expand_query};
+use crate::render;
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
     TopicStatus, unread,
 };
 use crate::tools::{
-    AckArgs, DEFAULT_COLUMNS, DelNoteArgs, EventsArgs, FetchRecordsArgs, HistoryArgs,
-    MemoryAddArgs, MemoryArgs, MemoryBlameArgs, MemoryCommitArgs, MemoryLogArgs,
-    MemorySearchArgs, MemoryWriteArgs, NotesArgs, PlatformCallArgs, PlatformMethodsArgs,
-    RECORD_COLUMNS, SendArgs, SendToArgs, SetNoteArgs, is_known,
+    AckArgs, DEFAULT_COLUMNS, DEFAULT_PAGE_LIMIT, DelNoteArgs, EventsArgs, FeedbackArgs,
+    FetchRecordsArgs, HistoryArgs, MAX_PAGE_LIMIT, MemoryAddArgs, MemoryArgs, MemoryBlameArgs,
+    MemoryCommitArgs, MemoryListArgs, MemoryLogArgs, MemorySearchArgs, MemoryWriteArgs, NotesArgs,
+    PlatformCallArgs, PlatformMethodsArgs, RECORD_COLUMNS, SendArgs, SendToArgs, SetNoteArgs,
+    is_known,
 };
 
 /// 一轮最多投多少条。剩下的下一轮再投，免得一次塞爆上下文。
 pub const MAX_DELIVERY: usize = 200;
 
+/// 一轮投递的字节上限：整帧不能超过 1 MiB（协议上限），这里留一半余量给信封和记忆信息。
+///
+/// 为什么按字节再设一道：200 条长消息也能撑到一兆。以前只按条数截，真碰上大段文字
+/// 会把 `turn_start` 撑爆，harness 那边帧解不开、直接断连——看起来像「桥挂了」。
+const MAX_DELIVERY_BYTES: usize = 512 * 1024;
+
 /// 查历史时的默认条数与上限。
 const DEFAULT_HISTORY: usize = 20;
 const MAX_HISTORY: usize = 200;
+
+/// 轮次结束后票还留多久。留它是为了两件事：补确认（可能慢一步）、写反馈（随时想写）。
+const TURN_GRACE: Duration = Duration::from_secs(600);
+
+/// 轮次结束后多久之内还接受 `ack_messages`。
+///
+/// 只给 60 秒：再晚就说不清「这是补刚才那一轮」还是「你其实在处理新的一轮」，
+/// 而新的一轮会正常投递、正常确认，不需要替旧票开太久的口子。
+const ACK_GRACE: Duration = Duration::from_secs(60);
 
 /// 调度层错误：存储坏了，或者拿了一张不存在的票。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -94,6 +111,24 @@ struct ActiveTurn {
     delivered: BTreeSet<u64>,
 }
 
+/// 刚刚收工的一轮。票不再有效，但留一小会儿：补确认、写反馈都要用到它。
+#[derive(Debug, Clone)]
+struct EndedTurn {
+    session: String,
+    room: RoomId,
+    delivered: BTreeSet<u64>,
+    at: Instant,
+}
+
+/// 一次工具调用站在哪一轮上。票据既可能有效（`live`），也可能是刚收工的那一轮。
+struct TurnCtx {
+    session: String,
+    room: RoomId,
+    delivered: BTreeSet<u64>,
+    /// 这一轮还在跑吗。写反馈时记进现场，方便区分「干到一半卡住」和「收工后才想起说」。
+    live: bool,
+}
+
 /// 某个房间的一个订阅者，判定唤醒时要的东西。
 #[derive(Debug, Clone)]
 struct Subscriber {
@@ -113,6 +148,8 @@ pub struct Bridge<S: Store> {
     active: HashMap<String, ActiveTurn>,
     /// 票 → 会话。票是开轮时签发的，收工作废。
     by_ticket: HashMap<Ticket, String>,
+    /// 刚收工的轮次。留 [`TURN_GRACE`]：补确认、写反馈还要用到票上的会话与房间。
+    ended: HashMap<Ticket, EndedTurn>,
     ticket_seq: u64,
     /// 记忆仓库管理器：负责裸仓库 init 与 worktree checkout。
     memory: MemoryRepo,
@@ -128,6 +165,7 @@ impl<S: Store> Bridge<S> {
             pending: VecDeque::new(),
             active: HashMap::new(),
             by_ticket: HashMap::new(),
+            ended: HashMap::new(),
             ticket_seq: 0,
             memory,
         }
@@ -140,6 +178,11 @@ impl<S: Store> Bridge<S> {
     /// 只读看存储，给管理页和测试用。
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    /// 可变地看存储。只给控制台用（改反馈状态），调度自己不要借这个口绕过流水。
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
     }
 
     /// 记录会话映射：acb 会话 id → harness 内部会话 id（harness 回报时调）。
@@ -372,6 +415,19 @@ impl<S: Store> Bridge<S> {
         let Some(session) = self.by_ticket.remove(ticket) else {
             return Err(BridgeError::UnknownTicket(ticket.to_string()));
         };
+        // 票作废，但留一小会儿：补确认、写反馈都还要知道「这是哪一轮、哪个房间」。
+        // 以前是直接扔掉，于是「轮次结束后 ack 会报 unauthorized」——重复投递的一大来源。
+        self.ended.insert(
+            ticket.clone(),
+            EndedTurn {
+                session: turn.session.clone(),
+                room: turn.room.clone(),
+                delivered: turn.delivered.clone(),
+                at: Instant::now(),
+            },
+        );
+        self.ended
+            .retain(|_, ended| ended.at.elapsed() < TURN_GRACE);
         self.active.remove(&session);
         Ok(())
     }
@@ -415,20 +471,6 @@ impl<S: Store> Bridge<S> {
         tool: &str,
         args: Value,
     ) -> Result<Value, ToolError> {
-        let session = self
-            .by_ticket
-            .get(ticket)
-            .cloned()
-            .ok_or_else(|| ToolError::new(ErrorCode::Unauthorized, "这张票无效或本轮已结束"))?;
-        let (turn_session, room, delivered) = {
-            let turn = self.active.get(&session).expect("有票就一定有活跃轮次");
-            (
-                turn.session.clone(),
-                turn.room.clone(),
-                turn.delivered.clone(),
-            )
-        };
-
         if !is_known(tool) {
             return Err(ToolError::new(
                 ErrorCode::ToolNotAllowed,
@@ -436,7 +478,13 @@ impl<S: Store> Bridge<S> {
             ));
         }
 
-        match tool {
+        let ctx = self.turn_ctx(ticket, tool)?;
+        let turn_session = ctx.session.clone();
+        let room = ctx.room.clone();
+        let delivered = ctx.delivered.clone();
+        let live = ctx.live;
+
+        let value = match tool {
             // 不给目标：接着说当前这一轮的房间，用本轮的身份。
             "send_message" => {
                 let args: SendArgs = parse(args)?;
@@ -487,6 +535,11 @@ impl<S: Store> Bridge<S> {
                 let args: PlatformCallArgs = parse(args)?;
                 self.platform_call(sessions, &room, args)
             }
+            // 反馈：诚实报告「这里卡住了」。这是出口，不是抱怨箱（ADR-0021）。
+            "report_feedback" => {
+                let args: FeedbackArgs = parse(args)?;
+                self.report_feedback(ticket, &turn_session, &room, live, args)
+            }
             // 记忆：文件层。
             "memory_read" => {
                 let args: MemoryArgs = parse(args)?;
@@ -497,7 +550,7 @@ impl<S: Store> Bridge<S> {
                 self.memory_write(&turn_session, args)
             }
             "memory_list" => {
-                let args: MemoryArgs = parse(args)?;
+                let args: MemoryListArgs = parse(args)?;
                 self.memory_list(&turn_session, args)
             }
             "memory_search" => {
@@ -541,7 +594,68 @@ impl<S: Store> Bridge<S> {
                 ErrorCode::ToolNotAllowed,
                 format!("没有这个工具：{other}"),
             )),
+        }?;
+
+        // 所有工具结果都从这一个口出去：超预算就分页，再不行就落盘（ADR-0022）。
+        // 放在这里而不是各个工具里，是为了「新加的工具天然受保护」——
+        // 以前每个接口各自截断，于是截断方式各不相同，最糟的一种是把 JSON 砍成半截字符串。
+        Ok(render::fit(tool, value, &self.spill_dir()))
+    }
+
+    /// 这张票能干什么。
+    ///
+    /// 分两种情况：轮次在跑（正常）；轮次刚结束但票还没过期（补确认、写反馈）。
+    /// 后者是这次修的：以前票一作废，所有调用一律 unauthorized，agent 分不清
+    /// 「轮次结束了」和「桥坏了」，于是反复重试、反复被重投。
+    fn turn_ctx(&mut self, ticket: &Ticket, tool: &str) -> Result<TurnCtx, ToolError> {
+        if let Some(session) = self.by_ticket.get(ticket) {
+            let turn = self.active.get(session).expect("有票就一定有活跃轮次");
+            return Ok(TurnCtx {
+                session: turn.session.clone(),
+                room: turn.room.clone(),
+                delivered: turn.delivered.clone(),
+                live: true,
+            });
         }
+
+        let Some(ended) = self.ended.get(ticket).cloned() else {
+            return Err(no_active_round());
+        };
+
+        // 轮次结束了。只放行两件事——其余工具这轮真的用不了，说清楚让 agent 收手。
+        match tool {
+            "ack_messages" => {
+                if ended.at.elapsed() > ACK_GRACE {
+                    return Err(ToolError::new(
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "[ack_expired] 这一轮结束超过 {} 秒了，补确认的口子关了。\
+                             那几条会在下一轮作为未读重投给你（编号一样），到时候再确认就行；\
+                             现在别重试——重试也不会成功。",
+                            ACK_GRACE.as_secs()
+                        ),
+                    ));
+                }
+            }
+            "report_feedback" => {}
+            _ => return Err(no_active_round()),
+        }
+
+        Ok(TurnCtx {
+            session: ended.session,
+            room: ended.room,
+            delivered: ended.delivered,
+            live: false,
+        })
+    }
+
+    /// 落盘兜底放在哪：状态库旁边（`state/spill/`），跟库一起备份、一起清。
+    fn spill_dir(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.config.storage.path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join("spill"))
+            .unwrap_or_else(|| std::path::PathBuf::from("spill"))
     }
 
     // ---- 内部 ----
@@ -740,13 +854,17 @@ impl<S: Store> Bridge<S> {
             });
 
         // 消息过多时不全投：只投前 delivery_limit 条，剩下的让模型用 fetch_records 抓。
-        // 截断前先记下「还有几条」，好写在投递里；没配或没超就不截。
         let limit = self.config.delivery_limit;
-        let mut more = None;
+        let total_pending = records.len();
         if limit > 0 && records.len() > limit {
-            more = Some(records.len() - limit);
             records.truncate(limit);
         }
+        // 再按字节卡一道：条数不多但每条很长时，200 条照样能把 `turn_start` 撑过 1 MiB，
+        // harness 那边帧就解不开了——表现是「连上了又立刻断」，比截断难查十倍。
+        let keep = fit_records(&records, MAX_DELIVERY_BYTES);
+        records.truncate(keep);
+        // 有截断就把「还有几条」写上，让 harness 提示模型去 fetch_records。
+        let more = (total_pending > records.len()).then(|| total_pending - records.len());
 
         Ok(Delivery {
             ticket,
@@ -828,13 +946,26 @@ impl<S: Store> Bridge<S> {
         let cursor = Cursor::new(session, room.clone());
         let watermark = self.store.ack(&cursor, &[record.id]).map_err(internal)?;
 
+        // 回执要「像回执」：ok 摆在第一位，发出去了才给 platform_id / at。
+        // 失败时这个函数直接返回 Err（调用方拿到的是 error），绝不会出现
+        // 「一脸成功但平台没收到」的形状——模型据此判断能不能去群里说「已经发了」。
         Ok(json!({
+            "ok": true,
             "id": record.id,
             "platform_id": sent.platform_id,
+            "at": sent.at,
+            "room": room.to_string(),
             "watermark": watermark,
         }))
     }
 
+    /// 确认一批记录。
+    ///
+    /// 两条规矩，都是为了让「确认」这件事**幂等**：
+    /// 1. 已经确认过的编号（<= 当前水位）当成功跳过。重复确认不是错误——以前它报
+    ///    bad_request，模型于是以为「确认失败了」，接着往下不再确认，那几条就被反复重投。
+    /// 2. 只有「本轮真的投给过这个会话」的编号才能确认；别的编号报 `not_delivered`，
+    ///    并在错误里说清本轮投的是哪一段，让模型一轮就知道该改什么。
     fn ack(
         &mut self,
         session: &str,
@@ -843,27 +974,57 @@ impl<S: Store> Bridge<S> {
         ids: Vec<u64>,
     ) -> Result<Value, ToolError> {
         if ids.is_empty() {
-            return Err(ToolError::new(ErrorCode::BadRequest, "ids 不能为空"));
-        }
-        for id in &ids {
-            if !delivered.contains(id) {
-                return Err(ToolError::new(
-                    ErrorCode::BadRequest,
-                    format!(
-                        "编号 {id} 不是本轮投递给你的记录，不能确认；\
-                         先把本轮投给你的都处理完再确认"
-                    ),
-                ));
-            }
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                "[bad_params] ids 不能为空：把投递里记录前面的 #编号写进来",
+            ));
         }
 
         let cursor = Cursor::new(session, room.clone());
-        let watermark = self.store.ack(&cursor, &ids).map_err(internal)?;
-        for id in &ids {
+        let watermark = self.store.watermark(&cursor).map_err(internal)?;
+
+        let mut fresh: Vec<u64> = Vec::new();
+        let mut already: Vec<u64> = Vec::new();
+        for id in ids {
+            if id <= watermark {
+                already.push(id);
+                continue;
+            }
+            if !delivered.contains(&id) {
+                return Err(ToolError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "[not_delivered] #{id} 这一轮没投给你，确认不了。这一轮投给你的：{range}。\
+                         已经确认过的编号不用再确认（跳过去就行）。",
+                        range = delivery_range(delivered)
+                    ),
+                ));
+            }
+            fresh.push(id);
+        }
+
+        if fresh.is_empty() {
+            // 全都是确认过的：这是好消息，不是错误。
+            return Ok(json!({
+                "ok": true,
+                "watermark": watermark,
+                "acked": [],
+                "already": already,
+                "note": "这些编号之前已经确认过了，水位没动。不用再确认，接着干活就行。",
+            }));
+        }
+
+        let watermark = self.store.ack(&cursor, &fresh).map_err(internal)?;
+        for id in fresh.iter().chain(already.iter()) {
             self.store.forget_delivery(&cursor, *id).map_err(internal)?;
         }
 
-        Ok(json!({ "watermark": watermark }))
+        Ok(json!({
+            "ok": true,
+            "watermark": watermark,
+            "acked": fresh,
+            "already": already,
+        }))
     }
 
     fn history(
@@ -886,13 +1047,27 @@ impl<S: Store> Bridge<S> {
             .filter(|record| args.before.is_none_or(|before| record.id < before))
             .collect();
 
-        let skip = records.len().saturating_sub(limit);
+        // 总数一定要给：不给的话「还有多少条」只能靠猜，猜错就以为翻到底了。
+        let total = records.len();
+        let skip = total.saturating_sub(limit);
         records.drain(..skip);
+        let has_more = skip > 0;
+        // 往更早翻：把 oldest-1 当 before 传回来即可（不用记 offset，也不会因为
+        // 中途有新消息进来而错位——新消息都在另一头）。
+        let next_before = if has_more {
+            records.first().map(|record| record.id)
+        } else {
+            None
+        };
 
         let rendered: Vec<Value> = records.iter().map(|r| record_columns(r, &columns)).collect();
         Ok(json!({
             "room": room,
             "columns": columns,
+            "total": total,
+            "returned": rendered.len(),
+            "has_more": has_more,
+            "next_before": next_before,
             "records": rendered,
         }))
     }
@@ -908,7 +1083,10 @@ impl<S: Store> Bridge<S> {
         self.ensure_readable(sessions, &room)?;
 
         if args.ids.is_empty() {
-            return Err(ToolError::new(ErrorCode::BadRequest, "ids 不能为空"));
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                "[bad_params] ids 不能为空：把投递里记录前面的 #编号写进来",
+            ));
         }
         let columns = column_set(args.columns.as_deref())?;
 
@@ -929,6 +1107,8 @@ impl<S: Store> Bridge<S> {
         Ok(json!({
             "room": room,
             "columns": columns,
+            "total": wanted.len(),
+            "returned": rendered.len(),
             "records": rendered,
             "missing": missing,
         }))
@@ -960,7 +1140,8 @@ impl<S: Store> Bridge<S> {
                 }));
             }
         }
-        Ok(json!({ "rooms": rooms }))
+        let total = rooms.len();
+        Ok(json!({ "rooms": rooms, "total": total }))
     }
 
     fn read_notes(
@@ -984,7 +1165,11 @@ impl<S: Store> Bridge<S> {
             .filter(|note| kind.is_none_or(|wanted| note.key.kind == wanted))
             .collect();
 
-        Ok(json!({ "room": room, "notes": notes.iter().map(note_json).collect::<Vec<_>>() }))
+        Ok(json!({
+            "room": room,
+            "total": notes.len(),
+            "notes": notes.iter().map(note_json).collect::<Vec<_>>(),
+        }))
     }
 
     fn write_note(
@@ -1059,8 +1244,9 @@ impl<S: Store> Bridge<S> {
         let room = self.resolve(&args.room, turn_room)?;
         self.ensure_readable(sessions, &room)?;
 
-        let limit = args.limit.unwrap_or(DEFAULT_HISTORY).min(MAX_HISTORY);
-        let mut records: Vec<Record> = self
+        let limit = args.limit.unwrap_or(DEFAULT_HISTORY).min(MAX_PAGE_LIMIT);
+        let offset = args.offset.unwrap_or(0);
+        let events: Vec<Record> = self
             .store
             .since(&room, 0, usize::MAX)
             .map_err(internal)?
@@ -1068,9 +1254,19 @@ impl<S: Store> Bridge<S> {
             .filter(|record| !record.is_message())
             .collect();
 
-        let skip = records.len().saturating_sub(limit);
-        records.drain(..skip);
-        Ok(json!({ "room": room, "events": records }))
+        let total = events.len();
+        let page: Vec<Record> = events.into_iter().skip(offset).take(limit).collect();
+        let returned = page.len();
+        let has_more = offset + returned < total;
+        Ok(json!({
+            "room": room,
+            "total": total,
+            "offset": offset,
+            "returned": returned,
+            "has_more": has_more,
+            "next_offset": if has_more { json!(offset + returned) } else { Value::Null },
+            "events": page,
+        }))
     }
 
     /// 平台能力目录（ADR-0020）。
@@ -1112,6 +1308,7 @@ impl<S: Store> Bridge<S> {
                 "connection": connection,
                 "platform": platform,
                 "total": methods.len(),
+                "returned": list.len(),
                 "methods": list,
                 "tags": tags_of(methods),
                 "hint": "名字里点号前那段是归属（跟平台 API 命名空间对齐）；tags 是用途，跨归属。\
@@ -1204,7 +1401,188 @@ impl<S: Store> Bridge<S> {
             .call(&room, spec.name, &args.params)
             .map_err(call_error)?;
 
-        Ok(cap_result(result))
+        // 查询在**分页之前**做：先过滤/分组，再切页——否则 `_page.total` 给的是过滤前的数，
+        // 模型永远算不出「到底几个」。
+        let grouped = args.query.group_by.is_some();
+        let result = crate::query::apply_to_value(result, &args.query)
+            .map_err(|error| ToolError::new(ErrorCode::BadRequest, error.to_string()))?;
+        if grouped {
+            // 分组结果本来就只有几行（十几个角色、几个人），不切页。
+            return Ok(result);
+        }
+
+        // 分页是**桥这一层**的事：平台照旧一次给全，桥切片后再交出去。
+        // 平台方法签名不用为分页改五十遍，大群的大列表也不会因为「一次给不完」被写死。
+        let limit = args.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+        let offset = args.offset.unwrap_or(0);
+        Ok(render::slice(result, offset, limit))
+    }
+
+    /// 记一条反馈（ADR-0021）。
+    ///
+    /// 取向是**写建议，不是填表**：正文一个字段，想说多少说多少（上限
+    /// [`MAX_FEEDBACK_BODY`] 字，超了截断并告知）；出处、次数、类型都可以不填。
+    /// 桥自己会补现场（会话、harness、房间、模型、这一轮还在不在跑），
+    /// agent 不用把「我是谁、我在哪」再抄一遍。
+    ///
+    /// 为什么要这个工具：agent 卡住时的唯一出路曾经是「自己想办法」——有的直接绕过桥
+    /// 去戳平台端口。那种绕道没有订阅校验、没有审计，也没人知道它撞了什么墙。
+    /// 给一个正式的出口，绕道才会自己消失。
+    fn report_feedback(
+        &mut self,
+        ticket: &Ticket,
+        session: &str,
+        room: &RoomId,
+        live: bool,
+        args: FeedbackArgs,
+    ) -> Result<Value, ToolError> {
+        let body = args.text.trim();
+        if body.is_empty() {
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                "[bad_params] text 不能为空：把「你被什么卡住了」写进来，一两句话就行。",
+            ));
+        }
+
+        let kind = match args.kind.as_deref().map(str::trim) {
+            None | Some("") => "friction",
+            Some(kind) => {
+                let kind = kind.to_ascii_lowercase();
+                if !FEEDBACK_KINDS.contains(&kind.as_str()) {
+                    return Err(ToolError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "[bad_params] kind 只能是 {}，收到 {kind}；不填默认 friction。",
+                            FEEDBACK_KINDS.join(" / ")
+                        ),
+                    ));
+                }
+                // 字符串要活得比函数长：转成静态表里的那个值。
+                FEEDBACK_KINDS
+                    .iter()
+                    .find(|known| **known == kind)
+                    .copied()
+                    .unwrap_or("friction")
+            }
+        };
+
+        let severity = match args.severity.as_deref().map(str::trim) {
+            None | Some("") => default_severity(kind),
+            Some(severity) => {
+                let severity = severity.to_ascii_lowercase();
+                if !FEEDBACK_SEVERITIES.contains(&severity.as_str()) {
+                    return Err(ToolError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "[bad_params] severity 只能是 {}，收到 {severity}。",
+                            FEEDBACK_SEVERITIES.join(" / ")
+                        ),
+                    ));
+                }
+                FEEDBACK_SEVERITIES
+                    .iter()
+                    .find(|known| **known == severity)
+                    .copied()
+                    .unwrap_or("major")
+            }
+        };
+
+        // 第一条非空行当标题，剩下的当正文。想写日记也行，列表里只显示第一行。
+        let (title_raw, _) = split_first_line(body);
+        let (title, title_clipped) = clip(title_raw, MAX_FEEDBACK_TITLE);
+        let (body, body_clipped) = clip(body, MAX_FEEDBACK_BODY);
+        let suggestion = args.suggestion.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        let (suggestion, suggestion_clipped) = match suggestion {
+            Some(text) => {
+                let (clipped, cut) = clip(text, MAX_FEEDBACK_SUGGESTION);
+                (Some(clipped), cut)
+            }
+            None => (None, false),
+        };
+
+        // 出处：清掉空串、限个数、限长度。这里不校验「这个编号存不存在」——
+        // 有时候最该记下来的正是「那个编号查不到」。
+        let mut refs: Vec<String> = Vec::new();
+        for item in args.refs.iter().take(MAX_FEEDBACK_REFS) {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (item, _) = clip(item, MAX_FEEDBACK_REF_CHARS);
+            if !refs.contains(&item) {
+                refs.push(item);
+            }
+        }
+        let refs_dropped = args.refs.len().saturating_sub(MAX_FEEDBACK_REFS);
+
+        let count = args.count.unwrap_or(1).clamp(1, MAX_FEEDBACK_OCCURRENCES);
+
+        let harness = self
+            .config
+            .session(session)
+            .map(|session| session.harness.clone());
+        let model = self
+            .config
+            .session(session)
+            .and_then(|session| session.model.clone());
+        let at = now_millis();
+        let log_title = title.clone();
+
+        let draft = crate::storage::FeedbackDraft {
+            fingerprint: feedback_fingerprint(&title),
+            title,
+            body,
+            suggestion,
+            kind: kind.to_owned(),
+            severity: severity.to_owned(),
+            refs,
+            occurrences: count,
+            tool: args.tool.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned),
+            session: session.to_owned(),
+            harness,
+            room: Some(room.to_string()),
+            context: json!({
+                "ticket": ticket.as_str(),
+                "model": model,
+                "turn_running": live,
+                "at": at,
+            }),
+            at,
+        };
+
+        let recorded = self.store.record_feedback(draft).map_err(internal)?;
+
+        // 也打进桥日志：一份被人看见的反馈，不该只躺在库里等人去查表。
+        eprintln!(
+            "反馈 #{} [{} {}] {}：{}（自称 {} 次，第 {} 次报告）",
+            recorded.id, kind, severity, session, log_title, recorded.occurrences, recorded.repeats
+        );
+
+        let mut truncated = serde_json::Map::new();
+        if title_clipped {
+            truncated.insert("title".into(), json!(MAX_FEEDBACK_TITLE));
+        }
+        if body_clipped {
+            truncated.insert("text".into(), json!(MAX_FEEDBACK_BODY));
+        }
+        if suggestion_clipped {
+            truncated.insert("suggestion".into(), json!(MAX_FEEDBACK_SUGGESTION));
+        }
+
+        Ok(json!({
+            "ok": true,
+            "id": recorded.id,
+            "duplicate": recorded.duplicate,
+            "repeats": recorded.repeats,
+            "occurrences": recorded.occurrences,
+            "truncated": truncated,
+            "refs_dropped": refs_dropped,
+            "note": if recorded.duplicate {
+                "这条已经提过（同样的标题），次数已累加，不用再提。接着干活就行。"
+            } else {
+                "记下了。这是出口，不是许愿池：写清「在哪一步卡住」比写「希望支持 X」有用得多。"
+            },
+        }))
     }
 
     /// 连接名 → 平台名。只给展示用，查不到就说 unknown，不要因此拒绝服务。
@@ -1267,16 +1645,42 @@ impl<S: Store> Bridge<S> {
         Ok(json!({ "path": args.path, "written": true }))
     }
 
-    fn memory_list(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
+    fn memory_list(&self, session: &str, args: MemoryListArgs) -> Result<Value, ToolError> {
         let worktree = self.memory_worktree(session, &args.memory)?;
         let entries = list_dir(&worktree, &args.path)?;
-        Ok(json!({ "path": args.path, "entries": entries }))
+        let total = entries.len();
+        let offset = args.offset.unwrap_or(0);
+        let limit = args.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+        let page: Vec<String> = entries.into_iter().skip(offset).take(limit).collect();
+        let has_more = offset + page.len() < total;
+        Ok(json!({
+            "path": args.path,
+            "total": total,
+            "offset": offset,
+            "returned": page.len(),
+            "has_more": has_more,
+            "next_offset": if has_more { json!(offset + page.len()) } else { Value::Null },
+            "entries": page,
+        }))
     }
 
     fn memory_search(&self, session: &str, args: MemorySearchArgs) -> Result<Value, ToolError> {
         let worktree = self.memory_worktree(session, &args.memory)?;
         let hits = search(&worktree, &args.path, &args.needle)?;
-        Ok(json!({ "needle": args.needle, "hits": hits }))
+        let total = hits.len();
+        let offset = args.offset.unwrap_or(0);
+        let limit = args.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+        let page: Vec<String> = hits.into_iter().skip(offset).take(limit).collect();
+        let has_more = offset + page.len() < total;
+        Ok(json!({
+            "needle": args.needle,
+            "total": total,
+            "offset": offset,
+            "returned": page.len(),
+            "has_more": has_more,
+            "next_offset": if has_more { json!(offset + page.len()) } else { Value::Null },
+            "hits": page,
+        }))
     }
 
     // ---- 记忆工具：git 层 ----
@@ -1328,6 +1732,43 @@ impl<S: Store> Bridge<S> {
         let branches = git_branch(&worktree)?;
         Ok(json!({ "branches": branches }))
     }
+}
+
+/// 按字节预算算「前多少条能一起投」。至少留一条：一条都投不出去，这一轮就别开了。
+///
+/// 从前往后累加，一旦超预算就停在断点上——**顺序不能乱**，投递是按时间读的。
+fn fit_records(records: &[Record], budget: usize) -> usize {
+    let mut used = 0usize;
+    for (index, record) in records.iter().enumerate() {
+        let size = serde_json::to_vec(record).map(|bytes| bytes.len()).unwrap_or(0);
+        if index > 0 && used + size > budget {
+            return index;
+        }
+        used += size;
+    }
+    records.len()
+}
+
+/// 「本轮投给你的是哪一段」——错误信息里要能直接照抄的答案。
+fn delivery_range(delivered: &BTreeSet<u64>) -> String {
+    match (delivered.iter().next(), delivered.iter().next_back()) {
+        (Some(first), Some(last)) if first == last => format!("#{first}"),
+        (Some(first), Some(last)) => format!("#{first}–#{last}（共 {} 条）", delivered.len()),
+        _ => "（这一轮没有投任何记录）".to_owned(),
+    }
+}
+
+/// 票用不了了。**说清「这一轮不会再有工具可用」**——这是让 agent 收手的关键一句。
+///
+/// 以前这里只有「这张票无效或本轮已结束」：模型分不清是自己调错了、还是桥坏了，
+/// 于是继续试别的工具，一路试到轮次真的结束。错误文案本身就是接口的一部分。
+fn no_active_round() -> ToolError {
+    ToolError::new(
+        ErrorCode::Unauthorized,
+        "[no_active_round] 这张票对应的轮次已经结束了，**这一轮不会再有工具可用——请结束本轮，别重试**。\
+         没确认的消息还在，会在下一轮作为未读重新投给你（编号不变），到那时再确认即可。\
+         还能做的只有两件：60 秒内补确认（ack_messages）、随时写反馈（report_feedback）。",
+    )
 }
 
 fn resolve_room(text: &str) -> Result<RoomId, ToolError> {
@@ -1457,10 +1898,88 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-// ── 平台能力（ADR-0020）────────────────────────────────────────────────
+// ── 反馈（ADR-0021）────────────────────────────────────────────────────
 
-/// 结果太长会撑爆上下文。超了就截断并说清楚截了——别让模型以为这就是全部。
-const MAX_CALL_RESULT_CHARS: usize = 8000;
+/// 反馈的类型。四种够表达「哪里不对」，再多就是让人纠结了。
+const FEEDBACK_KINDS: &[&str] = &["bug", "gap", "friction", "idea"];
+
+/// 影响面。三者足够排序：干不下去 / 很烦 / 小毛病。
+const FEEDBACK_SEVERITIES: &[&str] = &["blocker", "major", "minor"];
+
+/// 正文上限（字符）。4000 字大约能装一次完整的失败对话 + 复现步骤。
+///
+/// 为什么有上限而不是不限：一条反馈是给人看的，超过四千字人就不会看了；
+/// 真想长篇大论，写进文件再贴路径（refs 里放路径）。
+const MAX_FEEDBACK_BODY: usize = 4000;
+
+/// 标题上限（字符）：列表里一行扫过去的东西。
+const MAX_FEEDBACK_TITLE: usize = 120;
+
+/// 建议上限（字符）。
+const MAX_FEEDBACK_SUGGESTION: usize = 1000;
+
+/// 出处最多记多少条。
+const MAX_FEEDBACK_REFS: usize = 20;
+
+/// 单条出处的长度上限（字符）。
+const MAX_FEEDBACK_REF_CHARS: usize = 120;
+
+/// 自称发生次数的上限。比这更大就不像「撞了几次」，像在灌数。
+const MAX_FEEDBACK_OCCURRENCES: u32 = 100_000;
+
+/// 没写 severity 时按类型推：坏了或缺能力默认 major，别扭和愿望默认 minor。
+fn default_severity(kind: &str) -> &'static str {
+    match kind {
+        "bug" | "gap" => "major",
+        _ => "minor",
+    }
+}
+
+/// 第一行（标题），其余（正文）。空行跳过。
+fn split_first_line(text: &str) -> (&str, &str) {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let rest = &text[offset + line.len()..];
+            return (trimmed, rest.trim());
+        }
+        offset += line.len();
+    }
+    (text.trim(), "")
+}
+
+/// 按字符截断（不是字节，别把中文劈成半个）。返回（截断后的文本, 是否截过）。
+fn clip(text: &str, max_chars: usize) -> (String, bool) {
+    if text.chars().count() <= max_chars {
+        return (text.to_owned(), false);
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    (out, true)
+}
+
+/// 去重指纹：归一化标题的 FNV-1a。
+///
+/// 只认标题，不认类型：同一个坑这次报 gap、下次报 bug，还是同一个坑。
+/// 合并时保留第一次的类型（人已经看过那一行，不该被后来的报告悄悄改分类）。
+///
+/// 不引哈希库：这个东西只用来「同一条别再建一行」，不需要抗碰撞强度——
+/// 撞了最多是两条不同的反馈合并成一条（次数加起来），不会丢内容也不会出错。
+fn feedback_fingerprint(title: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in title
+        .to_lowercase()
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+// ── 平台能力（ADR-0020）────────────────────────────────────────────────
 
 fn no_catalog(connection: &str) -> ToolError {
     ToolError::new(
@@ -1678,20 +2197,4 @@ fn call_error(error: CallError) -> ToolError {
         CallError::Unavailable(_) => (ErrorCode::Internal, "unavailable"),
     };
     ToolError::new(code, format!("[{kind}] {error}"))
-}
-
-fn cap_result(value: Value) -> Value {
-    let text = value.to_string();
-    let total = text.chars().count();
-    if total <= MAX_CALL_RESULT_CHARS {
-        return value;
-    }
-    json!({
-        "truncated": true,
-        "total_chars": total,
-        "note": format!(
-            "结果有 {total} 字符，太长了，只给前 {MAX_CALL_RESULT_CHARS} 字符。要看其余部分就换更细的参数再查一次。"
-        ),
-        "preview": text.chars().take(MAX_CALL_RESULT_CHARS).collect::<String>(),
-    })
 }
