@@ -128,20 +128,131 @@ impl ParamType {
     }
 }
 
+/// 建议的用途标签。
+///
+/// 标签是**跨归属**的维度：`message.send` 和 `image.upload` 都挂 `image`，模型说「图片相关」
+/// 就能一次捞齐，不必知道平台把这些散在哪个命名空间里。
+///
+/// 词表只列跨平台都成立的概念，因为这是 core 唯一该懂的那种知识。适配器可以自己加，
+/// 但优先用这里的词——两个平台用同一个词，模型对同一个需求才只需要问一次。
+pub mod tags {
+    // 用途
+    pub const SEND: &str = "send";
+    pub const RECALL: &str = "recall";
+    pub const FORWARD: &str = "forward";
+    pub const HISTORY: &str = "history";
+    pub const UPLOAD: &str = "upload";
+    pub const DOWNLOAD: &str = "download";
+    pub const APPROVE: &str = "approve";
+
+    // 对象
+    pub const MESSAGE: &str = "message";
+    pub const MEMBER: &str = "member";
+    pub const GROUP: &str = "group";
+    pub const FRIEND: &str = "friend";
+    pub const ACCOUNT: &str = "account";
+
+    // 内容类型
+    pub const MEDIA: &str = "media";
+    pub const TEXT: &str = "text";
+    pub const IMAGE: &str = "image";
+    pub const VOICE: &str = "voice";
+    pub const VIDEO: &str = "video";
+    pub const FILE: &str = "file";
+
+    // 管理
+    pub const ADMIN: &str = "admin";
+    pub const MUTE: &str = "mute";
+
+    // 系统
+    pub const SYSTEM: &str = "system";
+}
+
+/// 同一个概念的各种叫法，一行一组。
+///
+/// 模型是照需求说的（「图片」「语音」），适配器声明的是标识符（`image`、`voice`）。
+/// 这张表把两头接上，省掉适配器为每个方法写一堆中文别名的负担。
+const ALIASES: &[&[&str]] = &[
+    &["image", "图片", "图", "照片", "截图", "pic", "picture"],
+    &["voice", "语音", "音频", "录音", "audio"],
+    &["video", "视频", "录像"],
+    &["file", "文件", "附件", "群文件"],
+    &["media", "媒体", "多模态"],
+    &["message", "消息", "信息", "历史消息"],
+    &["forward", "转发", "合并转发", "聊天记录"],
+    &["send", "发送", "发消息", "说话"],
+    &["recall", "撤回", "撤销"],
+    &["history", "历史", "记录", "上下文"],
+    &["member", "成员", "群员", "群成员", "成员列表"],
+    &["group", "群", "群聊", "群组"],
+    &["friend", "好友", "朋友", "私聊"],
+    &["account", "账号", "资料", "个人信息"],
+    &["admin", "管理", "管理员", "权限"],
+    &["mute", "禁言", "闭嘴"],
+    &["approve", "审批", "同意", "通过", "申请"],
+    &["upload", "上传"],
+    &["download", "下载"],
+    &["system", "系统", "状态"],
+];
+
+/// 把一个查询词展开成一组同义检索词（中英都算），第一个永远是原词。
+///
+/// 判断用双向包含：「图片相关」能对上 `image`，「图」也能；代价是短词会多命中几行，
+/// 但命中多了模型自己会挑，比漏掉强。
+pub fn expand_query(needle: &str) -> Vec<String> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut terms = vec![needle.clone()];
+    for row in ALIASES {
+        let hit = row.iter().any(|term| {
+            let term = term.to_lowercase();
+            needle.contains(&term) || term.contains(&needle)
+        });
+        if !hit {
+            continue;
+        }
+        for term in row.iter() {
+            let term = term.to_lowercase();
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+    }
+    terms
+}
+
 /// 一个平台方法的声明。适配器自己给，core 只认这个形状。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MethodSpec {
     /// 全名，强制 `resource.method`（`forward.get_content`）。
     pub name: &'static str,
     pub summary: &'static str,
+    /// 用途标签，跨归属表达「这是干什么的」。从 [`tags`] 里挑。
+    pub tags: &'static [&'static str],
     pub risk: Risk,
     pub params: &'static [ParamSpec],
 }
 
 impl MethodSpec {
-    /// 分组名：名字里点号前面那段。目录按它两层披露。
+    /// 归属：名字里点号前面那段。跟平台 API 的命名空间对齐，模型看到 `{"type":"forward"}`
+    /// 就能联想到 `forward.*`。
     pub fn group(&self) -> &'static str {
         self.name.split('.').next().unwrap_or(self.name)
+    }
+
+    /// 带不带这个标签。大小写不敏感——模型未必记得住声明时是大写还是小写。
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|item| item.eq_ignore_ascii_case(tag))
+    }
+
+    /// 这个词命中不命中：名字、说明、标签任一含它都算。
+    pub fn matches(&self, needle: &str) -> bool {
+        let needle = needle.to_lowercase();
+        self.name.to_lowercase().contains(&needle)
+            || self.summary.to_lowercase().contains(&needle)
+            || self.tags.iter().any(|tag| tag.to_lowercase().contains(&needle))
     }
 
     /// 参数表渲染成 JSON Schema。
@@ -379,6 +490,7 @@ mod tests {
     static METHODS: &[MethodSpec] = &[MethodSpec {
         name: "forward.get_content",
         summary: "读合并转发的正文",
+        tags: &[tags::FORWARD, tags::MESSAGE],
         risk: Risk::Read,
         params: FORWARD_PARAMS,
     }];
@@ -432,16 +544,65 @@ mod tests {
         assert!(matches!(error, CallError::UnsupportedPlatform(_)));
     }
 
-    /// 名字里点号前面那段就是分组名，目录靠它两层披露。
+    /// 名字里点号前面那段就是归属，目录靠它在清单里排序认路。
     #[test]
     fn method_group_is_prefix() {
         let spec = MethodSpec {
             name: "group.get_member_info",
             summary: "",
+            tags: &[],
             risk: Risk::Read,
             params: &[],
         };
         assert_eq!(spec.group(), "group");
+    }
+
+    /// 标签跨归属：两个不同命名空间的方法挂同一个 tag，是这个维度存在的全部理由。
+    #[test]
+    fn tag_cuts_across_groups() {
+        static MIXED: &[MethodSpec] = &[
+            MethodSpec {
+                name: "message.send",
+                summary: "发一条消息",
+                tags: &[tags::SEND, tags::IMAGE],
+                risk: Risk::Write,
+                params: &[],
+            },
+            MethodSpec {
+                name: "group.get_member_info",
+                summary: "查群成员",
+                tags: &[tags::MEMBER],
+                risk: Risk::Read,
+                params: &[],
+            },
+        ];
+
+        let pictures: Vec<&str> = MIXED
+            .iter()
+            .filter(|method| method.has_tag("image"))
+            .map(|method| method.name)
+            .collect();
+        assert_eq!(pictures, vec!["message.send"]);
+        assert_eq!(MIXED[0].group(), "message");
+    }
+
+    /// 模型说中文，适配器声明英文标识符：查询词得两头都能接上。
+    #[test]
+    fn query_terms_bridge_chinese_and_identifiers() {
+        let terms = expand_query("图片");
+        assert!(terms.contains(&"image".to_owned()), "中文要能对到标识符");
+        assert!(terms.contains(&"图片".to_owned()), "原词一定要留着");
+
+        // 反过来：模型照文档说英文，也得能搜到中文说明。
+        let terms = expand_query("voice");
+        assert!(terms.contains(&"语音".to_owned()));
+
+        // 带修饰的说法也要命中。
+        assert!(expand_query("图片相关").contains(&"image".to_owned()));
+
+        // 表里没有的词不能凭空消失，原样带回去让子串匹配兜底。
+        assert_eq!(expand_query("qwq"), vec!["qwq".to_owned()]);
+        assert!(expand_query("   ").is_empty());
     }
 
     /// 参数类型只做「大类型对得上」，够挡住把字符串塞进 integer 这类明显错。

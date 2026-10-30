@@ -70,10 +70,13 @@ core 迟早认识 QQ。
 
 **做法**（完整理由见 `docs/adr/0020-platform-capabilities.md`）：
 
-- core 只加**两个通用工具**，一个都不带平台名字：`platform_methods`（能力目录，三样参数都不给=分组摘要，
-  给 `group`=该组详情，给 `query`=模糊搜）/ `platform_call`（`{room, method, params}`，params 是任意 map，
-  core 原样转交，不认识任何字段）。
-- 适配器自己声明方法表（`MethodSpec { name, summary, risk, params }`），强制 `resource.method` 命名。
+- core 只加**两个通用工具**，一个都不带平台名字：`platform_methods`（能力目录，不给条件=逐条清单，
+  给 `group` / `tag` / `query`=命中方法连参数表，三者可叠加）/ `platform_call`（`{room, method, params}`，
+  params 是任意 map，core 原样转交，不认识任何字段）。
+- 目录两个维度：名字前缀是**归属**（跟平台 API 命名空间对齐），`MethodSpec.tags` 是**用途**（跨归属，
+  如 `image` 同时挂在 `message.send_image` 和 `group.get_file_url` 上）。core 给一张中英别名表
+  （`expand_query`），模型说「图片」也能搜到挂 `image` 的方法。
+- 适配器自己声明方法表（`MethodSpec { name, summary, tags, risk, params }`），强制 `resource.method` 命名。
   QQ 第一批只放 4 个**纯读**方法：`forward.get_content` / `message.get` / `group.get_member_info` /
   `group.get_member_list`。
 - `Outbound` 扩了 `catalog()` / `call()`，**都带默认实现**，所以现有 6 处测试 mock 一个都没改。

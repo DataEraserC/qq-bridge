@@ -14,6 +14,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import plugin from "../plugin/index.js"
+import { TOOLS } from "../../shared/tools.mjs"
 import { FakeBridge, TICKET, delivery, waitFor } from "./fake-bridge.mjs"
 
 const TOKEN = "t-main"
@@ -136,29 +137,11 @@ async function openTurn(bridge, host, payload = delivery()) {
 test("装上之后工具面齐全，名字和桥上的对得上", async (t) => {
   const { host } = await boot(t)
 
-  assert.deepEqual([...host.tools.keys()].sort(), [
-    "ack_messages",
-    "del_note",
-    "get_history",
-    "get_notes",
-    "get_platform_events",
-    "list_rooms",
-    "memory_git_add",
-    "memory_git_blame",
-    "memory_git_branch",
-    "memory_git_commit",
-    "memory_git_diff",
-    "memory_git_log",
-    "memory_git_push",
-    "memory_git_status",
-    "memory_list",
-    "memory_read",
-    "memory_search",
-    "memory_write",
-    "send_message",
-    "send_message_to",
-    "set_note",
-  ])
+  // 拿 shared/tools.mjs 当唯一真相：手抄一份清单迟早漂（之前就漏过 fetch_records）。
+  assert.deepEqual(
+    [...host.tools.keys()].sort(),
+    TOOLS.map((spec) => spec.name).sort(),
+  )
   // v2 的参数是 JSON Schema，不是 zod。
   const send = host.tools.get("send_message")
   assert.equal(send.input.type, "object")

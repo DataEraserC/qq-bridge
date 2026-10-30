@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
     Bridge, CallError, Element, Ingest, MemoryStore, MethodSpec, Outbound, OutboundError,
-    ParamSpec, ParamType, RecordDraft, Risk, RoomId, Sender, Sent, Ticket,
+    ParamSpec, ParamType, RecordDraft, Risk, RoomId, Sender, Sent, Ticket, outbound::tags,
 };
 use serde_json::{Value, json};
 
@@ -24,22 +24,45 @@ static MEMBER_PARAMS: &[ParamSpec] = &[
 
 static KICK_PARAMS: &[ParamSpec] = &[ParamSpec::required("user_id", "要踢的人")];
 
+static IMAGE_PARAMS: &[ParamSpec] = &[ParamSpec::required("file", "图片")];
+
+static FILE_PARAMS: &[ParamSpec] = &[ParamSpec::required("file_id", "群文件 id")];
+
+/// 故意让 `image` 这个标签跨在两个归属上：`message.*` 和 `group.*` 各有一个。
+/// 这正是 tag 维度存在的理由——模型问「图片相关」，一次就得把两边都捞出来。
 static METHODS: &[MethodSpec] = &[
     MethodSpec {
         name: "forward.get_content",
         summary: "读一条合并转发的正文",
+        tags: &[tags::FORWARD, tags::MESSAGE],
         risk: Risk::Read,
         params: FORWARD_PARAMS,
     },
     MethodSpec {
         name: "group.get_member_info",
         summary: "查群成员信息",
+        tags: &[tags::MEMBER, tags::GROUP],
         risk: Risk::Read,
         params: MEMBER_PARAMS,
     },
     MethodSpec {
+        name: "message.send_image",
+        summary: "往会话里发一张图",
+        tags: &[tags::SEND, tags::IMAGE, tags::MEDIA],
+        risk: Risk::Write,
+        params: IMAGE_PARAMS,
+    },
+    MethodSpec {
+        name: "group.get_file_url",
+        summary: "取群文件的下载地址",
+        tags: &[tags::FILE, tags::IMAGE, tags::DOWNLOAD],
+        risk: Risk::Read,
+        params: FILE_PARAMS,
+    },
+    MethodSpec {
         name: "group.kick",
         summary: "踢人",
+        tags: &[tags::ADMIN, tags::MEMBER],
         risk: Risk::Destructive,
         params: KICK_PARAMS,
     },
@@ -169,9 +192,9 @@ fn open_turn(bridge: &mut Bridge<MemoryStore>) -> Ticket {
 
 // ── 目录 ────────────────────────────────────────────────────────────────
 
-/// 什么都不给：只给分组摘要，省上下文。
+/// 什么都不给：逐条清单。够模型决定调哪个，但不带参数表——带表就等于全倒出来了。
 #[test]
-fn catalog_summary_lists_groups_without_dumping_everything() {
+fn catalog_lists_every_method_without_dumping_params() {
     let (mut bridge, _calls) = setup();
     let ticket = open_turn(&mut bridge);
 
@@ -180,15 +203,23 @@ fn catalog_summary_lists_groups_without_dumping_everything() {
         .expect("能查目录");
 
     assert_eq!(result["platform"], "qq");
-    assert_eq!(result["total"], 3);
-    let groups = result["groups"].as_array().expect("有分组");
-    assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0]["group"], "forward");
-    assert_eq!(groups[0]["count"], 1);
-    assert_eq!(groups[1]["group"], "group");
-    assert_eq!(groups[1]["count"], 2);
-    // 摘要里不该出现方法详情，否则等于全倒出来了。
-    assert!(result.get("methods").is_none());
+    assert_eq!(result["total"], 5);
+
+    let methods = result["methods"].as_array().expect("有清单");
+    assert_eq!(methods.len(), 5);
+    assert_eq!(methods[0]["name"], "forward.get_content");
+    assert_eq!(methods[0]["tags"][0], "forward");
+    assert_eq!(methods[2]["risk"], "write");
+    // 清单档不带参数表。
+    assert!(methods[0].get("params").is_none());
+
+    // 标签概览：模型能先看出「图片相关的有两个」。
+    let tags = result["tags"].as_array().expect("有标签概览");
+    let image = tags
+        .iter()
+        .find(|item| item["tag"] == "image")
+        .expect("有 image 标签");
+    assert_eq!(image["count"], 2);
 }
 
 /// 给 group：这一组的方法 + 参数表，参数表是 JSON Schema（模型最熟的形式）。
@@ -215,6 +246,70 @@ fn catalog_group_detail_carries_json_schema_params() {
     assert_eq!(methods[0]["params"]["required"][0], "id");
 }
 
+/// 标签是跨归属的：`image` 在 message 和 group 两处各有一个方法，一次全给。
+#[test]
+fn catalog_tag_pulls_methods_from_several_groups() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"tag": "image"}),
+        )
+        .expect("能按标签查");
+
+    let methods = result["methods"].as_array().expect("有方法");
+    assert_eq!(result["matched"], 2);
+    let names: Vec<&str> = methods
+        .iter()
+        .map(|method| method["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(names.contains(&"message.send_image"));
+    assert!(names.contains(&"group.get_file_url"));
+    // 缩了范围就带参数表，模型下一步就能直接调。
+    assert!(methods[0].get("params").is_some());
+}
+
+/// 模型说中文（「图片」），适配器声明的是 `image`：别名表把两头接上。
+#[test]
+fn catalog_query_in_chinese_still_reaches_tags() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"query": "图片"}),
+        )
+        .expect("能搜");
+
+    assert_eq!(result["matched"], 2);
+}
+
+/// 三个条件可以叠加，取交集。
+#[test]
+fn catalog_filters_stack() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"group": "group", "tag": "image"}),
+        )
+        .expect("能叠加");
+
+    assert_eq!(result["matched"], 1);
+    assert_eq!(result["methods"][0]["name"], "group.get_file_url");
+}
+
 #[test]
 fn catalog_group_that_does_not_exist_lists_the_real_ones() {
     let (mut bridge, _calls) = setup();
@@ -225,14 +320,34 @@ fn catalog_group_that_does_not_exist_lists_the_real_ones() {
             &ticket,
             &sessions(),
             "platform_methods",
-            json!({"group": "message"}),
+            json!({"group": "user"}),
         )
         .expect_err("没有这一组");
+    assert!(error.message.contains("no_match"));
     assert!(error.message.contains("forward"));
-    assert!(error.message.contains("group"));
+    assert!(error.message.contains("message"));
 }
 
-/// 知道要干什么但不知道方法名：按说明里的词也能搜到。
+/// 标签不存在时把手上的标签列出来，别让模型挨个瞎试。
+#[test]
+fn catalog_unknown_tag_lists_the_known_ones() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let error = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"tag": "qwq"}),
+        )
+        .expect_err("没这个标签");
+    assert!(error.message.contains("no_match"));
+    assert!(error.message.contains("image"));
+    assert!(error.message.contains("member"));
+}
+
+/// 关键词搜说明文字也还算数（不只是标签）。
 #[test]
 fn catalog_query_matches_the_summary_text() {
     let (mut bridge, _calls) = setup();
@@ -247,7 +362,7 @@ fn catalog_query_matches_the_summary_text() {
         )
         .expect("能搜");
 
-    let hits = result["hits"].as_array().expect("有命中");
+    let hits = result["methods"].as_array().expect("有命中");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["name"], "forward.get_content");
 }

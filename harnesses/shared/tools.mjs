@@ -186,20 +186,24 @@ ${COLUMNS_DOC}
   },
   {
     name: "platform_methods",
-    description: `查这个平台还能干哪些消息之外的事（读合并转发的正文、查群成员、审批入群……）。
+    description: `查这个平台还能干哪些消息之外的事（读合并转发的正文、查群成员、发图、审批入群……）。
 桥只提供这一个目录和下面那个通用调用口——平台特有的能力都从这里查，不在工具列表里。
 
-三样都不给：只返回分组摘要（有哪些组、各几个）。
-给 group：这一组每个方法的名字、说明、参数表。
-给 query：按关键词找（名字和说明都会搜）。
+不给条件：列出全部方法（名字 + 一句话 + 标签），不带参数表。
+给 group / tag / query：命中的方法带参数表。三者可以叠加。
+
+方法名是「归属.动作」，归属跟平台 API 的命名空间对齐（forward.* / message.* / group.*）。
+tags 是用途，跨归属：想找「图片相关」，用 tag="image"，不必知道平台把它放在哪个归属下。
+query 按词搜名字、说明、标签，中文和英文都认（「图片」能搜到 image）。
 
 看到消息里带「可调 platform_call(...)」的提示时，直接照着调就行，不用先查目录。`,
     schema: {
       type: "object",
       properties: {
         room: ROOM_SCHEMA,
-        group: { type: "string", description: "只看某一组，如 forward、group" },
-        query: { type: "string", description: "按关键词找方法" },
+        group: { type: "string", description: "只看某个归属，如 forward、message、group" },
+        tag: { type: "string", description: "只看带这个用途标签的，如 image、send、member、file" },
+        query: { type: "string", description: "按关键词找方法（中英都认）" },
       },
       additionalProperties: false,
     },

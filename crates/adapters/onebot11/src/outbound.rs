@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use acb_kernel::{
     CallError, Element, MethodSpec, Outbound, OutboundError, ParamSpec, ParamType, Risk, RoomId,
-    Sent,
+    Sent, outbound::tags,
 };
 use serde_json::{Value, json};
 
@@ -51,28 +51,35 @@ static MEMBER_LIST: &[ParamSpec] = &[ParamSpec::optional(
 )];
 
 /// 这台连接声明支持的方法。顺序即目录里的顺序。
+///
+/// `tags` 是跨归属的用途标记（ADR-0020）：模型说「图片相关」时靠它一次捞齐，不用先
+/// 知道 OneBot 把这类能力放在哪个命名空间。词从 `acb_kernel::outbound::tags` 里挑。
 static METHODS: &[MethodSpec] = &[
     MethodSpec {
         name: "forward.get_content",
         summary: "读一条合并转发的正文。消息里只有一个转发 id 时用它展开",
+        tags: &[tags::FORWARD, tags::MESSAGE],
         risk: Risk::Read,
         params: FORWARD_ID,
     },
     MethodSpec {
         name: "message.get",
         summary: "按平台消息 id 取一条消息的原始内容",
+        tags: &[tags::MESSAGE, tags::HISTORY],
         risk: Risk::Read,
         params: MESSAGE_ID,
     },
     MethodSpec {
         name: "group.get_member_info",
         summary: "查一个群成员的昵称、群名片、角色（群主/管理员/成员）",
+        tags: &[tags::MEMBER, tags::GROUP],
         risk: Risk::Read,
         params: MEMBER_INFO,
     },
     MethodSpec {
         name: "group.get_member_list",
         summary: "列出群成员。大群会很长，慎用",
+        tags: &[tags::MEMBER, tags::GROUP],
         risk: Risk::Read,
         params: MEMBER_LIST,
     },

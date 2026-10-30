@@ -29,7 +29,7 @@ use crate::memory::{
     MemoryRepo, git_add, git_blame, git_branch, git_commit, git_diff, git_log, git_push,
     git_status, list_dir, read_file, search, write_file,
 };
-use crate::outbound::{CallError, MethodSpec, Outbound, OutboundError, Risk};
+use crate::outbound::{CallError, MethodSpec, Outbound, OutboundError, Risk, expand_query};
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
     TopicStatus, unread,
@@ -1028,8 +1028,13 @@ impl<S: Store> Bridge<S> {
 
     /// 平台能力目录（ADR-0020）。
     ///
-    /// 三样参数都不给 = 分组摘要；给 `group` = 这一组的详情；给 `query` = 按关键词找。
-    /// 分批给是为了省上下文：一次把几十个方法的参数表全倒出来，每轮都要白付几千 token。
+    /// 两个维度、两档披露：
+    /// - 名字里点号前那段是**归属**，跟平台 API 的命名空间对齐；`tags` 是**用途**，跨归属。
+    /// - 不给任何条件 = 逐条清单（名字 + 一句话 + 标签），够模型决定调哪个。
+    /// - 给了 `group` / `tag` / `query` = 交集里的方法连**参数表**一起给，这时候模型是在准备调。
+    ///
+    /// 为什么清单不砍成「只有组名」：多一次往返就是多一整轮推理和几秒延迟，
+    /// 而一张清单在四五十个方法时也就一千来 token，只花在模型主动查的那一轮。
     fn platform_methods(
         &self,
         sessions: &[String],
@@ -1047,84 +1052,47 @@ impl<S: Store> Bridge<S> {
         let connection = room.connection.clone();
         let platform = self.platform_of(&room.connection).to_owned();
 
-        // 关键词找：名字和说明都搜，别只认名字。
-        if let Some(query) = args
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-        {
-            let needle = query.to_lowercase();
-            let hits: Vec<Value> = methods
-                .iter()
-                .filter(|method| {
-                    method.name.to_lowercase().contains(&needle)
-                        || method.summary.to_lowercase().contains(&needle)
-                })
-                .map(describe_method)
-                .collect();
-            let hint = if hits.is_empty() {
-                format!("没找到「{query}」。这个连接支持：{}", method_names(methods))
-            } else {
-                "对上了就 platform_call 调它；想看某组全部方法就给 group".to_owned()
-            };
+        let group = clean(args.group.as_deref());
+        let tag = clean(args.tag.as_deref());
+        let query = clean(args.query.as_deref());
+
+        // 没设条件：清单。不带参数表——那样就等于把整张表倒出来。
+        if group.is_none() && tag.is_none() && query.is_none() {
+            let list: Vec<Value> = methods.iter().map(describe_brief).collect();
             return Ok(json!({
                 "room": room_text,
                 "connection": connection,
                 "platform": platform,
-                "query": query,
-                "hits": hits,
-                "hint": hint,
+                "total": methods.len(),
+                "methods": list,
+                "tags": tags_of(methods),
+                "hint": "名字里点号前那段是归属（跟平台 API 命名空间对齐）；tags 是用途，跨归属。\
+                         要某个方法的参数表，再调一次并给 group / tag / query，三者可叠加。",
             }));
         }
 
-        // 某一组的详情：名字 + 说明 + 风险 + 参数表（JSON Schema）。
-        if let Some(group) = args
-            .group
-            .as_deref()
-            .map(str::trim)
-            .filter(|group| !group.is_empty())
-        {
-            let picked: Vec<Value> = methods
-                .iter()
-                .filter(|method| method.group() == group)
-                .map(describe_method)
-                .collect();
-            if picked.is_empty() {
-                return Err(ToolError::new(
-                    ErrorCode::BadRequest,
-                    format!(
-                        "[bad_params] 没有 {group} 这一组；有这些：{}",
-                        groups_of(methods).join(" / ")
-                    ),
-                ));
-            }
-            return Ok(json!({
-                "room": room_text,
-                "connection": connection,
-                "platform": platform,
-                "group": group,
-                "methods": picked,
-            }));
-        }
-
-        // 分组摘要。
-        let groups: Vec<Value> = groups_of(methods)
-            .into_iter()
-            .map(|group| {
-                json!({
-                    "group": group,
-                    "count": methods.iter().filter(|m| m.group() == group).count(),
-                })
+        // 缩了范围：命中的方法连参数表一起给。
+        let terms = query.as_deref().map(expand_query).unwrap_or_default();
+        let hits: Vec<&MethodSpec> = methods
+            .iter()
+            .filter(|method| group.map_or(true, |group| method.group() == group))
+            .filter(|method| tag.map_or(true, |tag| method.has_tag(tag)))
+            .filter(|method| {
+                terms.is_empty() || terms.iter().any(|term| method.matches(term))
             })
             .collect();
+
+        if hits.is_empty() {
+            return Err(no_match(methods, group, tag, query.as_deref()));
+        }
+
         Ok(json!({
             "room": room_text,
             "connection": connection,
             "platform": platform,
             "total": methods.len(),
-            "groups": groups,
-            "hint": "要看某一组的方法和参数，再调一次并给 group（比如 group=\"forward\"）；知道关键词也能给 query",
+            "matched": hits.len(),
+            "methods": hits.iter().map(|method| describe_method(method)).collect::<Vec<_>>(),
         }))
     }
 
@@ -1431,13 +1399,88 @@ fn no_catalog(connection: &str) -> ToolError {
     )
 }
 
+/// 空串当没给：模型有时会把「我不填」写成空字符串，别让它变成一次必然落空的过滤。
+fn clean(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+/// 清单档的一条：够模型判断「这是我要的」，但不带参数表。
+fn describe_brief(spec: &MethodSpec) -> Value {
+    json!({
+        "name": spec.name,
+        "summary": spec.summary,
+        "tags": spec.tags,
+        "risk": spec.risk.as_str(),
+    })
+}
+
+/// 详情档的一条：多一张参数表（JSON Schema，模型最熟的形式）。
 fn describe_method(spec: &MethodSpec) -> Value {
     json!({
         "name": spec.name,
         "summary": spec.summary,
+        "tags": spec.tags,
         "risk": spec.risk.as_str(),
         "params": spec.params_schema(),
     })
+}
+
+/// 这台连接用到的标签，按首次出现的顺序。
+fn tag_names(methods: &[MethodSpec]) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    for method in methods {
+        for tag in method.tags {
+            if !names.contains(tag) {
+                names.push(tag);
+            }
+        }
+    }
+    names
+}
+
+/// 标签概览，带各几个方法。
+fn tags_of(methods: &[MethodSpec]) -> Vec<Value> {
+    tag_names(methods)
+        .into_iter()
+        .map(|tag| {
+            json!({
+                "tag": tag,
+                "count": methods.iter().filter(|method| method.has_tag(tag)).count(),
+            })
+        })
+        .collect()
+}
+
+/// 过滤后一个都没命中：说清楚条件是什么、手上有哪些可选项。
+///
+/// 这类错只有一种正确写法——带上可选项，让模型一轮就改对，而不是换个词再试三次。
+fn no_match(
+    methods: &[MethodSpec],
+    group: Option<&str>,
+    tag: Option<&str>,
+    query: Option<&str>,
+) -> ToolError {
+    let mut given = Vec::new();
+    if let Some(group) = group {
+        given.push(format!("group={group}"));
+    }
+    if let Some(tag) = tag {
+        given.push(format!("tag={tag}"));
+    }
+    if let Some(query) = query {
+        given.push(format!("query={query}"));
+    }
+
+    let mut hint = format!("这个连接有这些归属：{}", groups_of(methods).join(" / "));
+    let known_tags = tag_names(methods);
+    if !known_tags.is_empty() {
+        hint.push_str(&format!("；有这些标签：{}", known_tags.join(" / ")));
+    }
+
+    ToolError::new(
+        ErrorCode::BadRequest,
+        format!("[no_match] 没有同时满足 {} 的方法；{hint}", given.join(" + ")),
+    )
 }
 
 fn method_names(methods: &[MethodSpec]) -> String {

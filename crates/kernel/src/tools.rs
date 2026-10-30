@@ -159,15 +159,19 @@ pub struct EventsArgs {
 
 /// 查平台能力目录（ADR-0020）。
 ///
-/// 三样都空 = 给分组摘要；给 `group` = 这一组的方法详情；给 `query` = 按关键词找。
+/// 三样都不给 = 逐条清单（名字 + 一句话 + 标签）；给了任一过滤条件 = 命中方法连参数表一起给。
+/// `group` / `tag` / `query` 可以叠加，取交集。
 #[derive(Debug, Default, Deserialize)]
 pub struct PlatformMethodsArgs {
     #[serde(default)]
     pub room: Option<String>,
-    /// 只看某一组，如 `forward`、`group`。
+    /// 只看某一归属，如 `forward`、`group`。
     #[serde(default)]
     pub group: Option<String>,
-    /// 按关键词找方法（名字或说明里含这个词）。
+    /// 只看带这个用途标签的方法，如 `image`、`send`、`member`。跨归属。
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// 按关键词找方法（名字、说明、标签都会搜，中英都认）。
     #[serde(default)]
     pub query: Option<String>,
 }
