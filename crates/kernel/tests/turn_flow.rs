@@ -575,6 +575,42 @@ fn history_and_events_read_from_the_transcript() {
     assert_eq!(rooms["rooms"][0]["room"]["connection"], "qq");
 }
 
+/// 记录里的 `columns` 状态表要用布尔，不能是「查了 / 没查」这种描述文字。
+///
+/// 那是给机器判断用的字段：布尔能直接当条件用，中文值只能让调用方再猜一遍。
+#[test]
+fn record_column_status_is_boolean_not_wording() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let history = bridge
+        .tool_call(&ticket, &sessions(), "get_history", json!({}))
+        .expect("能查");
+
+    let records = history["records"].as_array().expect("是数组");
+    assert_eq!(records.len(), 1);
+    let status = records[0]["columns"].as_object().expect("每条记录带列状态");
+
+    // 默认列被取了 → true；没要的列 → false。全是布尔，没有一种是字符串。
+    assert_eq!(status.get("id"), Some(&json!(true)));
+    assert_eq!(status.get("elements"), Some(&json!(true)));
+    assert_eq!(status.get("kind"), Some(&json!(false)));
+    assert_eq!(status.get("platform_id"), Some(&json!(false)));
+    for (column, value) in status {
+        assert!(
+            value.is_boolean(),
+            "{column} 的状态该是布尔，实际是 {value}"
+        );
+    }
+
+    // 取了的列照旧在记录上；没取的列不出现（状态表说了没取）。
+    assert!(records[0].get("id").is_some());
+    assert!(records[0].get("kind").is_none());
+}
+
 #[test]
 fn notes_written_in_one_room_are_invisible_in_another() {
     let (mut bridge, _sends) = bridge();

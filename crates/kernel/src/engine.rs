@@ -1373,16 +1373,18 @@ fn column_set(given: Option<&[String]>) -> Result<Vec<&'static str>, ToolError> 
     Ok(columns)
 }
 
-/// 把一条记录按指定列序列化，并附带「每列查没查」的状态。
+/// 把一条记录按指定列序列化，并附带「每列取没取」的状态。
 ///
-/// 返回形如 `{ "id": 237, "columns": { "id": "查了", "platform_id": "没查" } }`。
+/// 返回形如 `{ "id": 237, "columns": { "id": true, "platform_id": false } }`。
 /// 这样 agent 能一眼看出哪列是它要的、哪列没取，不会把「没取」误当「没有」。
+///
+/// 状态值是布尔，不是描述文字：「查了 / 没查」这种中文值只能给人看，机器要判断得再猜一遍。
 fn record_columns(record: &Record, columns: &[&str]) -> Value {
     let mut status = serde_json::Map::new();
     let mut out = serde_json::Map::new();
     for column in RECORD_COLUMNS {
         let taken = columns.contains(column);
-        status.insert((*column).to_owned(), json!(if taken { "查了" } else { "没查" }));
+        status.insert((*column).to_owned(), json!(taken));
         if !taken {
             continue;
         }

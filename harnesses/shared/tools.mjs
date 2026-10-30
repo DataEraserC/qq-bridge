@@ -106,7 +106,8 @@ ids 就是投递记录前面的编号。`,
     name: "fetch_records",
     description: `按水位编号精确查一批记录，只返回你要的列。
 ${COLUMNS_DOC}
-返回里每条记录会带一个 columns 字段，写清楚每一列是「查了」还是「没查」。`,
+返回里每条记录会带一个 columns 字段，用 true/false 标明这一列这次取了没有——
+false 是「这次没查」，不是「这条没这个值」，要的话把它加进 columns 再查一次。`,
     schema: {
       type: "object",
       properties: {
