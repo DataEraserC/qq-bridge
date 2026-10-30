@@ -28,8 +28,11 @@
 - id: agent-default-model
   name: "@deepseek-ai/dsh-agent-default-model"
   config:
-    provider: new-api-y9000p2025-openai-responses
-    model: 1AgentRouter/gpt-5.6-sol
+    # trae 这个 provider 不是这里声明的，是 dsh-our-free-model 插件装进来的
+    # （它带 trae-adapter，模型名 deepseek-v4.1-flash 也由它引入）。
+    # 之前指到 new-api 网关的 1AgentRouter/gpt-5.6-sol，那个渠道回 content-blocked。
+    provider: trae
+    model: deepseek-v4.1-flash
     reasoningEffort: high
 
 # 关键：内置 web 模板的 llm-pi-ai 是空配置，必须在这里把 new-api 的 provider
