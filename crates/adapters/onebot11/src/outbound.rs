@@ -274,7 +274,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acb_kernel::Risk;
+    use acb_kernel::{Risk, Scope};
 
     #[test]
     fn group_room_maps_to_send_group_msg() {
@@ -442,6 +442,33 @@ mod tests {
             "like.send",
         ] {
             assert!(names.contains(&expected), "缺 {expected}");
+        }
+    }
+
+    /// 「号上的事」和「房间里的事」要分清：前者不该逼模型先编一个群号出来。
+    #[test]
+    fn account_level_methods_are_connection_scoped() {
+        let outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
+        for method in outbound.catalog("qq") {
+            let account_level = matches!(
+                method.name,
+                "account.login_info"
+                    | "account.status"
+                    | "account.version"
+                    | "friend.list"
+                    | "friend.get_info"
+                    | "friend.approve"
+                    | "friend.delete"
+                    | "group.list"
+                    | "like.send"
+                    | "system.check_url"
+            );
+            let expected = if account_level {
+                Scope::Connection
+            } else {
+                Scope::Room
+            };
+            assert_eq!(method.scope, expected, "{} 的作用域标错了", method.name);
         }
     }
 

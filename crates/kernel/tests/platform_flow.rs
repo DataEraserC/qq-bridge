@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
     Bridge, CallError, Element, Ingest, MemoryStore, MethodSpec, Outbound, OutboundError,
-    ParamSpec, ParamType, RecordDraft, Risk, RoomId, Sender, Sent, Ticket, outbound::tags,
+    ParamSpec, ParamType, RecordDraft, Risk, RoomId, Scope, Sender, Sent, Ticket, outbound::tags,
 };
 use serde_json::{Value, json};
 
@@ -36,6 +36,7 @@ static METHODS: &[MethodSpec] = &[
         summary: "读一条合并转发的正文",
         tags: &[tags::FORWARD, tags::MESSAGE],
         risk: Risk::Read,
+        scope: Scope::Room,
         params: FORWARD_PARAMS,
     },
     MethodSpec {
@@ -43,6 +44,7 @@ static METHODS: &[MethodSpec] = &[
         summary: "查群成员信息",
         tags: &[tags::MEMBER, tags::GROUP],
         risk: Risk::Read,
+        scope: Scope::Room,
         params: MEMBER_PARAMS,
     },
     MethodSpec {
@@ -50,6 +52,7 @@ static METHODS: &[MethodSpec] = &[
         summary: "往会话里发一张图",
         tags: &[tags::SEND, tags::IMAGE, tags::MEDIA],
         risk: Risk::Write,
+        scope: Scope::Room,
         params: IMAGE_PARAMS,
     },
     MethodSpec {
@@ -57,6 +60,7 @@ static METHODS: &[MethodSpec] = &[
         summary: "取群文件的下载地址",
         tags: &[tags::FILE, tags::IMAGE, tags::DOWNLOAD],
         risk: Risk::Read,
+        scope: Scope::Room,
         params: FILE_PARAMS,
     },
     MethodSpec {
@@ -64,6 +68,7 @@ static METHODS: &[MethodSpec] = &[
         summary: "踢人",
         tags: &[tags::ADMIN, tags::MEMBER],
         risk: Risk::Destructive,
+        scope: Scope::Room,
         params: KICK_PARAMS,
     },
     MethodSpec {
@@ -71,7 +76,17 @@ static METHODS: &[MethodSpec] = &[
         summary: "禁言",
         tags: &[tags::ADMIN, tags::MUTE],
         risk: Risk::Destructive,
+        scope: Scope::Room,
         params: KICK_PARAMS,
+    },
+    // 跟房间无关的那一类：查的是这个号本身有什么，不是房间里发生了什么。
+    MethodSpec {
+        name: "friend.list",
+        summary: "好友列表",
+        tags: &[tags::FRIEND],
+        risk: Risk::Read,
+        scope: Scope::Connection,
+        params: &[],
     },
 ];
 
@@ -105,6 +120,7 @@ impl Outbound for Platformy {
             })),
             "group.get_member_info" => Ok(json!({"nickname": "老王", "role": "member"})),
             "group.kick" | "group.ban" => Ok(json!({"done": true})),
+            "friend.list" => Ok(json!({"friends": [{"user_id": "10001", "nickname": "老王"}]})),
             other => Err(CallError::NotImplemented(other.to_owned())),
         }
     }
@@ -221,10 +237,10 @@ fn catalog_lists_every_method_without_dumping_params() {
         .expect("能查目录");
 
     assert_eq!(result["platform"], "qq");
-    assert_eq!(result["total"], 6);
+    assert_eq!(result["total"], 7);
 
     let methods = result["methods"].as_array().expect("有清单");
-    assert_eq!(methods.len(), 6);
+    assert_eq!(methods.len(), 7);
     assert_eq!(methods[0]["name"], "forward.get_content");
     assert_eq!(methods[0]["tags"][0], "forward");
     assert_eq!(methods[2]["risk"], "write");
@@ -563,4 +579,63 @@ fn room_outside_the_subscription_is_refused() {
         .expect_err("没订阅这个房间");
     assert!(calls.lock().expect("没被毒死").is_empty());
     assert!(!error.message.is_empty());
+}
+
+/// 好友列表、账号资料这类跟房间无关：不该逼模型先编一个群号出来。
+#[test]
+fn connection_scoped_method_needs_no_room() {
+    let (mut bridge, calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "friend.list"}),
+        )
+        .expect("不给房间也能查好友列表");
+
+    assert_eq!(result["friends"][0]["nickname"], "老王");
+    assert_eq!(calls.lock().expect("没被毒死").len(), 1);
+}
+
+/// 连接级只按「这条连接有没有订阅」量，不按房间量。
+/// 反过来说：房间级那条边界一点没松——上面那个测试还红着就不行。
+#[test]
+fn connection_scoped_method_does_not_check_the_room() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge.tool_call(
+        &ticket,
+        &sessions(),
+        "platform_call",
+        json!({"room": "qq:group/999", "method": "friend.list"}),
+    );
+    assert!(result.is_ok(), "连接级方法不该因为房间没订阅就拒");
+}
+
+/// 清单里只有连接级方法带 scope 标记，房间级默认不写——省上下文。
+#[test]
+fn catalog_marks_only_connection_scoped_methods() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(&ticket, &sessions(), "platform_methods", json!({}))
+        .expect("能查目录");
+
+    let methods = result["methods"].as_array().expect("有清单");
+    let friend = methods
+        .iter()
+        .find(|item| item["name"] == "friend.list")
+        .expect("有好友列表");
+    assert_eq!(friend["scope"], "connection");
+
+    let forward = methods
+        .iter()
+        .find(|item| item["name"] == "forward.get_content")
+        .expect("有转发");
+    assert!(forward.get("scope").is_none(), "房间级是默认，不用写出来");
 }

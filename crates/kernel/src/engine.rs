@@ -29,7 +29,7 @@ use crate::memory::{
     MemoryRepo, git_add, git_blame, git_branch, git_commit, git_diff, git_log, git_push,
     git_status, list_dir, read_file, search, write_file,
 };
-use crate::outbound::{CallError, MethodSpec, Outbound, OutboundError, Risk, expand_query};
+use crate::outbound::{CallError, MethodSpec, Outbound, OutboundError, Risk, Scope, expand_query};
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
     TopicStatus, unread,
@@ -622,6 +622,53 @@ impl<S: Store> Bridge<S> {
         Ok(())
     }
 
+    /// 连接级权限：这组会话里有任何一个在订阅这条连接上的房间，就算有权限。
+    ///
+    /// 好友列表、账号资料这类方法跟房间无关，所以不要求模型报出一个具体房间；
+    /// 但也不能凭空调一个自己完全没订阅的号。
+    fn ensure_connection_readable(
+        &self,
+        sessions: &[String],
+        connection: &str,
+    ) -> Result<(), ToolError> {
+        let ok = self
+            .config
+            .sessions
+            .iter()
+            .filter(|session| sessions.iter().any(|id| id == &session.id))
+            .any(|session| {
+                session
+                    .subscriptions
+                    .iter()
+                    .any(|subscription| subscription.room.connection == connection)
+            });
+        if !ok {
+            return Err(ToolError::new(
+                ErrorCode::RoomNotSubscribed,
+                format!("你这组会话在连接 {connection} 上没有任何订阅"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 解析一次平台调用落在哪个房间上，并按方法声明的 [`Scope`] 做权限校验。
+    ///
+    /// 房间级的必须落在一个具体房间上；连接级的只借 `room` 选连接，不给就用当前轮次的。
+    fn resolve_capability_room(
+        &self,
+        sessions: &[String],
+        given: &Option<String>,
+        turn_room: &RoomId,
+        scope: Scope,
+    ) -> Result<RoomId, ToolError> {
+        let room = self.resolve(given, turn_room)?;
+        match scope {
+            Scope::Room => self.ensure_readable(sessions, &room)?,
+            Scope::Connection => self.ensure_connection_readable(sessions, &room.connection)?,
+        }
+        Ok(room)
+    }
+
     fn enqueue(&mut self, session: String, room: RoomId, reason: TurnReason) {
         let already = self
             .pending
@@ -1041,8 +1088,9 @@ impl<S: Store> Bridge<S> {
         turn_room: &RoomId,
         args: PlatformMethodsArgs,
     ) -> Result<Value, ToolError> {
-        let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
+        // 目录本身就是连接级的东西：同一个号的哪个房间，能做的事都一样。
+        // 所以这里不要求模型报出一个具体房间，只要它订阅了这条连接就行。
+        let room = self.resolve_capability_room(sessions, &args.room, turn_room, Scope::Connection)?;
 
         let methods = self.outbound.catalog(&room.connection);
         if methods.is_empty() {
@@ -1067,7 +1115,8 @@ impl<S: Store> Bridge<S> {
                 "methods": list,
                 "tags": tags_of(methods),
                 "hint": "名字里点号前那段是归属（跟平台 API 命名空间对齐）；tags 是用途，跨归属。\
-                         要某个方法的参数表，再调一次并给 group / tag / query，三者可叠加。",
+                         要某个方法的参数表，再调一次并给 group / tag / query，三者可叠加。\
+                         scope=connection 的方法跟房间无关（好友列表、账号资料这类），调它不用给 room。",
             }));
         }
 
@@ -1103,8 +1152,9 @@ impl<S: Store> Bridge<S> {
         turn_room: &RoomId,
         args: PlatformCallArgs,
     ) -> Result<Value, ToolError> {
+        // 先定位连接，权限校验要等方法查出来才知道该按房间算还是按连接算
+        // （好友列表这类跟房间无关，用房间级的尺子量它会逼模型瞎编一个群号）。
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
 
         let methods = self.outbound.catalog(&room.connection);
         if methods.is_empty() {
@@ -1125,6 +1175,13 @@ impl<S: Store> Bridge<S> {
                 format!("[unknown_method] 没有这个方法：{}；{hint}", args.method),
             ));
         };
+
+        // 权限按方法自己声明的边界来：房间里的事要订阅了这个房间，
+        // 号上的事（好友列表、账号资料）只要订阅了这个连接。
+        match spec.scope {
+            Scope::Room => self.ensure_readable(sessions, &room)?,
+            Scope::Connection => self.ensure_connection_readable(sessions, &room.connection)?,
+        }
 
         // 破坏性操作默认关。白名单挡不住「模型被群里的话骗着去调一个它本来就有权调的方法」，
         // 只有默认关才挡得住；要放行得在 config.toml 那条连接上显式写 allow_destructive。
@@ -1417,12 +1474,18 @@ fn clean(value: Option<&str>) -> Option<&str> {
 
 /// 清单档的一条：够模型判断「这是我要的」，但不带参数表。
 fn describe_brief(spec: &MethodSpec) -> Value {
-    json!({
+    let mut item = json!({
         "name": spec.name,
         "summary": spec.summary,
         "tags": spec.tags,
         "risk": spec.risk.as_str(),
-    })
+    });
+    // 房间级是默认，不写；只有「跟房间无关」的那些才标一下，
+    // 顺便告诉模型这些方法不用为了它编一个房间出来。五十来行清单里只多十处。
+    if spec.scope == Scope::Connection {
+        item["scope"] = json!(spec.scope.as_str());
+    }
+    item
 }
 
 /// 详情档的一条：多一张参数表（JSON Schema，模型最熟的形式）。
@@ -1432,6 +1495,7 @@ fn describe_method(spec: &MethodSpec) -> Value {
         "summary": spec.summary,
         "tags": spec.tags,
         "risk": spec.risk.as_str(),
+        "scope": spec.scope.as_str(),
         "params": spec.params_schema(),
     })
 }

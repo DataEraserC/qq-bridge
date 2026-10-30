@@ -76,7 +76,10 @@ core 迟早认识 QQ。
 - 目录两个维度：名字前缀是**归属**（跟平台 API 命名空间对齐），`MethodSpec.tags` 是**用途**（跨归属，
   如 `image` 同时挂在 `message.send_image` 和 `group.get_file_url` 上）。core 给一张中英别名表
   （`expand_query`），模型说「图片」也能搜到挂 `image` 的方法。
-- 适配器自己声明方法表（`MethodSpec { name, summary, tags, risk, params }`），强制 `resource.method` 命名。
+- 适配器自己声明方法表（`MethodSpec { name, summary, tags, risk, scope, params }`），强制 `resource.method` 命名。
+  方法还分两种**作用域**：房间级（默认，默认房间里的事）与连接级（`scope: connection`，
+  好友列表/账号资料/群列表/点赞/链接检测这类「号上的事」）。连接级方法 `room` 可以不给——
+  逼模型为了查好友列表先编一个群号出来，只会把订阅边界变成一张要填的表。10 个方法标了连接级。
   QQ 现在声明 **52 个方法**（`crates/adapters/onebot11/src/catalog.rs`），铺的是「人在这号上能做的事」：
   发言/发图/发语音/发文件/合并转发/撤回/引用/拍一拍/点赞/看历史/看成员/群文件/改名片/改群名/设管理/
   禁言/踢人/发公告/审批入群/加删好友/改群头像。**52 个都对着真机 NapCat 探测过，全部存在**。

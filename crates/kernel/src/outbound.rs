@@ -267,6 +267,10 @@ pub struct MethodSpec {
     /// 用途标签，跨归属表达「这是干什么的」。从 [`tags`] 里挑。
     pub tags: &'static [&'static str],
     pub risk: Risk,
+    /// 这个能力是「房间里的事」还是「账号上的事」。
+    ///
+    /// 好友列表、账号资料这类跟房间无关：模型不该为了查好友列表先编一个群号出来。
+    pub scope: Scope,
     pub params: &'static [ParamSpec],
 }
 
@@ -309,6 +313,26 @@ impl MethodSpec {
             schema.insert("required".into(), Value::Array(required));
         }
         Value::Object(schema)
+    }
+}
+
+/// 一个方法的适用边界。决定调它的时候 `room` 是不是必填、按什么粒度校验。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// 房间级：在这个房间里做什么（读转发正文、撤回、查群成员）。`room` 缺省用当前轮次的房间，
+    /// 给了就必须是会话订阅过的房间。
+    Room,
+    /// 连接级：这个号上的事，跟哪个房间无关（好友列表、账号资料、平台版本）。
+    /// `room` 可以不提；提了只用来选连接，校验的是「这个连接有房间在我的订阅里」。
+    Connection,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Room => "room",
+            Self::Connection => "connection",
+        }
     }
 }
 
@@ -527,6 +551,7 @@ mod tests {
         summary: "读合并转发的正文",
         tags: &[tags::FORWARD, tags::MESSAGE],
         risk: Risk::Read,
+        scope: Scope::Room,
         params: FORWARD_PARAMS,
     }];
 
@@ -587,6 +612,7 @@ mod tests {
             summary: "",
             tags: &[],
             risk: Risk::Read,
+            scope: Scope::Room,
             params: &[],
         };
         assert_eq!(spec.group(), "group");
@@ -601,6 +627,7 @@ mod tests {
                 summary: "发一条消息",
                 tags: &[tags::SEND, tags::IMAGE],
                 risk: Risk::Write,
+                scope: Scope::Room,
                 params: &[],
             },
             MethodSpec {
@@ -608,6 +635,7 @@ mod tests {
                 summary: "查群成员",
                 tags: &[tags::MEMBER],
                 risk: Risk::Read,
+                scope: Scope::Room,
                 params: &[],
             },
         ];

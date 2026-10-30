@@ -20,7 +20,7 @@ pub use config::{
 pub use endpoint::{Conn, ControlRegistry, EndpointError, handshake, run_connection, serve};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY, Pruned};
 pub use outbound::{
-    CallError, MethodSpec, Outbound, OutboundError, Outbounds, ParamSpec, ParamType, Risk, Sent,
+    CallError, MethodSpec, Outbound, OutboundError, Outbounds, ParamSpec, ParamType, Risk, Scope, Sent,
 };
 pub use storage::{
     Counts, Cursor, Deliveries, MIN_KEPT, MemoryStore, Note, NoteKey, NoteKind, Notes, PrunePlan,

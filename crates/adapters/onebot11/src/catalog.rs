@@ -12,7 +12,7 @@
 //!
 //! core 不认识这里任何一个名字，它只认 `MethodSpec` 这个形状（ADR-0020）。
 
-use acb_kernel::{MethodSpec, ParamSpec, ParamType, Risk, outbound::tags};
+use acb_kernel::{MethodSpec, ParamSpec, ParamType, Risk, Scope, outbound::tags};
 
 // ── 参数写法 ──────────────────────────────────────────────────────────────
 //
@@ -60,6 +60,28 @@ const fn m(
         summary,
         tags,
         risk,
+        scope: Scope::Room,
+        params,
+    }
+}
+
+/// 连接级方法：这个号上的事，跟房间无关（好友列表、账号资料、版本）。
+///
+/// 模型查好友列表时不该被迫先编一个群号出来。这类方法 `room` 可以不提；
+/// 提了也只用来「会话订阅了多个连接时选是哪个号」。
+const fn cm(
+    name: &'static str,
+    summary: &'static str,
+    tags: &'static [&'static str],
+    risk: Risk,
+    params: &'static [ParamSpec],
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        summary,
+        tags,
+        risk,
+        scope: Scope::Connection,
         params,
     }
 }
@@ -72,21 +94,21 @@ const fn m(
 
 pub static METHODS: &[MethodSpec] = &[
     // ── 账号自己 ──
-    m(
+    cm(
         "account.login_info",
         "这台号登的是谁：QQ 号、昵称",
         &[tags::ACCOUNT],
         Risk::Read,
         &[],
     ),
-    m(
+    cm(
         "account.status",
         "账号在线状态：是否在线、是否正常",
         &[tags::ACCOUNT, tags::SYSTEM],
         Risk::Read,
         &[],
     ),
-    m(
+    cm(
         "account.version",
         "平台实现的版本信息。排查「这个方法到底支不支持」时有用",
         &[tags::SYSTEM],
@@ -94,21 +116,21 @@ pub static METHODS: &[MethodSpec] = &[
         &[],
     ),
     // ── 好友 ──
-    m(
+    cm(
         "friend.list",
         "好友列表：QQ 号、昵称、备注",
         &[tags::FRIEND, tags::MEMBER],
         Risk::Read,
         &[],
     ),
-    m(
+    cm(
         "friend.get_info",
         "查一个陌生人/好友的资料：昵称、性别、年龄、签名",
         &[tags::FRIEND, tags::MEMBER],
         Risk::Read,
         &[req("user_id", "QQ 号")],
     ),
-    m(
+    cm(
         "friend.approve",
         "同意或拒绝一个加好友请求。flag 从好友请求事件里拿",
         &[tags::FRIEND, tags::APPROVE],
@@ -119,7 +141,7 @@ pub static METHODS: &[MethodSpec] = &[
             opt("remark", "同意时给他设的备注名"),
         ],
     ),
-    m(
+    cm(
         "friend.delete",
         "删好友。删掉之后对方从列表里消失",
         &[tags::FRIEND, tags::ADMIN],
@@ -127,7 +149,7 @@ pub static METHODS: &[MethodSpec] = &[
         &[req("user_id", "要删的 QQ 号")],
     ),
     // ── 群：看 ──
-    m(
+    cm(
         "group.list",
         "这台号在哪些群里：群号、群名。想给别的群发东西时先用它拿群号",
         &[tags::GROUP, tags::MEMBER],
@@ -544,7 +566,7 @@ pub static METHODS: &[MethodSpec] = &[
             opt("group_id", "在哪个群拍；在群里调用可以不填"),
         ],
     ),
-    m(
+    cm(
         "like.send",
         "给一个人的资料卡点赞（那个「赞」）。times 最多 10",
         &[tags::MEMBER, tags::SEND],
@@ -552,7 +574,7 @@ pub static METHODS: &[MethodSpec] = &[
         &[req("user_id", "给谁点赞"), num("times", "点几次，默认 1，最多 10")],
     ),
     // ── 其它 ──
-    m(
+    cm(
         "system.check_url",
         "问平台一个链接安不安全（腾讯自家的安全接口）。拿不准某个链接时先问一下",
         &[tags::SYSTEM],
