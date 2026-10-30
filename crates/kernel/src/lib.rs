@@ -10,6 +10,7 @@ pub mod memory;
 pub mod outbound;
 pub mod query;
 pub mod render;
+pub mod sanitize;
 pub mod storage;
 pub mod tools;
 

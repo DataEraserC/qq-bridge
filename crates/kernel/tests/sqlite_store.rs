@@ -781,3 +781,41 @@ fn feedback_survives_a_restart_and_merges_by_fingerprint() {
         assert!(store.feedback(Some("resolved"), 10).expect("能读").is_empty());
     }
 }
+
+/// 合并时补空字段：第一次没填，后来的报告带全了要补上——但分类不动。
+#[test]
+fn merging_fills_empty_fields_in_sqlite_too() {
+    let db = TempDb::new("feedback-fill");
+    let draft = |at: i64, full: bool| acb_kernel::FeedbackDraft {
+        fingerprint: "fill123".to_owned(),
+        title: "平台方法清单里没有撤回".to_owned(),
+        body: "平台方法清单里没有「撤回」这个动作名".to_owned(),
+        suggestion: full.then(|| "跟 delete_msg 对齐".to_owned()),
+        kind: if full { "gap".to_owned() } else { "friction".to_owned() },
+        severity: if full { "major".to_owned() } else { "minor".to_owned() },
+        refs: if full { vec!["#700".to_owned()] } else { Vec::new() },
+        occurrences: 1,
+        tool: full.then(|| "platform_methods".to_owned()),
+        session: "main".to_owned(),
+        harness: Some("dsh".to_owned()),
+        room: Some("qq:group/123".to_owned()),
+        context: serde_json::json!({"ticket": "main-1"}),
+        at,
+    };
+
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能开库");
+    // 第一次只有正文：那一次参数被解析器吞了。
+    store.record_feedback(draft(AT, false)).expect("能写");
+    // 第二次同一句话，参数带全了。
+    let again = store.record_feedback(draft(AT + 1, true)).expect("能再写");
+    assert!(again.duplicate);
+
+    let items = store.feedback(None, 10).expect("能读");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, "friction", "分类保留第一次");
+    assert_eq!(items[0].severity, "minor", "严重度跟着分类，也不动");
+    assert_eq!(items[0].refs, vec!["#700"], "空着的出处补上");
+    assert_eq!(items[0].suggestion.as_deref(), Some("跟 delete_msg 对齐"));
+    assert_eq!(items[0].tool.as_deref(), Some("platform_methods"));
+    assert_eq!(items[0].repeats, 2);
+}

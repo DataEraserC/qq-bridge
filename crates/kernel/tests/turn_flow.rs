@@ -1309,6 +1309,142 @@ fn feedback_rejects_empty_text_and_unknown_kind() {
     assert!(bad.message.contains("friction"), "{}", bad.message);
 }
 
+/// 实测过的脏数据：有的 harness 用文本流解析工具调用，标签漏进了 text 参数，
+/// 结果带着 `</mcp__acb__send_message>` 和特殊 token 的话真发到群里了。
+/// 桥在另一个进程拦不住解析器，但「落进参数之后」这一段必须切掉。
+#[test]
+fn leaked_call_markup_never_reaches_the_room() {
+    let (mut bridge, sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let receipt = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message",
+            json!({"elements": [{"type": "text", "text":
+                "在的，你说。</text>\n</mcp__acb__send_message>\n<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"mcp__acb__platform_methods\">"
+            }]}),
+        )
+        .expect("能发");
+
+    assert_eq!(receipt["ok"], json!(true));
+    assert_eq!(receipt["trimmed"], json!(true), "截断了就得说");
+    assert!(
+        receipt["note"].as_str().expect("有说明").contains("截断"),
+        "{}",
+        receipt["note"]
+    );
+
+    let sent = sends.lock().expect("没被毒死");
+    let text = sent[0].1[0].as_text().expect("是文本段");
+    assert_eq!(text, "在的，你说。", "群里只该看到正文");
+}
+
+/// 整段都是标记：切完没有正文，不该往平台上发一个空段。
+#[test]
+fn all_markup_text_is_refused_instead_of_sent_empty() {
+    let (mut bridge, sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let rejected = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message",
+            json!({"elements": [{"type": "text", "text": "</text></mcp__acb__send_message>"}]}),
+        )
+        .expect_err("切完没正文就该拒");
+    assert_eq!(rejected.code, ErrorCode::BadRequest);
+    assert!(rejected.message.contains("bad_params"), "{}", rejected.message);
+    assert!(sends.lock().expect("没被毒死").is_empty(), "一个字都不该发出去");
+}
+
+/// 反馈正文同样要切：不然人翻开列表看到的是「正文 + 一串标签」。
+#[test]
+fn feedback_body_gets_cut_and_the_receipt_says_so() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let recorded = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({"text": "转发点开只有一句「对」，读不出正文。</text>\n<refs>[\"#700\"]</refs>\n<kind>gap</kind>"}),
+        )
+        .expect("能记反馈");
+
+    assert_eq!(recorded["truncated"]["text_markup"], json!(true), "标记要被认出来");
+    assert!(
+        recorded["note"].as_str().expect("有说明").contains("标记"),
+        "{}",
+        recorded["note"]
+    );
+
+    let stored = bridge.store().feedback(None, 10).expect("能读");
+    assert_eq!(stored[0].body, "转发点开只有一句「对」，读不出正文。");
+    assert_eq!(stored[0].title, "转发点开只有一句「对」，读不出正文。");
+}
+
+/// 合并时只补「空着的」字段：分类与严重度按 ADR-0021 保留第一次，
+/// 但第一次没填（或那次参数被解析器吞了）的出处/建议/工具，后来的报告带全了要补上。
+#[test]
+fn merging_fills_empty_fields_but_keeps_the_first_classification() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    // 第一次：参数被吞，只剩正文（kind 掉回默认 friction）。
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({"text": "平台方法清单里没有「撤回」这个动作名"}),
+        )
+        .expect("能记反馈");
+
+    // 第二次：同一句话，参数这次带全了。
+    let again = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({
+                "text": "平台方法清单里没有「撤回」这个动作名",
+                "refs": ["#700", "platform_methods"],
+                "tool": "platform_methods",
+                "suggestion": "动作名跟 QQ 的 delete_msg 对齐",
+                "kind": "gap",
+            }),
+        )
+        .expect("能再记一次");
+    assert_eq!(again["duplicate"], json!(true));
+
+    let stored = bridge.store().feedback(None, 10).expect("能读");
+    assert_eq!(stored[0].kind, "friction", "分类保留第一次的（ADR-0021）");
+    assert_eq!(stored[0].refs, vec!["#700", "platform_methods"], "空着的出处补上了");
+    assert_eq!(
+        stored[0].suggestion.as_deref(),
+        Some("动作名跟 QQ 的 delete_msg 对齐"),
+        "空着的建议补上了"
+    );
+    assert_eq!(stored[0].tool.as_deref(), Some("platform_methods"));
+}
+
+
 /// 查历史要给总数：不然「还有没有更早的」只能靠猜。
 #[test]
 fn history_reports_total_and_how_to_go_further_back() {

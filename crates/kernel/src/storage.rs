@@ -665,6 +665,17 @@ impl Feedbacks for MemoryStore {
             existing.repeats += 1;
             existing.occurrences = existing.occurrences.saturating_add(draft.occurrences);
             existing.last_at = draft.at;
+            // 类型/严重度保留第一次的（ADR-0021：人已经看过那一行，不该被后来的报告改分类）。
+            // 但空着的字段不是分类，是缺信息——第一次没填、或者那次参数被吞了，后来带全了就补上。
+            if existing.refs.is_empty() && !draft.refs.is_empty() {
+                existing.refs = draft.refs;
+            }
+            if existing.suggestion.is_none() && draft.suggestion.is_some() {
+                existing.suggestion = draft.suggestion;
+            }
+            if existing.tool.is_none() && draft.tool.is_some() {
+                existing.tool = draft.tool;
+            }
             // 又出现了：原来是「已修/不修」，说明没修好，重新打开。
             if existing.status == "resolved" || existing.status == "wontfix" {
                 existing.status = "open".to_owned();

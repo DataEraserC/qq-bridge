@@ -1109,10 +1109,16 @@ impl Feedbacks for SqliteStore {
                         SET repeats = repeats + 1,
                             occurrences = ?2,
                             last_at = ?3,
+                            -- 类型/严重度按 ADR-0021 保留第一次的（人已经看过那一行）。
+                            -- 但「空着的字段」不是分类，是缺信息：第一次没填、
+                            -- 或者那次参数被解析器吞了，后来的报告带全了就该补上。
+                            refs = CASE WHEN refs IN ('[]', '') THEN ?4 ELSE refs END,
+                            suggestion = COALESCE(NULLIF(suggestion, ''), ?5),
+                            tool = COALESCE(NULLIF(tool, ''), ?6),
                             -- 又出现了：原来标了已修/不修说明没修好，重新打开。
                             status = CASE WHEN status IN ('resolved','wontfix') THEN 'open' ELSE status END
                       WHERE id = ?1",
-                    params![id, occurrences + draft.occurrences as i64, draft.at],
+                    params![id, occurrences + draft.occurrences as i64, draft.at, refs, draft.suggestion, draft.tool],
                 )
                 .map_err(io_error)?;
             let (repeats, occurrences): (i64, i64) = self

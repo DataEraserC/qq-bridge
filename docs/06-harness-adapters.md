@@ -436,6 +436,30 @@ dsh 跟 opencode 是**完全不同的接入方式**：opencode 走插件（进�
      node 版本都能跑（比全局 fetch/WebSocket 更健壮）。
    - **测试要用系统 node 跑**（`/etc/profiles/per-user/nixos/bin/node --test`）。
 
+### 模型有时用 XML 格式发调用，多参数会被吞（2026-10-31 实测）
+
+dsh 的模型适配器（trae / deepseek-v4.1-flash）有三种写法：标准 JSON 参数、XML 风格
+`<invoke name><text>…</text></invoke>`、以及混着模型特殊 token 的
+`<｜｜DSML｜｜ calls>`。**XML 那条路只认 `<text>` 一个参数**，别的同级标签会整个落进
+`text` 的字符串里。
+
+实测数据（同一个会话的 235 次 `tool/call` 里 **5 次**中招）：
+
+| 调用 | 收到的 `arguments` | 后果 |
+|---|---|---|
+| `send_message` ×2 | `{"text": "正文…</text></mcp__acb__send_message><｜｜DSML｜｜ calls>…"}` | **脏文本真发进群了**（群里出现过带标签的回复） |
+| `report_feedback` ×2 | `{"text": "正文…</text><refs>[…]<kind>idea</kind>…"}` | 正文带标签，`refs`/`kind`/`count` 全掉默认值 |
+| `send_message` ×1 | `{"text": "<脏>", "method":…, "params":…, "limit":…}` | 同一条里两次调用的参数被拆开塞进一个对象 |
+
+结论：
+- **不是桥解析错**——桥收到的 `arguments` 本来就是那样；也不是我们的配置教的（仓库里没有任何
+  XML 调用示例）。
+- 只有**单参数**工具（`send_message` 只给 `text`）恰好不受影响，这是它长期没被发现的原因。
+- 桥侧能做的只有「落进参数之后」的清理，见 ADR-0021「正文里混进调用标记怎么办」：
+  `crates/kernel/src/sanitize.rs` 在正文第一个标记处截断，并在回执里说明。
+- 真正的修法在上游：让解析器在 `</text>` 处收口。这件事我们改不了，记在这里是为了下次看到
+  「正文里怎么有标签」时不用重新查一遍。
+
 ### 还没验的
 
 - **模型真回话**：隔离探测的 dsh 没配模型，`session/prompt` 能 `accepted:true`、

@@ -929,10 +929,25 @@ impl<S: Store> Bridge<S> {
         &mut self,
         session: &str,
         room: &RoomId,
-        elements: Vec<Element>,
+        mut elements: Vec<Element>,
     ) -> Result<Value, ToolError> {
+        // 先把混进正文的「调用标记」切掉。这不是洁癖：群里真的出现过带
+        // `</mcp__acb__send_message>` 和特殊 token 的回复（见 sanitize 模块）。
+        // 切完落空的文本段直接丢，免得往平台上发一个空段。
+        let trimmed = crate::sanitize::trim_elements(&mut elements);
+        if trimmed {
+            elements.retain(|element| !matches!(element, Element::Text { text } if text.trim().is_empty()));
+        }
         if elements.is_empty() {
-            return Err(ToolError::new(ErrorCode::BadRequest, "没有内容可发"));
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                if trimmed {
+                    "[bad_params] 你的 text 整个都是调用标记（`</text>` 之类），切完没有正文可发。\
+                     把要说的话单独写一遍——参数要放在各自的字段里，别写进正文。"
+                } else {
+                    "没有内容可发"
+                },
+            ));
         }
         let account = self.config.account_of_room(room);
         if account.is_empty() {
@@ -973,14 +988,24 @@ impl<S: Store> Bridge<S> {
         // 回执要「像回执」：ok 摆在第一位，发出去了才给 platform_id / at。
         // 失败时这个函数直接返回 Err（调用方拿到的是 error），绝不会出现
         // 「一脸成功但平台没收到」的形状——模型据此判断能不能去群里说「已经发了」。
-        Ok(json!({
+        let mut receipt = json!({
             "ok": true,
             "id": record.id,
             "platform_id": sent.platform_id,
             "at": sent.at,
             "room": room.to_string(),
             "watermark": watermark,
-        }))
+        });
+        if trimmed {
+            // 必须说：模型以为发出去的是全文，实际少了尾巴。不说它就永远不知道。
+            receipt["trimmed"] = json!(true);
+            receipt["note"] = json!(
+                "你的 text 里混着调用标记（`</text>`、`<｜｜DSML｜｜` 之类），\
+                 已经在第一个标记处截断，后面那截没发出去。\
+                 那串东西是解析工具调用时漏进来的，不是正文；要传的参数放各自字段里，别写进 text。"
+            );
+        }
+        Ok(receipt)
     }
 
     /// 确认一批记录。
@@ -1464,11 +1489,18 @@ impl<S: Store> Bridge<S> {
         live: bool,
         args: FeedbackArgs,
     ) -> Result<Value, ToolError> {
-        let body = args.text.trim();
+        // 同上：dsh 的解析器实测会把整段 `<invoke>`（含后面的参数标签）塞进 text。
+        // 不切的话，反馈列表上看到的就是「正文 + 一串标签」，人根本没法读。
+        let (body, markup_trimmed) = crate::sanitize::trim_call_markup(args.text.trim());
         if body.is_empty() {
             return Err(ToolError::new(
                 ErrorCode::BadRequest,
-                "[bad_params] text 不能为空：把「你被什么卡住了」写进来，一两句话就行。",
+                if markup_trimmed {
+                    "[bad_params] 你的 text 整个都是调用标记（`</text>` 之类），切完没有正文。\
+                     把「被什么卡住了」写成正文再说一遍，参数放各自字段。"
+                } else {
+                    "[bad_params] text 不能为空：把「你被什么卡住了」写进来，一两句话就行。"
+                },
             ));
         }
 
@@ -1516,9 +1548,9 @@ impl<S: Store> Bridge<S> {
         };
 
         // 第一条非空行当标题，剩下的当正文。想写日记也行，列表里只显示第一行。
-        let (title_raw, _) = split_first_line(body);
+        let (title_raw, _) = split_first_line(&body);
         let (title, title_clipped) = clip(title_raw, MAX_FEEDBACK_TITLE);
-        let (body, body_clipped) = clip(body, MAX_FEEDBACK_BODY);
+        let (body, body_clipped) = clip(&body, MAX_FEEDBACK_BODY);
         let suggestion = args.suggestion.as_deref().map(str::trim).filter(|text| !text.is_empty());
         let (suggestion, suggestion_clipped) = match suggestion {
             Some(text) => {
@@ -1596,6 +1628,23 @@ impl<S: Store> Bridge<S> {
         if suggestion_clipped {
             truncated.insert("suggestion".into(), json!(MAX_FEEDBACK_SUGGESTION));
         }
+        if markup_trimmed {
+            // 单独标一个键：这不是「写太长被截」，是「参数写错了地方」。
+            truncated.insert("text_markup".into(), json!(true));
+        }
+
+        let mut note = if recorded.duplicate {
+            "这条已经提过（同样的标题），次数已累加，不用再提。接着干活就行。".to_owned()
+        } else {
+            "记下了。这是出口，不是许愿池：写清「在哪一步卡住」比写「希望支持 X」有用得多。"
+                .to_owned()
+        };
+        if markup_trimmed {
+            note.push_str(
+                " 另外：你的 text 里混着一串调用标记（`</text>` 之类），已经在第一个标记处截断——\
+                 那是解析工具调用时漏进来的，不是正文。参数请放在各自的字段里，别写进 text。",
+            );
+        }
 
         Ok(json!({
             "ok": true,
@@ -1605,11 +1654,7 @@ impl<S: Store> Bridge<S> {
             "occurrences": recorded.occurrences,
             "truncated": truncated,
             "refs_dropped": refs_dropped,
-            "note": if recorded.duplicate {
-                "这条已经提过（同样的标题），次数已累加，不用再提。接着干活就行。"
-            } else {
-                "记下了。这是出口，不是许愿池：写清「在哪一步卡住」比写「希望支持 X」有用得多。"
-            },
+            "note": note,
         }))
     }
 
