@@ -244,7 +244,7 @@ test("桥的旁白单独一行，不拼进对方说的话里", () => {
   assert.ok(!header.includes("第 2 次投递"), `标题别重复：${header}`)
 })
 
-test("内容元素都摊得开，平台内容不假装能懂", () => {
+test("内容元素都摊得开，平台内容原样摊给模型", () => {
   const text = renderElements([
     { type: "text", text: "看图 " },
     { type: "image", url: "https://x/1.png" },
@@ -252,7 +252,11 @@ test("内容元素都摊得开，平台内容不假装能懂", () => {
     { type: "at", all: true },
     { type: "quote", message_id: "9" },
     { type: "face", platform: "qq", id: "14" },
-    { type: "opaque", platform: "qq", payload: { big: true } },
+    {
+      type: "opaque",
+      platform: "qq",
+      payload: { type: "forward", data: { id: "abc123" } },
+    },
   ])
   assert.match(text, /看图/)
   assert.match(text, /\[图片 https:\/\/x\/1\.png\]/)
@@ -260,7 +264,32 @@ test("内容元素都摊得开，平台内容不假装能懂", () => {
   assert.match(text, /@全体成员/)
   assert.match(text, /\[引用 #9\]/)
   assert.match(text, /\[表情 14\]/)
-  assert.match(text, /qq内容/)
+  // 桥不解释平台语义，但原始载荷必须送到模型眼前，不能只剩一句占位。
+  assert.match(text, /qq 平台特有内容/)
+  assert.match(text, /"type":"forward"/)
+  assert.match(text, /"id":"abc123"/)
+  // 还要带上「可以怎么取」：只给一个 id，模型不知道自己能查（ADR-0020）。
+  assert.match(text, /可调 platform_call/)
+  assert.match(text, /forward\.get_content/)
+})
+
+test("不认识的平台内容也会指向能力目录，不让模型瞎猜方法名", () => {
+  const text = renderElements([
+    { type: "opaque", platform: "kook", payload: { type: "card", data: {} } },
+  ])
+  assert.match(text, /platform_methods/)
+  // 没声明对应方法的类型，不该瞎编一个 get_content 出来。
+  assert.doesNotMatch(text, /get_content/)
+})
+
+test("平台载荷过长会截断，但绝不整段吞掉", () => {
+  const huge = "x".repeat(2000)
+  const text = renderElements([
+    { type: "opaque", platform: "kook", payload: { card: huge } },
+  ])
+  assert.match(text, /kook 平台特有内容/)
+  assert.match(text, /已截断/)
+  assert.ok(text.length < 1000, `不能把上下文撑爆：${text.length}`)
 })
 
 test("endpoint 只认 host:port", () => {

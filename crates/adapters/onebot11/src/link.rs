@@ -173,6 +173,7 @@ pub fn pump<S: Store>(
     actions: Receiver<Action>,
     bridge: &Mutex<Bridge<S>>,
     connection: &str,
+    admin_qqs: &[String],
     shutdown: &AtomicBool,
 ) -> Result<(), LinkError> {
     let mut waiting: HashMap<String, Sender<Result<Value, LinkError>>> = HashMap::new();
@@ -208,6 +209,7 @@ pub fn pump<S: Store>(
                     text.as_str(),
                     bridge,
                     connection,
+                    admin_qqs,
                     &mut waiting,
                     &mut backlog,
                 );
@@ -244,6 +246,7 @@ fn handle_text<S: Store>(
     text: &str,
     bridge: &Mutex<Bridge<S>>,
     connection: &str,
+    admin_qqs: &[String],
     waiting: &mut HashMap<String, Sender<Result<Value, LinkError>>>,
     backlog: &mut VecDeque<RecordDraft>,
 ) {
@@ -260,7 +263,7 @@ fn handle_text<S: Store>(
         return;
     }
 
-    match event::parse(connection, &value) {
+    match event::parse(connection, &value, admin_qqs) {
         Ok(Parsed::Record(draft)) => {
             backlog.push_back(draft);
             feed(bridge, backlog);
@@ -301,6 +304,7 @@ pub fn supervise<S: Store + Send + 'static>(
     url: String,
     token: Option<String>,
     connection: String,
+    admin_qqs: Vec<String>,
     bridge: Arc<Mutex<Bridge<S>>>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -320,7 +324,7 @@ pub fn supervise<S: Store + Send + 'static>(
                     std::thread::spawn(move || probe_login(&sender, &bridge, &connection));
                 }
 
-                let outcome = pump(ws, actions, &bridge, &connection, &shutdown);
+                let outcome = pump(ws, actions, &bridge, &connection, &admin_qqs, &shutdown);
                 slot.clear();
                 if shutdown.load(Ordering::Relaxed) {
                     break;

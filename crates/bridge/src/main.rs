@@ -95,6 +95,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 connection.url,
                 connection.token,
                 connection.id,
+                connection.admin_qqs,
                 bridge,
                 shutdown,
             );

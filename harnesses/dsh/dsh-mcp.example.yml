@@ -1,20 +1,61 @@
-# dsh 的 MCP 配置示例（加到 dsh 的 profile 补丁里，或 plugins 列表）
+# dsh 侧配置示例：每个 acb 会话一个 agent preset，每个 preset 只挂它自己的 MCP。
 #
-# 两个条目分别对应「工具面」和「轮次驱动」——其实是一个进程（src/driver.mjs）
-# 干的，这里 MCP 只挂工具面，轮次驱动由同一个进程的 BridgeLink 自动做。
+# 为什么这样配（见 ADR-0019）：
+#   dsh 的 MCP 工具调用 tools/call 不带「来自哪个 session」，单进程没法路由到正确会话。
+#   正确做法是「每会话一个 preset、每 preset 挂自己的 MCP」——模型在某个 dsh session 里
+#   只会看到那一套工具（mcp__acb__*），不会再拿到「另一套没票的工具」去试错。
 #
-#   - id: acb-mcp
-#     name: '@deepseek-ai/dsh-mcp-client'
-#     config:
-#       serverName: acb
-#       transport: stdio
-#       command: /path/to/node
-#       args: ['/path/to/agent-chat-bridge/harnesses/dsh/src/driver.mjs']
-#       env:
-#         ACB_ENDPOINT: 127.0.0.1:7700
-#         ACB_TOKEN: eb9b833ac1c57ac69f167517fb3a793d
-#         ACB_HARNESS: dsh
-#         DSH_BASE_URL: http://127.0.0.1:3080
-#         # DSH_TOKEN: 可选；不填就走离线铸造 Cookie（读 ~/.dsh/.credentials.yaml）
+# 配套的 driver.mjs 用 streamable-http 常驻模式（ACB_MCP_PORT 指定端口），每个 acb 会话
+# 一个独立 driver 进程 + 一个独立端口。dsh 的 MCP client 用 streamable-http 连它，
+# 没有「driver 靠 dsh 拉起、dsh 靠 driver 建 session」的死结。
 #
-# 工具在模型那边叫 mcp__acb__send_message、mcp__acb__ack_messages 等。
+# 下面以两个 acb 会话（dsh + dsh-group2）为例。
+
+- id: agent-preset-registry
+  name: '@deepseek-ai/dsh-agent-preset-registry'
+  config:
+    default: acb-dsh
+
+# 会话一（acb 的 dsh 会话）：挂它自己的 MCP（连 3101 那个 driver 进程）。
+- id: preset-acb-dsh
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: acb-dsh
+    plugins:
+      - id: mcp-acb-dsh
+        name: '@deepseek-ai/dsh-mcp-client'
+        config:
+          transport: streamable-http
+          serverName: acb
+          url: http://127.0.0.1:3101/mcp
+
+# 会话二（acb 的 dsh-group2 会话）：挂它自己的 MCP（连 3102 那个 driver 进程）。
+- id: preset-acb-dsh-group2
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: acb-dsh-group2
+    plugins:
+      - id: mcp-acb-dsh-group2
+        name: '@deepseek-ai/dsh-mcp-client'
+        config:
+          transport: streamable-http
+          serverName: acb
+          url: http://127.0.0.1:3102/mcp
+
+# 两个 driver 进程（常驻，不是 dsh spawn），各自连桥 + 各自端口：
+#
+#   # 会话一（token = config.toml 里 dsh 会话的 token）
+#   ACB_ENDPOINT=127.0.0.1:7700 ACB_TOKEN=ea0e40... ACB_HARNESS=dsh \
+#     ACB_PRESET=acb-dsh ACB_MCP_PORT=3101 \
+#     DSH_BASE_URL=http://127.0.0.1:3080 \
+#     node harnesses/dsh/src/driver.mjs
+#
+#   # 会话二（token = dsh-group2 会话的 token）
+#   ACB_ENDPOINT=127.0.0.1:7700 ACB_TOKEN=3f7a1c... ACB_HARNESS=dsh \
+#     ACB_PRESET=acb-dsh-group2 ACB_MCP_PORT=3102 \
+#     DSH_BASE_URL=http://127.0.0.1:3080 \
+#     node harnesses/dsh/src/driver.mjs
+#
+# driver 建 dsh session 时传 agentPreset（ACB_PRESET），于是：
+#   - dsh 会话 dsh         → agentPreset=acb-dsh        → 只看到 3101 那套工具
+#   - dsh 会话 dsh-group2  → agentPreset=acb-dsh-group2 → 只看到 3102 那套工具

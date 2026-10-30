@@ -24,20 +24,21 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::config::{Config, Session, WakeDecision, WakeInput, WakePolicy};
+use crate::config::{Config, Session, TurnErrorAction, WakeDecision, WakeInput, WakePolicy};
 use crate::memory::{
     MemoryRepo, git_add, git_blame, git_branch, git_commit, git_diff, git_log, git_push,
     git_status, list_dir, read_file, search, write_file,
 };
-use crate::outbound::{Outbound, OutboundError};
+use crate::outbound::{CallError, MethodSpec, Outbound, OutboundError, Risk};
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
     TopicStatus, unread,
 };
 use crate::tools::{
-    AckArgs, DelNoteArgs, EventsArgs, HistoryArgs, MemoryAddArgs, MemoryArgs, MemoryBlameArgs,
-    MemoryCommitArgs, MemoryLogArgs, MemorySearchArgs, MemoryWriteArgs, NotesArgs, SendArgs,
-    SendToArgs, SetNoteArgs, is_known,
+    AckArgs, DEFAULT_COLUMNS, DelNoteArgs, EventsArgs, FetchRecordsArgs, HistoryArgs,
+    MemoryAddArgs, MemoryArgs, MemoryBlameArgs, MemoryCommitArgs, MemoryLogArgs,
+    MemorySearchArgs, MemoryWriteArgs, NotesArgs, PlatformCallArgs, PlatformMethodsArgs,
+    RECORD_COLUMNS, SendArgs, SendToArgs, SetNoteArgs, is_known,
 };
 
 /// 一轮最多投多少条。剩下的下一轮再投，免得一次塞爆上下文。
@@ -351,12 +352,56 @@ impl<S: Store> Bridge<S> {
     /// 一轮收工。票作废，会话空出来。
     ///
     /// **不推水位**：没确认的消息仍然算未读，下一轮接着投。
-    pub fn end_turn(&mut self, ticket: &Ticket) -> Result<(), BridgeError> {
+    ///
+    /// `error` 非空表示 harness 报告这轮失败了。这时按配置的 `on_turn_error` 动作
+    /// 列表顺序执行（记日志 / 发到指定房间），让失败信息能被看见，而不是只吞进日志。
+    pub fn end_turn(&mut self, ticket: &Ticket, error: Option<&str>) -> Result<(), BridgeError> {
+        // 先把这一轮的信息取出来（room + session），remove 之前要用它做失败通知。
+        let turn = self.active.get(self.by_ticket.get(ticket).ok_or_else(|| {
+            BridgeError::UnknownTicket(ticket.to_string())
+        })?);
+        let turn = turn.cloned();
+        let Some(turn) = turn else {
+            return Err(BridgeError::UnknownTicket(ticket.to_string()));
+        };
+
+        if let Some(error) = error {
+            self.notify_turn_error(&turn.session, &turn.room, error);
+        }
+
         let Some(session) = self.by_ticket.remove(ticket) else {
             return Err(BridgeError::UnknownTicket(ticket.to_string()));
         };
         self.active.remove(&session);
         Ok(())
+    }
+
+    /// 按「会话自己的」`on_turn_error` 顺序执行失败通知；会话没配就回退到全局默认
+    /// `default_on_turn_error`。一个动作失败不打断后面的。
+    fn notify_turn_error(&mut self, session: &str, room: &RoomId, error: &str) {
+        // 会话自己配了动作就用它的；没配（空）或找不到会话，回退到全局默认。
+        // 注意：会话存在但 on_turn_error 是空列表，也算「没配」——否则全局默认
+        // 永远不生效（会话总有这条记录）。这是之前失败通知发不出去的根因。
+        let actions = self
+            .config
+            .session(session)
+            .filter(|s| !s.on_turn_error.is_empty())
+            .map(|s| s.on_turn_error.clone())
+            .unwrap_or_else(|| self.config.default_on_turn_error.clone());
+        for action in actions {
+            match action {
+                // `log` 由 endpoint 的 Log 帧负责（见 turn_end 处理），这里无需重复。
+                TurnErrorAction::Log => {}
+                TurnErrorAction::Send { room: target } => {
+                    let text = format!("[一轮失败] 会话 {session}（{room}）：{error}");
+                    // 失败通知本身发不出去也不该影响主流程，但要把原因记进日志，
+                    // 别静默吞掉——否则「为什么没人收到失败提示」会变成查不出的黑洞。
+                    if let Err(err) = self.deliver_out(session, &target, vec![Element::text(text)]) {
+                        eprintln!("失败通知发到 {target} 没成：{err:?}");
+                    }
+                }
+            }
+        }
     }
 
     /// 调工具。
@@ -412,6 +457,10 @@ impl<S: Store> Bridge<S> {
                 let args: HistoryArgs = parse(args)?;
                 self.history(sessions, &room, args)
             }
+            "fetch_records" => {
+                let args: FetchRecordsArgs = parse(args)?;
+                self.fetch_records(sessions, &room, args)
+            }
             "list_rooms" => self.list_rooms(sessions),
             "get_notes" => {
                 let args: NotesArgs = parse(args)?;
@@ -428,6 +477,15 @@ impl<S: Store> Bridge<S> {
             "get_platform_events" => {
                 let args: EventsArgs = parse(args)?;
                 self.events(sessions, &room, args)
+            }
+            // 平台能力：core 不认识任何一个方法名，只做校验和转交（ADR-0020）。
+            "platform_methods" => {
+                let args: PlatformMethodsArgs = parse(args)?;
+                self.platform_methods(sessions, &room, args)
+            }
+            "platform_call" => {
+                let args: PlatformCallArgs = parse(args)?;
+                self.platform_call(sessions, &room, args)
             }
             // 记忆：文件层。
             "memory_read" => {
@@ -634,6 +692,15 @@ impl<S: Store> Bridge<S> {
                 model: session.model.clone(),
             });
 
+        // 消息过多时不全投：只投前 delivery_limit 条，剩下的让模型用 fetch_records 抓。
+        // 截断前先记下「还有几条」，好写在投递里；没配或没超就不截。
+        let limit = self.config.delivery_limit;
+        let mut more = None;
+        if limit > 0 && records.len() > limit {
+            more = Some(records.len() - limit);
+            records.truncate(limit);
+        }
+
         Ok(Delivery {
             ticket,
             session: pending.session,
@@ -642,6 +709,7 @@ impl<S: Store> Bridge<S> {
             reason: pending.reason,
             memories,
             session_info,
+            more,
         })
     }
 
@@ -698,6 +766,7 @@ impl<S: Store> Bridge<S> {
                     Sender {
                         id: account.clone(),
                         name: account,
+                        role: None,
                     },
                     sent.at,
                     elements,
@@ -759,6 +828,8 @@ impl<S: Store> Bridge<S> {
         let room = self.resolve(&args.room, turn_room)?;
         self.ensure_readable(sessions, &room)?;
 
+        let columns = column_set(args.columns.as_deref())?;
+
         let limit = args.limit.unwrap_or(DEFAULT_HISTORY).min(MAX_HISTORY);
         let mut records: Vec<Record> = self
             .store
@@ -770,7 +841,50 @@ impl<S: Store> Bridge<S> {
 
         let skip = records.len().saturating_sub(limit);
         records.drain(..skip);
-        Ok(json!({ "room": room, "records": records }))
+
+        let rendered: Vec<Value> = records.iter().map(|r| record_columns(r, &columns)).collect();
+        Ok(json!({
+            "room": room,
+            "columns": columns,
+            "records": rendered,
+        }))
+    }
+
+    /// 按水位编号精确查一批记录，只返回指定列。
+    fn fetch_records(
+        &self,
+        sessions: &[String],
+        turn_room: &RoomId,
+        args: FetchRecordsArgs,
+    ) -> Result<Value, ToolError> {
+        let room = self.resolve(&args.room, turn_room)?;
+        self.ensure_readable(sessions, &room)?;
+
+        if args.ids.is_empty() {
+            return Err(ToolError::new(ErrorCode::BadRequest, "ids 不能为空"));
+        }
+        let columns = column_set(args.columns.as_deref())?;
+
+        let wanted: std::collections::BTreeSet<u64> = args.ids.iter().copied().collect();
+        let records: Vec<Record> = self
+            .store
+            .since(&room, 0, usize::MAX)
+            .map_err(internal)?
+            .into_iter()
+            .filter(|record| wanted.contains(&record.id))
+            .collect();
+
+        // 找出没查到的编号，一起回给调用方，别让 agent 以为「那些 id 不存在」。
+        let found: std::collections::BTreeSet<u64> = records.iter().map(|r| r.id).collect();
+        let missing: Vec<u64> = wanted.difference(&found).copied().collect();
+
+        let rendered: Vec<Value> = records.iter().map(|r| record_columns(r, &columns)).collect();
+        Ok(json!({
+            "room": room,
+            "columns": columns,
+            "records": rendered,
+            "missing": missing,
+        }))
     }
 
     /// 这组会话订阅的所有房间，按（会话，房间）各列一行。
@@ -912,6 +1026,170 @@ impl<S: Store> Bridge<S> {
         Ok(json!({ "room": room, "events": records }))
     }
 
+    /// 平台能力目录（ADR-0020）。
+    ///
+    /// 三样参数都不给 = 分组摘要；给 `group` = 这一组的详情；给 `query` = 按关键词找。
+    /// 分批给是为了省上下文：一次把几十个方法的参数表全倒出来，每轮都要白付几千 token。
+    fn platform_methods(
+        &self,
+        sessions: &[String],
+        turn_room: &RoomId,
+        args: PlatformMethodsArgs,
+    ) -> Result<Value, ToolError> {
+        let room = self.resolve(&args.room, turn_room)?;
+        self.ensure_readable(sessions, &room)?;
+
+        let methods = self.outbound.catalog(&room.connection);
+        if methods.is_empty() {
+            return Err(no_catalog(&room.connection));
+        }
+        let room_text = room.to_string();
+        let connection = room.connection.clone();
+        let platform = self.platform_of(&room.connection).to_owned();
+
+        // 关键词找：名字和说明都搜，别只认名字。
+        if let Some(query) = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        {
+            let needle = query.to_lowercase();
+            let hits: Vec<Value> = methods
+                .iter()
+                .filter(|method| {
+                    method.name.to_lowercase().contains(&needle)
+                        || method.summary.to_lowercase().contains(&needle)
+                })
+                .map(describe_method)
+                .collect();
+            let hint = if hits.is_empty() {
+                format!("没找到「{query}」。这个连接支持：{}", method_names(methods))
+            } else {
+                "对上了就 platform_call 调它；想看某组全部方法就给 group".to_owned()
+            };
+            return Ok(json!({
+                "room": room_text,
+                "connection": connection,
+                "platform": platform,
+                "query": query,
+                "hits": hits,
+                "hint": hint,
+            }));
+        }
+
+        // 某一组的详情：名字 + 说明 + 风险 + 参数表（JSON Schema）。
+        if let Some(group) = args
+            .group
+            .as_deref()
+            .map(str::trim)
+            .filter(|group| !group.is_empty())
+        {
+            let picked: Vec<Value> = methods
+                .iter()
+                .filter(|method| method.group() == group)
+                .map(describe_method)
+                .collect();
+            if picked.is_empty() {
+                return Err(ToolError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "[bad_params] 没有 {group} 这一组；有这些：{}",
+                        groups_of(methods).join(" / ")
+                    ),
+                ));
+            }
+            return Ok(json!({
+                "room": room_text,
+                "connection": connection,
+                "platform": platform,
+                "group": group,
+                "methods": picked,
+            }));
+        }
+
+        // 分组摘要。
+        let groups: Vec<Value> = groups_of(methods)
+            .into_iter()
+            .map(|group| {
+                json!({
+                    "group": group,
+                    "count": methods.iter().filter(|m| m.group() == group).count(),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "room": room_text,
+            "connection": connection,
+            "platform": platform,
+            "total": methods.len(),
+            "groups": groups,
+            "hint": "要看某一组的方法和参数，再调一次并给 group（比如 group=\"forward\"）；知道关键词也能给 query",
+        }))
+    }
+
+    /// 调一个平台方法。core 只做校验和转交，不认识任何方法名。
+    fn platform_call(
+        &mut self,
+        sessions: &[String],
+        turn_room: &RoomId,
+        args: PlatformCallArgs,
+    ) -> Result<Value, ToolError> {
+        let room = self.resolve(&args.room, turn_room)?;
+        self.ensure_readable(sessions, &room)?;
+
+        let methods = self.outbound.catalog(&room.connection);
+        if methods.is_empty() {
+            return Err(no_catalog(&room.connection));
+        }
+
+        // 白名单：只能调适配器声明过的方法，没有「调任意平台 API」这条路。
+        let Some(spec) = methods.iter().find(|method| method.name == args.method) else {
+            let hint = match methods
+                .iter()
+                .find(|method| method.group() == group_of_name(&args.method))
+            {
+                Some(near) => format!("你是不是想调 {}？", near.name),
+                None => format!("这个连接支持：{}", method_names(methods)),
+            };
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                format!("[unknown_method] 没有这个方法：{}；{hint}", args.method),
+            ));
+        };
+
+        // 破坏性操作默认关。白名单挡不住「模型被群里的话骗着去调一个它本来就有权调的方法」，
+        // 只有默认关才挡得住。
+        if spec.risk == Risk::Destructive {
+            return Err(ToolError::new(
+                ErrorCode::ToolNotAllowed,
+                format!(
+                    "[forbidden] {} 是破坏性操作，默认不开放给模型；要开得在桥的配置里显式打开",
+                    spec.name
+                ),
+            ));
+        }
+
+        check_params(spec, &args.params)?;
+
+        let result = self
+            .outbound
+            .call(&room, spec.name, &args.params)
+            .map_err(call_error)?;
+
+        Ok(cap_result(result))
+    }
+
+    /// 连接名 → 平台名。只给展示用，查不到就说 unknown，不要因此拒绝服务。
+    fn platform_of(&self, connection: &str) -> &str {
+        self.config
+            .connections
+            .iter()
+            .find(|item| item.id == connection)
+            .map(|item| item.platform.as_str())
+            .unwrap_or("unknown")
+    }
+
     /// 参数里没给房间就用本轮的房间；给了就解析。
     fn resolve(&self, given: &Option<String>, turn_room: &RoomId) -> Result<RoomId, ToolError> {
         match given {
@@ -1025,6 +1303,74 @@ fn resolve_room(text: &str) -> Result<RoomId, ToolError> {
     })
 }
 
+/// 校验/归一列名，返回按文档顺序排好的列名列表。
+///
+/// 没指定（`None`）就给默认精简子集；指定了但含非法列名就报错，并把全部合法列名
+/// 列出来，让 agent 能照着改。
+fn column_set(given: Option<&[String]>) -> Result<Vec<&'static str>, ToolError> {
+    let Some(given) = given else {
+        return Ok(DEFAULT_COLUMNS.to_vec());
+    };
+    let mut columns: Vec<&'static str> = Vec::with_capacity(given.len());
+    for name in given {
+        let name = name.trim();
+        match RECORD_COLUMNS.iter().find(|known| **known == name) {
+            Some(known) => {
+                if !columns.contains(known) {
+                    columns.push(known);
+                }
+            }
+            None => {
+                return Err(ToolError::new(
+                    ErrorCode::BadRequest,
+                    format!(
+                        "没有这一列：{name}。能查的列有：{}",
+                        RECORD_COLUMNS.join("、")
+                    ),
+                ));
+            }
+        }
+    }
+    if columns.is_empty() {
+        return Ok(DEFAULT_COLUMNS.to_vec());
+    }
+    Ok(columns)
+}
+
+/// 把一条记录按指定列序列化，并附带「每列查没查」的状态。
+///
+/// 返回形如 `{ "id": 237, "columns": { "id": "查了", "platform_id": "没查" } }`。
+/// 这样 agent 能一眼看出哪列是它要的、哪列没取，不会把「没取」误当「没有」。
+fn record_columns(record: &Record, columns: &[&str]) -> Value {
+    let mut status = serde_json::Map::new();
+    let mut out = serde_json::Map::new();
+    for column in RECORD_COLUMNS {
+        let taken = columns.contains(column);
+        status.insert((*column).to_owned(), json!(if taken { "查了" } else { "没查" }));
+        if !taken {
+            continue;
+        }
+        let value = match *column {
+            "id" => json!(record.id),
+            "room" => json!(record.room),
+            "kind" => match &record.kind {
+                RecordKind::Message => json!("message"),
+                RecordKind::Event { event } => json!({ "event": event }),
+            },
+            "sender" => json!(record.sender),
+            "at" => json!(record.at),
+            "elements" => json!(record.elements),
+            "platform_id" => json!(record.platform_id),
+            "at_self" => json!(record.at_self),
+            "reply_to_self" => json!(record.reply_to_self),
+            _ => continue,
+        };
+        out.insert((*column).to_owned(), value);
+    }
+    out.insert("columns".to_owned(), Value::Object(status));
+    Value::Object(out)
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolError> {
     serde_json::from_value(args)
         .map_err(|error| ToolError::new(ErrorCode::BadRequest, format!("参数不对：{error}")))
@@ -1071,4 +1417,161 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ── 平台能力（ADR-0020）────────────────────────────────────────────────
+
+/// 结果太长会撑爆上下文。超了就截断并说清楚截了——别让模型以为这就是全部。
+const MAX_CALL_RESULT_CHARS: usize = 8000;
+
+fn no_catalog(connection: &str) -> ToolError {
+    ToolError::new(
+        ErrorCode::ToolNotAllowed,
+        format!("[unsupported_platform] 连接 {connection} 没声明任何平台特有方法"),
+    )
+}
+
+fn describe_method(spec: &MethodSpec) -> Value {
+    json!({
+        "name": spec.name,
+        "summary": spec.summary,
+        "risk": spec.risk.as_str(),
+        "params": spec.params_schema(),
+    })
+}
+
+fn method_names(methods: &[MethodSpec]) -> String {
+    methods
+        .iter()
+        .map(|method| method.name)
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// 有哪些分组，按声明顺序（不是字母序）：适配器写得顺，模型看得也顺。
+fn groups_of(methods: &[MethodSpec]) -> Vec<&'static str> {
+    let mut groups: Vec<&'static str> = Vec::new();
+    for method in methods {
+        if !groups.contains(&method.group()) {
+            groups.push(method.group());
+        }
+    }
+    groups
+}
+
+fn group_of_name(method: &str) -> &str {
+    method.split('.').next().unwrap_or(method)
+}
+
+/// 调之前把参数形状核一遍。
+///
+/// 未声明的参数也拒：既是白名单精神，也能帮模型发现字段名拼错了——平台那边回的错通常看不懂。
+fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
+    let empty = serde_json::Map::new();
+    let given = match params {
+        Value::Null => &empty,
+        Value::Object(map) => map,
+        _ => {
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                format!("[bad_params] {} 的 params 要给一个对象（map）", spec.name),
+            ));
+        }
+    };
+
+    for param in spec.params {
+        match given.get(param.name) {
+            None | Some(Value::Null) => {
+                if param.required {
+                    return Err(ToolError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "[bad_params] {} 少了必填参数 {}（{}）",
+                            spec.name, param.name, param.desc
+                        ),
+                    ));
+                }
+            }
+            Some(value) => {
+                if !param.ty.matches(value) {
+                    return Err(ToolError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "[bad_params] {} 的参数 {} 要 {}，给的是 {value}",
+                            spec.name,
+                            param.name,
+                            param.ty.json_type()
+                        ),
+                    ));
+                }
+                if !param.values.is_empty() {
+                    let allowed = value.as_str().is_some_and(|text| param.values.contains(&text));
+                    if !allowed {
+                        return Err(ToolError::new(
+                            ErrorCode::BadRequest,
+                            format!(
+                                "[bad_params] {} 的参数 {} 只能是 {}，给的是 {value}",
+                                spec.name,
+                                param.name,
+                                param.values.join(" / ")
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for key in given.keys() {
+        if !spec.params.iter().any(|param| param.name == key) {
+            let known = if spec.params.is_empty() {
+                "这个方法不要参数".to_owned()
+            } else {
+                format!(
+                    "能给的参数：{}",
+                    spec
+                        .params
+                        .iter()
+                        .map(|param| param.name)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                )
+            };
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                format!("[bad_params] {} 不认识参数 {key}；{known}", spec.name),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// 适配器报的错 → 工具错。分类写进 message 里，模型靠它判断该改参数还是该放弃。
+fn call_error(error: CallError) -> ToolError {
+    let (code, kind) = match &error {
+        CallError::UnknownMethod { .. } => (ErrorCode::BadRequest, "unknown_method"),
+        CallError::BadParams(_) => (ErrorCode::BadRequest, "bad_params"),
+        CallError::UnsupportedPlatform(_) => (ErrorCode::ToolNotAllowed, "unsupported_platform"),
+        CallError::NotImplemented(_) => (ErrorCode::ToolNotAllowed, "not_implemented"),
+        CallError::Forbidden(_) => (ErrorCode::ToolNotAllowed, "forbidden"),
+        CallError::Unavailable(_) => (ErrorCode::Internal, "unavailable"),
+    };
+    ToolError::new(code, format!("[{kind}] {error}"))
+}
+
+fn cap_result(value: Value) -> Value {
+    let text = value.to_string();
+    let total = text.chars().count();
+    if total <= MAX_CALL_RESULT_CHARS {
+        return value;
+    }
+    json!({
+        "truncated": true,
+        "total_chars": total,
+        "note": format!(
+            "结果有 {total} 字符，太长了，只给前 {MAX_CALL_RESULT_CHARS} 字符。要看其余部分就换更细的参数再查一次。"
+        ),
+        "preview": text.chars().take(MAX_CALL_RESULT_CHARS).collect::<String>(),
+    })
 }

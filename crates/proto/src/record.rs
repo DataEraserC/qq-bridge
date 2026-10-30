@@ -8,11 +8,27 @@ use serde::{Deserialize, Serialize};
 use crate::element::Element;
 use crate::room::RoomId;
 
-/// 谁发的。平台的用户 id 与显示名。
+/// 发送者在这个房间里的身份。桥不发明它：平台（适配器）判出来才填，判不出就
+/// `None`。渲染时「没身份」和「是普通群友」是两回事，所以用枚举而不是布尔。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SenderRole {
+    /// 配置里点名的系统管理员（admin_qqs 命中的号）。
+    SystemAdmin,
+    /// 群主。
+    Owner,
+    /// 群管理员。
+    Admin,
+}
+
+/// 谁发的。平台的用户 id 与显示名，外加（可选）身份。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sender {
     pub id: String,
     pub name: String,
+    /// 这个发送者的身份。适配器判得出来才填；判不出就是 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<SenderRole>,
 }
 
 /// 这条记录是消息还是事件。
@@ -87,6 +103,7 @@ mod tests {
             sender: Sender {
                 id: "10001".into(),
                 name: "老王".into(),
+                role: None,
             },
             at: 1_793_000_000_000,
             elements: vec![Element::text("在吗")],

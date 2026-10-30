@@ -15,8 +15,9 @@ pub mod ticket;
 pub use element::Element;
 pub use error::{DecodeError, ProtoError};
 pub use frame::{
-    Delivery, ErrorCode, Frame, LogLevel, MemoryInfo, SessionInfo, ToolError, TurnReason,
+    Delivery, ErrorCode, Frame, LogLevel, MemoryInfo, SessionInfo, SessionMapRef, ToolError,
+    TurnReason,
 };
-pub use record::{Record, RecordKind, Sender};
+pub use record::{Record, RecordKind, Sender, SenderRole};
 pub use room::RoomId;
 pub use ticket::Ticket;

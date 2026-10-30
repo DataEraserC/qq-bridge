@@ -141,6 +141,63 @@ test("turn/end 后回 turn_end 帧（无错误）", async (t) => {
   assert.equal(turnEnd.error, undefined)
 })
 
+test("seedMaps 复用桥下发的旧会话映射，不再 createSession", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  const driver = new TurnDriver({ dsh, log: () => {} })
+  // 模拟桥 Ready 帧带回来的已落盘映射。delivery 的 session 是 "main"（见 fake-bridge）。
+  driver.seedMaps([{ session: "main", harness_session: "session-acb-main-old" }])
+
+  const runPromise = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "prompt 没被调")
+
+  // 关键断言：用的是 seed 的旧会话，dsh 没有 createSession。
+  assert.equal(dsh.prompts[0].sessionId, "session-acb-main-old", "应复用 seed 的会话 id")
+  assert.equal(dsh.sessions.length, 0, "不应调用 createSession")
+
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
+  await runPromise
+})
+
+test("一轮失败后下次投递复用同一会话，不新建", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  const driver = new TurnDriver({ dsh, log: () => {} })
+
+  // 第一轮：推一个带 error reason 的 turn/end，让它失败。
+  const first = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "第一轮 prompt 没被调")
+  dsh.lastFollow.push({
+    type: "turn/end",
+    data: { turn: "t1", reason: { kind: "error", error: { message: "炸了" } } },
+  })
+  await first
+
+  // 第二轮：同一会话再投一次。
+  const second = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 2, "第二轮 prompt 没被调")
+
+  // 关键断言：两次 prompt 用的是同一个 sessionId，dsh 只 create 了一次。
+  assert.equal(dsh.prompts[0].sessionId, dsh.prompts[1].sessionId, "失败后应复用同一会话")
+  assert.equal(dsh.sessions.length, 1, "只应 createSession 一次")
+
+  // 收尾：第二轮正常结束。
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t2" } })
+  await second
+})
+
 test("callBridge 把工具参数转成带票的 tool_call", async (t) => {
   const bridge = await new FakeBridge().start()
   const link = await connectedLink(bridge)

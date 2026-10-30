@@ -46,7 +46,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     match read(&mut reader)? {
-        Frame::Ready { sessions } => println!("已绑定到会话组：{}", sessions.join("、")),
+        Frame::Ready { sessions, .. } => println!("已绑定到会话组：{}", sessions.join("、")),
         other => return Err(format!("握手失败：收到 {}", other.kind()).into()),
     }
 

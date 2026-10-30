@@ -28,6 +28,18 @@ const ROOM_SCHEMA = {
   description: "房间，形如 qq:group/123；不填就是当前轮次的房间",
 }
 
+const COLUMNS_DOC = `只返回这些列，写成字符串数组。
+能查的列：id（水位编号）、room（房间）、kind（消息/事件）、sender（谁发的）、at（时间）、
+elements（内容）、platform_id（平台原生消息 id，quote 引用要用它）、at_self（是否冲我）、
+reply_to_self（是否回我）。
+不填默认返回 id/at/sender/elements。填了非法列名会报错并列出合法列名。`
+
+const COLUMNS_SCHEMA = {
+  type: "array",
+  description: COLUMNS_DOC,
+  items: { type: "string" },
+}
+
 /** 全部工具。`schema` 是 JSON Schema，`name`/`description` 是给模型看的。 */
 export const TOOLS = [
   {
@@ -85,7 +97,28 @@ ids 就是投递记录前面的编号。`,
         room: ROOM_SCHEMA,
         limit: { type: "number", description: "最多几条，默认 20，上限 200" },
         before: { type: "number", description: "只看编号比它小的（往前翻）" },
+        columns: COLUMNS_SCHEMA,
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "fetch_records",
+    description: `按水位编号精确查一批记录，只返回你要的列。
+${COLUMNS_DOC}
+返回里每条记录会带一个 columns 字段，写清楚每一列是「查了」还是「没查」。`,
+    schema: {
+      type: "object",
+      properties: {
+        room: ROOM_SCHEMA,
+        ids: {
+          type: "array",
+          items: { type: "number" },
+          description: "要查的水位编号（投递记录前面的 #编号）",
+        },
+        columns: COLUMNS_SCHEMA,
+      },
+      required: ["ids"],
       additionalProperties: false,
     },
   },
@@ -148,6 +181,53 @@ ids 就是投递记录前面的编号。`,
         room: ROOM_SCHEMA,
         limit: { type: "number", description: "最多几条，默认 20" },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "platform_methods",
+    description: `查这个平台还能干哪些消息之外的事（读合并转发的正文、查群成员、审批入群……）。
+桥只提供这一个目录和下面那个通用调用口——平台特有的能力都从这里查，不在工具列表里。
+
+三样都不给：只返回分组摘要（有哪些组、各几个）。
+给 group：这一组每个方法的名字、说明、参数表。
+给 query：按关键词找（名字和说明都会搜）。
+
+看到消息里带「可调 platform_call(...)」的提示时，直接照着调就行，不用先查目录。`,
+    schema: {
+      type: "object",
+      properties: {
+        room: ROOM_SCHEMA,
+        group: { type: "string", description: "只看某一组，如 forward、group" },
+        query: { type: "string", description: "按关键词找方法" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "platform_call",
+    description: `调一个平台特有方法。core 不认识任何方法名，原样转给适配器。
+
+method 用 resource.method 的写法，如 forward.get_content、group.get_member_info。
+params 是对象，形状照 platform_methods 里给的参数表填。
+只能调这个房间所属连接声明过的方法，且房间必须在会话订阅范围内。
+踢人、禁言这类破坏性操作默认不开放。
+
+报错会带上分类：unknown_method（名字错了，会给你近似的）、bad_params（参数不对，
+会说哪个字段）、unsupported_platform（这平台没这能力）、not_implemented（平台有但我们
+还没写）、forbidden（没权限或没开）。照着改就行，别重复调同一个错的。`,
+    schema: {
+      type: "object",
+      properties: {
+        room: ROOM_SCHEMA,
+        method: { type: "string", description: "方法名，如 forward.get_content" },
+        params: {
+          type: "object",
+          description: "方法参数。照 platform_methods 给的参数表填",
+          additionalProperties: true,
+        },
+      },
+      required: ["method"],
       additionalProperties: false,
     },
   },

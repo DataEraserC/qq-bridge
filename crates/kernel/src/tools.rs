@@ -16,11 +16,15 @@ pub const TOOL_NAMES: &[&str] = &[
     "send_message_to",
     "ack_messages",
     "get_history",
+    "fetch_records",
     "list_rooms",
     "get_notes",
     "set_note",
     "del_note",
     "get_platform_events",
+    // 平台能力：一个目录 + 一个通用调用口（ADR-0020）。core 不认识任何方法名。
+    "platform_methods",
+    "platform_call",
     // 记忆：文件层
     "memory_read",
     "memory_write",
@@ -69,7 +73,42 @@ pub struct HistoryArgs {
     /// 只看编号小于它的记录（往前翻）。
     #[serde(default)]
     pub before: Option<u64>,
+    /// 只返回这些列。缺省给一个精简子集（id/at/sender/elements）。
+    /// 非法列名会报错，并在错误里列出全部合法列名。
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
 }
+
+/// 按水位编号精确查一批记录。
+#[derive(Debug, Default, Deserialize)]
+pub struct FetchRecordsArgs {
+    /// 房间；不填就是当前轮次的房间。水位编号是房间内递增的，跨房间会撞号，
+    /// 所以必须限定在一个房间内查。
+    #[serde(default)]
+    pub room: Option<String>,
+    /// 要查的水位编号（投递记录前面的 `#编号`）。
+    pub ids: Vec<u64>,
+    /// 只返回这些列。缺省给一个精简子集（id/at/sender/elements）。
+    /// 非法列名会报错，并在错误里列出全部合法列名。
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
+}
+
+/// 一条记录能按需取的全部列。顺序即文档/错误提示里的列出顺序。
+pub const RECORD_COLUMNS: &[&str] = &[
+    "id",
+    "room",
+    "kind",
+    "sender",
+    "at",
+    "elements",
+    "platform_id",
+    "at_self",
+    "reply_to_self",
+];
+
+/// 不指定 `columns` 时的精简默认：够 agent 读内容、知道是谁、什么时候说的。
+pub const DEFAULT_COLUMNS: &[&str] = &["id", "at", "sender", "elements"];
 
 /// 查笔记。
 #[derive(Debug, Default, Deserialize)]
@@ -116,6 +155,31 @@ pub struct EventsArgs {
     pub room: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// 查平台能力目录（ADR-0020）。
+///
+/// 三样都空 = 给分组摘要；给 `group` = 这一组的方法详情；给 `query` = 按关键词找。
+#[derive(Debug, Default, Deserialize)]
+pub struct PlatformMethodsArgs {
+    #[serde(default)]
+    pub room: Option<String>,
+    /// 只看某一组，如 `forward`、`group`。
+    #[serde(default)]
+    pub group: Option<String>,
+    /// 按关键词找方法（名字或说明里含这个词）。
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+/// 调一个平台方法。`params` 是任意 map，core 不认识里面任何字段，原样转给适配器。
+#[derive(Debug, Default, Deserialize)]
+pub struct PlatformCallArgs {
+    #[serde(default)]
+    pub room: Option<String>,
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
 }
 
 /// 记忆工具公共参数：操作哪个记忆 + worktree 内的相对路径。

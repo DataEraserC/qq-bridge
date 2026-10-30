@@ -44,6 +44,10 @@ pub struct Delivery {
     /// 「该以什么身份说话、用哪个模型」。可空是为了兼容旧协议帧。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_info: Option<SessionInfo>,
+    /// 还有多少条没投进来（桥按 `delivery_limit` 截断了）。`None` = 全投了，没有截断。
+    /// harness 渲染时据此提示模型「用 fetch_records 抓剩下的」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub more: Option<usize>,
 }
 
 /// 一个会话在本轮投递里的身份信息。
@@ -58,6 +62,16 @@ pub struct SessionInfo {
     /// 用哪个模型；没配就是 `None`，由 harness 侧决定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+/// 一条「acb 会话 ↔ harness 内部会话」的映射，握手时随 `Ready` 下发，
+/// 让 harness 跨进程重启也能复用同一个内部会话（ADR-0018 的 session_maps 表）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMapRef {
+    /// acb 会话 id。
+    pub session: String,
+    /// harness 内部会话 id（dsh 的 sessionId 之类）。
+    pub harness_session: String,
 }
 
 /// 一份记忆在本轮投递里的信息。
@@ -140,7 +154,13 @@ pub enum Frame {
     /// 桥 → harness：握手成功，绑定到这个 harness 接管的一组会话。
     ///
     /// 顺序即配置里的顺序。单会话时只有一个元素。
-    Ready { sessions: Vec<String> },
+    Ready {
+        sessions: Vec<String>,
+        /// 已落盘的会话映射（acb 会话 ↔ harness 内部会话）。harness 用它复用旧会话，
+        /// 跨进程重启也不丢上下文。没有就是空列表。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        maps: Vec<SessionMapRef>,
+    },
     /// 桥 → harness：开一轮。
     TurnStart { delivery: Delivery },
     /// harness → 桥：本轮收工。
@@ -281,6 +301,7 @@ mod tests {
                 sender: Sender {
                     id: "10001".into(),
                     name: "老王".into(),
+                    role: None,
                 },
                 at: 1_793_000_000_000,
                 elements: vec![Element::text("在吗")],
@@ -298,6 +319,7 @@ mod tests {
                 harness: "dsh".into(),
                 model: None,
             }),
+            more: None,
         }
     }
 
@@ -310,6 +332,10 @@ mod tests {
             },
             Frame::Ready {
                 sessions: vec!["main".into(), "second".into()],
+                maps: vec![SessionMapRef {
+                    session: "main".into(),
+                    harness_session: "session-acb-main".into(),
+                }],
             },
             Frame::TurnStart {
                 delivery: sample_delivery(),

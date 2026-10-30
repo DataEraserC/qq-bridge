@@ -335,11 +335,14 @@ export class DshClient {
    *   不传就由 dsh 造一个 `session-<uuid>`。持久化靠这个固定 id。
    * - cwd：会话的工作目录，决定它归到 dsh 的哪个 workspace（分组）。dsh 会先 mkdir 这个目录。
    *   复用 named 会话时 cwd 必须和首次一致，否则报 cwd 冲突。
+   * - agentPreset：dsh 的 agent preset id（config.id）。每个 acb 会话一个 preset，每个
+   *   preset 只挂它自己的 MCP，模型就只会看到那一套工具（ADR-0019）。
    */
-  async createSession({ sessionId, cwd } = {}) {
+  async createSession({ sessionId, cwd, agentPreset } = {}) {
     const result = await this.callUnary("session/create", {
       ...(sessionId === undefined ? {} : { sessionId }),
       ...(cwd === undefined ? {} : { cwd }),
+      ...(agentPreset === undefined ? {} : { agentPreset }),
     })
     if (!result.sessionId) {
       throw new DshError("protocol", `dsh 建会话没回 sessionId：${JSON.stringify(result).slice(0, 200)}`)

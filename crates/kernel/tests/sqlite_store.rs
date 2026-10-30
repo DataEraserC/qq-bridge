@@ -54,6 +54,7 @@ fn message(room: &RoomId, text: &str) -> RecordDraft {
         Sender {
             id: "323622442".into(),
             name: "萨卡班甲鱼".into(),
+                role: None,
         },
         AT,
         vec![Element::text(text)],
@@ -183,6 +184,7 @@ fn elements_survive_the_round_trip() {
         Sender {
             id: "1".into(),
             name: "老王".into(),
+                role: None,
         },
         AT,
         elements.clone(),
@@ -209,6 +211,7 @@ fn events_keep_their_type() {
             Sender {
                 id: "1".into(),
                 name: "老王".into(),
+                role: None,
             },
             AT,
             "poke",
@@ -462,6 +465,7 @@ fn platform_id_survives_a_restart_and_is_findable() {
             Sender {
                 id: "3683924053".into(),
                 name: "3683924053".into(),
+                role: None,
             },
             AT,
             vec![Element::text("只发 192.168 网段")],
@@ -555,6 +559,7 @@ fn a_version_one_database_is_migrated_in_place() {
         Sender {
             id: "3683924053".into(),
             name: "bot".into(),
+                role: None,
         },
         AT,
         vec![Element::text("新消息")],

@@ -105,6 +105,7 @@ fn message(room: &str, sender: &str, text: &str, at_self: bool) -> RecordDraft {
         Sender {
             id: sender.to_owned(),
             name: "老王".to_owned(),
+                role: None,
         },
         AT,
         vec![Element::text(text)],
@@ -122,6 +123,7 @@ fn poke(room: &str, at_self: bool) -> RecordDraft {
         Sender {
             id: "10001".to_owned(),
             name: "老王".to_owned(),
+                role: None,
         },
         AT,
         "poke",
@@ -205,7 +207,7 @@ fn mention_wakes_then_reply_and_ack_advance_the_watermark() {
     );
 
     // 5. 收工，队列空了。
-    bridge.end_turn(&ticket).expect("能收工");
+    bridge.end_turn(&ticket, None).expect("能收工");
     assert!(bridge.poll_turn().expect("能开轮").is_none());
     assert!(
         unread(bridge.store(), &cursor("main", "qq:group/123"), 100)
@@ -233,7 +235,7 @@ fn own_messages_never_come_back_as_unread() {
         .expect("能发");
 
     // 故意不确认第一条就收工——水位被挡住，正是「自己的话会不会被当成未读」的极端情况。
-    bridge.end_turn(&first).expect("能收工");
+    bridge.end_turn(&first, None).expect("能收工");
     bridge
         .ingest(message("qq:group/123", "10001", "还有话", true))
         .expect("能记下来");
@@ -374,7 +376,7 @@ fn a_busy_device_queues_and_does_not_run_two_turns() {
         "同一设备不能同时跑两轮"
     );
 
-    bridge.end_turn(&first.ticket).expect("能收工");
+    bridge.end_turn(&first.ticket, None).expect("能收工");
 
     let second = bridge
         .poll_turn()
@@ -392,7 +394,7 @@ fn unacked_records_come_back_marked_as_redelivery() {
         .expect("能记下来");
     let first = bridge.poll_turn().expect("能开轮").expect("有活");
     // 故意不确认就收工。
-    bridge.end_turn(&first.ticket).expect("能收工");
+    bridge.end_turn(&first.ticket, None).expect("能收工");
 
     bridge
         .ingest(message("qq:group/123", "10001", "第二句", true))
@@ -509,7 +511,7 @@ fn a_stale_ticket_is_rejected() {
         .ingest(message("qq:group/123", "10001", "在吗", true))
         .expect("能记下来");
     let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
-    bridge.end_turn(&ticket).expect("能收工");
+    bridge.end_turn(&ticket, None).expect("能收工");
 
     let error = bridge
         .tool_call(
@@ -662,7 +664,7 @@ fn quoting_my_message_wakes_without_a_mention() {
     bridge
         .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1]}))
         .expect("能确认");
-    bridge.end_turn(&ticket).expect("能收尾");
+    bridge.end_turn(&ticket, None).expect("能收尾");
 
     // 2. 对方「引用」我那条再说一句，既没 @ 也没叫名字，条数更不到 50。
     let quoted = RecordDraft::message(
@@ -670,6 +672,7 @@ fn quoting_my_message_wakes_without_a_mention() {
         Sender {
             id: "10001".into(),
             name: "老王".into(),
+                role: None,
         },
         AT + 1000,
         vec![
@@ -722,6 +725,7 @@ fn quoting_someone_elses_message_stays_quiet() {
         Sender {
             id: "10001".into(),
             name: "老王".into(),
+                role: None,
         },
         AT + 1000,
         vec![
@@ -940,4 +944,129 @@ fn different_sessions_run_turns_independently() {
         .expect("能取")
         .expect("不同会话能并发开轮");
     assert_eq!(second.session, "helper");
+}
+
+// ---------------------------------------------------------------------------
+// 失败通知（on_turn_error）
+// ---------------------------------------------------------------------------
+
+/// 一个会话没配 on_turn_error，只有全局默认；失败后应回退到全局默认去发通知。
+fn fallback_config() -> &'static str {
+    r#"
+        default_on_turn_error = ["send:qq:group/ops"]
+
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "bot"
+
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
+
+        [[sessions]]
+        id = "main"
+        harness = "dsh"
+        persona = "p"
+        token = "t-main"
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/123"
+
+        [sessions.subscriptions.wake]
+        at_mention = true
+        name_mention = false
+        poke = false
+        accumulate = 50
+    "#
+}
+
+/// 会话没配 on_turn_error（空），失败时必须回退到全局默认——不能因为「会话存在」
+/// 就拿到一个空列表而什么都不发。
+#[test]
+fn turn_failure_falls_back_to_default_when_session_has_no_override() {
+    let (mut bridge, sends) = group_bridge(fallback_config());
+
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let delivery = bridge.poll_turn_for(&group()).expect("能取").expect("有活");
+
+    // 收工时报错，触发失败通知。
+    bridge
+        .end_turn(&delivery.ticket, Some("模型 400 content-blocked"))
+        .expect("能收工");
+
+    let sends = sends.lock().expect("没被毒死");
+    assert_eq!(sends.len(), 1, "全局默认的失败通知要真的发出去");
+    assert_eq!(sends[0].0, room("qq:group/ops"), "发到全局默认指定的房间");
+    let text = match &sends[0].1[0] {
+        Element::Text { text } => text,
+        other => panic!("失败通知应是文本，收到 {other:?}"),
+    };
+    assert!(text.contains("一轮失败"), "要带「一轮失败」字样：{text}");
+    assert!(text.contains("content-blocked"), "要带原始错误：{text}");
+}
+
+/// 会话显式配了 on_turn_error 时，用会话自己的，不用全局默认。
+#[test]
+fn turn_failure_prefers_session_override_over_default() {
+    let config = r#"
+        default_on_turn_error = ["send:qq:group/ops"]
+
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "bot"
+
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
+
+        [[sessions]]
+        id = "main"
+        harness = "dsh"
+        persona = "p"
+        token = "t-main"
+        on_turn_error = ["send:qq:group/own"]
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/123"
+
+        [sessions.subscriptions.wake]
+        at_mention = true
+        name_mention = false
+        poke = false
+        accumulate = 50
+    "#;
+
+    let (mut bridge, sends) = group_bridge(config);
+
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let delivery = bridge.poll_turn_for(&group()).expect("能取").expect("有活");
+    bridge
+        .end_turn(&delivery.ticket, Some("boom"))
+        .expect("能收工");
+
+    let sends = sends.lock().expect("没被毒死");
+    assert_eq!(sends.len(), 1, "只发会话自己配的那一个");
+    assert_eq!(sends[0].0, room("qq:group/own"), "会话级配置优先");
 }

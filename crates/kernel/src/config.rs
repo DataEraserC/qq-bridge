@@ -32,6 +32,10 @@ pub const DEFAULT_MAX_RECORDS_PER_ROOM: u64 = 5000;
 /// 没配「留多少天」时的默认值。来源：实现默认。
 pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
 
+/// 一轮投递最多塞多少条新记录的默认值。来源：实现默认，可推翻。
+/// 超过这个数就只投前这么多条，末尾提示「还有 N 条，用 fetch_records 抓」。
+pub const DEFAULT_DELIVERY_LIMIT: usize = 30;
+
 /// 没配 worktree 根目录时的默认值：工作目录下的 `state/worktrees`。
 /// 来源：实现默认。放 `state/` 是因为那里已经在 .gitignore 里。
 /// 每个「会话 × 记忆」的 worktree 按 `根/记忆id/会话id` 分层，路径固定才谈得上幂等。
@@ -60,7 +64,29 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// 记忆 worktree 的根目录。每个「会话 × 记忆」checkout 到这下面。
     pub worktrees_root: String,
+    /// 会话**没配自己的 `on_turn_error`** 时的默认失败通知动作列表。
+    /// 空 = 只记日志。写法同会话级 `on_turn_error`（`log` / `send:<房间>`）。
+    pub default_on_turn_error: TurnErrorActions,
+    /// 一轮投递最多塞多少条新记录。超过就只投前 `delivery_limit` 条，并在末尾附一句
+    /// 「还有 N 条没投，用 fetch_records 抓」。0 或不配 = 不截断（照旧投满 MAX_DELIVERY）。
+    pub delivery_limit: usize,
 }
+
+/// 一轮失败后要做的通知动作。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnErrorAction {
+    /// 记进桥日志（默认行为，永远可做）。
+    Log,
+    /// 把失败信息作为一条消息发到指定房间。
+    Send { room: RoomId },
+}
+
+/// 一轮失败时按顺序执行的「通知动作」列表（挂在**会话**上，不是全局）。
+///
+/// 每个动作是一条字符串：`log` 记进日志；`send:<房间>` 把失败信息作为一条消息
+/// 发到指定房间（房间写法同订阅，如 `send:qq:group/123`）。顺序执行，一个动作
+/// 失败不打断后面的。空 = 只记日志（现状）。
+pub type TurnErrorActions = Vec<TurnErrorAction>;
 
 /// 流水保留策略。
 ///
@@ -151,6 +177,9 @@ pub struct Connection {
     /// 必填：桥要靠它分辨「这条消息是不是我自己发的」。分不出来就会自己回自己，
     /// 而且水位会被自己的话挡住。连上之后还会跟平台报的号核对一次。
     pub account: String,
+    /// 系统管理员的账号列表。发送者号命中其中之一，就标 `SenderRole::SystemAdmin`。
+    /// 空 = 没有系统管理员。适配器判身份时先查这个，查不到再去问平台群角色。
+    pub admin_qqs: Vec<String>,
 }
 
 /// 目前认识的适配器种类。加新适配器时在这里登记。
@@ -229,6 +258,9 @@ pub struct Session {
     pub token: String,
     /// 订阅列表。
     pub subscriptions: Vec<Subscription>,
+    /// 这个会话一轮失败时按顺序执行的「通知动作」列表。空 = 只记日志。
+    /// 见 [`TurnErrorAction`]。
+    pub on_turn_error: TurnErrorActions,
 }
 
 /// 一条订阅：连接 + 房间 + 唤醒策略。
@@ -441,6 +473,8 @@ pub enum ConfigError {
     EmptyStoragePath,
     #[error("worktree 根目录不能为空（不配就用默认的 {DEFAULT_WORKTREES_ROOT}）")]
     EmptyWorktreesRoot,
+    #[error("失败通知动作不合法：{action}（要写成 log 或 send:连接:段/段）")]
+    BadTurnErrorAction { action: String },
 }
 
 impl Config {
@@ -453,6 +487,8 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
+        let default_on_turn_error = parse_turn_error_actions(&raw.default_on_turn_error)?;
+
         let storage = match raw.storage {
             Some(raw) => {
                 let path = raw.path.trim().to_owned();
@@ -728,6 +764,8 @@ impl Config {
                 })
                 .flatten();
 
+            let on_turn_error = parse_turn_error_actions(&raw_session.on_turn_error)?;
+
             sessions.push(Session {
                 id,
                 harness,
@@ -737,6 +775,7 @@ impl Config {
                 memories: raw_session.memories,
                 token: raw_session.token.trim().to_owned(),
                 subscriptions,
+                on_turn_error,
             });
         }
 
@@ -751,6 +790,8 @@ impl Config {
             storage,
             retention,
             worktrees_root,
+            default_on_turn_error,
+            delivery_limit: raw.delivery_limit.unwrap_or(DEFAULT_DELIVERY_LIMIT),
         })
     }
 
@@ -809,6 +850,13 @@ impl Config {
         self.connection(&room.connection)
             .map(|connection| connection.account.clone())
             .unwrap_or_default()
+    }
+
+    /// 这个号是不是房间所属连接点名的系统管理员。
+    pub fn is_admin(&self, room: &RoomId, sender_id: &str) -> bool {
+        self.connection(&room.connection)
+            .map(|connection| connection.admin_qqs.iter().any(|qq| qq == sender_id))
+            .unwrap_or(false)
     }
 
     /// 按 harness 名找它接管的会话。握手时用：harness 报出名字 + 令牌，
@@ -907,6 +955,12 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
             .map(|token| token.trim().to_owned())
             .filter(|token| !token.is_empty()),
         account,
+        admin_qqs: raw
+            .admin_qqs
+            .into_iter()
+            .map(|qq| qq.trim().to_owned())
+            .filter(|qq| !qq.is_empty())
+            .collect(),
     })
 }
 
@@ -956,6 +1010,44 @@ fn check_not_blank(value: &str, field: &'static str) -> Result<(), &'static str>
     Ok(())
 }
 
+/// 把 TOML 里的失败通知动作字符串列表解析成 [`TurnErrorAction`]。
+///
+/// 每条是 `log` 或 `send:<连接>:<段/段>`（房间写法同订阅，如 `send:qq:group/123`）。
+/// 解析不了就报错——这是配置层面的错，不该带病启动。
+fn parse_turn_error_actions(raw: &[String]) -> Result<Vec<TurnErrorAction>, ConfigError> {
+    let mut actions = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let action = entry.trim();
+        if action == "log" {
+            actions.push(TurnErrorAction::Log);
+            continue;
+        }
+        if let Some(room_text) = action.strip_prefix("send:") {
+            // 房间写法的第一段是连接名，后面是段/段；这里拆出连接名和路径。
+            let room_text = room_text.trim();
+            let (connection, path) = match room_text.split_once(':') {
+                Some((connection, path)) => (connection, path),
+                None => {
+                    return Err(ConfigError::BadTurnErrorAction {
+                        action: entry.clone(),
+                    });
+                }
+            };
+            let room = RoomId::new(connection.trim(), path.trim()).map_err(|_| {
+                ConfigError::BadTurnErrorAction {
+                    action: entry.clone(),
+                }
+            })?;
+            actions.push(TurnErrorAction::Send { room });
+            continue;
+        }
+        return Err(ConfigError::BadTurnErrorAction {
+            action: entry.clone(),
+        });
+    }
+    Ok(actions)
+}
+
 // ---------------------------------------------------------------------------
 // 原始 TOML 形态
 // ---------------------------------------------------------------------------
@@ -977,6 +1069,12 @@ struct RawConfig {
     storage: Option<RawStorage>,
     retention: Option<RawRetention>,
     worktrees_root: Option<String>,
+    /// 会话没配 `on_turn_error` 时的默认动作列表（默认空 = 只记日志）。
+    #[serde(default)]
+    default_on_turn_error: Vec<String>,
+    /// 一轮投递最多塞多少条。0 = 不截断。
+    #[serde(default)]
+    delivery_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1015,6 +1113,9 @@ struct RawSession {
     token: String,
     #[serde(default)]
     subscriptions: Vec<RawSubscription>,
+    /// 一轮失败时的通知动作列表（默认空 = 只记日志）。
+    #[serde(default)]
+    on_turn_error: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1039,6 +1140,9 @@ struct RawConnection {
     url: String,
     token: Option<String>,
     account: Option<String>,
+    /// 系统管理员账号列表，可为空。
+    #[serde(default)]
+    admin_qqs: Vec<String>,
 }
 
 fn default_transport() -> String {

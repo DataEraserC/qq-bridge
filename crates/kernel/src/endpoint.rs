@@ -11,6 +11,7 @@
 //! 并发模型：整个桥在一把锁后面。锁只在「读一格状态 / 执行一个动作」时拿，**绝不**在等
 //! 网络时拿着——所以出站慢、harness 发呆，都不会卡住平台那一侧。
 
+use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,15 +146,15 @@ pub fn handshake<S: Store>(bridge: &Bridge<S>, frame: Frame) -> Result<Vec<Strin
 pub struct Conn {
     /// 这条连接代表的会话组（同一 harness + 令牌）。
     sessions: Vec<String>,
-    /// 正在跑的那一轮的票；有票说明 harness 正在跑一轮。
-    ticket: Option<Ticket>,
+    /// 正在跑的轮次的票，按会话存：一个会话一张票，不同会话可并行（ADR-0019）。
+    tickets: HashMap<String, Ticket>,
 }
 
 impl Conn {
     pub fn new(sessions: Vec<String>) -> Self {
         Self {
             sessions,
-            ticket: None,
+            tickets: HashMap::new(),
         }
     }
 
@@ -162,23 +163,23 @@ impl Conn {
         &self.sessions
     }
 
-    /// 正在跑的那一轮的票。
-    pub fn ticket(&self) -> Option<&Ticket> {
-        self.ticket.as_ref()
+    /// 手上还有几张在跑的票。
+    pub fn active_turns(&self) -> usize {
+        self.tickets.len()
     }
 
-    /// 有活就领一轮过来；正忙、没活都返回 `None`。
+    /// 有活就领一轮过来。引擎层自己会跳过「已经在跑」的会话，所以这里只管问。
+    ///
+    /// 一条连接可以同时跑多个会话的轮次：每个会话一张票，互不阻塞。
     pub fn take_delivery<S: Store>(
         &mut self,
         bridge: &mut Bridge<S>,
     ) -> Result<Option<Delivery>, EndpointError> {
-        if self.ticket.is_some() {
-            return Ok(None);
-        }
         let Some(delivery) = bridge.poll_turn_for(&self.sessions)? else {
             return Ok(None);
         };
-        self.ticket = Some(delivery.ticket.clone());
+        self.tickets
+            .insert(delivery.session.clone(), delivery.ticket.clone());
         Ok(Some(delivery))
     }
 
@@ -197,41 +198,45 @@ impl Conn {
                 tool,
                 args,
             } => {
-                let reply = match &self.ticket {
-                    Some(current) if current == &ticket => {
-                        match bridge.tool_call(&ticket, &self.sessions, &tool, args) {
-                            Ok(result) => Frame::ToolResult {
-                                id,
-                                result: Some(result),
-                                error: None,
-                            },
-                            Err(error) => Frame::ToolResult {
-                                id,
-                                result: None,
-                                error: Some(error),
-                            },
-                        }
+                let reply = if self.tickets.values().any(|t| t == &ticket) {
+                    match bridge.tool_call(&ticket, &self.sessions, &tool, args) {
+                        Ok(result) => Frame::ToolResult {
+                            id,
+                            result: Some(result),
+                            error: None,
+                        },
+                        Err(error) => Frame::ToolResult {
+                            id,
+                            result: None,
+                            error: Some(error),
+                        },
                     }
-                    _ => Frame::ToolResult {
+                } else {
+                    Frame::ToolResult {
                         id,
                         result: None,
                         error: Some(ToolError::new(
                             ErrorCode::Unauthorized,
                             "这张票不是本轮签发的",
                         )),
-                    },
+                    }
                 };
                 Ok(vec![reply])
             }
             Frame::TurnEnd { ticket, error } => {
-                if self.ticket.as_ref() != Some(&ticket) {
+                // 找到这张票对应的会话，把它从「在跑」里摘掉。
+                let owned = self
+                    .tickets
+                    .iter()
+                    .find_map(|(session, t)| (t == &ticket).then(|| session.clone()));
+                let Some(session) = owned else {
                     return Ok(vec![Frame::Log {
                         level: LogLevel::Warn,
                         message: "收到了不属于当前轮次的 turn_end，已忽略".into(),
                     }]);
-                }
-                bridge.end_turn(&ticket)?;
-                self.ticket = None;
+                };
+                self.tickets.remove(&session);
+                bridge.end_turn(&ticket, error.as_deref())?;
                 let mut replies = Vec::new();
                 if let Some(error) = error {
                     replies.push(Frame::Log {
@@ -321,13 +326,15 @@ impl Conn {
         }
     }
 
-    /// 连接断了：把没交代完的一轮放掉，别让设备一直占着。
+    /// 连接断了：把没交代完的轮次都放掉，别让会话一直占着。
     ///
     /// 不确认任何消息——它们还是未读，下一轮重投。
     pub fn abandon<S: Store>(&mut self, bridge: &mut Bridge<S>) {
-        if let Some(ticket) = self.ticket.take() {
-            let _ = bridge.end_turn(&ticket);
+        let tickets: Vec<Ticket> = self.tickets.values().cloned().collect();
+        for ticket in tickets {
+            let _ = bridge.end_turn(&ticket, None);
         }
+        self.tickets.clear();
     }
 }
 
@@ -353,10 +360,27 @@ pub fn run_connection<S: Store>(
         let guard = lock(bridge);
         handshake(&guard, frame)?
     };
+    // 把这条连接代表会话的已落盘映射带上，让 harness 跨重启复用旧会话（ADR-0018）。
+    let maps = {
+        let guard = lock(bridge);
+        guard
+            .session_maps()
+            .map(|all| {
+                all.into_iter()
+                    .filter(|map| sessions.contains(&map.session))
+                    .map(|map| acb_proto::SessionMapRef {
+                        session: map.session,
+                        harness_session: map.harness_session,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
     write_frame(
         &mut stream,
         &Frame::Ready {
             sessions: sessions.clone(),
+            maps,
         },
     )?;
 
@@ -376,8 +400,9 @@ pub fn run_connection<S: Store>(
     controls.register(&session.sessions().to_vec(), control_tx);
 
     let outcome = 'conn: loop {
-        // 1. 有活就发过去。
-        if session.ticket().is_none() {
+        // 1. 有活就发过去。引擎层会跳过「已经在跑」的会话，所以一条连接能同时
+        //    跑多个会话的轮次——每个会话一张票，互不阻塞（ADR-0019）。
+        {
             let delivery = {
                 let mut guard = lock(bridge);
                 session.take_delivery(&mut guard)
@@ -387,6 +412,9 @@ pub fn run_connection<S: Store>(
                     if let Err(error) = write_frame(&mut stream, &Frame::TurnStart { delivery }) {
                         break 'conn Err(error);
                     }
+                    // 领到一轮后别立刻又领同一会话的下一轮，先回头处理 harness 的响应；
+                    // 别的会话的活下一圈再领。
+                    continue;
                 }
                 Ok(None) => {}
                 Err(error) => break 'conn Err(error),

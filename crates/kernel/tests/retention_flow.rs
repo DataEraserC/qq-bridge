@@ -95,6 +95,7 @@ fn message(text: &str, at: i64) -> RecordDraft {
         Sender {
             id: "323622442".into(),
             name: "萨卡班甲鱼".into(),
+                role: None,
         },
         at,
         vec![Element::text(text)],
@@ -116,7 +117,7 @@ fn ack(bridge: &mut Bridge<MemoryStore>, session: &str, ids: &[u64]) {
             serde_json::json!({ "ids": ids }),
         )
         .expect("能确认");
-    bridge.end_turn(&delivery.ticket).expect("能收工");
+    bridge.end_turn(&delivery.ticket, None).expect("能收工");
 }
 
 fn left(bridge: &Bridge<MemoryStore>) -> Vec<u64> {

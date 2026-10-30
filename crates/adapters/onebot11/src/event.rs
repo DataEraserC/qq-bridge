@@ -7,7 +7,7 @@
 //! - 群 → `<连接>:group/<群号>`
 //! - 私聊 → `<连接>:private/<对方号>`
 
-use acb_kernel::{Element, RecordDraft, RoomId, Sender};
+use acb_kernel::{Element, RecordDraft, RoomId, Sender, SenderRole};
 use serde_json::Value;
 
 use crate::segment;
@@ -31,7 +31,12 @@ pub enum EventError {
 }
 
 /// 解析一条 OneBot 11 上报事件。
-pub fn parse(connection: &str, event: &Value) -> Result<Parsed, EventError> {
+///
+/// `admin_qqs` 是这条连接点名的系统管理员账号。发送者命中就标 `SystemAdmin`；
+/// 否则读事件自带的 `sender.role`（`owner`→群主、`admin`→群管理员、`member`→普通群友）。
+/// 事件没带 `sender`（拍一拍这类 notice 常见）时，昵称和群角色都判不出，交给调用方
+/// 用 `get_group_member_info` 兜底。
+pub fn parse(connection: &str, event: &Value, admin_qqs: &[String]) -> Result<Parsed, EventError> {
     let self_id = id_of(event.get("self_id"));
     let at = event
         .get("time")
@@ -40,13 +45,13 @@ pub fn parse(connection: &str, event: &Value) -> Result<Parsed, EventError> {
         .unwrap_or_else(now_millis);
 
     match post_type(event) {
-        Some("message") => message(connection, event, &self_id, at),
+        Some("message") => message(connection, event, &self_id, at, admin_qqs),
         // 自己发出去的消息回执。桥在发送时已经记过流水了，再记一遍会重复。
         Some("message_sent") => Ok(Parsed::Ignored("自己消息的回执".into())),
-        Some("notice") => notice(connection, event, &self_id, at),
+        Some("notice") => notice(connection, event, &self_id, at, admin_qqs),
         // 心跳每几秒一次，进流水只会把记录撑爆。
         Some("meta_event") => Ok(Parsed::Ignored("心跳/生命周期".into())),
-        Some("request") => request(connection, event, at),
+        Some("request") => request(connection, event, at, admin_qqs),
         other => Ok(Parsed::Ignored(format!(
             "不认识的事件：{}",
             other.unwrap_or("没有 post_type")
@@ -58,7 +63,13 @@ fn post_type(event: &Value) -> Option<&str> {
     event.get("post_type").and_then(Value::as_str)
 }
 
-fn message(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Parsed, EventError> {
+fn message(
+    connection: &str,
+    event: &Value,
+    self_id: &str,
+    at: i64,
+    admin_qqs: &[String],
+) -> Result<Parsed, EventError> {
     let sender_id = id_of(event.get("user_id"));
     if sender_id.is_empty() {
         return Err(EventError::Missing("user_id"));
@@ -82,10 +93,7 @@ fn message(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Pa
     Ok(Parsed::Record(
         RecordDraft::message(
             room,
-            Sender {
-                id: sender_id,
-                name: display_name(event),
-            },
+            sender_of(event, &sender_id, admin_qqs),
             at,
             elements,
             at_self,
@@ -95,7 +103,13 @@ fn message(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Pa
     ))
 }
 
-fn notice(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Parsed, EventError> {
+fn notice(
+    connection: &str,
+    event: &Value,
+    self_id: &str,
+    at: i64,
+    admin_qqs: &[String],
+) -> Result<Parsed, EventError> {
     let notice_type = event
         .get("notice_type")
         .and_then(Value::as_str)
@@ -109,10 +123,7 @@ fn notice(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Par
         }
     };
     let room = notice_room(connection, event, &sender_id)?;
-    let sender = Sender {
-        id: sender_id.clone(),
-        name: display_name(event),
-    };
+    let sender = sender_of(event, &sender_id, admin_qqs);
 
     // 拍一拍：被拍的是 target_id。拍到我，`at_self` 才为真（唤醒策略据此判定）。
     if notice_type == "notify" && event.get("sub_type").and_then(Value::as_str) == Some("poke") {
@@ -145,7 +156,12 @@ fn notice(connection: &str, event: &Value, self_id: &str, at: i64) -> Result<Par
     )))
 }
 
-fn request(connection: &str, event: &Value, at: i64) -> Result<Parsed, EventError> {
+fn request(
+    connection: &str,
+    event: &Value,
+    at: i64,
+    admin_qqs: &[String],
+) -> Result<Parsed, EventError> {
     let request_type = event
         .get("request_type")
         .and_then(Value::as_str)
@@ -156,10 +172,7 @@ fn request(connection: &str, event: &Value, at: i64) -> Result<Parsed, EventErro
 
     Ok(Parsed::Record(RecordDraft::event(
         room,
-        Sender {
-            id: sender_id,
-            name: display_name(event),
-        },
+        sender_of(event, &sender_id, admin_qqs),
         at,
         format!("request_{request_type}"),
         vec![Element::text(body)],
@@ -197,6 +210,33 @@ fn display_name(event: &Value) -> String {
         }
     }
     id_of(event.get("user_id"))
+}
+
+/// 构造发送者，顺手判身份：命中 admin_qqs 是系统管理员，否则看事件自带的 `sender.role`。
+fn sender_of(event: &Value, sender_id: &str, admin_qqs: &[String]) -> Sender {
+    let role = if admin_qqs.iter().any(|qq| qq == sender_id) {
+        Some(SenderRole::SystemAdmin)
+    } else {
+        role_of(event)
+    };
+    Sender {
+        id: sender_id.to_owned(),
+        name: display_name(event),
+        role,
+    }
+}
+
+/// 事件自带 `sender.role` → 身份。`owner` 群主、`admin` 群管理员、`member` 及空 = 普通群友。
+fn role_of(event: &Value) -> Option<SenderRole> {
+    match event
+        .get("sender")
+        .and_then(|sender| sender.get("role"))
+        .and_then(Value::as_str)
+    {
+        Some("owner") => Some(SenderRole::Owner),
+        Some("admin") => Some(SenderRole::Admin),
+        _ => None,
+    }
 }
 
 fn describe_notice(notice_type: &str, event: &Value) -> String {
@@ -267,7 +307,7 @@ mod tests {
 
     #[test]
     fn group_message_becomes_a_record_in_a_group_room() {
-        let Parsed::Record(draft) = parse("qq", &group_message()).expect("能解析") else {
+        let Parsed::Record(draft) = parse("qq", &group_message(), &[]).expect("能解析") else {
             panic!("群消息应当成一条记录");
         };
         assert_eq!(draft.room, RoomId::new("qq", "group/456").expect("合法"));
@@ -291,7 +331,7 @@ mod tests {
                 {"type": "text", "data": {"text": "只发子网"}}
             ]
         });
-        let Parsed::Record(draft) = parse("qq", &event).expect("能解析") else {
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
             panic!("应当成一条记录");
         };
 
@@ -319,7 +359,7 @@ mod tests {
             "user_id": 10001,
             "message": [{"type": "text", "data": {"text": "私聊"}}]
         });
-        let Parsed::Record(draft) = parse("qq", &event).expect("能解析") else {
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
             panic!("应当成一条记录");
         };
         assert_eq!(
@@ -341,7 +381,7 @@ mod tests {
             "target_id": 999,
             "sender": {"nickname": "老王"}
         });
-        let Parsed::Record(draft) = parse("qq", &event).expect("能解析") else {
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
             panic!("拍一拍要记下来");
         };
         assert_eq!(
@@ -365,7 +405,7 @@ mod tests {
             "user_id": 10001,
             "target_id": 10002
         });
-        let Parsed::Record(draft) = parse("qq", &event).expect("能解析") else {
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
             panic!("拍别人也要记");
         };
         assert!(!draft.at_self, "拍的不是我，不该叫醒我");
@@ -382,7 +422,7 @@ mod tests {
             "user_id": 10001,
             "target_id": 10002
         });
-        let Parsed::Record(draft) = parse("qq", &event).expect("能解析") else {
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
             panic!("进退群也要记");
         };
         assert_eq!(
@@ -399,7 +439,7 @@ mod tests {
         let event =
             json!({"post_type": "meta_event", "meta_event_type": "heartbeat", "self_id": 999});
         assert_eq!(
-            parse("qq", &event).expect("能解析"),
+            parse("qq", &event, &[]).expect("能解析"),
             Parsed::Ignored("心跳/生命周期".into())
         );
     }
@@ -409,7 +449,7 @@ mod tests {
         let mut event = group_message();
         event["post_type"] = json!("message_sent");
         assert!(matches!(
-            parse("qq", &event).expect("能解析"),
+            parse("qq", &event, &[]).expect("能解析"),
             Parsed::Ignored(_)
         ));
     }
@@ -418,14 +458,53 @@ mod tests {
     fn group_message_without_group_id_is_an_error() {
         let mut event = group_message();
         event.as_object_mut().expect("是对象").remove("group_id");
-        assert_eq!(parse("qq", &event), Err(EventError::Missing("group_id")));
+        assert_eq!(parse("qq", &event, &[]), Err(EventError::Missing("group_id")));
     }
 
     #[test]
     fn connection_name_comes_from_config_not_hardcoded() {
-        let Parsed::Record(draft) = parse("qq-test", &group_message()).expect("能解析") else {
+        let Parsed::Record(draft) = parse("qq-test", &group_message(), &[]).expect("能解析") else {
             panic!("应当成一条记录");
         };
         assert_eq!(draft.room.connection, "qq-test");
+    }
+
+    #[test]
+    fn admin_qqs_hit_marks_system_admin() {
+        let admins = vec!["10001".to_owned()];
+        let Parsed::Record(draft) = parse("qq", &group_message(), &admins).expect("能解析") else {
+            panic!("应当成一条记录");
+        };
+        assert_eq!(draft.sender.role, Some(SenderRole::SystemAdmin));
+    }
+
+    #[test]
+    fn sender_role_owner_becomes_group_owner() {
+        let mut event = group_message();
+        event["sender"] = json!({"nickname": "老王", "role": "owner"});
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
+            panic!("应当成一条记录");
+        };
+        assert_eq!(draft.sender.role, Some(SenderRole::Owner));
+    }
+
+    #[test]
+    fn sender_role_admin_becomes_group_admin() {
+        let mut event = group_message();
+        event["sender"] = json!({"nickname": "老王", "role": "admin"});
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
+            panic!("应当成一条记录");
+        };
+        assert_eq!(draft.sender.role, Some(SenderRole::Admin));
+    }
+
+    #[test]
+    fn plain_member_has_no_role() {
+        let mut event = group_message();
+        event["sender"] = json!({"nickname": "老王", "role": "member"});
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
+            panic!("应当成一条记录");
+        };
+        assert_eq!(draft.sender.role, None);
     }
 }

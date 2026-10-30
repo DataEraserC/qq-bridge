@@ -106,6 +106,7 @@ fn message(text: &str) -> RecordDraft {
         Sender {
             id: "323622442".into(),
             name: "萨卡班甲鱼".into(),
+                role: None,
         },
         AT,
         vec![Element::text(text)],
@@ -139,7 +140,7 @@ fn a_restart_continues_numbering_and_redelivery_counts() {
         assert_eq!(first_id, 1, "第一次投的是 #1");
         assert_eq!(delivery.records[0].redelivery, None, "第一次投不算重投");
 
-        bridge.end_turn(&delivery.ticket).expect("能收工");
+        bridge.end_turn(&delivery.ticket, None).expect("能收工");
     }
 
     // 第二程：换了进程（新桥、新连接），库里还是那份东西。
@@ -187,7 +188,7 @@ fn a_restart_continues_numbering_and_redelivery_counts() {
         )
         .expect("确认应当成功");
     assert_eq!(result["watermark"], 2);
-    bridge.end_turn(&delivery.ticket).expect("能收工");
+    bridge.end_turn(&delivery.ticket, None).expect("能收工");
 
     // 第三程：水位也是落盘的，重启后不该重投。
     let mut bridge = open_bridge(db.path());

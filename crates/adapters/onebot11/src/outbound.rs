@@ -6,7 +6,10 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use acb_kernel::{Element, Outbound, OutboundError, RoomId, Sent};
+use acb_kernel::{
+    CallError, Element, MethodSpec, Outbound, OutboundError, ParamSpec, ParamType, Risk, RoomId,
+    Sent,
+};
 use serde_json::{Value, json};
 
 use crate::link::{Action, LinkError, LinkSlot};
@@ -14,6 +17,96 @@ use crate::segment::to_onebot;
 
 /// 等平台回话的上限。超了就报错，不无限挂着。
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ── 平台方法表 ────────────────────────────────────────────────────────────
+//
+// core 不认识这些名字，它只认 `MethodSpec` 这个形状（ADR-0020）。想加能力就在表里加一条，
+// 桥那边一行都不用改。
+//
+// 第一批只放**纯读**方法：写和破坏性的等这条通路真机跑顺了再加。
+
+static FORWARD_ID: &[ParamSpec] = &[ParamSpec::required(
+    "id",
+    "转发 id，就是消息里 forward 段的 data.id",
+)];
+
+static MESSAGE_ID: &[ParamSpec] = &[ParamSpec::required(
+    "message_id",
+    "平台消息 id，就是消息里 quote 段的 message_id",
+)];
+
+static MEMBER_INFO: &[ParamSpec] = &[
+    ParamSpec::required("user_id", "成员号"),
+    ParamSpec::optional(
+        "group_id",
+        ParamType::String,
+        "群号；在群里调用可以不填，自动用当前房间",
+    ),
+];
+
+static MEMBER_LIST: &[ParamSpec] = &[ParamSpec::optional(
+    "group_id",
+    ParamType::String,
+    "群号；在群里调用可以不填，自动用当前房间",
+)];
+
+/// 这台连接声明支持的方法。顺序即目录里的顺序。
+static METHODS: &[MethodSpec] = &[
+    MethodSpec {
+        name: "forward.get_content",
+        summary: "读一条合并转发的正文。消息里只有一个转发 id 时用它展开",
+        risk: Risk::Read,
+        params: FORWARD_ID,
+    },
+    MethodSpec {
+        name: "message.get",
+        summary: "按平台消息 id 取一条消息的原始内容",
+        risk: Risk::Read,
+        params: MESSAGE_ID,
+    },
+    MethodSpec {
+        name: "group.get_member_info",
+        summary: "查一个群成员的昵称、群名片、角色（群主/管理员/成员）",
+        risk: Risk::Read,
+        params: MEMBER_INFO,
+    },
+    MethodSpec {
+        name: "group.get_member_list",
+        summary: "列出群成员。大群会很长，慎用",
+        risk: Risk::Read,
+        params: MEMBER_LIST,
+    },
+];
+
+/// 方法名 → OneBot 动作。`from_room` 说这个参数能从房间推出来（在群里调就不用填群号）。
+struct Route {
+    method: &'static str,
+    action: &'static str,
+    from_room: Option<&'static str>,
+}
+
+static ROUTES: &[Route] = &[
+    Route {
+        method: "forward.get_content",
+        action: "get_forward_msg",
+        from_room: None,
+    },
+    Route {
+        method: "message.get",
+        action: "get_msg",
+        from_room: None,
+    },
+    Route {
+        method: "group.get_member_info",
+        action: "get_group_member_info",
+        from_room: Some("group_id"),
+    },
+    Route {
+        method: "group.get_member_list",
+        action: "get_group_member_list",
+        from_room: Some("group_id"),
+    },
+];
 
 /// OneBot 出站通道。一条连接一个。
 pub struct OneBotOutbound {
@@ -75,6 +168,122 @@ impl Outbound for OneBotOutbound {
 
         parse_response(response)
     }
+
+    fn catalog(&self, _connection: &str) -> &'static [MethodSpec] {
+        METHODS
+    }
+
+    fn call(&mut self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
+        if room.connection != self.connection {
+            return Err(CallError::Forbidden(format!(
+                "这条连接叫 {}，收到 {} 的调用",
+                self.connection, room.connection
+            )));
+        }
+
+        let route = ROUTES
+            .iter()
+            .find(|route| route.method == method)
+            .ok_or_else(|| CallError::UnknownMethod {
+                method: method.to_owned(),
+                suggestion: None,
+            })?;
+
+        let payload = call_payload(route, room, params)?;
+        let response = self.dispatch(route.action, payload)?;
+        parse_call_response(method, response)
+    }
+}
+
+impl OneBotOutbound {
+    /// 塞一个动作进队列、等平台按 echo 回话。`send` 和 `call` 共用这一条通道。
+    fn dispatch(&mut self, action: &str, params: Value) -> Result<Value, CallError> {
+        let Some(sender) = self.slot.current() else {
+            return Err(CallError::Unavailable(format!(
+                "{} 还没连上",
+                self.connection
+            )));
+        };
+
+        self.seq += 1;
+        let echo = format!("acb-call-{}", self.seq);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        sender
+            .send(Action {
+                body: json!({"action": action, "params": params, "echo": echo}),
+                reply: reply_tx,
+            })
+            .map_err(|_| CallError::Unavailable("连接刚断了".into()))?;
+
+        reply_rx
+            .recv_timeout(self.timeout)
+            .map_err(|_| CallError::Unavailable("等平台回话超时".into()))?
+            .map_err(|error: LinkError| CallError::Unavailable(error.to_string()))
+    }
+}
+
+/// 组装真正要发给平台的参数。
+///
+/// 能从房间推出来的参数（`group_id`）就自动补上，模型在群里调用不用重复填群号；
+/// 推不出来又没给，明确报参数不对，别让平台那边回一个看不懂的错。
+fn call_payload(route: &Route, room: &RoomId, params: &Value) -> Result<Value, CallError> {
+    let mut payload = match params {
+        Value::Object(map) => map.clone(),
+        Value::Null => serde_json::Map::new(),
+        _ => return Err(CallError::BadParams("params 要给一个对象（map）".into())),
+    };
+
+    if let Some(key) = route.from_room {
+        if !payload.contains_key(key) {
+            let Some(group) = group_of(room) else {
+                return Err(CallError::BadParams(format!(
+                    "{} 要 {}，但房间 {} 不是群，params 里得自己给",
+                    route.method,
+                    key,
+                    room.key()
+                )));
+            };
+            payload.insert(key.to_owned(), Value::String(group.to_owned()));
+        }
+    }
+
+    Ok(Value::Object(payload))
+}
+
+/// 房间写法 `group/123` 里的群号。
+fn group_of(room: &RoomId) -> Option<&str> {
+    match room.path.as_slice() {
+        [kind, id] if kind == "group" => Some(id),
+        _ => None,
+    }
+}
+
+/// 平台回包 → 调用结果。
+///
+/// 读方法的成功结果在 `data` 里。失败按 retcode 分类：让模型能分清「我参数错了」「我没权限」
+/// 「我们还没实现」这三件事，而不是一律当成失败（ADR-0020）。
+fn parse_call_response(method: &str, value: Value) -> Result<Value, CallError> {
+    let retcode = value.get("retcode").and_then(Value::as_i64).unwrap_or(-1);
+    // 0 = 成功；1 = 已受理（部分实现异步处理也这么回）。
+    if retcode == 0 || retcode == 1 {
+        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
+    }
+
+    let detail = value
+        .get("wording")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or("平台没说原因");
+    let reason = format!("{detail}（retcode {retcode}）");
+
+    Err(match retcode {
+        // go-cqhttp 系沿用 HTTP 风格码。
+        1400 => CallError::BadParams(reason),
+        1401 | 1403 => CallError::Forbidden(reason),
+        1404 => CallError::NotImplemented(reason),
+        _ => CallError::UnsupportedPlatform(format!("{method}：{reason}")),
+    })
 }
 
 /// 房间写法决定调哪个动作。路径是「段/段」，第一段说场所类型。
@@ -219,5 +428,127 @@ mod tests {
         let room = RoomId::new("qq", "guild/9/channel/7").expect("合法");
         let error = action_of(&room, &[Element::text("hi")]).expect_err("认不出房间");
         assert!(matches!(error, OutboundError::Unsupported(_)));
+    }
+
+    // ── 平台方法目录与调用 ────────────────────────────────────────────────
+
+    /// 第一批只放读方法：写和破坏性的要逐条评估过再加。
+    #[test]
+    fn catalog_only_exposes_read_methods_for_now() {
+        let outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
+        let methods = outbound.catalog("qq");
+        assert!(!methods.is_empty(), "得有方法");
+        for method in methods {
+            assert_eq!(method.risk, Risk::Read, "{} 不是读方法", method.name);
+            // 强制 resource.method 写法，目录靠点号前那段分组。
+            assert!(method.name.contains('.'), "{} 没按 resource.method 命名", method.name);
+        }
+    }
+
+    /// 每个声明的方法都得有对应的平台动作，否则声明了也调不动。
+    #[test]
+    fn every_declared_method_has_a_route() {
+        let outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
+        for method in outbound.catalog("qq") {
+            assert!(
+                ROUTES.iter().any(|route| route.method == method.name),
+                "{} 声明了但没有路由",
+                method.name
+            );
+        }
+    }
+
+    #[test]
+    fn calling_before_the_connection_is_up_is_refused() {
+        let mut outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
+        let room = RoomId::new("qq", "group/456").expect("合法");
+        let error = outbound
+            .call(&room, "forward.get_content", &json!({"id": "x"}))
+            .expect_err("没连上就不该假装调成功");
+        assert!(matches!(error, CallError::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_call_for_another_connection_is_refused() {
+        let mut outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
+        let room = RoomId::new("qq2", "group/123").expect("合法");
+        let error = outbound
+            .call(&room, "message.get", &json!({"message_id": "1"}))
+            .expect_err("一条连接只管它自己那个号");
+        assert!(matches!(error, CallError::Forbidden(_)));
+    }
+
+    #[test]
+    fn an_undeclared_method_is_unknown() {
+        let mut outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
+        let room = RoomId::new("qq", "group/123").expect("合法");
+        let error = outbound
+            .call(&room, "group.kick", &json!({}))
+            .expect_err("没声明就调不动");
+        assert!(matches!(error, CallError::UnknownMethod { .. }));
+    }
+
+    #[test]
+    fn success_returns_only_the_data_payload() {
+        let result = parse_call_response(
+            "forward.get_content",
+            json!({"status": "ok", "retcode": 0, "data": {"messages": [1, 2]}}),
+        )
+        .expect("应当成功");
+        assert_eq!(result["messages"][1], 2);
+    }
+
+    /// 区分「我们还没实现」和「参数错了」——模型靠这个自己纠正。
+    #[test]
+    fn platform_retcodes_map_to_distinct_errors() {
+        let not_implemented = parse_call_response(
+            "forward.get_content",
+            json!({"retcode": 1404, "wording": "API 不存在"}),
+        )
+        .expect_err("1404 是实现层面缺");
+        assert!(matches!(not_implemented, CallError::NotImplemented(_)));
+
+        let bad = parse_call_response(
+            "group.get_member_info",
+            json!({"retcode": 1400, "wording": "参数错误"}),
+        )
+        .expect_err("1400 是参数错");
+        assert!(matches!(bad, CallError::BadParams(_)));
+
+        let denied = parse_call_response(
+            "message.get",
+            json!({"retcode": 1403, "wording": "权限不足"}),
+        )
+        .expect_err("1403 是没权限");
+        assert!(matches!(denied, CallError::Forbidden(_)));
+    }
+
+    /// 在群里调 `group.*` 不用重复填群号。
+    #[test]
+    fn group_id_is_filled_from_the_room() {
+        let route = ROUTES
+            .iter()
+            .find(|route| route.method == "group.get_member_list")
+            .expect("有这个路由");
+        let room = RoomId::new("qq", "group/456").expect("合法");
+
+        let payload = call_payload(route, &room, &json!({})).expect("能补");
+        assert_eq!(payload["group_id"], "456");
+
+        // 显式给了就用给的，不被房间覆盖。
+        let payload = call_payload(route, &room, &json!({"group_id": "999"})).expect("能补");
+        assert_eq!(payload["group_id"], "999");
+    }
+
+    /// 私聊里调要群号的方法又不给群号：明确报参数不对。
+    #[test]
+    fn group_method_without_a_group_room_is_a_param_error() {
+        let route = ROUTES
+            .iter()
+            .find(|route| route.method == "group.get_member_info")
+            .expect("有这个路由");
+        let room = RoomId::new("qq", "private/10001").expect("合法");
+        let error = call_payload(route, &room, &json!({"user_id": "1"})).expect_err("补不出来");
+        assert!(matches!(error, CallError::BadParams(_)));
     }
 }

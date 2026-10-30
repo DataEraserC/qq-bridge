@@ -555,6 +555,7 @@ mod tests {
             Sender {
                 id: "10001".into(),
                 name: "老王".into(),
+                role: None,
             },
             1_793_000_000_000,
             vec![Element::text(text)],
@@ -710,6 +711,7 @@ mod tests {
                 Sender {
                     id: "10001".into(),
                     name: "老王".into(),
+                role: None,
                 },
                 1_793_000_000_001,
                 "poke",

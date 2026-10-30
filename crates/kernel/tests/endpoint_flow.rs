@@ -69,6 +69,71 @@ fn config() -> &'static str {
     "#
 }
 
+/// 两个会话（main + group2）共用一个令牌的配置：一条连接就能同时跑两个会话，
+/// 专门用来验证「一条连接、多会话并行」（ADR-0019）。
+/// main 订两个房间（123 + 789），group2 订一个（456）。
+fn multi_session_config() -> &'static str {
+    r#"
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "bot"
+
+        [endpoint]
+        listen = "127.0.0.1:7700"
+
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
+
+        [[sessions]]
+        id = "main"
+        harness = "dsh"
+        persona = "p"
+        token = "t-both"
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/123"
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/789"
+
+        [[sessions]]
+        id = "group2"
+        harness = "dsh"
+        persona = "p"
+        token = "t-both"
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/456"
+    "#
+}
+
+/// 给指定房间造一条消息（用于两个会话各喂各的房间）。
+fn message_in(room_id: &str, text: &str) -> RecordDraft {
+    RecordDraft::message(
+        room(room_id),
+        Sender {
+            id: "10001".into(),
+            name: "老王".into(),
+                role: None,
+        },
+        AT,
+        vec![Element::text(text)],
+        true,
+    )
+}
+
 fn room(text: &str) -> RoomId {
     RoomId::parse(text).expect("房间合法")
 }
@@ -79,6 +144,7 @@ fn message(text: &str) -> RecordDraft {
         Sender {
             id: "10001".into(),
             name: "老王".into(),
+                role: None,
         },
         AT,
         vec![Element::text(text)],
@@ -99,6 +165,14 @@ fn write_frame(stream: &mut TcpStream, frame: &Frame) {
 fn bridge() -> Bridge<MemoryStore> {
     Bridge::new(
         acb_kernel::Config::parse(config()).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder::default()),
+    )
+}
+
+fn multi_session_bridge() -> Bridge<MemoryStore> {
+    Bridge::new(
+        acb_kernel::Config::parse(multi_session_config()).expect("配置合法"),
         MemoryStore::new(),
         Box::new(Recorder::default()),
     )
@@ -170,11 +244,11 @@ fn session_refuses_a_ticket_it_did_not_receive() {
     bridge.ingest(message("在吗")).expect("能记下来");
     let mut session = Conn::new(vec!["main".to_owned()]);
 
-    let delivery = session
+    session
         .take_delivery(&mut bridge)
         .expect("能取活")
         .expect("有活");
-    assert_eq!(session.ticket(), Some(&delivery.ticket));
+    assert_eq!(session.active_turns(), 1);
 
     // 冒充别的票。
     let replies = session
@@ -220,7 +294,7 @@ fn session_answers_ping_and_ends_turns() {
             },
         )
         .expect("能收工");
-    assert!(session.ticket().is_none());
+    assert!(session.active_turns() == 0);
     assert!(
         session
             .take_delivery(&mut bridge)
@@ -228,6 +302,134 @@ fn session_answers_ping_and_ends_turns() {
             .is_none(),
         "收工之后没活了"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 多会话并行（ADR-0019）：一条连接同时跑多个会话，互不阻塞
+// ---------------------------------------------------------------------------
+
+#[test]
+fn one_connection_runs_two_sessions_in_parallel() {
+    let mut bridge = multi_session_bridge();
+    // 两个会话各来一条消息。
+    bridge.ingest(message_in("qq:group/123", "在吗")).expect("main 有活");
+    bridge.ingest(message_in("qq:group/456", "hello")).expect("group2 有活");
+
+    // 一条连接同时代表 main + group2（同一令牌）。
+    let mut conn = Conn::new(vec!["main".to_owned(), "group2".to_owned()]);
+
+    // 连领两轮：main 和 group2 各一轮，谁也不挡谁。
+    let main_delivery = conn.take_delivery(&mut bridge).expect("能领").expect("main 有轮");
+    let group2_delivery = conn.take_delivery(&mut bridge).expect("能领").expect("group2 有轮");
+
+    // 两个会话同时在跑。
+    assert_eq!(conn.active_turns(), 2, "两个会话应当同时各有活跃轮次");
+    assert_ne!(
+        main_delivery.session, group2_delivery.session,
+        "两轮应当分属不同会话"
+    );
+    let main_ticket = main_delivery.ticket.clone();
+    let group2_ticket = group2_delivery.ticket.clone();
+    assert_ne!(main_ticket, group2_ticket, "两张票应当不同");
+
+    // main 用它的票调工具，应该被认（按票反查会话，不是全局单票）。
+    let replies = conn
+        .handle(
+            &mut bridge,
+            Frame::ToolCall {
+                id: "c-main".into(),
+                ticket: main_ticket.clone(),
+                tool: "send_message".into(),
+                args: json!({"elements": [{"type": "text", "text": "在"}]}),
+            },
+        )
+        .expect("不该崩");
+    assert!(
+        matches!(&replies[0], Frame::ToolResult { error: None, .. }),
+        "main 的票应当有效，实际是 {:?}",
+        replies[0].kind()
+    );
+
+    // group2 用它的票调工具，也应该被认——两张票同时有效，互不覆盖。
+    let replies = conn
+        .handle(
+            &mut bridge,
+            Frame::ToolCall {
+                id: "c-group2".into(),
+                ticket: group2_ticket.clone(),
+                tool: "send_message".into(),
+                args: json!({"elements": [{"type": "text", "text": "hi"}]}),
+            },
+        )
+        .expect("不该崩");
+    assert!(
+        matches!(&replies[0], Frame::ToolResult { error: None, .. }),
+        "group2 的票应当有效，实际是 {:?}",
+        replies[0].kind()
+    );
+
+    // main 收工，group2 还在跑——一个结束不影响另一个。
+    conn.handle(
+        &mut bridge,
+        Frame::TurnEnd {
+            ticket: main_ticket,
+            error: None,
+        },
+    )
+    .expect("main 能收工");
+    assert_eq!(conn.active_turns(), 1, "main 收工后 group2 应当还在跑");
+
+    // group2 也收工。
+    conn.handle(
+        &mut bridge,
+        Frame::TurnEnd {
+            ticket: group2_ticket,
+            error: None,
+        },
+    )
+    .expect("group2 能收工");
+    assert_eq!(conn.active_turns(), 0, "都收工了");
+}
+
+#[test]
+fn one_connection_takes_only_one_turn_per_session_at_a_time() {
+    let mut bridge = multi_session_bridge();
+    // main 在两个房间各来一条（两个独立的轮），group2 来一条。
+    bridge.ingest(message_in("qq:group/123", "一")).expect("main 房间一");
+    bridge.ingest(message_in("qq:group/789", "二")).expect("main 房间二");
+    bridge.ingest(message_in("qq:group/456", "hi")).expect("group2 一条");
+
+    let mut conn = Conn::new(vec!["main".to_owned(), "group2".to_owned()]);
+
+    let first = conn.take_delivery(&mut bridge).expect("能领").expect("有活");
+    let second = conn.take_delivery(&mut bridge).expect("能领").expect("有活");
+
+    // 两个活跃轮次应当分属 main 和 group2——同一会话同时只能占一轮（main 的第二个
+    // 房间不会在 main 还 busy 时被领走），group2 能并行领自己的轮。
+    let sessions: Vec<&String> = vec![&first.session, &second.session].into_iter().collect();
+    assert_eq!(
+        sessions,
+        vec![&"main".to_owned(), &"group2".to_owned()],
+        "两个活跃轮次应当分别是 main 和 group2，而不是 main 的两轮"
+    );
+
+    // 此时 main 和 group2 都 busy：main 的第二个房间虽还有未读，也不该再领到活。
+    assert!(
+        conn.take_delivery(&mut bridge).expect("能取").is_none(),
+        "main 和 group2 都 busy，不该再有活"
+    );
+
+    // main 收工后，它第二个房间的未读能接着领（同一会话串行，一个房间一个房间来）。
+    conn.handle(
+        &mut bridge,
+        Frame::TurnEnd {
+            ticket: first.ticket.clone(),
+            error: None,
+        },
+    )
+    .expect("能收工");
+    let third = conn.take_delivery(&mut bridge).expect("能领").expect("main 第二房间有活");
+    assert_eq!(third.session, "main", "收工后 main 另一个房间的未读接着投");
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +492,7 @@ fn a_real_connection_carries_a_whole_turn() {
         },
     );
     match read_frame(&mut reader).expect("能读到 ready") {
-        Frame::Ready { sessions } => assert_eq!(sessions, vec!["main".to_owned()]),
+        Frame::Ready { sessions, .. } => assert_eq!(sessions, vec!["main".to_owned()]),
         other => panic!("应当是 ready，实际是 {}", other.kind()),
     }
 
@@ -365,6 +567,54 @@ fn a_real_connection_carries_a_whole_turn() {
         }
         assert!(Instant::now() < deadline, "设备一直没空出来");
         thread::sleep(Duration::from_millis(20));
+    }
+
+    drop(reader);
+    drop(stream);
+    server.stop();
+}
+
+#[test]
+fn ready_carries_persisted_session_maps() {
+    let server = TestServer::start();
+    let bridge = Arc::clone(&server.bridge);
+
+    // 先落盘一条「acb 会话 main ↔ harness 会话 session-acb-main」的映射，
+    // 模拟上一次 harness 会话的 report_map。
+    {
+        let mut guard = bridge.lock().expect("没被毒死");
+        guard
+            .upsert_session_map(
+                "main".into(),
+                "session-acb-main".into(),
+                serde_json::json!({"fixed_id": "session-acb-main"}),
+            )
+            .expect("能落盘映射");
+    }
+
+    // 握手，Ready 帧应带回这条映射。
+    let mut stream = TcpStream::connect(server.address).expect("能连上");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("能设超时");
+    let mut reader = BufReader::new(stream.try_clone().expect("能复制"));
+
+    write_frame(
+        &mut stream,
+        &Frame::Hello {
+            version: PROTOCOL_VERSION,
+            harness: "dsh".into(),
+            token: Some(TOKEN.into()),
+        },
+    );
+    match read_frame(&mut reader).expect("能读到 ready") {
+        Frame::Ready { sessions, maps } => {
+            assert_eq!(sessions, vec!["main".to_owned()]);
+            assert_eq!(maps.len(), 1, "应带回一条映射");
+            assert_eq!(maps[0].session, "main");
+            assert_eq!(maps[0].harness_session, "session-acb-main");
+        }
+        other => panic!("应当是 ready，实际是 {}", other.kind()),
     }
 
     drop(reader);

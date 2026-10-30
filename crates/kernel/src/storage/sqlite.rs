@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use acb_proto::{Element, Record, RecordKind, RoomId, Sender};
+use acb_proto::{Element, Record, RecordKind, RoomId, Sender, SenderRole};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
@@ -26,7 +26,9 @@ use super::{
 ///         列改叫 `session`（ADR-0017）。
 /// 4 → 5：加 `session_maps` 表——acb 会话 ↔ harness 内部会话的映射，桥侧控制台落盘
 ///         （ADR-0018）。
-pub const SCHEMA_VERSION: i64 = 5;
+/// 5 → 6：`records` 加 `sender_role` 列——发送者身份（系统管理员/群主/群管理员），
+///         适配器判得出来才填，判不出留空。
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS records (
     event       TEXT,               -- 仅 kind = event
     sender_id   TEXT    NOT NULL,
     sender_name TEXT    NOT NULL,
+    sender_role TEXT,               -- 身份：system_admin | owner | admin，判不出留空
     at          INTEGER NOT NULL,   -- Unix 毫秒
     at_self     INTEGER NOT NULL,   -- 0 / 1
     reply_to_self INTEGER NOT NULL DEFAULT 0, -- 0 / 1，引用的是我发的消息
@@ -225,6 +228,11 @@ impl SqliteStore {
             }
         }
 
+        // 5 → 6：发送者身份。可空，老记录判不出就留空，不必回填。
+        if version < 6 {
+            self.add_column_if_missing("records", "sender_role", "TEXT")?;
+        }
+
         self.conn
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -352,8 +360,8 @@ impl Transcript for SqliteStore {
             .execute(
                 "INSERT INTO records
                  (connection, room_key, room_json, record_id, kind, event, sender_id, sender_name,
-                  at, at_self, reply_to_self, platform_id, elements)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  sender_role, at, at_self, reply_to_self, platform_id, elements)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     draft.room.connection,
                     draft.room.key(),
@@ -363,6 +371,7 @@ impl Transcript for SqliteStore {
                     event,
                     draft.sender.id,
                     draft.sender.name,
+                    draft.sender.role.map(|role| role_str(&role)),
                     draft.at,
                     if draft.at_self { 1 } else { 0 },
                     if draft.reply_to_self { 1 } else { 0 },
@@ -393,7 +402,7 @@ impl Transcript for SqliteStore {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT record_id, kind, event, sender_id, sender_name, at, at_self,
+                "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
                         reply_to_self, platform_id, elements
                  FROM records
                  WHERE connection = ?1 AND room_key = ?2 AND record_id > ?3
@@ -412,11 +421,12 @@ impl Transcript for SqliteStore {
                         event: row.get(2)?,
                         sender_id: row.get(3)?,
                         sender_name: row.get(4)?,
-                        at: row.get(5)?,
-                        at_self: row.get::<_, i64>(6)? != 0,
-                        reply_to_self: row.get::<_, i64>(7)? != 0,
-                        platform_id: row.get(8)?,
-                        elements: row.get(9)?,
+                        sender_role: row.get(5)?,
+                        at: row.get(6)?,
+                        at_self: row.get::<_, i64>(7)? != 0,
+                        reply_to_self: row.get::<_, i64>(8)? != 0,
+                        platform_id: row.get(9)?,
+                        elements: row.get(10)?,
                     })
                 },
             )
@@ -495,6 +505,7 @@ impl Transcript for SqliteStore {
                     Ok(Sender {
                         id: row.get(0)?,
                         name: row.get(1)?,
+                        role: None,
                     })
                 },
             )
@@ -556,6 +567,25 @@ impl Transcript for SqliteStore {
     }
 }
 
+/// 身份 → 库里的字符串。跟 [`SenderRole`] 的 serde 表示保持一致。
+fn role_str(role: &SenderRole) -> &'static str {
+    match role {
+        SenderRole::SystemAdmin => "system_admin",
+        SenderRole::Owner => "owner",
+        SenderRole::Admin => "admin",
+    }
+}
+
+/// 库里的字符串 → 身份。不认识的就当没判出来（宁可少标，别瞎标）。
+fn role_from_str(text: &str) -> Option<SenderRole> {
+    match text {
+        "system_admin" => Some(SenderRole::SystemAdmin),
+        "owner" => Some(SenderRole::Owner),
+        "admin" => Some(SenderRole::Admin),
+        _ => None,
+    }
+}
+
 /// 从库里读出来的一行，还没变回 [`Record`]。
 struct RawRow {
     id: u64,
@@ -563,6 +593,7 @@ struct RawRow {
     event: Option<String>,
     sender_id: String,
     sender_name: String,
+    sender_role: Option<String>,
     at: i64,
     at_self: bool,
     reply_to_self: bool,
@@ -589,6 +620,7 @@ impl RawRow {
             sender: Sender {
                 id: self.sender_id,
                 name: self.sender_name,
+                role: self.sender_role.as_deref().and_then(role_from_str),
             },
             at: self.at,
             elements,

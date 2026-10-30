@@ -63,6 +63,8 @@ export class BridgeLink {
     this.log = log ?? (() => {})
 
     this.sessions = []
+    /** 桥下发的会话映射（acb 会话 ↔ harness 内部会话），握手后填充。 */
+    this.sessionMaps = []
     /** 当前这一轮的票；没有票就没有进行中的轮次。 */
     this.ticket = null
     this.socket = null
@@ -221,6 +223,7 @@ export class BridgeLink {
     switch (frame.frame) {
       case "ready":
         this.sessions = Array.isArray(frame.sessions) ? frame.sessions : []
+        this.sessionMaps = Array.isArray(frame.maps) ? frame.maps : []
         this.backoff = RECONNECT_MIN_MS
         this.handshake?.resolve()
         return
@@ -344,6 +347,9 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
     const when = formatTime(record.at, now)
     const who = record.sender.name || record.sender.id
     const marks = []
+    // 身份标签：桥判得出来才标，判不出（role 为空）就什么都不加。
+    const role = roleLabel(record.sender.role)
+    if (role) marks.push(role)
     if (record.kind?.kind === "event") {
       marks.push(`事件 ${record.kind.event}`)
     }
@@ -365,8 +371,29 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
   }
 
   lines.push("")
+  // 消息太多被截断时，明确告诉模型：还有没投进来的，用 get_history 抓。
+  if (delivery.more) {
+    lines.push(
+      `⚠️ 本轮还有 ${delivery.more} 条没投进来（超了投递上限）。用 get_history 抓这个房间最新的 ${delivery.more} 条再看。`
+    )
+    lines.push("")
+  }
   lines.push("回这个房间用 send_message；确认处理完了用 ack_messages 带上这些编号。")
   return lines.join("\n")
+}
+
+/** 桥给的发送者身份 → 中文标签。判不出（空/不认识）返回空串。 */
+function roleLabel(role) {
+  switch (role) {
+    case "system_admin":
+      return "系统管理员"
+    case "owner":
+      return "群主"
+    case "admin":
+      return "群管理员"
+    default:
+      return ""
+  }
 }
 
 function formatTime(at, now) {
@@ -377,7 +404,8 @@ function formatTime(at, now) {
   return sameDay ? time : `${date.getMonth() + 1}/${date.getDate()} ${time}`
 }
 
-/** 元素数组 → 一行文本。平台内容（opaque）只报「有」，不假装能懂。 */export function renderElements(elements) {
+/** 元素数组 → 一行文本。平台特有内容原样摊给模型看，不替它下结论。 */
+export function renderElements(elements) {
   const parts = []
   for (const element of elements) {
     switch (element.type) {
@@ -405,14 +433,58 @@ function formatTime(at, now) {
       case "face":
         parts.push(`[表情 ${element.id ?? "?"}]`)
         break
-      case "opaque":
-        parts.push(`[${element.platform ?? "平台"}内容，核心不解释]`)
+      case "opaque": {
+        // 平台特有内容（QQ 合并转发、KOOK 卡片、Discord embed……）。
+        // 桥只负责原样透传、不解释语义（ADR-0004 规则 3）；但「桥不解释」
+        // 不等于「模型看不见」——这里是唯一送进对话的通道，必须把原始载荷摊开，
+        // 否则模型只收到一句空占位，这段内容在对话里等于凭空消失。
+        //
+        // 另外要带上「可以怎么取」（ADR-0020）：只给一个 id，模型根本不知道自己能查，
+        // 多半会回一句「你转了条消息我看不到」。
+        const hint = affordanceOf(element)
+        parts.push(
+          `[${element.platform ?? "平台"} 平台特有内容${hint ? `（${hint}）` : ""}，原样如下：${shortJson(element.payload)}]`,
+        )
         break
+      }
       default:
-        parts.push(`[不认识的内容 ${element.type ?? "?"}]`)
+        parts.push(`[不认识的内容 ${element.type ?? "?"}：${shortJson(element)}]`)
     }
   }
   return parts.join("")
+}
+
+/**
+ * 平台特有内容 → 「可以怎么取」的一句话提示。
+ *
+ * 不主动展开正文（投递体积不可控、会撞平台限流、可能把别人的私聊带进不该看的群），
+ * 也不指望模型自己去翻能力目录（它常常跳过这一步）。把动作写在内容旁边最省事。
+ */
+function affordanceOf(element) {
+  const payload = element.payload ?? {}
+  const kind = typeof payload.type === "string" ? payload.type : ""
+  const id = payload.data?.id
+
+  // 合并转发：OneBot 系都是这个形状。
+  if (kind === "forward" && typeof id === "string" && id) {
+    return `未展开，可调 platform_call(method="forward.get_content", params=${JSON.stringify({ id })}) 读取正文`
+  }
+  // 其它不认识的：至少告诉它去哪查，别让它瞎猜方法名。
+  return "可调 platform_methods 看这个平台能做什么"
+}
+
+/** 平台载荷能有多长就多长地给模型看，但别让一条消息撑爆上下文。 */
+const MAX_PLATFORM_JSON = 600
+
+function shortJson(value) {
+  let raw
+  try {
+    raw = JSON.stringify(value ?? null)
+  } catch {
+    raw = String(value) // 循环引用之类，退化成字符串，绝不因为序列化失败就把内容吞了
+  }
+  if (typeof raw !== "string") raw = String(raw)
+  return raw.length > MAX_PLATFORM_JSON ? `${raw.slice(0, MAX_PLATFORM_JSON)}…（已截断）` : raw
 }
 
 // ---------------------------------------------------------------------------
