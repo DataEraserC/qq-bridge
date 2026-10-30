@@ -84,7 +84,7 @@ account = "10001"      # 这个号登录的是谁，必填
 | text | `text` | |
 | at | `at`，`all` 时 `qq="all"` | |
 | quote | `reply` | |
-| image / audio / video | `image` / `record` / `video` | 用直链当 `file` |
+| image / audio / video | `image` / `record` / `video` | `file` 接受三种：http(s) 直链、`base64://…`（原始内容 750 KB 内，走协议帧）、桥文件中继给的 URL |
 | face | `face` | |
 | file | **报错** | OneBot 11 没有标准文件段，明确报错而不是悄悄丢 |
 | opaque（platform=qq） | 原样送出 | 平台特有内容照搬 |
@@ -105,6 +105,21 @@ account = "10001"      # 这个号登录的是谁，必填
   `message_id` 存下来——**没有它，就反查不出「被引用的是谁发的」**。
 - `reply` 段解成 `quote` 元素，只留被引用那条的编号。判定「这是不是在回我」放在桥里做
   （要查库），不在适配器里做：适配器只管把平台给的东西翻译全，不猜语义。
+
+## 文件怎么跨命名空间（ADR-0025）
+
+平台跑在容器里、agent 在宿主机是默认部署姿势，两边不共用文件系统：agent 给的
+`/home/.../a.png`，平台 stat 不到，报一个裸 ENOENT。解决不靠路径映射（每个环境要单独配
+一遍，docker/podman/windows × 各家 OneBot 配不完），靠**桥自带文件服务**：
+
+- 连接配置里加了 `[file_relay]`（`listen` / `public_base` / `dir`）就启用：
+  `send_message` 的元素和 `platform_call` 的 params 里，凡是**本机真实存在**的绝对路径，
+  桥收下文件、换成 `http://<public_base>/f/<token>/<文件名>` 交给平台。
+- 没配就完全不碰路径，行为同以前。`http(s)://`、`base64://`、本机不存在的路径（可能是
+  平台侧才有的，比如共享卷）一律原样透传。
+- `send_message` 换了路径时回执带 `relayed: [{from, to}]`。
+- 错误信息里出现 ENOENT / realpath / image not found 时，桥会附上三条出路，防止排查
+  被裸 ENOENT 带偏去查拼写和权限。
 
 ## 合并转发怎么摊开
 
