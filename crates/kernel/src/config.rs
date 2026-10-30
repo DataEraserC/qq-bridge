@@ -50,6 +50,8 @@ pub struct Config {
     pub sessions: Vec<Session>,
     /// 接入点配置。没配就不监听——只跑内存里的桥（测试、嵌入式）。
     pub endpoint: Option<EndpointConfig>,
+    /// 控制台配置。没配就不起控制台（ADR-0018）。
+    pub console: Option<ConsoleConfig>,
     /// 平台侧连接。一个账号一条，可以有多条。
     pub connections: Vec<Connection>,
     /// 状态存哪。流水、水位、笔记、投递计数都在这里，重启不改。
@@ -162,6 +164,17 @@ pub const KNOWN_MEMORY_KINDS: &[&str] = &["git"];
 pub struct EndpointConfig {
     /// 监听地址，形如 `127.0.0.1:7700`。
     pub listen: String,
+}
+
+/// 控制台：桥侧的统一管理 HTTP 服务（ADR-0018）。
+///
+/// 可远程访问（监听地址可配到非回环），因此 token 鉴权必填、必须认真校验。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsoleConfig {
+    /// 监听地址，形如 `0.0.0.0:3100` 或 `127.0.0.1:3100`。
+    pub listen: String,
+    /// 鉴权 token。所有请求都要带（`Authorization: Bearer <token>`）。
+    pub token: String,
 }
 
 /// 一张人格卡：纯文本人设。
@@ -487,6 +500,27 @@ impl Config {
             None => None,
         };
 
+        let console = match raw.console {
+            Some(raw) => {
+                let address = raw.listen.trim().to_owned();
+                if address.parse::<std::net::SocketAddr>().is_err() {
+                    return Err(ConfigError::BadListen {
+                        address,
+                        detail: "控制台要写成 主机:端口，如 127.0.0.1:3100".into(),
+                    });
+                }
+                let token = raw.token.trim().to_owned();
+                if token.is_empty() {
+                    return Err(ConfigError::BadListen {
+                        address,
+                        detail: "控制台可远程访问，token 不能为空".into(),
+                    });
+                }
+                Some(ConsoleConfig { listen: address, token })
+            }
+            None => None,
+        };
+
         let mut connections: Vec<Connection> = Vec::with_capacity(raw.connections.len());
         for raw_connection in raw.connections {
             let connection = build_connection(raw_connection)?;
@@ -712,6 +746,7 @@ impl Config {
             harnesses,
             sessions,
             endpoint,
+            console,
             connections,
             storage,
             retention,
@@ -936,6 +971,7 @@ struct RawConfig {
     #[serde(default)]
     sessions: Vec<RawSession>,
     endpoint: Option<RawEndpoint>,
+    console: Option<RawConsole>,
     #[serde(default)]
     connections: Vec<RawConnection>,
     storage: Option<RawStorage>,
@@ -1012,6 +1048,12 @@ fn default_transport() -> String {
 #[derive(Debug, Deserialize)]
 struct RawEndpoint {
     listen: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawConsole {
+    listen: String,
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -8,7 +8,7 @@
 import net from "node:net"
 
 /// 协议版本。和 `acb_proto::frame::PROTOCOL_VERSION` 必须一致。
-export const PROTOCOL_VERSION = 3
+export const PROTOCOL_VERSION = 4
 
 const MAX_FRAME_BYTES = 1024 * 1024
 const HANDSHAKE_TIMEOUT_MS = 10_000
@@ -47,7 +47,7 @@ export function parseEndpoint(text) {
  * `onTurn` 不会并发。
  */
 export class BridgeLink {
-  constructor({ endpoint, token, harness, onTurn, log }) {
+  constructor({ endpoint, token, harness, onTurn, onControl, log }) {
     if (!token) {
       throw new Error("没有接入令牌：要和配置里会话的 token 一致")
     }
@@ -59,6 +59,7 @@ export class BridgeLink {
     this.token = token
     this.harness = harness
     this.onTurn = onTurn ?? (async () => {})
+    this.onControl = onControl ?? (async () => {})
     this.log = log ?? (() => {})
 
     this.sessions = []
@@ -156,6 +157,21 @@ export class BridgeLink {
     this.ticket = null
   }
 
+  /**
+   * 回报一条控制指令的结果（ADR-0018）。
+   * `id`/`session`/`command` 原样带回来配对；`result` 是成功回的结构，`error` 是失败原因。
+   */
+  controlResult({ id, session, command, result = null, error = null }) {
+    this.#write({
+      frame: "control_result",
+      id,
+      session,
+      command,
+      ...(result !== null ? { result } : {}),
+      ...(error !== null ? { error } : {}),
+    })
+  }
+
   /** 保活（桥也会自己 ping）。 */
   ping() {
     this.#write({ frame: "ping" })
@@ -235,6 +251,26 @@ export class BridgeLink {
       case "log":
         this.log(frame.level ?? "info", frame.message ?? "")
         return
+      case "control": {
+        // 桥推来的控制指令（如 reset）。交给 harness 的 onControl 处理，处理完它要
+        // 用 controlResult 回报结果。不 await，让读循环继续跑。
+        Promise.resolve()
+          .then(() => this.onControl(frame))
+          .catch((error) => {
+            this.log("error", `控制指令 ${frame.command} 处理失败：${error?.message ?? error}`)
+            try {
+              this.controlResult({
+                id: frame.id,
+                session: frame.session,
+                command: frame.command,
+                error: String(error?.message ?? error),
+              })
+            } catch (reportError) {
+              this.log("error", `回报控制指令结果失败：${reportError?.message ?? reportError}`)
+            }
+          })
+        return
+      }
       case "ping":
         this.#write({ frame: "pong" })
         return

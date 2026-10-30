@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use acb_kernel::endpoint::{read_frame, reader_of};
 use acb_kernel::{
-    Bridge, Conn, Element, Frame, MemoryStore, Outbound, OutboundError, RecordDraft, RoomId,
-    Sender, Sent, handshake, serve,
+    Bridge, Conn, ControlRegistry, Element, Frame, MemoryStore, Outbound, OutboundError,
+    RecordDraft, RoomId, Sender, Sent, handshake, serve,
 };
 use acb_proto::frame::{PROTOCOL_VERSION, encode};
 use serde_json::json;
@@ -252,7 +252,7 @@ impl TestServer {
         let thread_bridge = Arc::clone(&bridge);
         let thread_shutdown = Arc::clone(&shutdown);
         let handle = thread::spawn(move || {
-            serve(listener, thread_bridge, thread_shutdown).expect("服务能跑");
+            serve(listener, thread_bridge, thread_shutdown, ControlRegistry::new()).expect("服务能跑");
         });
 
         Self {

@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use acb_adapter_onebot11::{LinkSlot, OneBotOutbound, supervise};
-use acb_kernel::{Bridge, Config, Outbounds, SqliteStore, serve};
+use acb_kernel::{Bridge, Config, ControlRegistry, Outbounds, SqliteStore, serve};
+
+mod console;
+use console::Console;
 
 /// 清理线程隔多久扫一次。来源：实现默认——桥不是数据库，5 分钟一次足够，
 /// 真需要更勤/更懒再做成配置项。
@@ -98,19 +101,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 控制指令注册表：控制台靠它把 control 帧推给管理某会话的 harness 连接。
+    let controls = ControlRegistry::new();
+
     match &config.endpoint {
         Some(endpoint) => {
             let listener = std::net::TcpListener::bind(&endpoint.listen)?;
             let bridge = Arc::clone(&bridge);
             let shutdown = Arc::clone(&shutdown);
+            let controls = controls.clone();
             std::thread::spawn(move || {
-                if let Err(error) = serve(listener, bridge, shutdown) {
+                if let Err(error) = serve(listener, bridge, shutdown, controls) {
                     eprintln!("接入点停了：{error}");
                 }
             });
             println!("接入点已监听 {}", endpoint.listen);
         }
         None => println!("没有配 [endpoint]，harness 连不进来"),
+    }
+
+    // 控制台：可远程访问的管理 HTTP 服务（ADR-0018）。
+    match &config.console {
+        Some(console) => {
+            let listener = std::net::TcpListener::bind(&console.listen)?;
+            let console_service = Arc::new(Console::new(
+                Arc::clone(&bridge),
+                controls,
+                console.token.clone(),
+            ));
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                Console::serve(listener, console_service, shutdown);
+            });
+            println!("控制台已监听 {}（token 鉴权）", console.listen);
+        }
+        None => println!("没有配 [console]，控制台不起"),
     }
 
     {

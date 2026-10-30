@@ -278,10 +278,42 @@ pub trait Deliveries {
     fn forget_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<(), StorageError>;
 }
 
-/// 四样东西合起来。桥只依赖这一个约束，换后端只换实现。
-pub trait Store: Transcript + Watermarks + Notes + Deliveries {}
+/// 会话映射：acb 会话 id → harness 内部会话 id。
+///
+/// 桥对映射的理解止于「一个 kv + 元信息」——它知道「这个 acb 会话在 harness 那边对应
+/// 哪个 id」，但不知道 harness 内部会话的细节（ADR-0018）。落盘在桥的状态库里，
+/// 桥重启不丢、控制台能直接读。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMap {
+    /// acb 会话 id。
+    pub session: String,
+    /// harness 内部会话 id（dsh 的 sessionId 之类）。
+    pub harness_session: String,
+    /// 元信息：给控制台展示用（标题、模型等，harness 回报什么存什么）。
+    pub meta: serde_json::Value,
+    /// 最后更新（Unix 毫秒）。
+    pub updated_at: i64,
+}
 
-impl<T> Store for T where T: Transcript + Watermarks + Notes + Deliveries {}
+/// 会话映射读写。
+pub trait SessionMaps {
+    /// 取某个 acb 会话的映射；没有给 `None`。
+    fn session_map(&self, session: &str) -> Result<Option<SessionMap>, StorageError>;
+
+    /// 写（或覆盖）某个 acb 会话的映射。
+    fn upsert_session_map(&mut self, map: SessionMap) -> Result<(), StorageError>;
+
+    /// 删某个 acb 会话的映射（重置时用）。
+    fn delete_session_map(&mut self, session: &str) -> Result<bool, StorageError>;
+
+    /// 全部映射。
+    fn session_maps(&self) -> Result<Vec<SessionMap>, StorageError>;
+}
+
+/// 五样东西合起来。桥只依赖这一个约束，换后端只换实现。
+pub trait Store: Transcript + Watermarks + Notes + Deliveries + SessionMaps {}
+
+impl<T> Store for T where T: Transcript + Watermarks + Notes + Deliveries + SessionMaps {}
 
 mod sqlite;
 
@@ -296,6 +328,7 @@ pub struct MemoryStore {
     acked: HashMap<Cursor, BTreeSet<u64>>,
     notes: BTreeMap<NoteKey, Note>,
     deliveries: HashMap<(Cursor, u64), u32>,
+    session_maps: HashMap<String, SessionMap>,
 }
 
 impl MemoryStore {
@@ -479,6 +512,27 @@ impl Deliveries for MemoryStore {
     fn forget_delivery(&mut self, cursor: &Cursor, id: u64) -> Result<(), StorageError> {
         self.deliveries.remove(&(cursor.clone(), id));
         Ok(())
+    }
+}
+
+impl SessionMaps for MemoryStore {
+    fn session_map(&self, session: &str) -> Result<Option<SessionMap>, StorageError> {
+        Ok(self.session_maps.get(session).cloned())
+    }
+
+    fn upsert_session_map(&mut self, map: SessionMap) -> Result<(), StorageError> {
+        self.session_maps.insert(map.session.clone(), map);
+        Ok(())
+    }
+
+    fn delete_session_map(&mut self, session: &str) -> Result<bool, StorageError> {
+        Ok(self.session_maps.remove(session).is_some())
+    }
+
+    fn session_maps(&self) -> Result<Vec<SessionMap>, StorageError> {
+        let mut maps: Vec<SessionMap> = self.session_maps.values().cloned().collect();
+        maps.sort_by(|a, b| a.session.cmp(&b.session));
+        Ok(maps)
     }
 }
 

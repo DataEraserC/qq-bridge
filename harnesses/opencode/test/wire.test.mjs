@@ -54,7 +54,7 @@ test("握手带上协议版本和令牌，拿到会话组", async (t) => {
   const { bridge, link } = await setup(t)
 
   assert.deepEqual(link.sessions, ["main"])
-  assert.deepEqual(bridge.hello, { frame: "hello", version: 3, harness: "opencode", token: "t-main" })
+  assert.deepEqual(bridge.hello, { frame: "hello", version: 4, harness: "opencode", token: "t-main" })
 })
 
 test("桥断了会自己重连，重连成功后重新绑上设备", async (t) => {

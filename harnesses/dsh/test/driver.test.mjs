@@ -69,7 +69,7 @@ function makeManualStream() {
 
 /** 起一个假桥 + 连上 + 握手的 link。FakeBridge 的 #greet 在 connect 时自动回 ready。 */
 async function connectedLink(bridge, token = "t-main") {
-  const link = new BridgeLink({ endpoint: bridge.endpoint, token, log: () => {} })
+  const link = new BridgeLink({ endpoint: bridge.endpoint, token, harness: "dsh", log: () => {} })
   await link.connect()
   return link
 }
@@ -81,6 +81,15 @@ async function waitFor(predicate, message) {
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   assert.fail(message)
+}
+
+/** 取下一帧，但跳过 report_map 的 control_result（建会话时 driver 会先回报映射）。 */
+async function nextTurnEnd(bridge) {
+  for (;;) {
+    const frame = await bridge.next()
+    if (frame.frame === "turn_end") return frame
+    // 不是 turn_end（比如 report_map 的 control_result）就接着取下一帧。
+  }
 }
 
 test("轮次驱动：turn_start → prompt → 等 turn/end → turn_end", async (t) => {
@@ -104,8 +113,8 @@ test("轮次驱动：turn_start → prompt → 等 turn/end → turn_end", async
   dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
   await runPromise
 
-  // 应该有一个 turn_end 帧（用 next() 从 LineQueue 里取）。
-  const turnEnd = await bridge.next()
+  // 应该有一个 turn_end 帧（跳过建会话时回报映射的 control_result）。
+  const turnEnd = await nextTurnEnd(bridge)
   assert.equal(turnEnd.frame, "turn_end")
   assert.equal(turnEnd.ticket, TICKET)
 })
@@ -126,7 +135,7 @@ test("turn/end 后回 turn_end 帧（无错误）", async (t) => {
   dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
   await runPromise
 
-  const turnEnd = await bridge.next()
+  const turnEnd = await nextTurnEnd(bridge)
   assert.equal(turnEnd.frame, "turn_end")
   assert.equal(turnEnd.ticket, TICKET)
   assert.equal(turnEnd.error, undefined)

@@ -1,6 +1,9 @@
 # Rust
 /target/
 
+# nix 构建产物
+/result
+
 # Node
 node_modules/
 

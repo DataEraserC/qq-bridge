@@ -140,14 +140,14 @@ test("unary RPC 按正确形状发出去（client-request + args 包装）", asy
   await dsh.start()
   try {
     const client = new DshClient({ baseUrl: dsh.baseUrl, token: "tok", secret: SECRET })
-    const sessionId = await client.createSession("acb:test")
-    assert.ok(sessionId.startsWith("session-"))
+    const sessionId = await client.createSession({ sessionId: "session-acb-main" })
+    assert.equal(sessionId, "session-1") // FakeDsh 回的是自造的 id，不回显传入的 sessionId
 
     const createReq = dsh.requests.find((r) => r.path === "/api/session/create")
     assert.equal(createReq.method, "POST")
     assert.equal(createReq.body.method, "session/create")
     assert.ok(createReq.body.payload.args.request)
-    assert.equal(createReq.body.payload.args.request.title, "acb:test")
+    assert.equal(createReq.body.payload.args.request.sessionId, "session-acb-main")
 
     await client.prompt(sessionId, [{ type: "text", text: "你好" }])
     const promptReq = dsh.requests.find((r) => r.path === "/api/session/prompt")

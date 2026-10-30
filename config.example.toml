@@ -22,6 +22,15 @@
 # harness 连这个地址。默认只听本机，外网连不上。
 listen = "127.0.0.1:7700"
 
+# 桥侧统一控制台（ADR-0018）：一个 HTTP 服务，能读会话/映射状态、重置会话。
+# 可选，不配就不起。可远程访问，所以 token 必填、必须认真校验。
+# 请求都要带 `Authorization: Bearer <token>`。
+# 端点：GET /api/status、GET /api/sessions、POST /api/session/:id/reset、GET /
+# 要启用就把下面三行取消注释：
+# [console]
+# listen = "127.0.0.1:3100"
+# token = "换成你自己的一长串随机字符"
+
 [storage]
 # 状态库：流水、水位、笔记、「第几次投递」都在这一个 SQLite 文件里。
 # 不配就用 state/acb.db（相对启动时的工作目录）。目录不存在会自动建。

@@ -141,6 +141,35 @@ impl<S: Store> Bridge<S> {
         &self.store
     }
 
+    /// 记录会话映射：acb 会话 id → harness 内部会话 id（harness 回报时调）。
+    pub fn upsert_session_map(
+        &mut self,
+        session: String,
+        harness_session: String,
+        meta: Value,
+    ) -> Result<(), BridgeError> {
+        self.store
+            .upsert_session_map(crate::storage::SessionMap {
+                session,
+                harness_session,
+                meta,
+                updated_at: now_millis(),
+            })
+            .map_err(BridgeError::Storage)
+    }
+
+    /// 删会话映射（重置时用）。
+    pub fn delete_session_map(&mut self, session: &str) -> Result<bool, BridgeError> {
+        self.store
+            .delete_session_map(session)
+            .map_err(BridgeError::Storage)
+    }
+
+    /// 全部会话映射，给控制台展示用。
+    pub fn session_maps(&self) -> Result<Vec<crate::storage::SessionMap>, BridgeError> {
+        self.store.session_maps().map_err(BridgeError::Storage)
+    }
+
     /// 哪几个会话正跑着轮次。
     pub fn busy_sessions(&self) -> Vec<String> {
         let mut sessions: Vec<String> = self.active.keys().cloned().collect();

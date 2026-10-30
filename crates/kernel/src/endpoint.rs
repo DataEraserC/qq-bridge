@@ -30,6 +30,62 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// 握手最多等多久。连上来又不说话的连接不能一直占着线程。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 控制指令注册表：会话 id → 给那个会话所在连接的出站指令通道。
+///
+/// 桥侧控制台要发 `control` 帧给某个 harness，得找到「管理那个会话的 Conn」。每个
+/// Conn 在握手后把自己代表的每个会话注册进来（发帧的 sender），断连时注销。控制台
+/// 从这里查到 sender，把 `control` 帧推过去，Conn 的循环里写出去。
+#[derive(Default, Clone)]
+pub struct ControlRegistry {
+    senders: Arc<Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<Frame>>>>,
+}
+
+impl ControlRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 注册一组会话 → 通道。
+    fn register(&self, sessions: &[String], sender: std::sync::mpsc::Sender<Frame>) {
+        let mut map = self
+            .senders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for session in sessions {
+            map.insert(session.clone(), sender.clone());
+        }
+    }
+
+    fn unregister(&self, sessions: &[String]) {
+        let mut map = self
+            .senders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for session in sessions {
+            map.remove(session);
+        }
+    }
+
+    /// 把一条控制指令推给管理 `session` 的连接。没有连接在管就返回 false。
+    pub fn send_control(&self, frame: Frame) -> bool {
+        let session = match &frame {
+            Frame::Control { session, .. } => session.clone(),
+            _ => return false,
+        };
+        let sender = {
+            let map = self
+                .senders
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.get(&session).cloned()
+        };
+        match sender {
+            Some(sender) => sender.send(frame).is_ok(),
+            None => false,
+        }
+    }
+}
+
 /// 接入点错误。
 #[derive(Debug, Error)]
 pub enum EndpointError {
@@ -185,6 +241,77 @@ impl Conn {
                 }
                 Ok(replies)
             }
+            // harness 回报控制指令结果：重置成功/失败，把会话映射落盘。
+            Frame::ControlResult {
+                id: _,
+                session,
+                command,
+                result,
+                error,
+            } => {
+                match command.as_str() {
+                    "reset" => {
+                        match error {
+                            Some(err) => {
+                                // 重置失败：不动映射，记一笔日志。
+                                Ok(vec![Frame::Log {
+                                    level: LogLevel::Warn,
+                                    message: format!("重置会话 {session} 失败：{err}"),
+                                }])
+                            }
+                            None => {
+                                // 重置成功：删掉旧映射，等 harness 下次回报新映射。
+                                let _ = bridge.delete_session_map(&session);
+                                // 如果 harness 在 result 里直接给了新会话 id，就记下来。
+                                if let Some(serde_json::Value::Object(map)) = &result {
+                                    if let Some(serde_json::Value::String(new_id)) =
+                                        map.get("session_id")
+                                    {
+                                        let _ = bridge.upsert_session_map(
+                                            session.clone(),
+                                            new_id.clone(),
+                                            serde_json::json!({}),
+                                        );
+                                    }
+                                }
+                                Ok(vec![Frame::Log {
+                                    level: LogLevel::Info,
+                                    message: format!("会话 {session} 已重置"),
+                                }])
+                            }
+                        }
+                    }
+                    "report_map" => {
+                        // harness 主动回报映射（比如新建会话后）。
+                        match error {
+                            Some(err) => Ok(vec![Frame::Log {
+                                level: LogLevel::Warn,
+                                message: format!("会话 {session} 回报映射失败：{err}"),
+                            }]),
+                            None => {
+                                if let Some(serde_json::Value::Object(map)) = &result {
+                                    let session_id = map
+                                        .get("session_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or_default();
+                                    if !session_id.is_empty() {
+                                        let _ = bridge.upsert_session_map(
+                                            session.clone(),
+                                            session_id.to_owned(),
+                                            map.get("meta").cloned().unwrap_or(serde_json::json!({})),
+                                        );
+                                    }
+                                }
+                                Ok(Vec::new())
+                            }
+                        }
+                    }
+                    other => Ok(vec![Frame::Log {
+                        level: LogLevel::Warn,
+                        message: format!("不认识的 control_result 指令：{other}"),
+                    }]),
+                }
+            }
             Frame::Ping => Ok(vec![Frame::Pong]),
             Frame::Pong => Ok(Vec::new()),
             other => Err(EndpointError::Protocol(format!(
@@ -208,6 +335,7 @@ impl Conn {
 pub fn run_connection<S: Store>(
     bridge: &Mutex<Bridge<S>>,
     mut stream: TcpStream,
+    controls: &ControlRegistry,
 ) -> Result<(), EndpointError> {
     let _ = stream.set_nodelay(true);
     // 一个句柄读写到底，不复制 fd：读和写在同一个线程里本来就是串行的，
@@ -243,6 +371,10 @@ pub fn run_connection<S: Store>(
 
     let mut session = Conn::new(sessions);
 
+    // 控制指令通道：本连接把「代表哪些会话」的 sender 注册出去，控制台据此推 control 帧。
+    let (control_tx, control_rx) = std::sync::mpsc::channel::<Frame>();
+    controls.register(&session.sessions().to_vec(), control_tx);
+
     let outcome = 'conn: loop {
         // 1. 有活就发过去。
         if session.ticket().is_none() {
@@ -261,7 +393,20 @@ pub fn run_connection<S: Store>(
             }
         }
 
-        // 2. 看看 harness 说了什么。等不到就回头再看一眼有没有活。
+        // 2. 控制台推来的控制指令，直接写出去。
+        loop {
+            match control_rx.try_recv() {
+                Ok(frame) => {
+                    if let Err(error) = write_frame(&mut stream, &frame) {
+                        break 'conn Err(error);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // 3. 看看 harness 说了什么。等不到就回头再看一眼有没有活。
         match read_line(&mut stream, &mut buffer, POLL_INTERVAL) {
             Ok(Incoming::Idle) => continue,
             Ok(Incoming::Closed) => break 'conn Ok(()),
@@ -286,6 +431,9 @@ pub fn run_connection<S: Store>(
             Err(error) => break 'conn Err(error),
         }
     };
+
+    // 断连就注销控制指令通道，别让控制台往死通道上推。
+    controls.unregister(&session.sessions().to_vec());
 
     // 无论怎么结束，都要把没跑完的轮次放掉。
     let queued = {
@@ -316,6 +464,7 @@ pub fn serve<S: Store + Send + 'static>(
     listener: TcpListener,
     bridge: Arc<Mutex<Bridge<S>>>,
     shutdown: Arc<AtomicBool>,
+    controls: ControlRegistry,
 ) -> Result<(), EndpointError> {
     listener.set_nonblocking(true)?;
     while !shutdown.load(Ordering::SeqCst) {
@@ -324,9 +473,10 @@ pub fn serve<S: Store + Send + 'static>(
                 // 接过来的连接要显式改回阻塞模式，读超时的逻辑建立在阻塞 socket 上。
                 stream.set_nonblocking(false)?;
                 let bridge = Arc::clone(&bridge);
+                let controls = controls.clone();
                 std::thread::spawn(move || {
                     // 一条连接坏了不影响别的连接，但要说清楚为什么坏的。
-                    if let Err(error) = run_connection(&bridge, stream) {
+                    if let Err(error) = run_connection(&bridge, stream, &controls) {
                         eprintln!("接入点：一条连接结束了：{error}");
                     }
                 });

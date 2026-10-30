@@ -329,9 +329,18 @@ export class DshClient {
     return result.items ?? []
   }
 
-  /** 建一个会话，返回 sessionId。 */
-  async createSession(title) {
-    const result = await this.callUnary("session/create", { title })
+  /**
+   * 建（或复用）一个会话，返回 sessionId。
+   * - sessionId：显式命名。传了就用它复用/创建（dsh 的 claim 逻辑：同名同 cwd 直接复用），
+   *   不传就由 dsh 造一个 `session-<uuid>`。持久化靠这个固定 id。
+   * - cwd：会话的工作目录，决定它归到 dsh 的哪个 workspace（分组）。dsh 会先 mkdir 这个目录。
+   *   复用 named 会话时 cwd 必须和首次一致，否则报 cwd 冲突。
+   */
+  async createSession({ sessionId, cwd } = {}) {
+    const result = await this.callUnary("session/create", {
+      ...(sessionId === undefined ? {} : { sessionId }),
+      ...(cwd === undefined ? {} : { cwd }),
+    })
     if (!result.sessionId) {
       throw new DshError("protocol", `dsh 建会话没回 sessionId：${JSON.stringify(result).slice(0, 200)}`)
     }

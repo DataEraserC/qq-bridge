@@ -13,6 +13,7 @@
 #       env:
 #         ACB_ENDPOINT: 127.0.0.1:7700
 #         ACB_TOKEN: eb9b833ac1c57ac69f167517fb3a793d
+#         ACB_HARNESS: dsh
 #         DSH_BASE_URL: http://127.0.0.1:3080
 #         # DSH_TOKEN: 可选；不填就走离线铸造 Cookie（读 ~/.dsh/.credentials.yaml）
 #

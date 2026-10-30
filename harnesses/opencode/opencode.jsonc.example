@@ -8,6 +8,36 @@
 // 会话配置里的 harness 名对得上（这里是 opencode）。
 {
   "$schema": "https://opencode.ai/config.json",
+
+  // 模型 provider 配置。**务必用 @ai-sdk/openai 而不是 @ai-sdk/openai-compatible**：
+  // 实测 new-api 网关（1100）的 Chat Completions 流式末尾会附加一个畸形的
+  // `choices:[]` + 坏 usage chunk，@ai-sdk/openai-compatible 解析它必抛错、无限断流重试
+  // （请求体无限增长）；而 @ai-sdk/openai 默认走 Responses API（/v1/responses），该端点
+  // 格式干净规范，能稳定跑通。baseURL 直连 http://127.0.0.1:1100/v1 即可，无需 tls_proxy。
+  "model": {
+    "providerID": "arc",
+    "model": "1AgentRouter/gpt-5.6-sol"
+  },
+  "provider": {
+    "arc": {
+      "npm": "@ai-sdk/openai",
+      "name": "AgentRouter (OpenAI Responses)",
+      "options": {
+        "baseURL": "http://127.0.0.1:1100/v1",
+        "apiKey": "<模型网关的 apiKey>"
+      },
+      "models": {
+        "1AgentRouter/gpt-5.6-sol": {
+          "name": "gpt-5.6-sol",
+          "limit": {
+            "context": 200000,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+
   "plugins": [
     {
       "package": "/path/to/agent-chat-bridge/harnesses/opencode/plugin",

@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
     Cursor, Deliveries, MIN_KEPT, Note, NoteKey, NoteKind, Notes, PrunePlan, RecordDraft,
-    StorageError, TopicStatus, Transcript, Watermarks,
+    SessionMap, SessionMaps, StorageError, TopicStatus, Transcript, Watermarks,
 };
 
 /// 这个程序认识的库结构版本。改表就加一。
@@ -24,7 +24,9 @@ use super::{
 ///         `room` 列改叫 `room_key`，并留下 `room_json` 存原始路径结构。
 /// 3 → 4：device 概念升级为「harness 会话」——水位/投递计数/乱序确认三张表的 `device`
 ///         列改叫 `session`（ADR-0017）。
-pub const SCHEMA_VERSION: i64 = 4;
+/// 4 → 5：加 `session_maps` 表——acb 会话 ↔ harness 内部会话的映射，桥侧控制台落盘
+///         （ADR-0018）。
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -87,6 +89,14 @@ CREATE TABLE IF NOT EXISTS notes (
     corrected  INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (connection, room_key, kind, note_key)
+);
+
+CREATE TABLE IF NOT EXISTS session_maps (
+    session         TEXT    NOT NULL,   -- acb 会话 id
+    harness_session TEXT    NOT NULL,   -- harness 内部会话 id（dsh 的 sessionId）
+    meta            TEXT    NOT NULL,   -- 元信息 JSON（标题/模型等，harness 回报什么存什么）
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (session)
 );
 "#;
 
@@ -884,6 +894,97 @@ impl Deliveries for SqliteStore {
             )
             .map_err(io_error)?;
         Ok(())
+    }
+}
+
+impl SessionMaps for SqliteStore {
+    fn session_map(&self, session: &str) -> Result<Option<SessionMap>, StorageError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT harness_session, meta, updated_at FROM session_maps WHERE session = ?1",
+                params![session],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(io_error)?;
+
+        let Some((harness_session, meta, updated_at)) = row else {
+            return Ok(None);
+        };
+        let meta: serde_json::Value = serde_json::from_str(&meta)
+            .map_err(|error| backend(format!("会话映射的元信息读不懂：{error}")))?;
+        Ok(Some(SessionMap {
+            session: session.to_owned(),
+            harness_session,
+            meta,
+            updated_at,
+        }))
+    }
+
+    fn upsert_session_map(&mut self, map: SessionMap) -> Result<(), StorageError> {
+        let meta = serde_json::to_string(&map.meta)
+            .map_err(|error| backend(format!("会话映射的元信息存不进库：{error}")))?;
+        self.conn
+            .execute(
+                "INSERT INTO session_maps (session, harness_session, meta, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (session) DO UPDATE SET
+                     harness_session = excluded.harness_session,
+                     meta = excluded.meta,
+                     updated_at = excluded.updated_at",
+                params![map.session, map.harness_session, meta, map.updated_at],
+            )
+            .map_err(io_error)?;
+        Ok(())
+    }
+
+    fn delete_session_map(&mut self, session: &str) -> Result<bool, StorageError> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM session_maps WHERE session = ?1", params![session])
+            .map_err(io_error)?;
+        Ok(removed > 0)
+    }
+
+    fn session_maps(&self) -> Result<Vec<SessionMap>, StorageError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT session, harness_session, meta, updated_at FROM session_maps
+                 ORDER BY session",
+            )
+            .map_err(io_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(io_error)?;
+
+        let mut maps = Vec::new();
+        for row in rows {
+            let (session, harness_session, meta, updated_at) = row.map_err(io_error)?;
+            let meta: serde_json::Value = serde_json::from_str(&meta)
+                .map_err(|error| backend(format!("会话映射的元信息读不懂：{error}")))?;
+            maps.push(SessionMap {
+                session,
+                harness_session,
+                meta,
+                updated_at,
+            });
+        }
+        Ok(maps)
     }
 }
 

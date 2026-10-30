@@ -16,7 +16,9 @@ use crate::ticket::Ticket;
 /// 多台设备，`send_message_to` 因此才能跨设备发。这是改语义，不是加帧，所以要升版本。
 /// 3：device 概念升级为「harness 会话」——`hello` 加 `harness` 字段，`delivery` 的
 /// `device`/`memory` 合并成 `session`，串行键改成「harness 名 + 会话 id」（ADR-0017）。
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4：加控制面——`control`（桥→harness 发指令）和 `control_result`（harness 回报），
+/// 供桥侧统一控制台触达 harness 内部（ADR-0018）。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 单帧上限：1 MiB。超了直接断连，不做截断。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -165,6 +167,31 @@ pub enum Frame {
     },
     /// 桥 → harness：日志。
     Log { level: LogLevel, message: String },
+    /// 桥 → harness：控制指令。控制台发起的、要 harness 自己执行的动作（如重置会话）。
+    /// 桥只转发，不替 harness 做——具体语义由 harness 决定（ADR-0018）。
+    Control {
+        /// 控制指令 id，harness 回报时原样带回来，好配对。
+        id: String,
+        /// 作用于哪个会话。
+        session: String,
+        /// 指令名。目前只有 `reset`（重置该会话的映射）。
+        command: String,
+        /// 指令参数。
+        #[serde(default)]
+        args: serde_json::Value,
+    },
+    /// harness → 桥：控制指令的结果。
+    ControlResult {
+        /// 对应哪条 `control` 的 id。
+        id: String,
+        session: String,
+        command: String,
+        /// 执行结果。失败时是字符串错误，成功时是 harness 回的结构。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// 保活。
     Ping,
     /// 保活回应。
@@ -182,6 +209,8 @@ impl Frame {
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::Log { .. } => "log",
+            Self::Control { .. } => "control",
+            Self::ControlResult { .. } => "control_result",
             Self::Ping => "ping",
             Self::Pong => "pong",
         }
@@ -223,7 +252,7 @@ pub fn decode(line: &str) -> Result<Frame, DecodeError> {
 
     match tag {
         "hello" | "ready" | "turn_start" | "turn_end" | "tool_call" | "tool_result" | "log"
-        | "ping" | "pong" => {
+        | "control" | "control_result" | "ping" | "pong" => {
             serde_json::from_value(value).map_err(|error| DecodeError::MissingField {
                 detail: error.to_string(),
             })
@@ -311,6 +340,19 @@ mod tests {
             Frame::Log {
                 level: LogLevel::Warn,
                 message: "上游拒绝".into(),
+            },
+            Frame::Control {
+                id: "ctl-1".into(),
+                session: "main".into(),
+                command: "reset".into(),
+                args: serde_json::json!({}),
+            },
+            Frame::ControlResult {
+                id: "ctl-1".into(),
+                session: "main".into(),
+                command: "reset".into(),
+                result: Some(serde_json::json!({"new_session": "session-abc"})),
+                error: None,
             },
             Frame::Ping,
             Frame::Pong,

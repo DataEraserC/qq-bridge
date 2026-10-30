@@ -38,8 +38,11 @@ function readConfig() {
   return {
     endpoint: process.env.ACB_ENDPOINT?.trim() || "127.0.0.1:7700",
     token: process.env.ACB_TOKEN?.trim() || "",
+    harness: process.env.ACB_HARNESS?.trim() || "",
     dshBaseUrl: process.env.DSH_BASE_URL?.trim() || "http://127.0.0.1:3080",
     dshToken: process.env.DSH_TOKEN?.trim() || "",
+    // 会话的工作目录：dsh 按它把会话归到某个 workspace（分组）。留空就不分组。
+    cwd: process.env.ACB_CWD?.trim() || "",
   }
 }
 
@@ -53,13 +56,16 @@ async function main() {
   const dsh = new DshClient({ baseUrl: config.dshBaseUrl, token: config.dshToken, log })
 
   // 轮次驱动：桥推 turn_start → dsh 投话 → 等 turn/end → turn_end。
-  const driver = new TurnDriver({ dsh, log })
+  const driver = new TurnDriver({ dsh, log, cwd: config.cwd })
 
   const link = new BridgeLink({
     endpoint: config.endpoint,
     token: config.token,
+    harness: config.harness,
     log,
     onTurn: (delivery) => driver.run(delivery, link),
+    // 桥推来的控制指令（如 reset）：driver 处理，处理完回报结果。
+    onControl: (frame) => driver.handleControl(frame, link),
   })
 
   // MCP server：暴露桥上的工具，工具调用转成 tool_call（带当前 ticket）。
@@ -98,11 +104,53 @@ async function main() {
 // ---------------------------------------------------------------------------
 
 class TurnDriver {
-  constructor({ dsh, log }) {
+  constructor({ dsh, log, cwd = "" }) {
     this.dsh = dsh
     this.log = log
-    this.sessions = new Map() // acb session id -> dsh sessionId
+    this.cwd = cwd
+    // acb session id -> 固定的 dsh sessionId（`acb:<id>`）。用固定 id 而不是 dsh 造的
+    // uuid，是为了持久化：进程重启后 createSession 传同一个 sessionId + cwd，
+    // dsh 的 claim 逻辑会直接复用旧会话，不丢上下文。
+    this.sessions = new Map()
     this.chain = Promise.resolve()
+  }
+
+  /** 这个 acb 会话对应的固定 dsh sessionId（不带时间戳后缀）。 */
+  #fixedSessionId(acbSession) {
+    // dsh 的 sessionId 都是 `session-<uuid>` 风格；这里用 `session-acb-<id>` 保持
+    // 一致的命名空间，且不含冒号（避免任何潜在的 id 校验歧义）。
+    return `session-acb-${acbSession}`
+  }
+
+  /**
+   * 重置某个 acb 会话：丢掉当前映射，下次开轮用带时间戳的新 id 新建一个干净会话。
+   * 旧会话留在 dsh 里不删（符合「新会话即可」的重置语义）。
+   */
+  resetSession(acbSession) {
+    this.sessions.delete(acbSession)
+    this.log("info", `已重置会话 ${acbSession}，下次开轮会新建`)
+  }
+
+  /**
+   * 处理桥推来的控制指令（ADR-0018）。目前只认 `reset`：
+   * 丢掉当前会话映射，回报成功；下次开轮用带时间戳的新 id 新建干净会话。
+   * 处理完用 link.controlResult 回报，好让桥把映射落盘。
+   */
+  async handleControl(frame, link) {
+    const { id, session, command } = frame
+    if (command === "reset") {
+      try {
+        this.resetSession(session)
+        link.controlResult({ id, session, command, result: { ok: true } })
+      } catch (error) {
+        this.log("error", `重置会话 ${session} 失败：${error?.message ?? error}`)
+        link.controlResult({ id, session, command, error: String(error?.message ?? error) })
+      }
+      return
+    }
+    // 不认识的指令：报错，别默默吞掉。
+    this.log("warn", `不认识的 control 指令：${command}`)
+    link.controlResult({ id, session, command, error: `不认识的指令 ${command}` })
   }
 
   run(delivery, link) {
@@ -114,7 +162,7 @@ class TurnDriver {
   async #one(delivery, link) {
     let failure = null
     try {
-      const sessionId = await this.#session(delivery.session)
+      const sessionId = await this.#session(delivery.session, link)
       const text = renderTurn(delivery)
       const info = delivery.session_info ?? {}
       const model = info.model ?? "(dsh 默认)"
@@ -139,16 +187,36 @@ class TurnDriver {
   }
 
   /**
-   * 这个会话的 dsh 会话：记住的 > 新建。dsh 的 sessionId 我们存内存里；进程重启会
-   * 丢，但 dsh 那边会话还活着，下次可以用 session/list 按标题找回（先做简单的：
-   * 内存缓存 + 进程内复用）。
+   * 这个会话的 dsh 会话：内存缓存 > 按固定 id 复用（dsh 侧 persist，重启不丢）。
+   * 固定 id 是 `acb:<session>`，配合固定 cwd，dsh 的 claim 会直接复用它；
+   * 换新（重置）后 id 带时间戳，就新建一个。
    */
-  async #session(session) {
+  async #session(session, link) {
     const cached = this.sessions.get(session)
     if (cached) return cached
-    const sessionId = await this.dsh.createSession(`acb:${session}`)
+    const fixed = this.#fixedSessionId(session)
+    const sessionId = await this.dsh.createSession({
+      sessionId: fixed,
+      ...(this.cwd ? { cwd: this.cwd } : {}),
+    })
     this.sessions.set(session, sessionId)
-    this.log("info", `新 dsh 会话 ${sessionId}（acb:${session}）`)
+    this.log("info", `dsh 会话 ${sessionId}（${fixed}${this.cwd ? `，归组 ${this.cwd}` : ""}）`)
+    // 建好会话就把映射回报给桥，让控制台能查到「acb 会话 ↔ dsh 会话」的对应关系。
+    // 用 report_map 指令，result 里带 session_id + meta（这里放固定 id 和分组）。
+    if (link) {
+      link.controlResult({
+        id: `map-${Date.now()}`,
+        session,
+        command: "report_map",
+        result: {
+          session_id: sessionId,
+          meta: {
+            fixed_id: fixed,
+            cwd: this.cwd || null,
+          },
+        },
+      })
+    }
     return sessionId
   }
 
