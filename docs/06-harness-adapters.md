@@ -46,35 +46,16 @@ API 才退到进程外驱动或 MCP。这条判断写进了 [ADR-0013](adr/0013-
 
 ## 当前各家的情况
 
-下面「判断」一栏里，只有 opencode 是我看过文档、写过代码的；其余是**待核实**，别当结论用。
+下面「判断」一栏里，只有 opencode 和 dsh 是**真跑通过**的；其余是**待核实**，别当结论用。
 
 | harness | 扩展点 | 轮次驱动 | 判断 |
 |---------|--------|----------|------|
 | opencode | 插件（v2：`export default { id, setup(ctx) }`；工具用 `ctx.tool.transform` 注册，模型经 `execute` 调 `tools.X`） | 进程内：`ctx.session.prompt` 排话 + `ctx.session.wait` 等它说完 | 插件型，见 `harnesses/opencode/plugin/`；真机整轮已验（私聊 + 群） |
 | DSH | MCP（`dsh-mcp-client`，工具名 `mcp__acb__*`） | 进程外：驱动器调 webui HTTP/WS API（`session/prompt` + `session/follow` 等 `turn/end`） | 进程外 + MCP，见 `harnesses/dsh/`；协议层真机已验，模型真回话待配模型 |
 | WorkBuddy | 待核实 | 待核实 | 未看 |
-| Trae | MCP（有自定义 agent、Subagent、Hooks、Commands）；技能（Skill）是**文件**，不是工具注册接口 | 待核实（没有公开的无头/服务端驱动文档） | 只读过官方文档，没跑过：工具面大概率走 MCP，轮次驱动还没找到入口 |
+| Trae | 待核实 | 待核实 | 未看 |
 | Codex | 无插件；有 `codex exec` 这类无头入口 | 进程外：每轮起一次 | 大概率进程外 + MCP 补工具面 |
 | OpenClaw | 待核实 | 待核实 | 未看 |
-
-## Trae 的技能目录（读文档所得，别当结论用）
-
-Trae 的 **Skill 是提示词包，不是工具**。这点容易搞混，但它决定了桥该怎么接：
-
-- 一个技能 = 一个目录 + 一个 `SKILL.md`（`---` 前置区写 `name` / `description`，正文写说明、
-  步骤、示例），可以再带 `examples/`、`templates/`、`resources/` 里的脚本和素材。
-- 来源三处：项目 `.trae/skills/`、全局 `~/.trae/skills/`（国内版 `~/.trae-cn/skills`）、
-  以及 Agent Skills 规范的 `.agents/skills/`（要在设置里打开开关；同名时 `.trae/skills/` 优先）。
-  另外有插件市场安装和 `.zip` 导入。
-- 加载是两段式：先只扫所有技能的名字和描述建立索引，判定相关之后才把正文注入上下文。
-  这和「规则（Rules）开局全量注入」正好相反。
-- 启用/禁用状态落在项目 `.trae/` 下的 `skill-config.json` 里。
-
-**对桥的意义**：技能里写的是「怎么做」，能力（读文件、跑命令、调接口）仍然来自 agent 自己的
-工具。所以接 Trae 时，`acb` 的工具面还是得走 MCP；指望用技能把 `send_message` 装进去是走错路。
-反过来说，技能是个现成的落点——把「这个号怎么用桥」写成技能发到 `.agents/skills/`，
-就不用每次在人格卡里重复一段协议说明。**桥本身不该有「技能」这个概念**（人格卡管人设、
-记忆管知识、工具管动作），这是 harness 侧的部署物。
 
 ## opencode 这一份怎么用
 
