@@ -11,6 +11,7 @@
 //! 连接方式只做了正向 WebSocket（`ws-client`：桥主动连平台开出来的 WS 服务端）。
 //! 反向 WS 要桥当服务端，还没做。
 
+pub mod catalog;
 pub mod event;
 pub mod link;
 pub mod outbound;

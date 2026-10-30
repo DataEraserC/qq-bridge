@@ -70,10 +70,35 @@ impl ParamSpec {
         }
     }
 
+    /// 形状不固定的必填参数（OneBot 那种消息段）。
+    pub const fn any(name: &'static str, desc: &'static str) -> Self {
+        Self {
+            name,
+            ty: ParamType::Any,
+            required: true,
+            desc,
+            values: &[],
+        }
+    }
+
+    /// 形状不固定的可选参数。
+    pub const fn maybe_any(name: &'static str, desc: &'static str) -> Self {
+        Self {
+            name,
+            ty: ParamType::Any,
+            required: false,
+            desc,
+            values: &[],
+        }
+    }
+
     /// 渲染成 JSON Schema 的一个属性。
     pub fn to_schema(&self) -> Value {
         let mut schema = serde_json::Map::new();
-        schema.insert("type".into(), Value::String(self.ty.json_type().into()));
+        // Any 不写 type：JSON Schema 里「什么形状都行」就是不约束。
+        if self.ty != ParamType::Any {
+            schema.insert("type".into(), Value::String(self.ty.json_type().into()));
+        }
         schema.insert("description".into(), Value::String(self.desc.into()));
         if !self.values.is_empty() {
             schema.insert(
@@ -98,6 +123,11 @@ pub enum ParamType {
     Bool,
     StringList,
     Object,
+    /// 形状不固定（OneBot 的消息段：可能是字符串，也可能是数组）。不校验，原样转交。
+    ///
+    /// 用它是**明确的取舍**：这类参数只做存在性检查，错了让平台那边报。
+    /// 硬编成一种形状反而会把合法写法挡在外面。
+    Any,
 }
 
 impl ParamType {
@@ -108,6 +138,8 @@ impl ParamType {
             Self::Bool => "boolean",
             Self::StringList => "array",
             Self::Object => "object",
+            // JSON Schema 里「任意」就是不写 type，这里给个占位，调用方要跳过它。
+            Self::Any => "",
         }
     }
 
@@ -124,6 +156,7 @@ impl ParamType {
                         .is_some_and(|items| items.iter().all(Value::is_string))
             }
             Self::Object => value.is_object(),
+            Self::Any => true,
         }
     }
 }
@@ -144,6 +177,7 @@ pub mod tags {
     pub const UPLOAD: &str = "upload";
     pub const DOWNLOAD: &str = "download";
     pub const APPROVE: &str = "approve";
+    pub const POKE: &str = "poke";
 
     // 对象
     pub const MESSAGE: &str = "message";
@@ -190,6 +224,7 @@ const ALIASES: &[&[&str]] = &[
     &["admin", "管理", "管理员", "权限"],
     &["mute", "禁言", "闭嘴"],
     &["approve", "审批", "同意", "通过", "申请"],
+    &["poke", "拍一拍", "戳一戳", "戳"],
     &["upload", "上传"],
     &["download", "下载"],
     &["system", "系统", "状态"],

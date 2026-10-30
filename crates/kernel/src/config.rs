@@ -180,6 +180,34 @@ pub struct Connection {
     /// 系统管理员的账号列表。发送者号命中其中之一，就标 `SenderRole::SystemAdmin`。
     /// 空 = 没有系统管理员。适配器判身份时先查这个，查不到再去问平台群角色。
     pub admin_qqs: Vec<String>,
+    /// 破坏性平台方法（踢人、禁言、解散群……）放不放行。默认全拒。
+    ///
+    /// 这是「AI 能做任何人也做的事」和「群消息是不可信输入」之间唯一的那道闸：
+    /// 白名单挡不住「模型合法地调一个它本来就有权调的方法」，只有默认关才挡得住。
+    pub allow_destructive: DestructivePolicy,
+}
+
+/// 破坏性方法的放行策略。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum DestructivePolicy {
+    /// 一律拒绝（默认）。
+    #[default]
+    None,
+    /// 全部放行。
+    All,
+    /// 只放行这几个方法名。
+    Only(Vec<String>),
+}
+
+impl DestructivePolicy {
+    /// 这个方法现在能不能调。非破坏性方法的判断不归它管。
+    pub fn allows(&self, method: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Only(names) => names.iter().any(|name| name == method),
+        }
+    }
 }
 
 /// 目前认识的适配器种类。加新适配器时在这里登记。
@@ -961,6 +989,10 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
             .map(|qq| qq.trim().to_owned())
             .filter(|qq| !qq.is_empty())
             .collect(),
+        allow_destructive: raw
+            .allow_destructive
+            .map(RawDestructive::into_policy)
+            .unwrap_or_default(),
     })
 }
 
@@ -1143,6 +1175,41 @@ struct RawConnection {
     /// 系统管理员账号列表，可为空。
     #[serde(default)]
     admin_qqs: Vec<String>,
+    /// `true` 全开，或写方法名数组只开那几个。不写 = 全关。
+    #[serde(default)]
+    allow_destructive: Option<RawDestructive>,
+}
+
+/// `allow_destructive` 有两种写法：布尔，或方法名数组。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDestructive {
+    Bool(bool),
+    List(Vec<String>),
+}
+
+impl RawDestructive {
+    fn into_policy(self) -> DestructivePolicy {
+        match self {
+            Self::Bool(true) => DestructivePolicy::All,
+            Self::Bool(false) => DestructivePolicy::None,
+            Self::List(names) => {
+                let names: Vec<String> = names
+                    .into_iter()
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+                    .collect();
+                // 写了 `["*"]` 就当全开，省得列一大串。
+                if names.iter().any(|name| name == "*") {
+                    DestructivePolicy::All
+                } else if names.is_empty() {
+                    DestructivePolicy::None
+                } else {
+                    DestructivePolicy::Only(names)
+                }
+            }
+        }
+    }
 }
 
 fn default_transport() -> String {
@@ -1239,6 +1306,51 @@ mod tests {
     fn transport_defaults_to_forward_websocket() {
         let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
         assert_eq!(config.connections[0].transport.as_str(), "ws-client");
+    }
+
+    /// 破坏性方法默认全关：AI 能做人也做的事，但那道闸默认是落下的。
+    #[test]
+    fn destructive_methods_are_closed_unless_the_connection_says_otherwise() {
+        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
+        let policy = &config.connections[0].allow_destructive;
+        assert_eq!(*policy, DestructivePolicy::None);
+        assert!(!policy.allows("group.kick"));
+    }
+
+    #[test]
+    fn allow_destructive_accepts_true_false_and_a_method_list() {
+        let with = |extra: &str| {
+            let text = ONE_CONNECTION.replace(
+                "account = \"10001\"",
+                &format!("account = \"10001\"\n{extra}"),
+            );
+            Config::parse(&config_with(&text, ONE_SESSION))
+                .expect("能解析")
+                .connections[0]
+                .allow_destructive
+                .clone()
+        };
+
+        let all = with("allow_destructive = true");
+        assert_eq!(all, DestructivePolicy::All);
+        assert!(all.allows("group.kick"));
+        assert!(all.allows("message.recall"));
+
+        let none = with("allow_destructive = false");
+        assert!(!none.allows("group.kick"));
+
+        let some = with("allow_destructive = [\"group.kick\"]");
+        assert_eq!(some, DestructivePolicy::Only(vec!["group.kick".to_owned()]));
+        assert!(some.allows("group.kick"));
+        assert!(!some.allows("group.ban"), "没列出来的不许");
+
+        // `["*"]` 是「全开」的简写。
+        let star = with("allow_destructive = [\"*\"]");
+        assert_eq!(star, DestructivePolicy::All);
+
+        // 空数组等于没开，不能因为「写了这一行」就放开。
+        let empty = with("allow_destructive = []");
+        assert!(!empty.allows("group.kick"));
     }
 
     #[test]

@@ -270,7 +270,7 @@ test("内容元素都摊得开，平台内容原样摊给模型", () => {
   assert.match(text, /"id":"abc123"/)
   // 还要带上「可以怎么取」：只给一个 id，模型不知道自己能查（ADR-0020）。
   assert.match(text, /可调 platform_call/)
-  assert.match(text, /forward\.get_content/)
+  assert.match(text, /message\.forward_content/)
 })
 
 test("不认识的平台内容也会指向能力目录，不让模型瞎猜方法名", () => {

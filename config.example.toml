@@ -57,6 +57,13 @@ max_age_days = 90
 #   ws-server = 桥当服务端，等平台连过来（还没实现）
 # account 是这条连接登录的号：桥靠它认出「这句是我自己说的」。
 # 连上之后会跟平台报的号核对一次，对不上会警告。
+#
+# allow_destructive：破坏性平台方法（踢人、禁言、改群名、撤回别人消息、解散群……）
+# 放不放给模型。不写 = 全关。三种写法等价可选：
+#   allow_destructive = true                    # 全开：人在群里能做的，模型都能做
+#   allow_destructive = ["group.kick", "group.ban"]   # 只开这几个
+#   allow_destructive = false                   # 全关（默认）
+# 想让它真的顶一个人的位置干活，就写 true；只想像个普通成员聊天，就别写。
 
 [[connections]]
 id = "qq"
@@ -66,6 +73,8 @@ transport = "ws-client"
 url = "ws://127.0.0.1:3001"
 token = ""
 account = "10001"
+# 想让它真顶一个人的位置（能踢人能禁言能改群名），把这行改成 true。
+allow_destructive = false
 
 # 同一个平台的第二个号：id 换个名字就行。它看到的群是 qq2:group/123，
 # 跟 qq:group/123 是两个房间，各记各的水位，永远不会重复收。

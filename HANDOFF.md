@@ -77,13 +77,16 @@ core 迟早认识 QQ。
   如 `image` 同时挂在 `message.send_image` 和 `group.get_file_url` 上）。core 给一张中英别名表
   （`expand_query`），模型说「图片」也能搜到挂 `image` 的方法。
 - 适配器自己声明方法表（`MethodSpec { name, summary, tags, risk, params }`），强制 `resource.method` 命名。
-  QQ 第一批只放 4 个**纯读**方法：`forward.get_content` / `message.get` / `group.get_member_info` /
-  `group.get_member_list`。
+  QQ 现在声明 **52 个方法**（`crates/adapters/onebot11/src/catalog.rs`），铺的是「人在这号上能做的事」：
+  发言/发图/发语音/发文件/合并转发/撤回/引用/拍一拍/点赞/看历史/看成员/群文件/改名片/改群名/设管理/
+  禁言/踢人/发公告/审批入群/加删好友/改群头像。**52 个都对着真机 NapCat 探测过，全部存在**。
 - `Outbound` 扩了 `catalog()` / `call()`，**都带默认实现**，所以现有 6 处测试 mock 一个都没改。
   OneBot 侧不需要新通道：`Action{action,params,echo}` 本来就是通用 RPC，`send` 只是它的特例。
 - 错误分五种，分类当 message 前缀给模型：`unknown_method`（附同组近似名）/ `unsupported_platform` /
   `not_implemented` / `forbidden` / `bad_params`（指出哪个字段）。模型靠这个自己纠错，不是靠猜。
-- `Risk::Destructive` 一律拒（配置里「显式打开」的开关还没做，见第 6 节）。
+- `Risk::Destructive` 默认拒，但连接上一个开关能放行：`allow_destructive = true`（全开）/
+  `["group.kick"]`（只开这几个）/ 不写（全关）。真机 `config.toml` 现在是 `true`——
+  用户要求「人能做的模型都能做」。开了就意味这个号能干的事模型都能干，这是明示的风险。
 - opaque 渲染带上「可调什么」（affordance）：`[QQ 平台特有内容（未展开，可调
   platform_call(method="forward.get_content", params={"id":"…"}) 读取正文），原样如下：{…}]`。
   不主动展开正文（体积/限流/隐私），但也不让模型以为自己无能为力。
@@ -183,12 +186,13 @@ systemctl --user stop acb-drivers acb-bridge        # 停（顺序：驱动先�
 1. **poke 事件昵称兜底**：OneBot 的 notice/poke 事件常不带 sender 字段，昵称显示成 QQ 号。需要 `get_group_member_info` 异步查 API 兜底。**注**：现在有 `platform_call` 了，但那是给模型用的，适配器内部兜底还得自己写（未做）。
 2. **dsh 重启后旧 sessionId 失效的自愈**：seed 的旧 sessionId 若在 dsh 重启后失效，prompt 会失败。需区分「session 失效」vs「模型失败」做自愈兜底（留待观察）。
 3. **git 仓库有个异常的 `~/` 目录**（误创建的），里面是 qqab-memories，待清理（不是关键）。
-4. **平台能力第一批只有 4 个纯读方法**：`forward.get_content` / `message.get` / `group.get_member_info` /
-   `group.get_member_list`。写和破坏性方法**故意没加**——等这条通路真机跑顺了再逐条评估。
-5. **破坏性方法的配置开关还没做**：`Risk::Destructive` 现在一律拒绝，配置里没有「显式打开」的项。
-   要开的时候得在 `config.rs` 加按连接的允许列表，再改 `engine.rs` 里那段判断。
-6. **待验证**：真实消息触发时，模型是否会自己调 `forward.get_content` 把转发正文读出来。
-   （工具面已确认在 MCP 里可见；参数名 `id` 已用 curl 直打 OneBot 验证过能取到正文。）
+4. ~~平台能力只有 4 个纯读方法~~（已完成）：现在 52 个，覆盖「人在这号上能做的事」，
+   全部对着真机 NapCat 探测过。表在 `crates/adapters/onebot11/src/catalog.rs`。
+5. ~~破坏性方法的配置开关~~（已完成）：`[[connections]] allow_destructive = true / ["group.kick"] / 省略`。
+   真机现在开的是 `true`。
+6. **待验证**：真实消息触发时，模型是否会自己调 `message.forward_content` 把转发正文读出来，
+   以及平台特有方法（`platform_call`）这条通路在**模型手里**用不用得顺。
+   （方法名/参数名已在真机上逐个探测过，桥侧校验与路由有测试覆盖；差的是「模型真的会去调」这一步。）
 
 ---
 

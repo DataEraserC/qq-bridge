@@ -1127,13 +1127,15 @@ impl<S: Store> Bridge<S> {
         };
 
         // 破坏性操作默认关。白名单挡不住「模型被群里的话骗着去调一个它本来就有权调的方法」，
-        // 只有默认关才挡得住。
-        if spec.risk == Risk::Destructive {
+        // 只有默认关才挡得住；要放行得在 config.toml 那条连接上显式写 allow_destructive。
+        if spec.risk == Risk::Destructive && !self.allows_destructive(&room.connection, spec.name) {
             return Err(ToolError::new(
                 ErrorCode::ToolNotAllowed,
                 format!(
-                    "[forbidden] {} 是破坏性操作，默认不开放给模型；要开得在桥的配置里显式打开",
-                    spec.name
+                    "[forbidden] {} 是破坏性操作，连接 {} 默认不开放。\
+                     要开就在 config.toml 的 [[connections]] 那段加 allow_destructive = true\
+                     （或只列要开的方法，如 allow_destructive = [\"{}\"]）",
+                    spec.name, room.connection, spec.name
                 ),
             ));
         }
@@ -1156,6 +1158,15 @@ impl<S: Store> Bridge<S> {
             .find(|item| item.id == connection)
             .map(|item| item.platform.as_str())
             .unwrap_or("unknown")
+    }
+
+    /// 这条连接的配置放不放行这个破坏性方法。查不到连接 = 不放行。
+    fn allows_destructive(&self, connection: &str, method: &str) -> bool {
+        self.config
+            .connections
+            .iter()
+            .find(|item| item.id == connection)
+            .is_some_and(|item| item.allow_destructive.allows(method))
     }
 
     /// 参数里没给房间就用本轮的房间；给了就解析。

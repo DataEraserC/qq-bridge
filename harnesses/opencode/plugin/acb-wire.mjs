@@ -467,7 +467,7 @@ function affordanceOf(element) {
 
   // 合并转发：OneBot 系都是这个形状。
   if (kind === "forward" && typeof id === "string" && id) {
-    return `未展开，可调 platform_call(method="forward.get_content", params=${JSON.stringify({ id })}) 读取正文`
+    return `未展开，可调 platform_call(method="message.forward_content", params=${JSON.stringify({ id })}) 读取正文`
   }
   // 其它不认识的：至少告诉它去哪查，别让它瞎猜方法名。
   return "可调 platform_methods 看这个平台能做什么"

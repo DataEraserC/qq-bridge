@@ -212,10 +212,11 @@ query 按词搜名字、说明、标签，中文和英文都认（「图片」�
     name: "platform_call",
     description: `调一个平台特有方法。core 不认识任何方法名，原样转给适配器。
 
-method 用 resource.method 的写法，如 forward.get_content、group.get_member_info。
-params 是对象，形状照 platform_methods 里给的参数表填。
+method 用 resource.method 的写法，如 message.forward_content、group.get_member_info。
+params 是对象，形状照 platform_methods 里给的参数表填；群号/私聊对象能从房间推出来时可以不填。
 只能调这个房间所属连接声明过的方法，且房间必须在会话订阅范围内。
-踢人、禁言这类破坏性操作默认不开放。
+踢人、禁言、改群名这类破坏性操作默认不开放（报 forbidden）；连接配置里开了就会真的执行，
+这时候你就是在替这个人操作，想清楚再调。
 
 报错会带上分类：unknown_method（名字错了，会给你近似的）、bad_params（参数不对，
 会说哪个字段）、unsupported_platform（这平台没这能力）、not_implemented（平台有但我们
@@ -224,7 +225,7 @@ params 是对象，形状照 platform_methods 里给的参数表填。
       type: "object",
       properties: {
         room: ROOM_SCHEMA,
-        method: { type: "string", description: "方法名，如 forward.get_content" },
+        method: { type: "string", description: "方法名，如 message.send_group、group.get_member_info" },
         params: {
           type: "object",
           description: "方法参数。照 platform_methods 给的参数表填",

@@ -66,6 +66,13 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Destructive,
         params: KICK_PARAMS,
     },
+    MethodSpec {
+        name: "group.ban",
+        summary: "禁言",
+        tags: &[tags::ADMIN, tags::MUTE],
+        risk: Risk::Destructive,
+        params: KICK_PARAMS,
+    },
 ];
 
 type Calls = Arc<Mutex<Vec<(String, Value)>>>;
@@ -97,6 +104,7 @@ impl Outbound for Platformy {
                 "messages": [{"sender": "老王", "text": "转发的正文"}]
             })),
             "group.get_member_info" => Ok(json!({"nickname": "老王", "role": "member"})),
+            "group.kick" | "group.ban" => Ok(json!({"done": true})),
             other => Err(CallError::NotImplemented(other.to_owned())),
         }
     }
@@ -152,9 +160,19 @@ fn config() -> &'static str {
 }
 
 fn setup() -> (Bridge<MemoryStore>, Calls) {
+    setup_with("")
+}
+
+/// 给 qq 那条连接额外加配置（比如 `allow_destructive = true`）。
+fn setup_with(extra: &str) -> (Bridge<MemoryStore>, Calls) {
     let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    // 插在 qq 连接的第一行配置后面；`account = "bot"` 全篇只出现一次。
+    let text = config().replace(
+        "account = \"bot\"",
+        &format!("account = \"bot\"\n        {extra}"),
+    );
     let bridge = Bridge::new(
-        acb_kernel::Config::parse(config()).expect("配置合法"),
+        acb_kernel::Config::parse(&text).expect("配置合法"),
         MemoryStore::new(),
         Box::new(Platformy {
             calls: calls.clone(),
@@ -203,10 +221,10 @@ fn catalog_lists_every_method_without_dumping_params() {
         .expect("能查目录");
 
     assert_eq!(result["platform"], "qq");
-    assert_eq!(result["total"], 5);
+    assert_eq!(result["total"], 6);
 
     let methods = result["methods"].as_array().expect("有清单");
-    assert_eq!(methods.len(), 5);
+    assert_eq!(methods.len(), 6);
     assert_eq!(methods[0]["name"], "forward.get_content");
     assert_eq!(methods[0]["tags"][0], "forward");
     assert_eq!(methods[2]["risk"], "write");
@@ -480,6 +498,53 @@ fn destructive_method_is_refused_by_default() {
     assert!(error.message.contains("forbidden"));
     // 关键：根本没交到适配器手上。
     assert!(calls.lock().expect("没被毒死").is_empty());
+}
+
+/// 但配了 `allow_destructive = true` 就要真的放行——「人能做的模型也能做」靠这一条成立。
+#[test]
+fn destructive_method_runs_when_the_connection_allows_it() {
+    let (mut bridge, calls) = setup_with("allow_destructive = true");
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "group.kick", "params": {"user_id": "1"}}),
+        )
+        .expect("开了就放行");
+
+    assert_eq!(result["done"], true);
+    assert_eq!(calls.lock().expect("没被毒死").len(), 1);
+}
+
+/// 只开名单里的那几个：列表外的仍然拒。
+#[test]
+fn allow_destructive_list_only_opens_the_named_methods() {
+    let (mut bridge, calls) = setup_with("allow_destructive = [\"group.ban\"]");
+    let ticket = open_turn(&mut bridge);
+
+    let refused = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "group.kick", "params": {"user_id": "1"}}),
+        )
+        .expect_err("不在名单里");
+    assert!(refused.message.contains("forbidden"));
+
+    let allowed = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "group.ban", "params": {"user_id": "1"}}),
+        )
+        .expect("在名单里");
+    assert_eq!(allowed["done"], true);
+    assert_eq!(calls.lock().expect("没被毒死").len(), 1);
 }
 
 /// 订阅之外房间一律拒绝，和 send_message_to 同一条边界。
