@@ -521,12 +521,14 @@ impl<S: Store> Bridge<S> {
 
     /// 调工具。
     ///
-    /// `sessions` 是这次接入代表的会话组（同一 harness）。发到哪儿、读哪儿的判据都从这里来：
-    /// 能碰的房间 = 当前会话订阅的房间，越界就拒。跨会话发送被砍掉（ADR-0017）。
+    /// 工具面一律按**会话**圈，不按连接圈（设备概念已删，2026-11-01 用户裁定）：
+    /// 能读、能列、能发的房间 = 当前轮次会话订阅的房间。同一条连接上兄弟会话的
+    /// 房间不可见——否则一条连接带两个会话时，agent 会自称管着对方会话的房间。
+    /// 跨会话发送被砍掉（ADR-0017），读的边界同理。
     pub fn tool_call(
         &mut self,
         ticket: &Ticket,
-        sessions: &[String],
+        _connection_sessions: &[String],
         tool: &str,
         args: Value,
     ) -> Result<Value, ToolError> {
@@ -539,6 +541,8 @@ impl<S: Store> Bridge<S> {
 
         let ctx = self.turn_ctx(ticket, tool)?;
         let turn_session = ctx.session.clone();
+        // 下面的分支全用 `sessions` 当可见域——按会话圈，不是连接圈。
+        let sessions: &[String] = std::slice::from_ref(&turn_session);
         let room = ctx.room.clone();
         let delivered = ctx.delivered.clone();
         let live = ctx.live;

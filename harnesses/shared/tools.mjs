@@ -137,7 +137,7 @@ false 是「这次没查」，不是「这条没这个值」，要的话把它�
   {
     name: "list_rooms",
     description:
-      "你这组设备订阅了哪些房间、各自未读多少。想发消息前先看能发到哪（一行一台设备的视角）。",
+      "你当前会话订阅了哪些房间、各自未读多少。想发消息前先看能发到哪。同一实例上别的会话订阅的房间不在这里，也发不过去。",
     schema: { type: "object", properties: {}, additionalProperties: false },
   },
   {

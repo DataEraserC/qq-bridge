@@ -575,6 +575,97 @@ fn history_and_events_read_from_the_transcript() {
     assert_eq!(rooms["rooms"][0]["room"]["connection"], "qq");
 }
 
+/// 工具面按会话圈，不按连接圈。
+///
+/// 一条连接可以代表多个会话（同 harness 同令牌）。A 会话开轮时调 list_rooms，
+/// 只该看见 A 自己订阅的房间——兄弟会话的房间列进来，agent 就会自称管着
+/// 别人的房间（2026-11-01 真机实测：opencode 一条连接带两会话，agent 报 3 个房间）。
+#[test]
+fn tool_scope_is_the_turn_session_not_the_connection() {
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let config = r#"
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "bot"
+
+        [[personas]]
+        id = "p"
+        name = "人格"
+        text = "你是桥。"
+
+        [[harnesses]]
+        id = "dsh"
+        name = "DeepSeek"
+
+        [[sessions]]
+        id = "main"
+        harness = "dsh"
+        persona = "p"
+        token = "t"
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/123"
+
+        [sessions.subscriptions.wake]
+        at_mention = true
+        name_mention = false
+        poke = false
+        accumulate = 50
+
+        [[sessions]]
+        id = "sib"
+        harness = "dsh"
+        persona = "p"
+        token = "t"
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/789"
+
+        [sessions.subscriptions.wake]
+        at_mention = true
+        name_mention = false
+        poke = false
+        accumulate = 50
+    "#;
+    let mut bridge = Bridge::new(
+        acb_kernel::Config::parse(config).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder { sends }),
+    );
+
+    // 兄弟会话 sib 的房间里有动静，开的是 sib 的轮。
+    let _ = bridge
+        .ingest(message("qq:group/789", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    // 连接代表两个会话，但工具的可见域只有当前轮次会话的房间。
+    let rooms = bridge
+        .tool_call(&ticket, &["main".to_owned(), "sib".to_owned()], "list_rooms", json!({}))
+        .expect("能查");
+    let listed: Vec<_> = rooms["rooms"]
+        .as_array()
+        .expect("是数组")
+        .iter()
+        .map(|r| {
+            r["room"]["path"]
+                .as_array()
+                .expect("房间带路径")
+                .iter()
+                .map(|p| p.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    assert_eq!(listed.len(), 1, "只列当前会话的房间：{listed:?}");
+    assert!(listed[0].contains("789"), "是 sib 的房间，不是 main 的：{listed:?}");
+}
+
 /// 记录里的 `columns` 状态表要用布尔，不能是「查了 / 没查」这种描述文字。
 ///
 /// 那是给机器判断用的字段：布尔能直接当条件用，中文值只能让调用方再猜一遍。
@@ -922,10 +1013,15 @@ fn a_room_outside_the_group_is_still_refused() {
 }
 
 #[test]
-fn reading_another_sessions_room_is_allowed_inside_the_group() {
+/// 工具面按会话圈，不按会话组圈（2026-11-01 用户裁定，推翻旧的「组内能读」设计：
+/// 一条连接挂的多个会话是各自独立的大脑——opencode 一个实例带多条独立会话，
+/// 不是同一个大脑的分身，兄弟会话的房间不该出现在自己的可见域里）。
+/// 组外房间照旧拒绝，这条边界原来就有，一并守着。
+#[test]
+fn reading_another_sessions_room_is_refused() {
     let (mut bridge, _sends) = group_bridge(group_config());
 
-    // 助手那个群的流水：主会话这一轮里读得到（「get from」——读可跨到组内别的房间）。
+    // 兄弟会话 helper 的房间先进了流水；主会话被叫醒，领到一轮。
     bridge
         .ingest(message("qq:group/2", "10001", "另一边的消息", false))
         .expect("能记下来");
@@ -939,15 +1035,15 @@ fn reading_another_sessions_room_is_allowed_inside_the_group() {
         .expect("有活")
         .ticket;
 
-    let history = bridge
+    let sibling = bridge
         .tool_call(
             &ticket,
             &group(),
             "get_history",
             json!({"room": "qq:group/2"}),
         )
-        .expect("组内能读");
-    assert_eq!(history["records"].as_array().expect("是数组").len(), 1);
+        .expect_err("兄弟会话的房间也读不到");
+    assert_eq!(sibling.code, ErrorCode::RoomNotSubscribed);
 
     let outside = bridge
         .tool_call(
