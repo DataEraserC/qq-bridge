@@ -371,10 +371,10 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
   }
 
   lines.push("")
-  // 消息太多被截断时，明确告诉模型：还有没投进来的，用 get_history 抓。
+  // 消息太多被截断时，明确告诉模型：截掉的是更早的，最新的都投进来了。
   if (delivery.more) {
     lines.push(
-      `⚠️ 本轮还有 ${delivery.more} 条没投进来（超了投递上限）。用 get_history 抓这个房间最新的 ${delivery.more} 条再看。`
+      `⚠️ 投递超限，更早的 ${delivery.more} 条没投进来（本轮只保留最新的）。需要更早的上下文时用 fetch_records 按编号回看。`
     )
     lines.push("")
   }

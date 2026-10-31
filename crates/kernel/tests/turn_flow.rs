@@ -1866,3 +1866,33 @@ fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
     assert_eq!(acked["watermark"], 5, "自愈把 #4 补确认了，前沿才能到 5");
     bridge.end_turn(&side.ticket, None).expect("能收工");
 }
+
+// ---------------------------------------------------------------------------
+// 投递截断：只丢旧不丢新（2026-10-31 用户裁定）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delivery_truncation_keeps_the_newest_and_drops_the_old() {
+    // 积压 5 条、上限 2 条：投出来的必须是 #4、#5（最新两条），被截掉的是
+    // 更早的 3 条——模型干活要的是最新上下文，把新消息截掉等于把要回的话截掉。
+    let text = format!("delivery_limit = 2\n{}", config());
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let mut bridge = Bridge::new(
+        acb_kernel::Config::parse(&text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder {
+            sends: sends.clone(),
+        }),
+    );
+
+    for i in 1..=5 {
+        bridge
+            .ingest(message("qq:group/123", "10001", &format!("第{i}条"), true))
+            .expect("能记下来");
+    }
+
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    let ids: Vec<u64> = delivery.records.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![4, 5], "截断必须保留最新的两条");
+    assert_eq!(delivery.more, Some(3), "被截掉的是更早的 3 条");
+}

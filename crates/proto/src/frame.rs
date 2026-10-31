@@ -327,6 +327,7 @@ mod tests {
                 model: None,
             }),
             more: None,
+            turn_timeout_ms: None,
         }
     }
 

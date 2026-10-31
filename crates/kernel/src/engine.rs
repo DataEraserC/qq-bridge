@@ -728,6 +728,11 @@ impl<S: Store> Bridge<S> {
     ) -> Result<Vec<Record>, StorageError> {
         let cursor = Cursor::new(session, room.clone());
         let mut records = unread(&self.store, &cursor, MAX_DELIVERY)?;
+        // unread 只取水位之后的前 MAX_DELIVERY 条——那是**最旧**的一段。极端积压时
+        // 不能把最新的挡在外面：只丢旧不丢新，和 open_turn 的投递截断同一个原则。
+        if records.len() > MAX_DELIVERY {
+            records.drain(..records.len() - MAX_DELIVERY);
+        }
         records.retain(|record| record.sender.id != account);
         Ok(records)
     }
@@ -937,18 +942,23 @@ impl<S: Store> Bridge<S> {
                 model: session.model.clone(),
             });
 
-        // 消息过多时不全投：只投前 delivery_limit 条，剩下的让模型用 fetch_records 抓。
+        // 消息过多时不全投。截断只丢**旧**的不丢新的（2026-10-31 用户裁定）——
+        // 模型干活要的是最新上下文，把新消息截掉等于把要回的话截掉；更早的部分
+        // 让模型用 fetch_records 按编号回看（流水里都还在）。
         let limit = self.config.delivery_limit;
-        let total_pending = records.len();
+        let mut dropped = 0usize;
         if limit > 0 && records.len() > limit {
-            records.truncate(limit);
+            dropped = records.len() - limit;
+            records.drain(..dropped);
         }
         // 再按字节卡一道：条数不多但每条很长时，200 条照样能把 `turn_start` 撑过 1 MiB，
         // harness 那边帧就解不开了——表现是「连上了又立刻断」，比截断难查十倍。
+        // 同样只丢旧不丢新：fit_records 从最新一条往前装。
         let keep = fit_records(&records, MAX_DELIVERY_BYTES);
-        records.truncate(keep);
-        // 有截断就把「还有几条」写上，让 harness 提示模型去 fetch_records。
-        let more = (total_pending > records.len()).then(|| total_pending - records.len());
+        dropped += records.len() - keep;
+        records.drain(..records.len() - keep);
+        // 有截断就把「截掉几条更早的」写上，让 harness 提示模型需要时去回看。
+        let more = (dropped > 0).then_some(dropped);
 
         Ok(Delivery {
             ticket,
@@ -2031,15 +2041,19 @@ impl<S: Store> Bridge<S> {
 ///
 /// 从前往后累加，一旦超预算就停在断点上——**顺序不能乱**，投递是按时间读的。
 fn fit_records(records: &[Record], budget: usize) -> usize {
+    // 从最新（尾部）往前装：截断只丢旧不丢新（2026-10-31 用户裁定），跟 open_turn
+    // 的条数截断同一个原则。至少保最新的 1 条——就算它自己超预算，也不能空手开轮。
     let mut used = 0usize;
-    for (index, record) in records.iter().enumerate() {
+    let mut keep = 0usize;
+    for record in records.iter().rev() {
         let size = serde_json::to_vec(record).map(|bytes| bytes.len()).unwrap_or(0);
-        if index > 0 && used + size > budget {
-            return index;
+        if keep > 0 && used + size > budget {
+            break;
         }
         used += size;
+        keep += 1;
     }
-    records.len()
+    keep
 }
 
 /// 「本轮投给你的是哪一段」——错误信息里要能直接照抄的答案。
