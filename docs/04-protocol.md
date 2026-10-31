@@ -12,24 +12,25 @@
 ## 接入点
 
 - 监听地址来自配置的 `[endpoint] listen`，默认只听 `127.0.0.1`，外网连不上。
-- **令牌绑一组设备**：配置里几台设备写同一个 `token`，它们就是一组，由这条连接代表。令牌对不上任何设备就直接断开，不回 `ready`。
-- 一条连接只服务它那一组设备：`poll_turn` 只领这组里的活，不会把别人的轮次领走。
-- **跨设备说话只能走 `send_message_to`**：参数里没有「别的设备 id」这种入口，能发的范围就是这组设备订阅的并集（[ADR-0002](../adr/0002-subscription-model.md)）。
+- **令牌绑一组会话**：配置里几个会话写同一个 `token`，它们就是一组，由这条连接代表。令牌对不上任何会话就直接断开，不回 `ready`。
+- 一条连接只服务它那一组会话：`poll_turn` 只领这组里的活，不会把别人的轮次领走。
+- **跨会话发送已砍**（ADR-0017）：`send_message_to` 能发的范围 = 本会话订阅的房间，越界拒绝；参数里没有「别的会话 id」这种入口。
 - 握手 10 秒内不说话就断；空闲时桥每 100ms 回头看一眼有没有活，所以有活时最迟约 0.1 秒推过去。
 - **断线不丢消息**：连接断在轮次中间，这一轮直接放掉，不确认任何消息——它们还是未读，下一轮重投（[ADR-0010](../adr/0010-ack-watermark.md)）。
-- 同一设备开两条连接不会破坏串行：桥保证一个设备同时只有一轮，第二条连接暂时领不到活。
+- 同一组会话开两条连接不会破坏串行：桥保证一个会话同时只有一轮，第二条连接暂时领不到活。
 
 ## 帧一览
 
 | 帧 | 方向 | 用途 |
 |----|------|------|
 | `hello` | harness → 桥 | 握手：协议版本 + 接入令牌 |
-| `hello` | harness → 桥 | 握手：协议版本 + 接入令牌 |
-| `ready` | 桥 → harness | 握手成功：`devices` = 这条连接代表哪几台设备（配置顺序） |
-| `turn_start` | 桥 → harness | 开一轮：回合票 + 设备 + 记忆 + 房间 + 本次投递的记录 + 开轮原因 |
+| `ready` | 桥 → harness | 握手成功：`sessions` = 这条连接代表哪几个会话（配置顺序）+ `maps` = 已落盘的会话映射（harness 重启后据此复用旧会话，ADR-0018） |
+| `turn_start` | 桥 → harness | 开一轮：回合票 + 会话 + 记忆 + 房间 + 本次投递的记录 + 开轮原因 + 轮次超时 |
 | `turn_end` | harness → 桥 | 本轮收工（可带错误） |
 | `tool_call` | harness → 桥 | 调用工具：票 + 工具名 + 参数 |
 | `tool_result` | 桥 → harness | 工具结果或错误 |
+| `control` | 桥 → harness | 控制指令（如重置会话映射）。桥只转发，语义由 harness 决定（ADR-0018） |
+| `control_result` | harness → 桥 | 控制指令的执行结果 |
 | `log` | 桥 → harness | 给 harness 侧的日志，不影响流程 |
 | `ping` / `pong` | 双向 | 保活 |
 
@@ -52,7 +53,7 @@ sequenceDiagram
 
 - **票是唯一身份**。`tool_call` 必须带本轮的票，票在 `turn_start` 签发、`turn_end` 作废。票不对，调用一律拒绝。
 - 一轮只投一个房间的记录（[ADR-0003](../adr/0003-serial-turns.md)）。
-- 同一份记忆的轮次串行：上一轮 `turn_end` 之前不会有下一轮 `turn_start`（哪怕两台设备共用一份记忆）。
+- 同一会话的轮次串行（串行键 = harness 名 + 会话 id，ADR-0017）：上一轮 `turn_end` 之前不会有下一轮 `turn_start`。不同会话各自并发，记忆不是锁。
 
 ## 一次投递（delivery）
 
@@ -61,11 +62,14 @@ sequenceDiagram
 | 字段 | 含义 |
 |------|------|
 | `ticket` | 本轮的票。之后每个 `tool_call` 都要带上它 |
-| `device` | 这一轮替哪台设备说话 |
-| `memory` | 这台设备的记忆 id。 **harness 按记忆找会话**——两台设备共用一份记忆时，它们本该落在同一个会话里 |
+| `session` | 这一轮替哪个会话干活 |
+| `memories` | 会话引用的记忆列表（id + worktree 路径，惰性 checkout，ADR-0017）。记忆独立成仓库，一个会话可引用多份 |
+| `session_info` | 会话身份：id / name / harness / model（model 为空 = harness 侧自己决定） |
 | `room` | 本轮只涉及这一个房间 |
 | `records` | 投递的记录，可能为空 |
+| `more` | 非 0 表示投递超限、**更早的** N 条没投进来（只丢旧不丢新），需要时用 `fetch_records` 回看 |
 | `reason` | 为什么开这一轮：`wake` / `clock` |
+| `turn_timeout_ms` | 本轮超时（毫秒），来自配置 `turn_timeout_secs`；0 = 关闭超时。到点 harness 应主动打断这轮（如 dsh 的 session/cancel），打断按失败处理走 `on_turn_error` |
 
 ## 记录（record）
 

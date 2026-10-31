@@ -72,7 +72,7 @@ v2 的插件是一个目录：`index.js` 是入口，`acb-wire.mjs` 是协议客
   "plugins": [
     {
       "package": "/path/to/agent-chat-bridge/harnesses/opencode/plugin",
-      "options": { "token": "设备令牌" }
+      "options": { "token": "接入令牌" }
     }
   ]
 }
@@ -83,7 +83,7 @@ v2 的插件是一个目录：`index.js` 是入口，`acb-wire.mjs` 是协议客
 也可以用环境变量，选项优先于环境变量：
 
 ```bash
-export ACB_TOKEN=<设备令牌>         # 和 config.toml 里设备的 token 一致
+export ACB_TOKEN=<接入令牌>         # 和 config.toml 里会话的 token 一致
 export ACB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 ```
 
@@ -105,7 +105,7 @@ export ACB_ENDPOINT=127.0.0.1:7700  # 可选，默认就是这个
 - **工具只在轮次内可用**。没有票的调用一律 `unauthorized`。这样人在 TUI 里手动跟同一个实例
   聊天，也不会把话发到别人的房间里。
 - **失败也回 `turn_end`**。`prompt` 抛错、会话被删、连接断了，都带着错误收工——桥靠
-  `turn_end` 或断连释放设备，不回就一直占着。
+  `turn_end` 或断连释放会话，不回就一直占着。
 - **断线自己重连**，退避 1 秒起、最长 10 秒。桥比 opencode 晚启动也能接上。
 
 ### 写 v2 插件绕不过去的几个坑（都是实测）
@@ -132,7 +132,7 @@ node --test harnesses/opencode/test/wire.test.mjs
 node --test harnesses/opencode/test/plugin.test.mjs
 
 # 3. 对着真桥（不用 opencode）：握手成不成
-node harnesses/opencode/probe.mjs --token <设备令牌>
+node harnesses/opencode/probe.mjs --token <接入令牌>
 
 # 4. 真链路：真 opencode + 真桥 + 真 QQ，模型真的回话（已验，见下）
 ```
@@ -176,7 +176,7 @@ systemctl --user stop oc-test
 
 ## 实测进度（2026-10-29）
 
-**加载 → setup → 握手 → 绑定设备组，四步都验过了。** 启动方式：
+**加载 → setup → 握手 → 绑定会话组，四步都验过了。** 启动方式：
 
 ```bash
 # 项目根的 opencode.jsonc 里 plugins 指向本仓库的 plugin 目录（见 opencode.jsonc.example）
@@ -186,7 +186,7 @@ opencode2 --standalone
 看到这两样就算接上了：
 
 ```
-[acb] info 已接入桥，绑定设备组 main
+[acb] info 已接入桥，绑定会话组 main
 ```
 ```
 ESTAB 127.0.0.1:7700   127.0.0.1:44758  users:(("acb-bridge",pid=17401,fd=7))
@@ -264,7 +264,7 @@ ESTAB 127.0.0.1:44758  127.0.0.1:7700   users:((".opencode2-wrap",pid=169923,fd=
 
 ## 换成 1AgentRouter：卡住的两个真坑（2026-10-29 下午）
 
-想让设备走 `1AgentRouter/gpt-5.6-sol`（本机 `localhost:1100` 的中转），折腾一上午没成，
+想让会话走 `1AgentRouter/gpt-5.6-sol`（本机 `localhost:1100` 的中转），折腾一上午没成，
 下午找出来是**两个和模型本身无关的原因**。
 
 ### 坑一：opencode 只接受 https 的 baseURL（来源：实测）
@@ -331,7 +331,7 @@ cd ~/qqab-scratch/oc-live && script -qec "env -u HTTP_PROXY -u HTTPS_PROXY \
 ```
 
 `opencode.json` 里三块都要有：`model`（默认模型）、`provider.arc`（https 反代地址 + 模型条目
-+ `limit.output`）、`plugins`（指向仓库里的插件目录 + 设备令牌）。
++ `limit.output`）、`plugins`（指向仓库里的插件目录 + 接入令牌）。
 
 不靠 QQ 消息也能验「模型这一环」通不通——拿私有服务的鉴权去直接投一个问题：
 
@@ -372,7 +372,7 @@ curl -u "opencode:$PW" -H 'Content-Type: application/json' \
 - 单条投递最大的一次是 78 条未读（水位落后 + 被 @ 叫醒，一次全给），约 1 万字，也不是常态。
 
 所以「慢」来自上游模型的思考时间叠加会话语料增长。要快要换快模型；
-真要控上下文，是在**设备会话层面**做裁剪/摘要，不是改投递逻辑。
+真要控上下文，是在**会话层面**做裁剪/摘要，不是改投递逻辑。
 
 ## dsh（DeepSeek Harness）这一份（2026-10-29）
 

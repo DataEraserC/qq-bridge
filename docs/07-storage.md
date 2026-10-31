@@ -16,9 +16,9 @@ path = "/var/lib/acb/bridge.db"
 | 表 | 一句话 | 粒度 |
 |---|---|---|
 | `records` | 流水：房间里说过的每一句、发生的每个事件 | 按房间，编号 1、2、3… 各自排 |
-| `watermarks` | 水位：这个设备读到第几条了 | 按「设备 + 房间」 |
-| `acks` | 乱序确认：水位之上、已经确认但前面还有缺口的那几条 | 按「设备 + 房间 + 记录」 |
-| `deliveries` | 投递次数：这条记录投给这个设备几次了（「第 N 次投递」的 N） | 按「设备 + 房间 + 记录」 |
+| `watermarks` | 水位：这个会话读到第几条了 | 按「会话 + 房间」 |
+| `acks` | 乱序确认：水位之上、已经确认但前面还有缺口的那几条 | 按「会话 + 房间 + 记录」 |
+| `deliveries` | 投递次数：这条记录投给这个会话几次了（「第 N 次投递」的 N） | 按「会话 + 房间 + 记录」 |
 | `notes` | 笔记：agent 自己记下的备忘 | 按房间 + 种类 + 键 |
 | `feedback` | 反馈：agent 写的「哪里卡住了」，同指纹合并、次数累加 | 按条，自带会话/房间/现场 |
 | `meta` | 结构版本号 | 一个键值对 |
@@ -39,15 +39,15 @@ erDiagram
         text platform_id
     }
     watermarks {
-        text device
+        text session
         integer watermark
     }
     acks {
-        text device
+        text session
         integer record_id
     }
     deliveries {
-        text device
+        text session
         integer record_id
         integer times
     }
@@ -88,7 +88,7 @@ max_age_days = 90             # 记录最多留多少天
 
 | 判据 | 意思 |
 |---|---|
-| `record_id < 安全线` | 安全线 = 这个房间所有**在册**订阅者水位的最小值。有一个设备没读到，这个房间这次就一条都不删 |
+| `record_id < 安全线` | 安全线 = 这个房间所有**在册**订阅者水位的最小值。有一个会话没读到，这个房间这次就一条都不删 |
 | 不在最新 N 条里 | N = `max_records_per_room` |
 | `at` 早于时间线 | 时间线 = 现在 − `max_age_days` 天 |
 
@@ -98,7 +98,7 @@ max_age_days = 90             # 记录最多留多少天
 
 - **每个房间至少留一条**。不是留念，是编号基准：编号靠 `MAX(record_id)+1` 往推，全删光了下一个又回到 1，而水位还停在几百——新消息会被当成已读，直接消失（`MIN_KEPT`）。
 - **没人订阅的房间不清**。「谁读过」这个判据只对在册订阅者成立，人删了订阅，这个房间的账就不归这里管了。
-- **设备从配置里删掉之后，它的水位不再挡清理**。曾经读过的记录可以删；那个设备以后再加回来，中间那段它是看不到的。
+- **会话从配置里删掉之后，它的水位不再挡清理**。曾经读过的记录可以删；那个会话以后再加回来，中间那段它是看不到的。
 - 清理**不影响编号**：删了 1..1200，下一句仍然是 5001。
 - `get_history` 只能翻到清理剩下的部分。翻不到不代表没发生过，只代表太旧了。
 
@@ -137,11 +137,11 @@ EOF
 python3 - <<'EOF'
 import sqlite3
 con = sqlite3.connect("state/acb.db")
-room, device = "private/323622442", "main"
-water = con.execute("select watermark from watermarks where device=? and connection='qq' and room_key=?", (device, room)).fetchone()
+room, session = "private/323622442", "main"
+water = con.execute("select watermark from watermarks where session=? and connection='qq' and room_key=?", (session, room)).fetchone()
 water = water[0] if water else 0
 n = con.execute("select count(*) from records where connection='qq' and room_key=? and record_id>?", (room, water)).fetchone()[0]
-print(f"{device} 在 {room} 的未读：{n} 条（水位 {water}）")
+print(f"{session} 在 {room} 的未读：{n} 条（水位 {water}）")
 EOF
 ```
 
