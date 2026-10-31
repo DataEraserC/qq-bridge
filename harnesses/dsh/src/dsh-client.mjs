@@ -152,6 +152,10 @@ const METHOD_ARG_WRAPPERS = {
   "session/cancel": "request",
   "session/selectModel": "request",
   "session/follow": "request",
+  // workspace 系（ensureWorkspaceTitle 用）：不包装会被 dsh 报 gateway/arguments-invalid。
+  "workspace/create": "request",
+  "workspace/rename": "request",
+  "workspace/delete": "request",
 }
 
 function endpointOf(method) {
