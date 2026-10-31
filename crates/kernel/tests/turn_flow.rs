@@ -1720,3 +1720,149 @@ fn 没配文件中继时本机路径原样透传() {
         "没配 [file_relay] 就不碰路径——行为跟没有这个功能时完全一样"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 多订阅者下的水位（2026-10-31 真机事故回归）
+// ---------------------------------------------------------------------------
+
+const TWO_SESSION_CONFIG: &str = r#"
+    [[connections]]
+    id = "qq"
+    platform = "qq"
+    kind = "onebot11"
+    url = "ws://127.0.0.1:3001"
+    account = "bot"
+
+    [[personas]]
+    id = "p"
+    name = "人格"
+    text = "你是桥。"
+
+    [[harnesses]]
+    id = "dsh"
+    name = "DeepSeek"
+
+    [[sessions]]
+    id = "main"
+    harness = "dsh"
+    persona = "p"
+    token = "t-main"
+
+    [[sessions.subscriptions]]
+    connection = "qq"
+    room = "group/123"
+
+    [sessions.subscriptions.wake]
+    poke = true
+
+    [[sessions]]
+    id = "side"
+    harness = "dsh"
+    persona = "p"
+    token = "t-side"
+
+    [[sessions.subscriptions]]
+    connection = "qq"
+    room = "group/123"
+
+    [sessions.subscriptions.wake]
+    poke = true
+"#;
+
+#[test]
+fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
+    // 两个会话订同一个群。修复前：main 发的回复只在 main 的水位上确认，
+    // side 的水位上永远留一个洞——水位只推连续前沿，洞后面的消息在 side
+    // 那边就永远算未读，表现为「同一批积压戳一次投一遍」（2026-10-31 真机）。
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let mut bridge = Bridge::new(
+        acb_kernel::Config::parse(TWO_SESSION_CONFIG).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder {
+            sends: sends.clone(),
+        }),
+    );
+
+    // 1. 戳一下，两个会话都醒；各开一轮把 #1 确认掉，两边的水位都到 1。
+    bridge.ingest(poke("qq:group/123", true)).expect("能记下来");
+    let first = bridge.poll_turn().expect("能开轮").expect("有活");
+    assert_eq!(first.session, "main");
+    bridge
+        .tool_call(&first.ticket, &["main".to_owned()], "ack_messages", json!({"ids": [1]}))
+        .expect("能确认");
+    bridge.end_turn(&first.ticket, None).expect("能收工");
+    let second = bridge.poll_turn().expect("能开轮").expect("有活");
+    assert_eq!(second.session, "side");
+    bridge
+        .tool_call(&second.ticket, &["side".to_owned()], "ack_messages", json!({"ids": [1]}))
+        .expect("能确认");
+    bridge.end_turn(&second.ticket, None).expect("能收工");
+
+    // 2. main 再被戳醒，回了一句话（#3，自己发的）。
+    bridge.ingest(poke("qq:group/123", true)).expect("能记下来");
+    let turn = bridge.poll_turn().expect("能开轮").expect("有活");
+    assert_eq!(turn.session, "main");
+    bridge
+        .tool_call(
+            &turn.ticket,
+            &["main".to_owned()],
+            "send_message",
+            json!({"elements": [{"type": "text", "text": "在"}]}),
+        )
+        .expect("能发");
+    // #3 是自己发的，deliver_out 已替所有订阅者确认；模型只需确认收到的 #2。
+    let acked = bridge
+        .tool_call(&turn.ticket, &["main".to_owned()], "ack_messages", json!({"ids": [2]}))
+        .expect("能确认");
+    assert_eq!(acked["watermark"], 3);
+    bridge.end_turn(&turn.ticket, None).expect("能收工");
+
+    // 3. side 开轮：#3 已经在 side 的账上确认过了（只是 #2 还没轮到它开轮）。
+    //    所以投递里只有 #2，而且确认 #2 之后水位能直接迈过 #3。
+    let side = bridge.poll_turn().expect("能开轮").expect("side 还挂着一次唤醒");
+    assert_eq!(side.session, "side");
+    assert_eq!(
+        side.records.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![2],
+        "side 只欠 #2；自己人的 #3 不该出现"
+    );
+    let acked = bridge
+        .tool_call(&side.ticket, &["side".to_owned()], "ack_messages", json!({"ids": [2]}))
+        .expect("能确认");
+    assert_eq!(
+        acked["watermark"], 3,
+        "确认 #2 后前沿要能跳过已确认的 #3——否则 #3 就是永久洞"
+    );
+    bridge.end_turn(&side.ticket, None).expect("能收工");
+
+    // 4. 自愈：旧版本留下的洞（自己发的记录停在水位上），下次开轮自动补掉，
+    //    不用手工修库。
+    bridge
+        .store_mut()
+        .append(RecordDraft::message(
+            room_of("qq:group/123"),
+            Sender {
+                id: "bot".to_owned(),
+                name: "bot".to_owned(),
+                role: None,
+            },
+            AT,
+            vec![Element::text("历史版本留下的洞")],
+            false,
+        ))
+        .expect("能记下来");
+    bridge.ingest(poke("qq:group/123", true)).expect("能记下来");
+    let main = bridge.poll_turn().expect("能开轮").expect("有活");
+    bridge.end_turn(&main.ticket, None).expect("能收工");
+    let side = bridge.poll_turn().expect("能开轮").expect("side 有活");
+    assert_eq!(
+        side.records.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![5],
+        "只有新戳的 #5；#4 是自己发的，自愈时已确认"
+    );
+    let acked = bridge
+        .tool_call(&side.ticket, &["side".to_owned()], "ack_messages", json!({"ids": [5]}))
+        .expect("能确认");
+    assert_eq!(acked["watermark"], 5, "自愈把 #4 补确认了，前沿才能到 5");
+    bridge.end_turn(&side.ticket, None).expect("能收工");
+}

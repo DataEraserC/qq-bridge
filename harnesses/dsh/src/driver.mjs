@@ -27,7 +27,7 @@
 //   ACB_MCP_PORT  设了就起 streamable-http MCP（常驻模式）；不设走 stdio（兼容/测试）
 //   DSH_BASE_URL  dsh webui 地址，默认 http://127.0.0.1:3080
 //   DSH_TOKEN     dsh 启动 token（可选，没有就走离线铸造 Cookie）
-//   ACB_CWD       会话工作目录：dsh 按它把会话归进某个 workspace（Workspaces 分组）
+//   ACB_CWD       会话工作目录：先按它 workspace/create 拿 id，再把会话挂进去（Workspaces 分组）
 //   ACB_WORKSPACE_TITLE  新建 workspace 时给它起的显示标题（默认「ACB」）
 
 import { BridgeLink, BridgeError, normalizeToolArgs, renderTurn } from "../../opencode/plugin/acb-wire.mjs"
@@ -48,7 +48,7 @@ function readConfig() {
     harness: process.env.ACB_HARNESS?.trim() || "",
     dshBaseUrl: process.env.DSH_BASE_URL?.trim() || "http://127.0.0.1:3080",
     dshToken: process.env.DSH_TOKEN?.trim() || "",
-    // 会话的工作目录：dsh 按它把会话归到某个 workspace（分组）。留空就不分组。
+    // 会话的工作目录：先 workspace/create 拿 id，建会话时挂进去（归组）。留空就不分组。
     cwd: process.env.ACB_CWD?.trim() || "",
     // dsh workspace 标题（新建 workspace 时命名，如「QQ 聊天」）。留空不命名。
     workspaceTitle: process.env.ACB_WORKSPACE_TITLE?.trim() || "",
@@ -179,8 +179,6 @@ class TurnDriver {
     this.sessions = new Map()
     // 重置代次：reset 过的会话换新 id（-r<代次>），避开同 id + 不同 cwd 的冲突。
     this.generations = new Map()
-    // 已经探过 workspace 归属的 cwd（每个只发一次 workspace/create）。
-    this.workspaceEnsured = new Set()
     this.chain = Promise.resolve()
   }
 
@@ -312,11 +310,26 @@ class TurnDriver {
     const cached = this.sessions.get(session)
     if (cached) return cached
     const fixed = this.#fixedSessionId(session)
+    // 先把 workspace 备好、拿到 id，再建会话——**光传 cwd 不会归组**，dsh 只把它
+    // 当工作目录，GUI 里照样「未分组」（2026-10-31 真机踩过）。旧版 bridge.js 的
+    // 顺序就是 workspace/create → sessions.create({ workspaceId })。
+    let workspaceId = null
+    if (this.cwd) {
+      try {
+        const ws = await this.dsh.ensureWorkspaceTitle(this.cwd, this.workspaceTitle)
+        workspaceId = ws.workspaceId
+        if (ws.created) this.log("info", `dsh workspace ${this.cwd} 新建并命名为「${this.workspaceTitle}」`)
+      } catch (error) {
+        // workspace 备不出来不挡开轮：会话照建，只是 GUI 里没分组。
+        this.log("warn", `备 dsh workspace 失败（会话照建，只是不归组）：${error?.message ?? error}`)
+      }
+    }
     let sessionId
     try {
       sessionId = await this.dsh.createSession({
         sessionId: fixed,
         ...(this.cwd ? { cwd: this.cwd } : {}),
+        ...(workspaceId ? { workspaceId } : {}),
         ...(this.preset ? { agentPreset: this.preset } : {}),
       })
     } catch (error) {
@@ -329,6 +342,7 @@ class TurnDriver {
         sessionId = await this.dsh.createSession({
           sessionId: fallback,
           ...(this.cwd ? { cwd: this.cwd } : {}),
+          ...(workspaceId ? { workspaceId } : {}),
           ...(this.preset ? { agentPreset: this.preset } : {}),
         })
       } else {
@@ -337,20 +351,6 @@ class TurnDriver {
     }
     this.sessions.set(session, sessionId)
     this.log("info", `dsh 会话 ${sessionId}（${fixed}${this.cwd ? `，归组 ${this.cwd}` : ""}${this.preset ? `，preset ${this.preset}` : ""}）`)
-    // workspace 标题：best-effort，失败不影响开轮。每个 cwd 只探一次（workspace/create
-    // 对已存在的路径虽然无害，但没必要每次建会话都发）；且只在 workspace 是这次新建
-    // 的时候命名，不覆盖已有的（可能是用户手改过的）标题。
-    if (this.cwd && this.workspaceTitle && !this.workspaceEnsured.has(this.cwd)) {
-      this.workspaceEnsured.add(this.cwd)
-      try {
-        const named = await this.dsh.ensureWorkspaceTitle(this.cwd, this.workspaceTitle)
-        if (named?.created) this.log("info", `dsh workspace ${this.cwd} 命名为「${this.workspaceTitle}」`)
-      } catch (error) {
-        // 探过但失败：从集合里放出来，下轮再试一次。
-        this.workspaceEnsured.delete(this.cwd)
-        this.log("warn", `给 dsh workspace 命名失败（不影响会话）：${error?.message ?? error}`)
-      }
-    }
     // 建好会话就把映射回报给桥，让控制台能查到「acb 会话 ↔ dsh 会话」的对应关系。
     // 用 report_map 指令，result 里带 session_id + meta（这里放固定 id 和分组）。
     if (link) {
@@ -363,6 +363,7 @@ class TurnDriver {
           meta: {
             fixed_id: fixed,
             cwd: this.cwd || null,
+            workspace_id: workspaceId,
           },
         },
       })

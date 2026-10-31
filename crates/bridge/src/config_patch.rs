@@ -27,7 +27,8 @@ pub fn apply_patch(text: &str, ops: &[serde_json::Value]) -> Result<(String, Vec
             "harness" => harness_op(&mut doc, op, &mut changes),
             "connection" => connection_op(&mut doc, op, &mut changes),
             "global" => global_op(&mut doc, op, &mut changes),
-            other => Err(format!("不认识的 op 类型「{other}」（能用的：session / subscription / persona / memory / harness / connection / global）")),
+            "delete" => delete_op(&mut doc, op, &mut changes),
+            other => Err(format!("不认识的 op 类型「{other}」（能用的：session / subscription / persona / memory / harness / connection / global / delete）")),
         }
         .map_err(|error| format!("{where_}：{error}"))?;
     }
@@ -507,6 +508,38 @@ fn upsert_named_table(
     Ok(())
 }
 
+/// 删除一个具名条目：`{"op":"delete","section":"session|persona|memory|harness|connection","id":"..."}`。
+///
+/// 删完留下的悬空引用（比如删了人格还有会话指着它）不在这里查——落盘前
+/// console 会用完整配置校验兜住，报错和手改 TOML 写错是一样的体验。
+fn delete_op(
+    doc: &mut DocumentMut,
+    op: &serde_json::Value,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    let id = string_field(op, "id")?;
+    let section = string_field(op, "section")?;
+    let array_key = match section.as_str() {
+        "connection" => "connections",
+        "persona" => "personas",
+        "memory" => "memories",
+        "harness" => "harnesses",
+        "session" => "sessions",
+        other => return Err(format!("不认识的 section「{other}」")),
+    };
+    let array = doc
+        .get_mut(array_key)
+        .and_then(Item::as_array_of_tables_mut)
+        .ok_or(format!("配置里没有 [[{array_key}]] 段，删不了"))?;
+    let position = array
+        .iter()
+        .position(|t| t.get("id").and_then(Item::as_str) == Some(id.as_str()))
+        .ok_or(format!("{array_key} 里没有 id 为「{id}」的条目"))?;
+    array.remove(position);
+    changes.push(format!("{array_key}/{id}：删除"));
+    Ok(())
+}
+
 fn string_field(op: &serde_json::Value, key: &str) -> Result<String, String> {
     op.get(key)
         .and_then(serde_json::Value::as_str)
@@ -605,8 +638,30 @@ keywords = ["喂"]
     }
 
     #[test]
-    fn wake_patch_keeps_comments_and_only_touched_keys() {
+    fn delete_removes_entry_and_keeps_the_rest() {
         let text = base();
+        let ops = parse_ops(serde_json::json!([
+            {"op": "delete", "section": "persona", "id": "p"},
+            {"op": "delete", "section": "session", "id": "main"},
+            {"op": "delete", "section": "connection", "id": "qq"}
+        ]));
+        let (new_text, changes) = super::apply_patch(&text, &ops).expect("补丁能打");
+        assert_eq!(changes.len(), 3);
+        assert!(!new_text.contains("[[personas]]"));
+        assert!(!new_text.contains("[[sessions]]"));
+        assert!(!new_text.contains("[[connections]]"));
+        // 没删的还在。注释挂在被删表的 decor 上会跟着走（toml_edit 语义），
+        // 注释保留由 wake_patch 测试单独覆盖。
+        assert!(new_text.contains("[[harnesses]]"));
+        // 删成不存在的 id 要报错，而不是静默成功。
+        let ops = parse_ops(serde_json::json!([
+            {"op": "delete", "section": "persona", "id": "nope"}
+        ]));
+        assert!(super::apply_patch(&text, &ops).is_err());
+    }
+
+    #[test]
+    fn wake_patch_keeps_comments_and_only_touched_keys() {        let text = base();
         let ops = parse_ops(serde_json::json!([
             {"op": "subscription", "session": "main", "room": "qq:group/123",
              "wake": {"keywords": ["喂", "在吗"], "accumulate": 10}}

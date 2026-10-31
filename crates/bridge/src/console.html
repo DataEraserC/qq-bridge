@@ -5,8 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>acb-bridge 控制台</title>
 <style>
-  :root { --bg:#14161a; --panel:#1e2127; --line:#33373f; --text:#d8dce3; --dim:#8b919c; --accent:#4f9cf9; --ok:#59c37f; --warn:#e0a33e; --err:#e06c6c; }
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1e2127; --line:#33373f; --text:#d8dce3; --dim:#8b919c; --accent:#4f9cf9; --ok:#59c37f; --warn:#e0a33e; --err:#e06c6c; }
   * { box-sizing:border-box; }
+  /* 输入控件统一暗色：弹窗表单里的 input/select 不写这条会走浏览器默认白底，夜间刺眼。 */
+  input, select, textarea { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; font:inherit; padding:4px 8px; }
+  input:focus, select:focus, textarea:focus { outline:1px solid var(--accent); }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
   header { display:flex; align-items:center; gap:12px; padding:10px 18px; border-bottom:1px solid var(--line); background:var(--panel); }
   header h1 { font-size:16px; margin:0; font-weight:600; }
@@ -217,7 +220,7 @@ async function loadConfig() {
     <td>${esc(k.id)}</td><td>${esc(k.platform)}/${esc(k.kind)}</td><td class="wrap">${esc(k.url)}</td>
     <td>${k.token === null ? '<span class="muted">无</span>' : secret(k.token)}</td>
     <td>${esc(k.account)}</td><td>${esc(k.allow_destructive)}</td>
-    <td><button class="mini" onclick="editConnection('${esc(k.id)}')">编辑</button></td></tr>`).join("");
+    <td><button class="mini" onclick="editConnection('${esc(k.id)}')">编辑</button><button class="mini danger" onclick="delEntry('connection','${esc(k.id)}')">删</button></td></tr>`).join("");
   const sessRows = (c.sessions||[]).map((s) => `<tr>
     <td>${esc(s.id)}${s.name && s.name !== s.id ? '<br><span class="muted">' + esc(s.name) + "</span>" : ""}</td>
     <td>${esc(s.harness)}</td><td>${esc(s.persona || "—")}</td>
@@ -226,14 +229,15 @@ async function loadConfig() {
       + `<button class="mini" onclick="editWake('${esc(s.id)}',${i})">唤醒</button><button class="mini danger" onclick="delSub('${esc(s.id)}',${i})">删</button>`
     ).join("<hr style='border:none;border-top:1px solid var(--line);margin:6px 0'>") || "无"}
     <button class="mini" onclick="addSub('${esc(s.id)}')">+ 订阅</button>
-    <button class="mini" onclick="editSession('${esc(s.id)}')">会话信息</button></td></tr>`).join("");
+    <button class="mini" onclick="editSession('${esc(s.id)}')">会话信息</button>
+    <button class="mini danger" onclick="delEntry('session','${esc(s.id)}')">删会话</button></td></tr>`).join("");
   $("#config").innerHTML = `
   <div class="card"><h2>连接（一个账号一条）<span class="hint">改了要重启桥</span><button class="mini" onclick="addConnection()" style="float:right">+ 新连接</button></h2><table>
     <tr><th>id</th><th>平台</th><th>地址</th><th>令牌</th><th>账号</th><th>破坏性放行</th><th></th></tr>${connRows}</table></div>
   <div class="card"><h2>harness 会话<button class="mini" onclick="addSession()" style="float:right">+ 新会话</button></h2><table>
     <tr><th>id</th><th>harness</th><th>人格</th><th>接入令牌</th><th>订阅与唤醒</th></tr>${sessRows}</table></div>
-  <div class="card"><h2>人格<button class="mini" onclick="addPersona()" style="float:right">+ 新人格</button></h2>${(c.personas||[]).map((p) => `<div class="kv"><div class="k">${esc(p.id)}（${esc(p.name)}）<button class="mini" onclick="editPersona('${esc(p.id)}')">编辑</button></div><pre>${esc(p.text)}</pre></div>`).join("") || '<p class="empty">无</p>'}</div>
-  <div class="card"><h2>记忆<button class="mini" onclick="addMemory()" style="float:right">+ 新记忆仓库</button></h2>${(c.memories||[]).map((m) => `<div class="kv"><div class="k">${esc(m.id)}（${esc(m.name)}）<button class="mini" onclick="editMemory('${esc(m.id)}')">编辑</button></div><div>${esc(m.kind)} @ <span class="wrap">${esc(m.location)}</span></div></div>`).join("") || '<p class="empty">无</p>'}</div>
+  <div class="card"><h2>人格<button class="mini" onclick="addPersona()" style="float:right">+ 新人格</button></h2>${(c.personas||[]).map((p) => `<div class="kv"><div class="k">${esc(p.id)}（${esc(p.name)}）<button class="mini" onclick="editPersona('${esc(p.id)}')">编辑</button><button class="mini danger" onclick="delEntry('persona','${esc(p.id)}')">删</button></div><pre>${esc(p.text)}</pre></div>`).join("") || '<p class="empty">无</p>'}</div>
+  <div class="card"><h2>记忆<button class="mini" onclick="addMemory()" style="float:right">+ 新记忆仓库</button></h2>${(c.memories||[]).map((m) => `<div class="kv"><div class="k">${esc(m.id)}（${esc(m.name)}）<button class="mini" onclick="editMemory('${esc(m.id)}')">编辑</button><button class="mini danger" onclick="delEntry('memory','${esc(m.id)}')">删</button></div><div>${esc(m.kind)} @ <span class="wrap">${esc(m.location)}</span></div></div>`).join("") || '<p class="empty">无</p>'}</div>
   <div class="card"><h2>文件中继</h2>${c.file_relay ? `<div class="kv">
     <div class="k">mode</div><div>${esc(c.file_relay.mode)}</div>
     <div class="k">listen</div><div>${esc(c.file_relay.listen)}</div>
@@ -333,6 +337,12 @@ async function submitPatch(ops) {
     alert(e.message);
     return false;
   }
+}
+
+/** 删除一个具名条目（连接/会话/人格/记忆）。引用完整性由保存时的整体校验兜住。 */
+async function delEntry(section, id) {
+  if (!confirm(`确定删除 ${section}「${id}」？\n保存后按轮次边界热生效；配置文件同目录会留 .bak 备份。`)) return;
+  await submitPatch([{ op: "delete", section, id }]);
 }
 
 function closeModal() {

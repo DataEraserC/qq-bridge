@@ -881,6 +881,7 @@ impl<S: Store> Bridge<S> {
 
     fn open_turn(&mut self, pending: Pending) -> Result<Delivery, BridgeError> {
         let account = self.config.account_of_room(&pending.room);
+        self.heal_own_holes(&pending.session, &pending.room, &account)?;
         let mut records = self.pending_records(&pending.session, &pending.room, &account)?;
         // 引用里的平台编号翻成本房间编号，跟平台编号并排放（ADR-0024）。
         self.fill_quote_refs(&pending.room, &mut records);
@@ -961,6 +962,32 @@ impl<S: Store> Bridge<S> {
         })
     }
 
+    /// 开轮前自愈：把水位之上「本连接账号自己发的」记录确认掉。
+    ///
+    /// 自己发的消息不算未读（投递时会被过滤），但水位只推连续前沿——这些记录
+    /// 如果停在水位之上，就是前沿迈不过去的洞，洞后面的真消息会被反复重投。
+    /// 历史上 deliver_out 只确认发送者自己的会话（2026-10-31 修），留下的旧洞
+    /// 也靠这里在下次开轮时自动补上，不用手工修库。
+    fn heal_own_holes(&mut self, session: &str, room: &RoomId, account: &str) -> Result<(), BridgeError> {
+        if account.is_empty() {
+            return Ok(());
+        }
+        let cursor = Cursor::new(session, room.clone());
+        let watermark = self.store.watermark(&cursor)?;
+        let own: Vec<u64> = self
+            .store
+            .since(room, watermark, usize::MAX)?
+            .into_iter()
+            .filter(|record| record.sender.id == account)
+            .map(|record| record.id as u64)
+            .collect();
+        if own.is_empty() {
+            return Ok(());
+        }
+        self.store.ack(&cursor, &own)?;
+        Ok(())
+    }
+
     /// 会话引用的记忆列表（id + worktree 路径）。worktree 惰性 checkout，失败这一轮就
     /// 开不成——记忆配错了要早点暴露，别让 harness 拿到一个碰不了的路径。
     fn session_memories(&self, session: &str) -> Vec<MemoryInfo> {
@@ -986,7 +1013,7 @@ impl<S: Store> Bridge<S> {
 
     fn deliver_out(
         &mut self,
-        session: &str,
+        _session: &str,
         room: &RoomId,
         mut elements: Vec<Element>,
     ) -> Result<Value, ToolError> {
@@ -1046,8 +1073,16 @@ impl<S: Store> Bridge<S> {
             .map_err(internal)?;
 
         // 自己说的话不是未读：写进流水的同时确认掉。
-        let cursor = Cursor::new(session, room.clone());
-        let watermark = self.store.ack(&cursor, &[record.id]).map_err(internal)?;
+        //
+        // 必须给**所有订阅这个房间的会话**都确认，不能只确认发消息的这个会话。
+        // 血的教训（2026-10-31 真机）：一个群被两个会话订阅时（dsh 和 dsh-group2），
+        // A 会话发的消息只在 A 的水位上确认掉，B 的水位上永远留一个洞——而水位
+        // 只推连续前沿，洞后面的消息就永远算未读，表现为「同一批积压反复重投」。
+        let mut watermark = 0;
+        for subscriber in self.subscribers_of(room) {
+            let cursor = Cursor::new(subscriber.session, room.clone());
+            watermark = self.store.ack(&cursor, &[record.id]).map_err(internal)?;
+        }
 
         // 回执要「像回执」：ok 摆在第一位，发出去了才给 platform_id / at。
         // 失败时这个函数直接返回 Err（调用方拿到的是 error），绝不会出现

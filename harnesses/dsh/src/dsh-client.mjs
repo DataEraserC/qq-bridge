@@ -337,15 +337,19 @@ export class DshClient {
    * 建（或复用）一个会话，返回 sessionId。
    * - sessionId：显式命名。传了就用它复用/创建（dsh 的 claim 逻辑：同名同 cwd 直接复用），
    *   不传就由 dsh 造一个 `session-<uuid>`。持久化靠这个固定 id。
-   * - cwd：会话的工作目录，决定它归到 dsh 的哪个 workspace（分组）。dsh 会先 mkdir 这个目录。
-   *   复用 named 会话时 cwd 必须和首次一致，否则报 cwd 冲突。
+   * - cwd：会话的工作目录。dsh 会先 mkdir 这个目录。复用 named 会话时 cwd 必须
+   *   和首次一致，否则报 cwd 冲突。
+   * - workspaceId：把会话挂进哪个 workspace（分组）。**光传 cwd 不会归组**——
+   *   dsh 只把它当工作目录，GUI 里照样「未分组」（2026-10-31 真机踩过）；
+   *   要归组必须先 workspace/create 拿 id，再把它传进来（旧版 bridge.js 同款）。
    * - agentPreset：dsh 的 agent preset id（config.id）。每个 acb 会话一个 preset，每个
    *   preset 只挂它自己的 MCP，模型就只会看到那一套工具（ADR-0019）。
    */
-  async createSession({ sessionId, cwd, agentPreset } = {}) {
+  async createSession({ sessionId, cwd, workspaceId, agentPreset } = {}) {
     const result = await this.callUnary("session/create", {
       ...(sessionId === undefined ? {} : { sessionId }),
       ...(cwd === undefined ? {} : { cwd }),
+      ...(workspaceId === undefined ? {} : { workspaceId }),
       ...(agentPreset === undefined ? {} : { agentPreset }),
     })
     if (!result.sessionId) {
