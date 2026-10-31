@@ -363,7 +363,7 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
     }
     const tail = marks.length ? `（${marks.join("、")}）` : ""
     lines.push(`#${record.id} ${when} ${who}(${record.sender.id})${tail}`)
-    lines.push(`  ${renderElements(record.elements ?? [], { quoteRef: record.quote_ref })}`)
+    lines.push(`  ${renderElements(deliverableElements(record), { quoteRef: record.quote_ref })}`)
     // 桥的旁白不是对方说的话，单独一行，绝不拼进上面那行内容里。
     if (record.note) {
       lines.push(`  ※ ${record.note}`)
@@ -380,6 +380,29 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
   }
   lines.push("回这个房间用 send_message；确认处理完了用 ack_messages 带上这些编号。")
   return lines.join("\n")
+}
+
+/**
+ * 这条记录里「该进上下文」的元素。
+ *
+ * **消息**里的 opaque（合并转发、卡片、embed）照旧原样摊开——「桥不解释」
+ * 不等于「模型看不见」（ADR-0004）。
+ * **事件**里的 opaque 是未解析事件的原始载荷（无解析实现的降级存法，
+ * ADR-0004 补充裁定 2026-10-31）：不在投递里摊开——事件载荷动辄几十个字段，
+ * 塞上下文纯烧 token，绝大多数轮次根本用不上。投递只给流水编号，agent
+ * 真想看细节时用 fetch_records 按编号拉完整记录。
+ */
+function deliverableElements(record) {
+  const elements = record.elements ?? []
+  if (record.kind?.kind !== "event") return elements
+  return elements.map((element) =>
+    element.type === "opaque"
+      ? {
+          type: "text",
+          text: `[未解析的平台事件，原始载荷已存流水，想看用 fetch_records 查 #${record.id}]`,
+        }
+      : element,
+  )
 }
 
 /** 桥给的发送者身份 → 中文标签。判不出（空/不认识）返回空串。 */

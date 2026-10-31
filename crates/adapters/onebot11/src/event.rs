@@ -145,13 +145,26 @@ fn notice(
     }
 
     // 其它通知（进退群、禁言、撤回……）也是房间里发生的事，记一条可读的。
-    let body = describe_notice(notice_type, event);
+    // 认得的事件给模板人话；不认得的（无解析实现）降级：文本只给类型名，
+    // 原始事件 JSON 装进 Opaque 一并存流水。投递时渲染层不给载荷、只给流水
+    // 编号，agent 想看细节用 fetch_records 按编号拉（ADR-0004 补充裁定）。
+    let mut elements = Vec::new();
+    match describe_notice(notice_type, event) {
+        Some(body) => elements.push(Element::text(body)),
+        None => {
+            elements.push(Element::text(format!("[{notice_type}]（未解析事件）")));
+            elements.push(Element::Opaque {
+                platform: "qq".to_owned(),
+                payload: event.clone(),
+            });
+        }
+    }
     Ok(Parsed::Record(RecordDraft::event(
         room,
         sender,
         at,
         notice_type,
-        vec![Element::text(body)],
+        elements,
         false,
     )))
 }
@@ -239,24 +252,25 @@ fn role_of(event: &Value) -> Option<SenderRole> {
     }
 }
 
-fn describe_notice(notice_type: &str, event: &Value) -> String {
+/// 认得的通知事件给一句人话；不认得的返回 `None`——调用方降级存原始载荷。
+fn describe_notice(notice_type: &str, event: &Value) -> Option<String> {
     let operator = id_of(event.get("operator_id"));
     let target = id_of(event.get("target_id"));
     match notice_type {
-        "group_increase" => format!("[{notice_type}] {target} 加入"),
-        "group_decrease" => format!("[{notice_type}] {target} 离开"),
+        "group_increase" => Some(format!("[{notice_type}] {target} 加入")),
+        "group_decrease" => Some(format!("[{notice_type}] {target} 离开")),
         "group_ban" => {
             let duration = event
                 .get("duration")
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
-            format!("[{notice_type}] {target} 被 {operator} 禁言 {duration} 秒")
+            Some(format!("[{notice_type}] {target} 被 {operator} 禁言 {duration} 秒"))
         }
         "group_recall" | "friend_recall" => {
-            format!("[{notice_type}] {operator} 撤回了一条消息")
+            Some(format!("[{notice_type}] {operator} 撤回了一条消息"))
         }
-        "group_admin" => format!("[{notice_type}] {target} 的管理员身份变了"),
-        other => format!("[{other}] {target}"),
+        "group_admin" => Some(format!("[{notice_type}] {target} 的管理员身份变了")),
+        _ => None,
     }
 }
 
@@ -431,6 +445,55 @@ mod tests {
                 event: "group_increase".into()
             }
         );
+        assert!(matches!(draft.elements[0], Element::Text { .. }));
+    }
+
+    /// 没有解析实现的事件：降级存原始 JSON（ADR-0004 补充裁定 2026-10-31）。
+    /// 文本只给类型名，载荷整个进 Opaque——流水里一条不丢。
+    #[test]
+    fn unrecognized_notices_keep_the_raw_event_in_an_opaque_element() {
+        let event = json!({
+            "post_type": "notice",
+            "notice_type": "group_msg_emoji_like",
+            "self_id": 999,
+            "group_id": 456,
+            "user_id": 10001,
+            "message_id": 592852179,
+            "emoji_id": "5"
+        });
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
+            panic!("不认识的事件也要记，只是不解析");
+        };
+        assert_eq!(draft.elements.len(), 2, "类型名一行 + 原始载荷一段");
+        assert_eq!(
+            draft.elements[0],
+            Element::text("[group_msg_emoji_like]（未解析事件）")
+        );
+        match &draft.elements[1] {
+            Element::Opaque { platform, payload } => {
+                assert_eq!(platform, "qq");
+                assert_eq!(payload["notice_type"], "group_msg_emoji_like");
+                assert_eq!(payload["emoji_id"], "5", "载荷要原样，一个字段都不能丢");
+            }
+            other => panic!("第二段应当是 Opaque 原始载荷：{other:?}"),
+        }
+    }
+
+    /// 认得的事件不附带原始载荷——有解析实现就不必浪费字节。
+    #[test]
+    fn recognized_notices_do_not_carry_raw_payload() {
+        let event = json!({
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "self_id": 999,
+            "group_id": 456,
+            "user_id": 10001,
+            "target_id": 10002
+        });
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
+            panic!("进退群也要记");
+        };
+        assert_eq!(draft.elements.len(), 1, "只有人话一行，没有 Opaque");
         assert!(matches!(draft.elements[0], Element::Text { .. }));
     }
 

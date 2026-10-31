@@ -316,6 +316,40 @@ test("平台载荷过长会截断，但绝不整段吞掉", () => {
   assert.ok(text.length < 1000, `不能把上下文撑爆：${text.length}`)
 })
 
+test("事件记录里的原始载荷不摊开，只给流水编号让 agent 自己查", () => {
+  // 未解析事件的降级存法（ADR-0004 补充裁定 2026-10-31）：载荷存流水，
+  // 投递不塞上下文。渲染要给编号 + 查法，否则模型不知道细节去哪找。
+  const record = {
+    id: 87,
+    room: { connection: "qq", path: ["group", "158296748"] },
+    kind: { kind: "event", event: "group_msg_emoji_like" },
+    sender: { id: "10002", name: "小明" },
+    at: Date.now(),
+    elements: [
+      { type: "text", text: "[group_msg_emoji_like]（未解析事件）" },
+      { type: "opaque", platform: "qq", payload: { notice_type: "group_msg_emoji_like", emoji_id: "5" } },
+    ],
+  }
+  const text = renderTurn({ ...delivery(), records: [record] }, { now: Date.now() })
+
+  assert.match(text, /fetch_records/)
+  assert.match(text, /#87/)
+  assert.ok(!text.includes("emoji_id"), `原始载荷不该进上下文：${text}`)
+})
+
+test("消息记录里的 opaque 照旧摊开，不受事件降级影响", () => {
+  const record = {
+    ...delivery().records[0],
+    id: 88,
+    elements: [
+      { type: "opaque", platform: "qq", payload: { type: "forward", data: { id: "abc" } } },
+    ],
+  }
+  const text = renderTurn({ ...delivery(), records: [record] }, { now: Date.now() })
+  assert.match(text, /qq 平台特有内容/, "消息里的平台内容必须摊开（ADR-0004）")
+  assert.match(text, /"id":"abc"/)
+})
+
 test("endpoint 只认 host:port", () => {
   assert.deepEqual(parseEndpoint("127.0.0.1:7700"), {
     host: "127.0.0.1",
