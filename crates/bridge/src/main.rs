@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use acb_adapter_onebot11::{LinkSlot, OneBotOutbound, supervise};
+use acb_adapter_onebot11::OneBotAdapterFactory;
 use acb_kernel::{
-    Bridge, Config, ControlRegistry, FileRelay, Outbounds, SqliteStore, serve,
+    AdapterRegistry, Bridge, Config, ControlRegistry, FileRelay, Outbounds, SqliteStore, serve,
 };
 
 mod config_patch;
@@ -72,15 +72,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // 每条连接先占一个发送口，桥建好之后再起守护线程去连。
+    // 适配器由注册表按 kind 实例化；main 不再知道 onebot11 的构造细节。
+    let mut adapters = AdapterRegistry::<SqliteStore>::new();
+    adapters.register(std::sync::Arc::new(OneBotAdapterFactory))?;
+
     let mut outbounds = Outbounds::new();
-    let mut links = Vec::new();
+    let mut launches = Vec::new();
     for connection in &config.connections {
-        let slot = LinkSlot::new();
-        outbounds = outbounds.with(
-            connection.id.clone(),
-            Box::new(OneBotOutbound::new(slot.clone(), connection.id.clone())),
-        );
-        links.push((connection.clone(), slot));
+        let instance = adapters.create(connection)?;
+        outbounds = outbounds.with(connection.id.clone(), instance.outbound);
+        launches.push(instance.launch);
     }
 
     let bridge = Arc::new(Mutex::new(Bridge::new(
@@ -89,20 +90,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(outbounds),
     )));
 
-    for (connection, slot) in links {
+    // provider id 写错要在启动时死，不能等第一轮才报。
+    {
+        let guard = bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.validate_plugins()?;
+    }
+
+    for launch in launches {
         let bridge = Arc::clone(&bridge);
         let shutdown = Arc::clone(&shutdown);
-        std::thread::spawn(move || {
-            supervise(
-                slot,
-                connection.url,
-                connection.token,
-                connection.id,
-                connection.admin_qqs,
-                bridge,
-                shutdown,
-            );
-        });
+        std::thread::spawn(move || launch(bridge, shutdown));
     }
 
     // 控制指令注册表：控制台靠它把 control 帧推给管理某会话的 harness 连接。

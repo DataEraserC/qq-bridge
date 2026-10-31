@@ -76,9 +76,14 @@ export class FakeBridge {
   }
 
   async next() {
-    const frame = await this.lines.next()
-    this.frames.push(frame)
-    return frame
+    // report_map 的 control_result 是插件建会话后的旁路回报，不属于轮次帧。
+    // 测试关心的是 turn_end / tool_call，跳过它，别让每个用例都先撞一帧。
+    for (;;) {
+      const frame = await this.lines.next()
+      this.frames.push(frame)
+      if (frame.frame === "control_result") continue
+      return frame
+    }
   }
 
   async send(frame) {

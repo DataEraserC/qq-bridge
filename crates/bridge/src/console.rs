@@ -228,6 +228,7 @@ impl<S: Store + Send + 'static> Console<S> {
                 "subscriptions": s.subscriptions.iter().map(|sub| json!({
                     "room": sub.room.to_string(),
                     "wake": json!({
+                        "provider": sub.wake.provider.to_string(),
                         "at_mention": sub.wake.at_mention,
                         "reply": sub.wake.reply,
                         "name_mention": sub.wake.name_mention,
@@ -421,6 +422,20 @@ impl<S: Store + Send + 'static> Console<S> {
             let bridge = lock(&self.bridge);
             reload_impact(bridge.config(), &new_config)
         };
+
+        // provider 校验必须在落盘之前：未知 provider 不该被写进磁盘。
+        {
+            let bridge = lock(&self.bridge);
+            if let Err(error) = bridge.validate_plugins_for(&new_config) {
+                return Err((
+                    400,
+                    json!({
+                        "error": format!("配置里的 provider 不存在或不可用：{error}"),
+                        "saved": false,
+                    }),
+                ));
+            }
+        }
 
         // 备份失败不算致命（首次保存时旧文件可能不存在），但落盘失败必须报——
         // 不能让「磁盘上和桥里跑的」悄悄分家。

@@ -302,6 +302,48 @@ pub fn expand_query(needle: &str) -> Vec<String> {
     terms
 }
 
+/// 一个目标参数的角色。
+///
+/// - `Room`：指向一个房间（`group_id` / `user_id`），必须和当前房间一致；
+///   要换房间只能用 `platform_call` 的 `room` 参数。
+/// - `Member`：指向房间里的一个成员/消息对象（「拍谁」「踢谁」），
+///   不受房间目标校验影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetRole {
+    Room,
+    Member,
+}
+
+/// 声明一个参数和房间路径的关系。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetSpec {
+    pub param: &'static str,
+    /// 房间路径的第一段，如 `group` / `private`。由适配器声明，core 只比对。
+    pub room_kind: &'static str,
+    pub role: TargetRole,
+}
+
+impl TargetSpec {
+    /// 这个参数是房间目标：在 `room_kind` 类型的房间里必须等于房间的 id。
+    pub const fn room(param: &'static str, room_kind: &'static str) -> Self {
+        Self {
+            param,
+            room_kind,
+            role: TargetRole::Room,
+        }
+    }
+
+    /// 这个参数是成员/消息目标：同一个参数在某些房间类型里可能是“拍谁/踢谁”，
+    /// 不能按房间目标校验。
+    pub const fn member(param: &'static str, room_kind: &'static str) -> Self {
+        Self {
+            param,
+            room_kind,
+            role: TargetRole::Member,
+        }
+    }
+}
+
 /// 一个平台方法的声明。适配器自己给，core 只认这个形状。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MethodSpec {
@@ -316,6 +358,8 @@ pub struct MethodSpec {
     /// 好友列表、账号资料这类跟房间无关：模型不该为了查好友列表先编一个群号出来。
     pub scope: Scope,
     pub params: &'static [ParamSpec],
+    /// 哪些参数是房间目标、哪些是成员目标。空 = 这个方法没有房间目标参数。
+    pub targets: &'static [TargetSpec],
 }
 
 impl MethodSpec {
@@ -614,6 +658,7 @@ mod tests {
         risk: Risk::Read,
         scope: Scope::Room,
         params: FORWARD_PARAMS,
+        targets: &[],
     }];
 
     impl Outbound for Platformy {
@@ -675,6 +720,7 @@ mod tests {
             risk: Risk::Read,
             scope: Scope::Room,
             params: &[],
+            targets: &[],
         };
         assert_eq!(spec.group(), "group");
     }
@@ -690,6 +736,7 @@ mod tests {
                 risk: Risk::Write,
                 scope: Scope::Room,
                 params: &[],
+                targets: &[],
             },
             MethodSpec {
                 name: "group.get_member_info",
@@ -698,6 +745,7 @@ mod tests {
                 risk: Risk::Read,
                 scope: Scope::Room,
                 params: &[],
+                targets: &[],
             },
         ];
 

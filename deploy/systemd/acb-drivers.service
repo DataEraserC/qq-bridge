@@ -1,0 +1,17 @@
+[Unit]
+Description=ACB dsh drivers (MCP 3101/3102)
+After=acb-bridge.service
+Wants=acb-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/deploy
+Environment=PATH=/run/current-system/sw/bin:/etc/profiles/per-user/nixos/bin:/run/wrappers/bin
+ExecStart=/run/current-system/sw/bin/bash /home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/deploy/start-drivers.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/drivers.log
+StandardError=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/drivers.log
+
+[Install]
+WantedBy=default.target

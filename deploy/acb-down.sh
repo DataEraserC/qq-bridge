@@ -19,7 +19,7 @@ else
   echo "没有状态库，跳过备份"
 fi
 
-for unit in acb-drivers acb-bridge dsh-acb; do
+for unit in acb-opencode-keeper acb-drivers acb-bridge dsh-acb; do
   if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
     echo "→ 停 $unit"
     systemctl --user stop "$unit"
@@ -30,6 +30,6 @@ done
 
 echo
 echo "=== 结果（inactive 就是停干净了）==="
-for unit in dsh-acb acb-bridge acb-drivers; do
-  printf '%-12s %s\n' "$unit" "$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+for unit in dsh-acb acb-bridge acb-drivers acb-opencode-keeper; do
+  printf '%-24s %s\n' "$unit" "$(systemctl --user is-active "$unit" 2>/dev/null || true)"
 done

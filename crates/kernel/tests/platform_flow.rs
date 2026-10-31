@@ -6,8 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
-    Bridge, CallError, Element, Ingest, MemoryStore, MethodSpec, Outbound, OutboundError,
-    ParamSpec, ParamType, RecordDraft, Risk, RoomId, Scope, Sender, Sent, Ticket, outbound::tags,
+    Bridge, CallError, Element, ErrorCode, Ingest, MemoryStore, MethodSpec, Outbound,
+    OutboundError, ParamSpec, ParamType, RecordDraft, Risk, RoomId, Scope, Sender, Sent,
+    TargetSpec, Ticket, outbound::tags,
 };
 use serde_json::{Value, json};
 
@@ -28,6 +29,9 @@ static IMAGE_PARAMS: &[ParamSpec] = &[ParamSpec::required("file", "图片")];
 
 static FILE_PARAMS: &[ParamSpec] = &[ParamSpec::required("file_id", "群文件 id")];
 
+/// 测试平台声明：`group_id` 是房间目标，不能由模型在 params 里换掉。
+static GROUP_TARGETS: &[TargetSpec] = &[TargetSpec::room("group_id", "group")];
+
 /// 故意让 `image` 这个标签跨在两个归属上：`message.*` 和 `group.*` 各有一个。
 /// 这正是 tag 维度存在的理由——模型问「图片相关」，一次就得把两边都捞出来。
 static METHODS: &[MethodSpec] = &[
@@ -38,6 +42,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Read,
         scope: Scope::Room,
         params: FORWARD_PARAMS,
+        targets: &[],
     },
     MethodSpec {
         name: "group.get_member_info",
@@ -46,6 +51,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Read,
         scope: Scope::Room,
         params: MEMBER_PARAMS,
+        targets: GROUP_TARGETS,
     },
     MethodSpec {
         name: "message.send_image",
@@ -54,6 +60,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Write,
         scope: Scope::Room,
         params: IMAGE_PARAMS,
+        targets: &[],
     },
     MethodSpec {
         name: "group.get_file_url",
@@ -62,6 +69,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Read,
         scope: Scope::Room,
         params: FILE_PARAMS,
+        targets: GROUP_TARGETS,
     },
     MethodSpec {
         name: "group.kick",
@@ -70,6 +78,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Destructive,
         scope: Scope::Room,
         params: KICK_PARAMS,
+        targets: GROUP_TARGETS,
     },
     MethodSpec {
         name: "group.ban",
@@ -78,6 +87,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Destructive,
         scope: Scope::Room,
         params: KICK_PARAMS,
+        targets: GROUP_TARGETS,
     },
     MethodSpec {
         name: "group.get_member_list",
@@ -86,6 +96,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Read,
         scope: Scope::Room,
         params: &[],
+        targets: GROUP_TARGETS,
     },
     // 跟房间无关的那一类：查的是这个号本身有什么，不是房间里发生了什么。
     MethodSpec {
@@ -95,6 +106,7 @@ static METHODS: &[MethodSpec] = &[
         risk: Risk::Read,
         scope: Scope::Connection,
         params: &[],
+        targets: &[],
     },
 ];
 
@@ -126,6 +138,7 @@ impl Outbound for Platformy {
             "forward.get_content" => Ok(json!({
                 "messages": [{"sender": "老王", "text": "转发的正文"}]
             })),
+            "message.send_image" => Ok(json!({"done": true})),
             "group.get_member_info" => Ok(json!({"nickname": "老王", "role": "member"})),
             "group.kick" | "group.ban" => Ok(json!({"done": true})),
             "friend.list" => Ok(json!({"friends": [{"user_id": "10001", "nickname": "老王"}]})),
@@ -602,6 +615,30 @@ fn room_outside_the_subscription_is_refused() {
     assert!(!error.message.is_empty());
 }
 
+/// core 用 MethodSpec.targets 兜底：房间目标参数不能由模型在 params 里换掉。
+#[test]
+fn platform_call_cannot_change_the_room_target_via_params() {
+    let (mut bridge, calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let error = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({"method": "group.get_member_info", "params": {"user_id": "10001", "group_id": "999"}}),
+        )
+        .expect_err("不能在 params 里换群");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("group_id"), "{}", error.message);
+    assert!(
+        error.message.contains("room"),
+        "错误要给出怎么改：{}",
+        error.message
+    );
+    assert!(calls.lock().expect("没被毒死").is_empty(), "拒绝前不该调平台");
+}
+
 /// 好友列表、账号资料这类跟房间无关：不该逼模型先编一个群号出来。
 #[test]
 fn connection_scoped_method_needs_no_room() {
@@ -881,21 +918,20 @@ fn 平台调用的params里本机文件换成中继URL() {
             &sessions(),
             "platform_call",
             json!({
-                "method": "group.get_member_info",
-                "params": {"user_id": "10001", "group_id": source.display().to_string()},
+                "method": "message.send_image",
+                "params": {"file": source.display().to_string()},
             }),
         )
         .expect("能调");
 
     let calls = calls.lock().expect("没被毒死");
     let (method, params) = &calls[0];
-    assert_eq!(method, "group.get_member_info");
-    let file = params["group_id"].as_str().expect("group_id 还是字符串");
+    assert_eq!(method, "message.send_image");
+    let file = params["file"].as_str().expect("file 还是字符串");
     assert!(
         file.starts_with("http://10.89.0.1:3131/f/"),
         "本机路径应该换成中继 URL，实际是 {file}"
     );
-    assert_eq!(params["user_id"], json!("10001"), "别的参数不动");
     let rest = file.strip_prefix("http://10.89.0.1:3131/f/").expect("前缀对");
     assert!(
         temp.0.join("relay").join(rest).is_file(),
@@ -927,15 +963,15 @@ fn 平台调用的http路径原样透传() {
             &sessions(),
             "platform_call",
             json!({
-                "method": "group.get_member_info",
-                "params": {"user_id": "10001", "group_id": "https://elsewhere.example/a.png"},
+                "method": "message.send_image",
+                "params": {"file": "https://elsewhere.example/a.png"},
             }),
         )
         .expect("能调");
 
     let calls = calls.lock().expect("没被毒死");
     assert_eq!(
-        calls[0].1["group_id"],
+        calls[0].1["file"],
         json!("https://elsewhere.example/a.png"),
         "http(s) 路径不依赖本地命名空间，不该动"
     );

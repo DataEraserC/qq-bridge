@@ -12,7 +12,9 @@
 //!
 //! core 不认识这里任何一个名字，它只认 `MethodSpec` 这个形状（ADR-0020）。
 
-use acb_kernel::{MethodSpec, ParamSpec, ParamType, Risk, Scope, outbound::tags};
+use std::sync::OnceLock;
+
+use acb_kernel::{MethodSpec, ParamSpec, ParamType, Risk, Scope, TargetSpec, outbound::tags};
 
 // ── 参数写法 ──────────────────────────────────────────────────────────────
 //
@@ -62,6 +64,7 @@ const fn m(
         risk,
         scope: Scope::Room,
         params,
+        targets: &[],
     }
 }
 
@@ -83,6 +86,7 @@ const fn cm(
         risk,
         scope: Scope::Connection,
         params,
+        targets: &[],
     }
 }
 
@@ -569,7 +573,7 @@ pub static METHODS: &[MethodSpec] = &[
         &[tags::POKE, tags::SEND, tags::MEMBER],
         Risk::Write,
         &[
-            req("user_id", "拍谁；在私聊里调用可以不填"),
+            opt("user_id", "拍谁；群里必须给，私聊里不填就是拍对方"),
             opt("group_id", "在哪个群拍；在群里调用可以不填"),
         ],
     ),
@@ -625,6 +629,21 @@ const fn route(method: &'static str, action: &'static str) -> Route {
     }
 }
 
+/// 房间目标参数的声明。core 用它做“不许在 params 里换房间”的兜底校验。
+const GROUP_ROOM: &[TargetSpec] = &[TargetSpec::room("group_id", "group")];
+const PRIVATE_ROOM: &[TargetSpec] = &[TargetSpec::room("user_id", "private")];
+const BOTH_ROOMS: &[TargetSpec] = &[
+    TargetSpec::room("group_id", "group"),
+    TargetSpec::room("user_id", "private"),
+];
+/// poke 在群里 `user_id` 是“拍谁”（成员目标），`group_id` 才是房间目标；
+/// 在私聊里 `user_id` 又变成房间目标。
+const POKE_TARGETS: &[TargetSpec] = &[
+    TargetSpec::room("group_id", "group"),
+    TargetSpec::member("user_id", "group"),
+    TargetSpec::room("user_id", "private"),
+];
+
 /// 群参数 `group_id` 由房间补上。
 const fn group_route(method: &'static str, action: &'static str) -> Route {
     Route {
@@ -641,6 +660,16 @@ const fn private_route(method: &'static str, action: &'static str) -> Route {
         method,
         target: Target::Fixed(action),
         from_group: None,
+        from_private: Some("user_id"),
+    }
+}
+
+/// 群聊/私聊同一个动作、两边都可能从房间推导目标参数（如合并转发）。
+const fn both_route(method: &'static str, action: &'static str) -> Route {
+    Route {
+        method,
+        target: Target::Fixed(action),
+        from_group: Some("group_id"),
         from_private: Some("user_id"),
     }
 }
@@ -685,7 +714,7 @@ pub static ROUTES: &[Route] = &[
     group_route("group.delete_file", "delete_group_file"),
     group_route("message.send_group", "send_group_msg"),
     private_route("message.send_private", "send_private_msg"),
-    route("message.send_forward", "send_forward_msg"),
+    both_route("message.send_forward", "send_forward_msg"),
     route("message.get", "get_msg"),
     route("message.recall", "delete_msg"),
     group_route("message.history_group", "get_group_msg_history"),
@@ -707,3 +736,35 @@ pub static ROUTES: &[Route] = &[
     route("like.send", "send_like"),
     route("system.check_url", "check_url_safely"),
 ];
+
+/// 方法表 + 从路由推导出的目标参数声明。
+///
+/// `METHODS` 本身保持静态；目标声明在第一次访问时合并进来。这样新增方法时
+/// 不用在两张表里各抄一遍 targets，路由表仍然是唯一真相。
+pub fn catalog() -> &'static [MethodSpec] {
+    static CATALOG: OnceLock<Vec<MethodSpec>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        METHODS
+            .iter()
+            .map(|method| MethodSpec {
+                targets: targets_of(method.name),
+                ..*method
+            })
+            .collect()
+    })
+}
+
+fn targets_of(method: &str) -> &'static [TargetSpec] {
+    if method == "poke.send" {
+        return POKE_TARGETS;
+    }
+    let Some(route) = ROUTES.iter().find(|route| route.method == method) else {
+        return &[];
+    };
+    match (route.from_group, route.from_private) {
+        (Some(_), Some(_)) => BOTH_ROOMS,
+        (Some(_), None) => GROUP_ROOM,
+        (None, Some(_)) => PRIVATE_ROOM,
+        (None, None) => &[],
+    }
+}

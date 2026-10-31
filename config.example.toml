@@ -160,6 +160,7 @@ connection = "qq"
 room = "group/123456789"
 
 [sessions.subscriptions.wake]
+provider = "acb.wake.default"  # 唤醒策略实现（ADR-0026）；不写就是内置
 at_mention = true
 reply = true          # 引用我发的某条消息也算对我说话（QQ 的「回复」就是这种）
 name_mention = true

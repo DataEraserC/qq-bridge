@@ -24,12 +24,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::config::{Config, Session, TurnErrorAction, WakeDecision, WakeInput, WakePolicy};
+use crate::config::{Config, Session, TurnErrorAction, WakeDecision, WakePolicy};
 use crate::memory::{
     MemoryRepo, git_add, git_blame, git_branch, git_commit, git_diff, git_log, git_push,
     git_status, list_dir, read_file, search, write_file,
 };
-use crate::outbound::{CallError, MethodSpec, Outbound, OutboundError, Risk, Scope, expand_query};
+use crate::outbound::{
+    CallError, MethodSpec, Outbound, OutboundError, Risk, Scope, TargetRole, expand_query,
+};
+use crate::plugin::{PluginError, PluginManager, WakeContext};
 use crate::render;
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
@@ -70,6 +73,8 @@ const ACK_GRACE: Duration = Duration::from_secs(60);
 pub enum BridgeError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Plugin(#[from] PluginError),
     #[error("这张票无效或本轮已结束：{0}")]
     UnknownTicket(String),
 }
@@ -143,6 +148,8 @@ pub struct Bridge<S: Store> {
     config: Config,
     store: S,
     outbound: Box<dyn Outbound>,
+    /// 扩展宿主（ADR-0026）。Phase 1 只承载 wake provider。
+    plugins: PluginManager,
     pending: VecDeque<Pending>,
     /// 键是会话 id：一个会话同时只跑一轮。
     active: HashMap<String, ActiveTurn>,
@@ -174,6 +181,7 @@ impl<S: Store> Bridge<S> {
             config,
             store,
             outbound,
+            plugins: PluginManager::with_native_builtins(),
             pending: VecDeque::new(),
             active: HashMap::new(),
             by_ticket: HashMap::new(),
@@ -188,6 +196,18 @@ impl<S: Store> Bridge<S> {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 启动时校验配置里的 provider 都存在。`main` 在起线程前调用；
+    /// 未知 provider 应该在启动时死，而不是等第一轮才报。
+    pub fn validate_plugins(&self) -> Result<(), PluginError> {
+        self.plugins.validate_config(&self.config)
+    }
+
+    /// 校验一份**还没生效**的配置（控制台保存时用）。暂存前先过这一关，
+    /// 避免未知 provider 被写进磁盘、等到下一轮才炸。
+    pub fn validate_plugins_for(&self, config: &Config) -> Result<(), PluginError> {
+        self.plugins.validate_config(config)
     }
 
     /// 暂存一份新配置。**不立即生效**：下一次开轮（[`Self::poll_turn`]）时换上
@@ -354,6 +374,16 @@ impl<S: Store> Bridge<S> {
             return Ok(Ingest::NotSubscribed { room });
         }
 
+        // 先把这一轮要用的 provider 都解析出来。放 append 之前是有意的：provider id 写错
+        // 应该在入库前就报错，不能先写一条流水再发现叫不醒。
+        let mut wake_providers = Vec::with_capacity(subscribers.len());
+        for subscriber in &subscribers {
+            wake_providers.push(
+                self.plugins
+                    .resolve_wake(&subscriber.wake.provider, &subscriber.wake)?,
+            );
+        }
+
         // 「引用的是不是我发的」要查库，所以入库前先判。判据是本房间那条连接的登录账号——
         // 被引用的那条如果是这个号发的，这条就算冲我来的（WakePolicy::reply）。
         let account = self.config.account_of_room(&room);
@@ -367,8 +397,14 @@ impl<S: Store> Bridge<S> {
             RecordKind::Message => None,
         };
 
+        let platform = self
+            .config
+            .connection(&room.connection)
+            .map(|connection| connection.platform.clone())
+            .unwrap_or_else(|| "unknown".to_owned());
+
         let mut woke = Vec::new();
-        for subscriber in subscribers {
+        for (subscriber, provider) in subscribers.into_iter().zip(wake_providers) {
             let cursor = Cursor::new(subscriber.session.clone(), room.clone());
 
             // 平台把我们自己说的话回传回来：记下来，但不是未读，也不叫醒自己。
@@ -380,15 +416,22 @@ impl<S: Store> Bridge<S> {
             let pending = self
                 .pending_records(&subscriber.session, &room, &subscriber.account)?
                 .len() as u32;
-            let input = WakeInput {
+            let context = WakeContext {
+                session: &subscriber.session,
+                room: &room,
+                connection: &room.connection,
+                platform: &platform,
                 sender_id: &record.sender.id,
                 text: &text,
                 at_self: record.at_self,
                 reply_to_self: record.reply_to_self,
                 event,
+                // 平台适配器还没有把 hints/tags 接进来；Phase 1 先给空切片。
+                tags: &[],
                 unread: pending,
+                now: now_millis(),
             };
-            if subscriber.wake.decide(&input) == WakeDecision::Wake {
+            if provider.decide(&subscriber.wake, &context) == WakeDecision::Wake {
                 woke.push(subscriber.session.clone());
                 self.enqueue(subscriber.session, room.clone(), TurnReason::Wake);
             }
@@ -1678,6 +1721,9 @@ impl<S: Store> Bridge<S> {
         }
 
         check_params(spec, &args.params)?;
+        // 房间目标参数不能在 params 里被换掉；适配器可以再兜一层，但这一层是
+        // core 对所有适配器（包括动态加载的）统一的执行契约（ADR-0027）。
+        check_target_params(spec, &room, &args.params)?;
 
         // params 里的本机文件路径同样换成中继 URL（ADR-0025）——upload_file 这类
         // 平台方法拿的是 params 里的路径，跟 send_message 的元素是同一个断层。
@@ -2506,6 +2552,77 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
     }
 
     Ok(())
+}
+
+/// 房间目标参数校验：`group_id` / `user_id` 这类参数只能等于当前房间。
+///
+/// `MethodSpec.targets` 由适配器声明（ADR-0027）。core 不认识平台词，只做两件事：
+/// - 当前房间类型匹配的 `Room` 目标：参数给了就必须等于房间 id；
+/// - 其它房间类型的 `Room` 目标：给了就拒绝——除非同一参数在当前房间类型里
+///   被声明成 `Member`（如 `poke.send` 在群里的 `user_id` 是“拍谁”）。
+fn check_target_params(
+    spec: &MethodSpec,
+    room: &RoomId,
+    params: &Value,
+) -> Result<(), ToolError> {
+    let Some(given) = params.as_object() else {
+        // check_params 已经处理过非对象；这里只兜底。
+        return Ok(());
+    };
+    if given.is_empty() || spec.targets.is_empty() {
+        return Ok(());
+    }
+
+    let room_kind = room.path.first().map(String::as_str).unwrap_or("");
+    let room_id = room.path.get(1).map(String::as_str).unwrap_or("");
+
+    for target in spec.targets {
+        if target.role != TargetRole::Room {
+            continue;
+        }
+        let Some(value) = given.get(target.param) else {
+            continue;
+        };
+        let given_id = value.as_str().unwrap_or_default();
+
+        if target.room_kind == room_kind {
+            if given_id != room_id {
+                return Err(bad_target(spec, room, target, given_id));
+            }
+            continue;
+        }
+
+        // 这个参数指向另一种房间。只有“同一参数在当前房间类型里是成员目标”
+        // 的情况可以放过（poke.send 群里的 user_id）。
+        let is_member_here = spec.targets.iter().any(|other| {
+            other.role == TargetRole::Member
+                && other.param == target.param
+                && other.room_kind == room_kind
+        });
+        if !is_member_here {
+            return Err(bad_target(spec, room, target, given_id));
+        }
+    }
+
+    Ok(())
+}
+
+fn bad_target(
+    spec: &MethodSpec,
+    room: &RoomId,
+    target: &crate::outbound::TargetSpec,
+    given_id: &str,
+) -> ToolError {
+    let suggestion = format!("{}:{}/{}", room.connection, target.room_kind, given_id);
+    ToolError::new(
+        ErrorCode::BadRequest,
+        format!(
+            "[bad_params] {} 的 {} 是 {given_id}，但当前房间是 {room}。\
+             **不要在 params 里换目标**；要操作它，把 platform_call 的 room 改成 \"{suggestion}\"\
+             （并确认本会话订阅了它）。",
+            spec.name, target.param
+        ),
+    )
 }
 
 /// 适配器报的错 → 工具错。分类写进 message 里，模型靠它判断该改参数还是该放弃。

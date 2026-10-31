@@ -48,6 +48,7 @@ connection = "qq"
 room = "group/123456789"     # 私聊是 private/对方QQ号
 
 [sessions.subscriptions.wake]
+provider = "acb.wake.default"  # 唤醒策略实现；不写就是内置（ADR-0026）
 at_mention = true      # 被 @ 醒
 reply = true           # 被回复（引用我发的消息）醒
 name_mention = true    # 被叫名字醒

@@ -1,0 +1,16 @@
+[Unit]
+Description=ACB bridge
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch
+Environment=PATH=/run/current-system/sw/bin:/etc/profiles/per-user/nixos/bin:/run/wrappers/bin
+ExecStart=/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/result/bin/acb-bridge --config config.toml
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/bridge.log
+StandardError=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/bridge.log
+
+[Install]
+WantedBy=default.target

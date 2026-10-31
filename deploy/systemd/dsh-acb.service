@@ -1,0 +1,16 @@
+[Unit]
+Description=ACB dsh harness
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nixos
+Environment=PATH=/run/current-system/sw/bin:/etc/profiles/per-user/nixos/bin:/run/wrappers/bin
+ExecStart=/run/current-system/sw/bin/bash /home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/deploy/start-dsh.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/dsh.log
+StandardError=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/dsh.log
+
+[Install]
+WantedBy=default.target

@@ -9,7 +9,7 @@ use std::time::Duration;
 use acb_kernel::{CallError, Element, MethodSpec, Outbound, OutboundError, RoomId, Sent};
 use serde_json::{Value, json};
 
-use crate::catalog::{METHODS, ROUTES, Route, Target};
+use crate::catalog::{ROUTES, Route, Target, catalog};
 use crate::forward;
 use crate::link::{Action, LinkError, LinkSlot};
 use crate::segment::to_onebot;
@@ -81,7 +81,7 @@ impl Outbound for OneBotOutbound {
     }
 
     fn catalog(&self, _connection: &str) -> &'static [MethodSpec] {
-        METHODS
+        catalog()
     }
 
     fn call(&mut self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
@@ -206,28 +206,167 @@ fn call_payload(route: &Route, room: &RoomId, params: &Value) -> Result<Value, C
         _ => return Err(CallError::BadParams("params 要给一个对象（map）".into())),
     };
 
-    for (key, kind) in [(route.from_group, "group"), (route.from_private, "private")] {
-        let Some(key) = key else { continue };
-        if payload.contains_key(key) {
-            continue;
+    // 房间目标参数（group_id / user_id）只能从当前房间推导，**不允许在 params 里换房间**。
+    // 要操作同一会话的另一个房间，用 platform_call 的 room 参数，而不是偷换 group_id。
+    match (route.from_group, route.from_private) {
+        (Some(group_key), Some(private_key)) => {
+            match room.path.as_slice() {
+                [kind, id] if kind == "group" => {
+                    fill_room_target(&mut payload, route.method, group_key, room, id)?;
+                    // user_id 在这类方法里可能有两种身份：
+                    // - poke.send 在群里：user_id 是“拍谁”，不是房间目标，必须保留；
+                    // - 其它（如 message.send_forward）：user_id 指向另一个私聊房间，拒绝。
+                    if route.method != "poke.send" && payload.contains_key(private_key) {
+                        return Err(CallError::BadParams(format!(
+                            "{} 的 {} 指向另一个私聊房间；当前房间是 {}。\
+                             要发到私聊，请用 room 参数选那个私聊房间，不要在 params 里改目标",
+                            route.method,
+                            private_key,
+                            room
+                        )));
+                    }
+                    if route.method == "poke.send" && !payload.contains_key(private_key) {
+                        return Err(CallError::BadParams(
+                            "poke.send 在群里要给 user_id：拍谁就写谁".into(),
+                        ));
+                    }
+                }
+                [kind, id] if kind == "private" => {
+                    fill_room_target(&mut payload, route.method, private_key, room, id)?;
+                    if payload.contains_key(group_key) {
+                        return Err(CallError::BadParams(format!(
+                            "{} 的 {} 指向另一个群；当前房间是 {}。\
+                             要发到群，请用 room 参数选那个群，不要在 params 里改目标",
+                            route.method,
+                            group_key,
+                            room
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(CallError::BadParams(format!(
+                        "{} 需要群聊或私聊房间，但房间 {} 既不是 group/ 也不是 private/",
+                        route.method,
+                        room.key()
+                    )));
+                }
+            }
         }
-        let filled = match room.path.as_slice() {
-            [room_kind, id] if room_kind == kind => Some(id.to_owned()),
-            _ => None,
-        };
-        let Some(value) = filled else {
-            return Err(CallError::BadParams(format!(
-                "{} 要 {}，但房间 {} 不是 {} 类型，params 里得自己给",
-                route.method,
-                key,
-                room.key(),
-                kind
-            )));
-        };
-        payload.insert(key.to_owned(), Value::String(value));
+        (Some(key), None) => fill_matching_group_target(&mut payload, route.method, key, room)?,
+        (None, Some(key)) => fill_matching_private_target(&mut payload, route.method, key, room)?,
+        (None, None) => {}
     }
 
     Ok(Value::Object(payload))
+}
+
+/// 群方法：当前房间必须是 group；params 里给了 group_id 就只能等于当前群。
+fn fill_matching_group_target(
+    payload: &mut serde_json::Map<String, Value>,
+    method: &str,
+    key: &str,
+    room: &RoomId,
+) -> Result<(), CallError> {
+    let Some(id) = group_id_of(room) else {
+        if let Some(value) = payload.get(key) {
+            let target = value.as_str().unwrap_or_default();
+            return Err(CallError::BadParams(format!(
+                "{} 的 {} 指向群 {target}，但当前房间是 {}；\
+                 要操作它，把 platform_call 的 room 改成 \"{}\"（并确认本会话订阅了它），\
+                 不要在 params 里换目标",
+                method,
+                key,
+                room,
+                target_room_text(room, "group", target)
+            )));
+        }
+        return Err(CallError::BadParams(format!(
+            "{} 要 {}，但房间 {} 不是群类型，params 里得自己给",
+            method,
+            key,
+            room.key()
+        )));
+    };
+    fill_room_target(payload, method, key, room, id)
+}
+
+/// 私聊方法：当前房间必须是 private；params 里给了 user_id 就只能等于当前私聊对象。
+fn fill_matching_private_target(
+    payload: &mut serde_json::Map<String, Value>,
+    method: &str,
+    key: &str,
+    room: &RoomId,
+) -> Result<(), CallError> {
+    let Some(id) = private_id_of(room) else {
+        if let Some(value) = payload.get(key) {
+            let target = value.as_str().unwrap_or_default();
+            return Err(CallError::BadParams(format!(
+                "{} 的 {} 指向私聊 {target}，但当前房间是 {}；\
+                 要操作它，把 platform_call 的 room 改成 \"{}\"（并确认本会话订阅了它），\
+                 不要在 params 里换目标",
+                method,
+                key,
+                room,
+                target_room_text(room, "private", target)
+            )));
+        }
+        return Err(CallError::BadParams(format!(
+            "{} 要 {}，但房间 {} 不是私聊类型，params 里得自己给",
+            method,
+            key,
+            room.key()
+        )));
+    };
+    fill_room_target(payload, method, key, room, id)
+}
+
+/// 把房间目标参数填成房间里的 id；如果 params 里已有不同的值，拒绝。
+fn fill_room_target(
+    payload: &mut serde_json::Map<String, Value>,
+    method: &str,
+    key: &str,
+    room: &RoomId,
+    room_id: &str,
+) -> Result<(), CallError> {
+    match payload.get(key) {
+        Some(value) => {
+            let given = value.as_str().unwrap_or_default();
+            if given != room_id {
+                let kind = if key == "group_id" { "group" } else { "private" };
+                return Err(CallError::BadParams(format!(
+                    "{} 的 {} 是 {given}，但当前房间是 {room}；\
+                     不要在 params 里换目标。要操作它，把 platform_call 的 room 改成 \"{}\"\
+                     （并确认本会话订阅了它）",
+                    method,
+                    key,
+                    target_room_text(room, kind, given)
+                )));
+            }
+        }
+        None => {
+            payload.insert(key.to_owned(), Value::String(room_id.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// 给错误信息一个能直接照抄的 room 值：用当前连接的连接名 + 目标类型 + 目标 id。
+fn target_room_text(room: &RoomId, kind: &str, id: &str) -> String {
+    format!("{}:{}/{}", room.connection, kind, id)
+}
+
+fn group_id_of(room: &RoomId) -> Option<&str> {
+    match room.path.as_slice() {
+        [kind, id] if kind == "group" => Some(id),
+        _ => None,
+    }
+}
+
+fn private_id_of(room: &RoomId) -> Option<&str> {
+    match room.path.as_slice() {
+        [kind, id] if kind == "private" => Some(id),
+        _ => None,
+    }
 }
 
 /// 平台回包 → 调用结果。
@@ -317,7 +456,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acb_kernel::{Risk, Scope};
+    use acb_kernel::{Risk, Scope, TargetRole};
 
     #[test]
     fn group_room_maps_to_send_group_msg() {
@@ -445,11 +584,42 @@ mod tests {
         }
         for route in ROUTES {
             assert!(
-                METHODS.iter().any(|method| method.name == route.method),
+                catalog().iter().any(|method| method.name == route.method),
                 "{} 有路由但没声明，模型永远查不到它",
                 route.method
             );
         }
+    }
+
+    /// 目录要把“房间目标”和“成员目标”声明清楚，core 才能兜底拒绝换房间。
+    #[test]
+    fn catalog_declares_room_and_member_targets() {
+        let methods = catalog();
+        let poke = methods
+            .iter()
+            .find(|method| method.name == "poke.send")
+            .expect("有 poke");
+        assert!(poke
+            .targets
+            .iter()
+            .any(|target| target.param == "group_id" && target.role == TargetRole::Room));
+        assert!(poke
+            .targets
+            .iter()
+            .any(|target| target.param == "user_id" && target.role == TargetRole::Member));
+
+        let forward = methods
+            .iter()
+            .find(|method| method.name == "message.send_forward")
+            .expect("有合并转发");
+        assert!(forward
+            .targets
+            .iter()
+            .any(|target| target.param == "group_id" && target.role == TargetRole::Room));
+        assert!(forward
+            .targets
+            .iter()
+            .any(|target| target.param == "user_id" && target.role == TargetRole::Room));
     }
 
     /// 目录里不许出现重复方法名——否则 platform_call 会静默用第一条。
@@ -603,9 +773,65 @@ mod tests {
         let payload = call_payload(route, &room, &json!({})).expect("能补");
         assert_eq!(payload["group_id"], "456");
 
-        // 显式给了就用给的，不被房间覆盖。
-        let payload = call_payload(route, &room, &json!({"group_id": "999"})).expect("能补");
-        assert_eq!(payload["group_id"], "999");
+        // 显式给了别的群：拒绝，不允许在 params 里换房间。
+        let error = call_payload(route, &room, &json!({"group_id": "999"}))
+            .expect_err("不能在 params 里换群");
+        assert!(matches!(error, CallError::BadParams(_)), "{error:?}");
+    }
+
+    #[test]
+    fn poke_in_group_keeps_the_member_target_and_fills_the_group() {
+        let route = ROUTES
+            .iter()
+            .find(|route| route.method == "poke.send")
+            .expect("有 poke 路由");
+        let room = RoomId::new("qq", "group/456").expect("合法");
+
+        let payload = call_payload(route, &room, &json!({"user_id": "10002"})).expect("能补");
+        assert_eq!(payload["group_id"], "456");
+        assert_eq!(payload["user_id"], "10002", "群里的 user_id 是拍谁");
+
+        let error = call_payload(route, &room, &json!({})).expect_err("群里必须给 user_id");
+        assert!(matches!(error, CallError::BadParams(_)), "{error:?}");
+    }
+
+    #[test]
+    fn poke_in_private_fills_the_target() {
+        let route = ROUTES
+            .iter()
+            .find(|route| route.method == "poke.send")
+            .expect("有 poke 路由");
+        let room = RoomId::new("qq", "private/10002").expect("合法");
+
+        let payload = call_payload(route, &room, &json!({})).expect("能补");
+        assert_eq!(payload["user_id"], "10002");
+        assert!(payload.get("group_id").is_none());
+    }
+
+    #[test]
+    fn send_forward_uses_the_room_target_and_refuses_the_other_kind() {
+        let route = ROUTES
+            .iter()
+            .find(|route| route.method == "message.send_forward")
+            .expect("有转发布路由");
+        let group = RoomId::new("qq", "group/456").expect("合法");
+        let private = RoomId::new("qq", "private/10002").expect("合法");
+        let messages = json!([{"type": "node", "data": {}}]);
+
+        let payload = call_payload(route, &group, &json!({"messages": messages})).expect("能补");
+        assert_eq!(payload["group_id"], "456");
+        assert!(payload.get("user_id").is_none());
+
+        let error = call_payload(
+            route,
+            &group,
+            &json!({"messages": messages, "user_id": "10002"}),
+        )
+        .expect_err("群里不能把目标换成私聊");
+        assert!(matches!(error, CallError::BadParams(_)), "{error:?}");
+
+        let payload = call_payload(route, &private, &json!({"messages": messages})).expect("能补");
+        assert_eq!(payload["user_id"], "10002");
     }
 
     /// 私聊里调要群号的方法又不给群号：明确报参数不对。

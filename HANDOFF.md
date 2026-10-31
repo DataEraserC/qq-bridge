@@ -136,10 +136,11 @@ core 迟早认识 QQ。
 | dsh harness 驱动 | `harnesses/dsh/src/driver.mjs`（+ dsh-client.mjs / mcp-server.mjs / mcp-http-server.mjs） |
 | opencode harness | `harnesses/opencode/plugin/`（acb-wire.mjs / index.js） |
 | 架构文档 | `docs/adr/`（0017 多 agent 模型、0018 会话映射、0019 并行会话等） |
-| 起停脚本 | `deploy/acb-up.sh`（起）/ `acb-down.sh`（停，带备份）/ `start-drivers.sh` |
+| 起停脚本 | `deploy/acb-up.sh`（起）/ `acb-down.sh`（停，带备份）/ `start-drivers.sh` / `start-dsh.sh` / `opencode-keeper.sh` |
+| systemd 单元 | `deploy/systemd/{dsh-acb,acb-bridge,acb-drivers,acb-opencode-keeper}.service`（仓库是权威文件） |
 | dsh 部署层 overlay | `harnesses/dsh/dsh-mcp.patch.yml`（权威副本，原在 `~/qqab-scratch/dsh-live/web-acb-prod-v2.patch.yml`） |
 | dsh 的 API key | `deploy/acb.env`（**不入库**；模板 `deploy/acb.env.example`） |
-| 日志 | `~/qqab-scratch/logs/{dsh,bridge,drivers}.log`（scratch **不持久**，重启即清，别把东西存那儿） |
+| 日志 | `state/logs/{dsh,bridge,drivers,opencode-1093015329}.log`（在仓库里，持久） |
 
 ---
 
@@ -147,18 +148,20 @@ core 迟早认识 QQ。
 
 **一条命令：`deploy/acb-up.sh` 起，`deploy/acb-down.sh` 停。**
 
-⚠️ **持久性边界（2026-10-30 确认）：** 根子卷 `/root` 重启即清空。持久的只有 `@persistent` 子卷下的
+⚠️ **持久性边界（2026-11-01 更新）：** 根子卷 `/root` 重启即清空。持久的只有 `@persistent` 子卷下的
 `~/Documents`（本仓库）、`~/.dsh`、`~/.workbuddy`。**`~/qqab-scratch` 整个目录重启后不存在**——所以
-起停脚本、dsh overlay、密钥都放仓库 `deploy/`，scratch 只留日志。`~/qqab-scratch/acb-up.sh` 现在只是
-指向仓库的符号链接，重启后就没了，别把它当唯一入口。
-（down 会先自动备份库三件套，再按「驱动 → 桥」顺序停；up 按「桥 → 驱动」顺序起，并打印桥自述状态。）
+起停脚本、systemd 单元、dsh overlay、密钥、日志全部放仓库：单元在 `deploy/systemd/`，日志在
+`state/logs/`。systemd 侧只放指向仓库单元文件的符号链接（`~/.config/systemd/user/`），不再用 transient unit。
+（down 会先自动备份库三件套，再按「opencode keeper → 驱动 → 桥 → dsh」顺序停；up 按相反顺序起，
+并打印四个单元状态与桥自述。）
 
 **为什么不用原来的 `run_in_background` 托管（重要，别再退回去）：**
 2026-10-30 21:2x 实测踩过——桥和驱动挂在 AI 会话的沙箱里跑，会话一关，进程**还活着但开不出新
 socket**：桥报 `连不上 127.0.0.1:53001：Function not implemented (os error 38)`，驱动报
 `connect ENOSYS 127.0.0.1:7700`。表现是「进程都在、群里却没人理」，最容易误判成模型不发言。
-现在两个进程挂在**用户级 systemd**（`acb-bridge.service` / `acb-drivers.service`，`Restart=always`），
-不依赖任何会话，掉线自愈。
+现在四个单元挂在**用户级 systemd**（`dsh-acb` / `acb-bridge` / `acb-drivers` / `acb-opencode-keeper`，
+`Restart=always`），单元文件在仓库 `deploy/systemd/`，不依赖任何会话，掉线自愈；`Linger=yes` 保证
+不登录也能在开机后拉起用户级 systemd。
 
 **手工操作（等价）：**
 ```bash

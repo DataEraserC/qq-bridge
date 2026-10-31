@@ -1,0 +1,98 @@
+# ADR-0027 平台适配器在 core 外：注册表 + 事件/动作队列 + 唤醒提示
+
+来源：用户裁定（2026-11-01：平台适配器、harness 适配器在 core 外；平台适配器实现平台接口，注册到 core；core 用它拉事件、入库、唤醒；平台独有事件唤醒不应污染 core）。技术细节为实现默认。
+
+## 这条决定了什么行为
+
+- **PlatformAdapter 在 core 外**：实现特定聊天平台的连接、解码、出站、方法目录和平台调用。
+- **AdapterRegistry** 按 `kind` 注册工厂；core 按连接配置实例化适配器。适配器 manifest 声明：id、platform、kind、transport、能力、目录版本、options schema。
+- **适配器拥有 I/O，core 拥有账本和调度**：
+
+  ```text
+  适配器线程（socket/WS）
+     ├─ 归一化事件 ──▶ EventQueue ──▶ core 状态线程（ingest / 未读 / 唤醒）
+     └─ ActionQueue ◀── 发送 / 平台调用命令 ── core
+  ```
+
+  适配器不直接调 `Bridge::ingest`、不写 store、不决定唤醒、不改水位；core 从事件队列拉取/消费，完成入库和唤醒。
+
+- **唤醒不写死平台语义**：适配器把平台事件归一化成 `InboundEvent`，附带通用 `WakeHints`（`mention_me`、`reply_to_me`、`poked_me`、`mention_all`、`tags`）和原始 `payload`。内置唤醒策略只匹配通用 hints/tags；平台独有策略是策略插件，可以读 `platform` + `payload`。core 不认识 `poke`、`group_increase` 等平台事件名。
+- **harness 适配器天然在 core 外**：bridge 只提供协议和 manifest/registry（harness id、token、协议版本、能力），不把 harness 代码加载进 bridge 进程。bridge 自己若要提供驱动，走外置进程 Provider。
+
+## 不这样会怎样
+
+- 适配器直接调 `ingest` / 持有全局锁：平台慢响应会卡住整座桥，平台怪癖会渗进 core。
+- core 解析平台事件名：每接一个平台，core 的 match 分支就多一层；唤醒策略无法独立替换。
+- 适配器直接写 store：流水、水位、ack 的一致性失去唯一写入者。
+- harness 适配器塞进 bridge 进程：语言/ABI/崩溃域都被绑死，与“多 harness”目标相反。
+
+## 技术细节
+
+### 适配器契约（Phase 2 落地）
+
+```text
+PlatformAdapter:
+  manifest() -> AdapterManifest
+  connect(host: AdapterHost)
+  send(command) -> Sent
+  call(method, params) -> Value
+  shutdown()
+
+AdapterHost:
+  event_sink: bounded queue
+  action_source: bounded queue
+  log / clock / cancel
+```
+
+- 每条连接一个适配器实例；core 不持有适配器实例，只持有 registry 和动作队列句柄。
+- 事件队列有界；满了要背压或断开，不能无声丢。
+- 动作回执用 correlation id + 结果队列；core 不在锁里等平台回话。
+- `MethodSpec` 必须 owned（`Arc<[MethodSpec]>` / `Cow<'static, str>`），动态适配器才能构造目录。
+- `MethodSpec` 必须带执行契约：`target_params`（哪些参数是房间目标、能否覆盖）、`effect`（read/write/send/delete）、`record`（成功后是否写流水/推水位）。core 在不知道方法名的前提下靠这些字段守住边界。
+
+### InboundEvent / WakeHints
+
+```text
+InboundEvent:
+  connection, room, at,
+  kind: message | event,
+  actor, target,
+  elements,
+  platform,
+  hints: { mention_me, reply_to_me, poked_me, mention_all, tags },
+  raw: Option<Value>
+```
+
+- hints 由适配器计算，core 只传递；策略插件决定是否唤醒。
+- 平台独有事件放在 `tags` / `raw` 里；core 不解析。
+- `reply_to_self` 这类需要查库的判定仍由 core 做（表里有平台 id）。
+
+### 迁移顺序
+
+1. 先加 `PlatformAdapter` trait + `AdapterRegistry` + `EventQueue` / `ActionQueue`，`onebot11` 作为第一个注册实现；core 不再在锁里调 outbound。
+2. 把唤醒判定从 `WakePolicy::decide` 改为 wake provider + `WakeContext`；适配器填 hints/tags，先保持默认策略行为不变。
+3. 补 `MethodSpec` 的 target/effect/record 元数据，修掉 `platform_call` 跨房间和发送不记账。
+4. 再考虑动态适配器（外置进程 / 动态加载）。
+
+### 与现有 ADR 的关系
+
+- 不推翻 ADR-0012 的“一条连接一个账号/一个适配器实例”，只是把实例化从 `main.rs` 硬编码改成注册表。
+- 不推翻 ADR-0020 的“两个通用工具”，但把目录从展示信息升级为执行契约。
+- 不推翻 ADR-0017/0019 的会话模型；平台适配器不知道订阅，core 负责权限。
+
+## 实现记录（2026-11-01）
+
+- **Phase 2a 已落地**：`call_payload` 现在拒绝在 `params` 里换 `group_id`/`user_id`；群目标只能等于当前房间，要操作别的房间必须用 `room` 参数。
+- 顺手修掉两个目标参数混用问题：
+  - `poke.send` 在群里 `user_id` 是“拍谁”（成员目标），`group_id` 才是房间目标；私聊里 `user_id` 由房间推导。之前 `call_payload` 对“同时有 group/private 目标”的路由处理是错的。
+  - `message.send_forward` 现在按房间推导 `group_id`/`user_id`，并拒绝在群里指定 `user_id` 把目标换成私聊。
+- **Phase 2b 已落地（target 部分）**：`MethodSpec` 增加 `targets: &[TargetSpec]`；`TargetSpec` 区分 `Room` / `Member`，并声明房间路径类型。kernel 的 `platform_call` 在 `check_params` 之后调用 `check_target_params`，即使适配器自己没检查，core 也会拒绝在 `params` 里换房间目标。OneBot 的 targets 由 `ROUTES` 推导，避免方法表和路由表各抄一份。
+- **Phase 2c-1 已落地**：`AdapterManifest` + `AdapterFactory` + `AdapterRegistry`；`main.rs` 不再知道 `OneBotOutbound` / `LinkSlot` / `supervise` 怎么拼，只注册 `OneBotAdapterFactory`，按连接 `kind` 取 `AdapterInstance`。连接线程仍由适配器自己的 `launch` 启动，core 不持有 socket。
+- **尚未做**：`effect`/`record` 元数据与 `platform_call` 发送记账、`EventQueue`/`ActionQueue`（把 core 在锁里调适配器这件事彻底拆掉）。这些是 Phase 2c 的下一刀。
+
+## 参考
+
+- 扩展宿主：[ADR-0026](0026-plugin-host.md)
+- 连接模型：[ADR-0012](0012-platform-connections.md)
+- 平台能力：[ADR-0020](0020-platform-capabilities.md)
+- 事件模型：[ADR-0005](0005-platform-events.md)

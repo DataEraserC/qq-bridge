@@ -440,6 +440,17 @@ fn fill_wake(
 ) -> Result<(), String> {
     for (key, val) in wake {
         match key.as_str() {
+            "provider" => match val {
+                serde_json::Value::Null => {
+                    wake_table.remove("provider");
+                }
+                serde_json::Value::String(text) => {
+                    let text = text.trim();
+                    acb_kernel::ProviderId::parse(text).map_err(|error| error.to_string())?;
+                    wake_table.insert("provider", value(text));
+                }
+                _ => return Err("wake.provider 要是字符串或 null".into()),
+            },
             "at_mention" | "reply" | "name_mention" | "poke" => {
                 let flag = val.as_bool().ok_or(format!("wake.{key} 要是布尔"))?;
                 wake_table.insert(key.as_str(), value(flag));

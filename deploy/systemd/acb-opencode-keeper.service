@@ -1,0 +1,17 @@
+[Unit]
+Description=ACB opencode keeper
+After=acb-bridge.service
+Wants=acb-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch
+Environment=PATH=/run/current-system/sw/bin:/etc/profiles/per-user/nixos/bin:/run/wrappers/bin
+ExecStart=/run/current-system/sw/bin/bash /home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/deploy/opencode-keeper.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/opencode-keeper.log
+StandardError=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/opencode-keeper.log
+
+[Install]
+WantedBy=default.target

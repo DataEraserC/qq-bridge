@@ -18,6 +18,8 @@ use acb_proto::RoomId;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::plugin::ProviderId;
+
 /// 没配「攒多少条」时的默认值。来源：实现默认，可推翻。
 pub const DEFAULT_ACCUMULATE: u32 = 10;
 
@@ -368,6 +370,8 @@ pub enum WakeDecision {
 /// （ADR-0002 / 0007）。关键词、事件类型、免打扰名单是可选开关，默认全关。
 #[derive(Debug, Clone, PartialEq)]
 pub struct WakePolicy {
+    /// 唤醒策略的 provider id（ADR-0026）。默认是内置实现。
+    pub provider: ProviderId,
     /// @ 到本账号就醒。
     pub at_mention: bool,
     /// 引用我发的消息就醒（QQ 的「回复」就是这种）。
@@ -392,6 +396,7 @@ pub struct WakePolicy {
 impl Default for WakePolicy {
     fn default() -> Self {
         Self {
+            provider: ProviderId::builtin_wake(),
             at_mention: true,
             reply: true,
             name_mention: true,
@@ -484,6 +489,13 @@ pub enum ConfigError {
     },
     #[error("会话 {session} 的房间 {room} 的 accumulate 必须是正整数")]
     BadAccumulate { session: String, room: String },
+    #[error("会话 {session} 的房间 {room} 的唤醒策略 provider 不合法：{provider}（{detail}）")]
+    BadWakeProvider {
+        session: String,
+        room: String,
+        provider: String,
+        detail: String,
+    },
     #[error("会话 {session} 的接入令牌不能为空")]
     EmptyToken { session: String },
     #[error("会话 {session} 引用了不存在的人格 {persona}")]
@@ -1107,7 +1119,23 @@ fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, 
         }
     }
 
+    let provider = match raw
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => ProviderId::parse(text).map_err(|error| ConfigError::BadWakeProvider {
+            session: session.to_owned(),
+            room: room.to_string(),
+            provider: text.to_owned(),
+            detail: error.to_string(),
+        })?,
+        None => ProviderId::builtin_wake(),
+    };
+
     Ok(WakePolicy {
+        provider,
         at_mention: raw.at_mention.unwrap_or(default.at_mention),
         reply: raw.reply.unwrap_or(default.reply),
         name_mention: raw.name_mention.unwrap_or(default.name_mention),
@@ -1336,6 +1364,8 @@ struct RawSubscription {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawWake {
+    /// 唤醒策略 provider id（ADR-0026）。不写就用内置实现。
+    provider: Option<String>,
     at_mention: Option<bool>,
     reply: Option<bool>,
     name_mention: Option<bool>,
@@ -1746,8 +1776,27 @@ mod tests {
     #[test]
     fn wake_defaults_are_the_five_documented_switches() {
         let policy = WakePolicy::default();
+        assert_eq!(policy.provider, ProviderId::builtin_wake());
         assert!(policy.at_mention && policy.reply && policy.name_mention && policy.poke);
         assert_eq!(policy.accumulate, Some(DEFAULT_ACCUMULATE));
+    }
+
+    #[test]
+    fn wake_provider_is_parsed_and_bad_ids_are_rejected() {
+        let text = format!(
+            "{ONE_CONNECTION}\n{ONE_SESSION}\n[sessions.subscriptions.wake]\nprovider = \"vendor.test\"\n"
+        );
+        let config = Config::parse(&text).expect("能解析");
+        let wake = &config.session("main").expect("会话在").subscriptions[0].wake;
+        assert_eq!(wake.provider.to_string(), "vendor.test");
+
+        let bad = format!(
+            "{ONE_CONNECTION}\n{ONE_SESSION}\n[sessions.subscriptions.wake]\nprovider = \"nodot\"\n"
+        );
+        assert!(matches!(
+            Config::parse(&bad),
+            Err(ConfigError::BadWakeProvider { .. })
+        ));
     }
 
     #[test]

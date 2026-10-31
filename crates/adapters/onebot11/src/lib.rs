@@ -13,12 +13,14 @@
 
 pub mod catalog;
 pub mod event;
+pub mod factory;
 pub mod forward;
 pub mod link;
 pub mod outbound;
 pub mod segment;
 
 pub use event::{EventError, Parsed};
+pub use factory::{MANIFEST, OneBotAdapterFactory};
 pub use link::{Action, LinkError, LinkSlot, connect, pump, supervise};
 pub use outbound::OneBotOutbound;
 pub use segment::{PLATFORM, SegmentError};

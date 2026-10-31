@@ -47,4 +47,4 @@ ss -tln | grep -E "7700|3080|3100|3131"
 ## 还是不行
 
 拿上这几样去提 issue：桥日志（`journalctl --user -u acb-bridge.service`）、
-驱动日志（`~/qqab-scratch/logs/`）、控制台会话页截图、出问题时你在群里发的原话。
+驱动日志（`state/logs/`）、控制台会话页截图、出问题时你在群里发的原话。
