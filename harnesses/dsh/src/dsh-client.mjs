@@ -351,6 +351,23 @@ export class DshClient {
   }
 
   /**
+   * 给 workspace（按路径归组）设显示标题——只在这次调用真正新建出 workspace 时才命名，
+   * 已存在的不动（可能是用户在 dsh 里手改过的）。返回 { workspaceId, created }。
+   * 参考旧实现（src/bridge.js）：workspace/create {path} → created 时 workspace/rename {workspaceId, title}。
+   */
+  async ensureWorkspaceTitle(path, title) {
+    const result = await this.callUnary("workspace/create", { path })
+    const workspaceId = result?.workspace?.workspaceId
+    if (!workspaceId) {
+      throw new DshError("protocol", `workspace/create 没回 workspaceId：${JSON.stringify(result).slice(0, 200)}`)
+    }
+    if (result.created && title) {
+      await this.callUnary("workspace/rename", { workspaceId, title })
+    }
+    return { workspaceId, created: Boolean(result.created) }
+  }
+
+  /**
    * 把一条消息投进会话（mode: queue 排队，steer 打断当前轮）。
    * 返回 dsh 的响应（通常 { accepted: true }）。
    */

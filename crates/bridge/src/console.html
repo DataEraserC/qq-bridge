@@ -54,6 +54,11 @@
   .form-row > label:first-child { min-width:110px; color:var(--dim); font-size:13px; }
   .form-row input[type=checkbox] { width:auto; }
   .hint { color:var(--dim); font-size:12px; }
+  /* 表单弹窗：从对应条目点开，浮层居中，不再插到页面顶部 */
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:flex-start; justify-content:center; z-index:50; overflow:auto; padding:40px 16px; }
+  #modal.open { display:flex; }
+  #modal-box { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; width:min(640px, 100%); box-shadow:0 12px 40px rgba(0,0,0,.5); }
+  #modal-box h2 { margin-top:0; }
 </style>
 </head>
 <body>
@@ -75,19 +80,27 @@
   <section id="tab-feedback"><div class="card"><h2>agent 反馈</h2><div id="feedback"></div></div></section>
   <section id="tab-config"><div id="config"></div></section>
 </main>
+<div id="modal" onclick="if(event.target===this)closeModal()"><div id="modal-box"></div></div>
 <script>
 "use strict";
 const $ = (s, el=document) => el.querySelector(s);
+// token 存 localStorage；包 try/catch——某些嵌入环境（沙箱 iframe）禁存储会直接抛异常。
+// 就算 localStorage 用不了，服务端种的 HttpOnly cookie 也能保住登录。
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
 const token = (() => {
   const m = location.search.match(/[?&]token=([^&]*)/);
-  if (m) { localStorage.setItem("acb-console-token", decodeURIComponent(m[1])); history.replaceState(null, "", location.pathname); }
-  return localStorage.getItem("acb-console-token") || "";
+  if (m) { store.set("acb-console-token", decodeURIComponent(m[1])); history.replaceState(null, "", location.pathname); }
+  return store.get("acb-console-token") || "";
 })();
 if (!token) { location.href = "/?login=1"; }
 
 async function api(path, options = {}) {
   const res = await fetch(path, { ...options, headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json", ...(options.headers||{}) } });
-  if (res.status === 401) { localStorage.removeItem("acb-console-token"); location.href = "/?login=1"; throw new Error("未授权"); }
+  if (res.status === 401) { store.del("acb-console-token"); location.href = "/?login=1"; throw new Error("未授权"); }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
   return body;
@@ -184,7 +197,6 @@ async function loadConfig() {
     : "";
   if (tomlEditorText !== null) {
     $("#config").innerHTML = banner + `
-    <div id="edit-area"></div>
     <div class="card"><h2>编辑配置 TOML（高级）</h2>
       <p class="muted">结构化表单能满足日常改动；这里留了原文编辑做兜底。
       保存时先校验再落盘：解析不过一个字节都不写；落盘前自动备份成 config.toml.bak。</p>
@@ -216,13 +228,12 @@ async function loadConfig() {
     <button class="mini" onclick="addSub('${esc(s.id)}')">+ 订阅</button>
     <button class="mini" onclick="editSession('${esc(s.id)}')">会话信息</button></td></tr>`).join("");
   $("#config").innerHTML = `
-  <div id="edit-area"></div>
-  <div class="card"><h2>连接（一个账号一条）<span class="hint">改了要重启桥</span></h2><table>
+  <div class="card"><h2>连接（一个账号一条）<span class="hint">改了要重启桥</span><button class="mini" onclick="addConnection()" style="float:right">+ 新连接</button></h2><table>
     <tr><th>id</th><th>平台</th><th>地址</th><th>令牌</th><th>账号</th><th>破坏性放行</th><th></th></tr>${connRows}</table></div>
-  <div class="card"><h2>harness 会话</h2><table>
+  <div class="card"><h2>harness 会话<button class="mini" onclick="addSession()" style="float:right">+ 新会话</button></h2><table>
     <tr><th>id</th><th>harness</th><th>人格</th><th>接入令牌</th><th>订阅与唤醒</th></tr>${sessRows}</table></div>
-  <div class="card"><h2>人格</h2>${(c.personas||[]).map((p) => `<div class="kv"><div class="k">${esc(p.id)}（${esc(p.name)}）<button class="mini" onclick="editPersona('${esc(p.id)}')">编辑</button></div><pre>${esc(p.text)}</pre></div>`).join("") || '<p class="empty">无</p>'}</div>
-  <div class="card"><h2>记忆</h2>${(c.memories||[]).map((m) => `<div class="kv"><div class="k">${esc(m.id)}（${esc(m.name)}）<button class="mini" onclick="editMemory('${esc(m.id)}')">编辑</button></div><div>${esc(m.kind)} @ <span class="wrap">${esc(m.location)}</span></div></div>`).join("") || '<p class="empty">无</p>'}</div>
+  <div class="card"><h2>人格<button class="mini" onclick="addPersona()" style="float:right">+ 新人格</button></h2>${(c.personas||[]).map((p) => `<div class="kv"><div class="k">${esc(p.id)}（${esc(p.name)}）<button class="mini" onclick="editPersona('${esc(p.id)}')">编辑</button></div><pre>${esc(p.text)}</pre></div>`).join("") || '<p class="empty">无</p>'}</div>
+  <div class="card"><h2>记忆<button class="mini" onclick="addMemory()" style="float:right">+ 新记忆仓库</button></h2>${(c.memories||[]).map((m) => `<div class="kv"><div class="k">${esc(m.id)}（${esc(m.name)}）<button class="mini" onclick="editMemory('${esc(m.id)}')">编辑</button></div><div>${esc(m.kind)} @ <span class="wrap">${esc(m.location)}</span></div></div>`).join("") || '<p class="empty">无</p>'}</div>
   <div class="card"><h2>文件中继</h2>${c.file_relay ? `<div class="kv">
     <div class="k">mode</div><div>${esc(c.file_relay.mode)}</div>
     <div class="k">listen</div><div>${esc(c.file_relay.listen)}</div>
@@ -313,21 +324,34 @@ async function submitPatch(ops) {
     const r = await api("/api/config/patch", { method: "POST", body: JSON.stringify({ ops }) });
     tomlResult = r;
     loadConfig();
+    return true;
   } catch (e) {
     tomlResult = { error: e.message };
     const box = $("#toml-result");
     if (box) box.innerHTML = '<p class="err">' + esc(e.message) + "</p>";
-    else alert(e.message);
+    // 弹窗开着时错误别只写进被遮住的角落，要让人看见。
+    alert(e.message);
+    return false;
   }
 }
 
+function closeModal() {
+  $("#modal").classList.remove("open");
+}
+
+/** 表单弹窗：从点开的位置浮出，居中显示；点遮罩/取消关闭。 */
 function formFrame(titleHtml, bodyHtml, onSave) {
-  const area = $("#edit-area");
-  area.innerHTML = `<div class="card"><h2>${titleHtml}</h2>${bodyHtml}
-    <p><button class="act" id="form-save">保存</button>
-    <button class="act ghost" onclick="document.getElementById('edit-area').innerHTML=''">取消</button></p></div>`;
-  area.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  $("#form-save").addEventListener("click", () => { try { onSave(); } catch (e) { alert(e.message); } });
+  $("#modal-box").innerHTML = `<h2>${titleHtml}</h2>${bodyHtml}
+    <p style="margin-bottom:0"><button class="act" id="form-save">保存</button>
+    <button class="act ghost" onclick="closeModal()">取消</button></p>`;
+  $("#modal").classList.add("open");
+  $("#form-save").addEventListener("click", async () => {
+    try {
+      // onSave 返回 false（通常是补丁没保存成功）就不关弹窗，让人改完再存。
+      const result = await onSave();
+      if (result !== false) closeModal();
+    } catch (e) { alert(e.message); }
+  });
 }
 
 const wakeFormHtml = (w) => `
@@ -463,6 +487,85 @@ function editGlobals() {
       submitPatch([{ op: "global", patch }]);
     });
 }
+
+// ---------------------------------------------------------------------------
+// 新增表单
+// ---------------------------------------------------------------------------
+
+const randToken = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+
+function addConnection() {
+  formFrame("新增连接 <span class='hint'>（保存后要重启桥才连上）</span>", `
+    <div class="form-row"><label>连接 id</label><input type="text" id="nc-id" placeholder="qq2"></div>
+    <div class="form-row"><label>平台</label><input type="text" id="nc-platform" value="qq"><span class="hint">平台标识（连接名参与房间路由）</span></div>
+    <div class="form-row"><label>适配器</label><input type="text" id="nc-kind" value="onebot11"></div>
+    <div class="form-row"><label>地址</label><input type="text" id="nc-url" placeholder="ws://127.0.0.1:53001/ws?token=…" style="width:340px"></div>
+    <div class="form-row"><label>账号</label><input type="text" id="nc-account" placeholder="机器人 QQ 号"></div>
+    <div class="form-row"><label>令牌</label><input type="text" id="nc-token" placeholder="可选（OneBot access token）"></div>`,
+    () => {
+      const g = (id) => document.getElementById(id).value.trim();
+      const id = g("nc-id");
+      if (!id) { alert("连接 id 不能为空"); return false; }
+      if (!g("nc-url") || !g("nc-account")) { alert("地址和账号都得填"); return false; }
+      const create = {
+        platform: g("nc-platform"), kind: g("nc-kind"),
+        url: g("nc-url"), account: g("nc-account"),
+      };
+      if (g("nc-token")) create.token = g("nc-token");
+      return submitPatch([{ op: "connection", id, create }]);
+    });
+}
+
+function addSession() {
+  const harnesses = (cfgCache?.harnesses || []);
+  if (!harnesses.length) { alert("配置里还没有任何 harness，先用「编辑 TOML 原文」加 [[harnesses]]"); return; }
+  const personas = (cfgCache?.personas || []);
+  formFrame("新增 harness 会话", `
+    <div class="form-row"><label>会话 id</label><input type="text" id="ns-id" placeholder="dsh-group3"></div>
+    <div class="form-row"><label>harness</label><select id="ns-harness">${harnesses.map((h) => `<option>${esc(h.id)}</option>`).join("")}</select></div>
+    <div class="form-row"><label>人格</label><select id="ns-persona"><option value="">（不设）</option>${personas.map((p) => `<option>${esc(p.id)}</option>`).join("")}</select></div>
+    <div class="form-row"><label>显示名</label><input type="text" id="ns-name" placeholder="可选"></div>
+    <div class="form-row"><label>接入令牌</label><input type="text" id="ns-token" value="${randToken()}" style="width:340px"><span class="hint">harness 连桥用；驱动要重启才能拿到新会话的令牌</span></div>
+    <p class="hint">建好后去「订阅」给它加房间；驱动侧要在 start-drivers.sh 里登记这个会话 id 才会被驱动。</p>`,
+    () => {
+      const g = (id) => document.getElementById(id).value.trim();
+      const id = g("ns-id");
+      if (!id) { alert("会话 id 不能为空"); return false; }
+      const create = {
+        harness: document.getElementById("ns-harness").value,
+        token: g("ns-token"),
+      };
+      if (!create.token) { alert("接入令牌不能为空"); return false; }
+      if (document.getElementById("ns-persona").value) create.persona = document.getElementById("ns-persona").value;
+      if (g("ns-name")) create.name = g("ns-name");
+      return submitPatch([{ op: "session", id, create }]);
+    });
+}
+
+function addPersona() {
+  formFrame("新增人格", `
+    <div class="form-row"><label>人格 id</label><input type="text" id="np-id" placeholder="assistant"></div>
+    <div class="form-row"><label>名字</label><input type="text" id="np-name" placeholder="显示用"></div>
+    <div class="form-row"><label style="align-self:flex-start">人设文本</label><textarea id="np-text" style="width:100%;min-height:120px" placeholder="你是谁 / 性格 / 语气…"></textarea></div>`,
+    () => {
+      const g = (id) => document.getElementById(id).value.trim();
+      if (!g("np-id")) { alert("人格 id 不能为空"); return false; }
+      return submitPatch([{ op: "persona", id: g("np-id"), name: g("np-name") || g("np-id"), text: document.getElementById("np-text").value }]);
+    });
+}
+
+function addMemory() {
+  formFrame("新增记忆仓库", `
+    <div class="form-row"><label>仓库 id</label><input type="text" id="nm-id" placeholder="shared-notes"></div>
+    <div class="form-row"><label>名字</label><input type="text" id="nm-name" placeholder="显示用"></div>
+    <div class="form-row"><label>类型</label><input type="text" id="nm-kind" value="git"><span class="hint">目前 git</span></div>
+    <div class="form-row"><label>位置</label><input type="text" id="nm-loc" placeholder="~/Documents/notes.git" style="width:320px"></div>`,
+    () => {
+      const g = (id) => document.getElementById(id).value.trim();
+      if (!g("nm-id") || !g("nm-loc")) { alert("仓库 id 和位置都得填"); return false; }
+      return submitPatch([{ op: "memory", id: g("nm-id"), name: g("nm-name") || g("nm-id"), kind: g("nm-kind") || "git", location: g("nm-loc") }]);
+    });
+}
 document.querySelectorAll("nav button").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
@@ -470,8 +573,8 @@ document.querySelectorAll("nav button").forEach((btn) => {
     tabs[btn.dataset.tab]().catch((e) => console.error(e));
   });
 });
-$("#logout").addEventListener("click", () => { localStorage.removeItem("acb-console-token"); location.href = "/?login=1"; });
-$("#conn-note").textContent = "token 已从本页保存，只存在浏览器 localStorage";
+$("#logout").addEventListener("click", () => { store.del("acb-console-token"); location.href = "/?login=1"; });
+$("#conn-note").textContent = "登录态存在浏览器 cookie 和 localStorage 里，刷新不用重输";
 loadStatus().catch((e) => console.error(e));
 </script>
 </body>

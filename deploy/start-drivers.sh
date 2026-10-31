@@ -41,6 +41,16 @@ fi
 # 走离线铸造 cookie（~/.dsh/.credentials.yaml 里的 browser-session 密钥），
 # 见 dsh-client.mjs 的 ensureAuth：能铸造就优先铸造，所以这里不传 DSH_TOKEN。
 
+# 会话的归组与命名：cwd 决定 dsh UI 里归进哪个 workspace（Workspaces 列表按它分组），
+# 标题只在 workspace 第一次被创建时命名，不覆盖已有标题。
+# 所有驱动都归同一个 workspace，dsh 侧看起来就是旧实现那样的「QQ 聊天」一组。
+# 注意：改 ACB_CWD 会让旧会话 id 的 cwd 对不上（dsh 报 belongs to … not …），
+# 驱动会自动换新 id 重建（driver.mjs 的冲突兜底），历史上下文留在旧 workspace 里。
+ACB_CWD="${ACB_CWD:-$HOME/nix-config}"
+ACB_WORKSPACE_TITLE="${ACB_WORKSPACE_TITLE:-QQ 聊天}"
+export ACB_CWD ACB_WORKSPACE_TITLE
+echo "dsh 会话归组：$ACB_CWD（workspace 标题：$ACB_WORKSPACE_TITLE）"
+
 # 从 config.toml 的 [[sessions]] 块里取某个会话的 token。
 session_token() {
   awk -v want="\"$1\"" '

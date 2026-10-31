@@ -17,12 +17,26 @@ class ControllableDsh {
     this.sessions = []
     this.modelPicks = []
     this.lastFollow = null
+    this.createCalls = []
+    this.workspaceCalls = []
+    // 设了就按它匹配请求的 sessionId 抛 conflict（测驱动的冲突兜底）。
+    this.conflictOn = null
+    this.workspaceCreated = false
   }
 
-  async createSession(title) {
+  async createSession(args = {}) {
+    this.createCalls.push(args)
+    if (this.conflictOn && this.conflictOn.test(String(args.sessionId ?? ""))) {
+      throw new Error('session/create 失败（session/conflict）：session "x" belongs to "/a", not "/b"')
+    }
     const id = `session-${this.sessions.length + 1}`
     this.sessions.push(id)
     return id
+  }
+
+  async ensureWorkspaceTitle(path, title) {
+    this.workspaceCalls.push({ path, title })
+    return { workspaceId: "ws-1", created: this.workspaceCreated }
   }
 
   async selectModel(sessionId, choice) {
@@ -202,6 +216,70 @@ test("一轮失败后下次投递复用同一会话，不新建", async (t) => {
   // 收尾：第二轮正常结束。
   dsh.lastFollow.push({ type: "turn/end", data: { turn: "t2" } })
   await second
+})
+
+test("reset 之后换带代次的新 id，冲突时再兜底换新", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  const driver = new TurnDriver({ dsh, log: () => {}, cwd: "/w", preset: "p" })
+
+  // 第一轮：正常建会话。
+  const first = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "第一轮 prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
+  await first
+  assert.equal(dsh.createCalls[0].sessionId, "session-acb-main")
+  assert.equal(dsh.createCalls[0].cwd, "/w", "cwd 要传给 dsh（workspace 归组）")
+
+  // reset：映射丢掉 + 代次 +1。下一轮必须用新 id，不能撞旧会话。
+  driver.resetSession("main")
+  const second = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 2, "第二轮 prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t2" } })
+  await second
+  assert.match(dsh.createCalls[1].sessionId, /^session-acb-main-r\w+$/, "reset 后 id 要带代次后缀")
+
+  // 再 reset 一次并让 dsh 对固定 id 报 conflict：驱动要兜底换新 id 而不是硬顶。
+  driver.resetSession("main")
+  dsh.conflictOn = /^session-acb-main$/
+  const third = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 3, "第三轮 prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t3" } })
+  await third
+  assert.match(dsh.createCalls[2].sessionId, /^session-acb-main-r\w+$/, "第三次请求本身就该带新代次")
+})
+
+test("workspace 标题：只在新建 workspace 时命名，已有的不动", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  dsh.workspaceCreated = true
+  const driver = new TurnDriver({ dsh, log: () => {}, cwd: "/w", workspaceTitle: "QQ 聊天" })
+  const run = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
+  await run
+  assert.deepEqual(dsh.workspaceCalls, [{ path: "/w", title: "QQ 聊天" }])
+
+  // workspace 已存在（created:false）：第二次建会话不应再发命名请求。
+  dsh.workspaceCreated = false
+  driver.resetSession("main")
+  const second = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 2, "第二轮 prompt 没被调")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t2" } })
+  await second
+  assert.equal(dsh.workspaceCalls.length, 1, "已有 workspace 不重复命名")
 })
 
 test("callBridge 把工具参数转成带票的 tool_call", async (t) => {

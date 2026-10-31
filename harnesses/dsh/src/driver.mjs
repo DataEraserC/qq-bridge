@@ -27,6 +27,8 @@
 //   ACB_MCP_PORT  设了就起 streamable-http MCP（常驻模式）；不设走 stdio（兼容/测试）
 //   DSH_BASE_URL  dsh webui 地址，默认 http://127.0.0.1:3080
 //   DSH_TOKEN     dsh 启动 token（可选，没有就走离线铸造 Cookie）
+//   ACB_CWD       会话工作目录：dsh 按它把会话归进某个 workspace（Workspaces 分组）
+//   ACB_WORKSPACE_TITLE  新建 workspace 时给它起的显示标题（如「QQ 聊天」）
 
 import { BridgeLink, BridgeError, normalizeToolArgs, renderTurn } from "../../opencode/plugin/acb-wire.mjs"
 import { TOOLS } from "../../shared/tools.mjs"
@@ -48,6 +50,8 @@ function readConfig() {
     dshToken: process.env.DSH_TOKEN?.trim() || "",
     // 会话的工作目录：dsh 按它把会话归到某个 workspace（分组）。留空就不分组。
     cwd: process.env.ACB_CWD?.trim() || "",
+    // dsh workspace 标题（新建 workspace 时命名，如「QQ 聊天」）。留空不命名。
+    workspaceTitle: process.env.ACB_WORKSPACE_TITLE?.trim() || "",
     // dsh 的 agent preset id（config.id）：本进程建会话时指名用哪个 preset。
     // 每个 acb 会话一个 preset，每个 preset 只挂它自己的 MCP，这样模型在某个
     // dsh 会话里只会看到那一套工具，不会拿到「另一套没票的工具」去试错（ADR-0019）。
@@ -81,6 +85,7 @@ async function main() {
     cwd: config.cwd,
     preset: config.preset,
     model: config.model,
+    workspaceTitle: config.workspaceTitle,
   })
 
   const link = new BridgeLink({
@@ -156,11 +161,15 @@ async function main() {
 // ---------------------------------------------------------------------------
 
 class TurnDriver {
-  constructor({ dsh, log, cwd = "", preset = "", model = null }) {
+  constructor({ dsh, log, cwd = "", preset = "", model = null, workspaceTitle = "" }) {
     this.dsh = dsh
     this.log = log
     this.cwd = cwd
     this.preset = preset
+    // 配了就把 cwd 对应的 dsh workspace 命名成这个标题（只在新建 workspace 时命名，
+    // 不覆盖用户在 dsh 里手改过的名字）。dsh UI 的 Workspaces 列表就按它显示，
+    // 类似旧实现的「QQ 聊天」。
+    this.workspaceTitle = workspaceTitle
     // 要钉住的模型 {provider, model, reasoningEffort}；provider/model 任一为空就不干预。
     this.model = model && model.provider && model.model ? model : null
     // 已经钉过模型的 dsh 会话。一个会话只调一次 selectModel，别每轮都发一遍。
@@ -169,23 +178,30 @@ class TurnDriver {
     // uuid，是为了持久化：进程重启后 createSession 传同一个 sessionId + cwd，
     // dsh 的 claim 逻辑会直接复用旧会话，不丢上下文。
     this.sessions = new Map()
+    // 重置代次：reset 过的会话换新 id（-r<代次>），避开同 id + 不同 cwd 的冲突。
+    this.generations = new Map()
+    // 已经探过 workspace 归属的 cwd（每个只发一次 workspace/create）。
+    this.workspaceEnsured = new Set()
     this.chain = Promise.resolve()
   }
 
-  /** 这个 acb 会话对应的固定 dsh sessionId（不带时间戳后缀）。 */
+  /** 这个 acb 会话对应的固定 dsh sessionId（重置过后带代次后缀）。 */
   #fixedSessionId(acbSession) {
     // dsh 的 sessionId 都是 `session-<uuid>` 风格；这里用 `session-acb-<id>` 保持
     // 一致的命名空间，且不含冒号（避免任何潜在的 id 校验歧义）。
-    return `session-acb-${acbSession}`
+    const generation = this.generations.get(acbSession)
+    return `session-acb-${acbSession}${generation ? `-r${generation}` : ""}`
   }
 
   /**
-   * 重置某个 acb 会话：丢掉当前映射，下次开轮用带时间戳的新 id 新建一个干净会话。
-   * 旧会话留在 dsh 里不删（符合「新会话即可」的重置语义）。
+   * 重置某个 acb 会话：丢掉当前映射 + 记一代次号，下次开轮用带代次的新 id
+   * 新建一个干净会话（不记代次的话还是同一个 id，dsh 会因为 cwd 冲突拒绝：
+   * `session "…" belongs to …, not …`）。旧会话留在 dsh 里不删（符合「新会话即可」的重置语义）。
    */
   resetSession(acbSession) {
     this.sessions.delete(acbSession)
-    this.log("info", `已重置会话 ${acbSession}，下次开轮会新建`)
+    this.generations.set(acbSession, Date.now().toString(36))
+    this.log("info", `已重置会话 ${acbSession}，下次开轮用新 id 新建`)
   }
 
   /**
@@ -297,13 +313,45 @@ class TurnDriver {
     const cached = this.sessions.get(session)
     if (cached) return cached
     const fixed = this.#fixedSessionId(session)
-    const sessionId = await this.dsh.createSession({
-      sessionId: fixed,
-      ...(this.cwd ? { cwd: this.cwd } : {}),
-      ...(this.preset ? { agentPreset: this.preset } : {}),
-    })
+    let sessionId
+    try {
+      sessionId = await this.dsh.createSession({
+        sessionId: fixed,
+        ...(this.cwd ? { cwd: this.cwd } : {}),
+        ...(this.preset ? { agentPreset: this.preset } : {}),
+      })
+    } catch (error) {
+      const message = String(error?.message ?? error)
+      // 同 id 已存在但归属别的 cwd（比如 cwd 环境变量改过、或旧版本没传 cwd）：
+      // 不硬顶，换一个带代次的 id 新建，保住「能开轮」这个主要矛盾。
+      if (/conflict|belongs to/i.test(message)) {
+        const fallback = `${fixed}-r${Date.now().toString(36)}`
+        this.log("warn", `dsh 会话 ${fixed} 有 id/cwd 冲突，改用 ${fallback} 新建：${message}`)
+        sessionId = await this.dsh.createSession({
+          sessionId: fallback,
+          ...(this.cwd ? { cwd: this.cwd } : {}),
+          ...(this.preset ? { agentPreset: this.preset } : {}),
+        })
+      } else {
+        throw error
+      }
+    }
     this.sessions.set(session, sessionId)
     this.log("info", `dsh 会话 ${sessionId}（${fixed}${this.cwd ? `，归组 ${this.cwd}` : ""}${this.preset ? `，preset ${this.preset}` : ""}）`)
+    // workspace 标题：best-effort，失败不影响开轮。每个 cwd 只探一次（workspace/create
+    // 对已存在的路径虽然无害，但没必要每次建会话都发）；且只在 workspace 是这次新建
+    // 的时候命名，不覆盖已有的（可能是用户手改过的）标题。
+    if (this.cwd && this.workspaceTitle && !this.workspaceEnsured.has(this.cwd)) {
+      this.workspaceEnsured.add(this.cwd)
+      try {
+        const named = await this.dsh.ensureWorkspaceTitle(this.cwd, this.workspaceTitle)
+        if (named?.created) this.log("info", `dsh workspace ${this.cwd} 命名为「${this.workspaceTitle}」`)
+      } catch (error) {
+        // 探过但失败：从集合里放出来，下轮再试一次。
+        this.workspaceEnsured.delete(this.cwd)
+        this.log("warn", `给 dsh workspace 命名失败（不影响会话）：${error?.message ?? error}`)
+      }
+    }
     // 建好会话就把映射回报给桥，让控制台能查到「acb 会话 ↔ dsh 会话」的对应关系。
     // 用 report_map 指令，result 里带 session_id + meta（这里放固定 id 和分组）。
     if (link) {

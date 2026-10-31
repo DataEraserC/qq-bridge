@@ -103,52 +103,67 @@ impl<S: Store + Send + 'static> Console<S> {
             }
         }
         let Some(header_end) = header_end else {
-            return write_response(&mut stream, 400, "application/json", r#"{"error":"请求头不完整"}"#);
+            return write_response(&mut stream, 400, "application/json", r#"{"error":"请求头不完整"}"#, &[]);
         };
         let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
-        let (method, path, auth) = parse_request_line(&header_text);
-        // 读 body（反馈改状态要带 {"status": "...", "note": "..."}）。
-        let body = read_body(&mut stream, &buffer[header_end + 4..], &header_text);
+    let (method, path, auth) = parse_request_line(&header_text);
+    let cookie = header_text
+        .lines()
+        .find_map(|l| l.strip_prefix("Cookie:").map(str::trim))
+        .unwrap_or_default()
+        .to_owned();
+    // 读 body（反馈改状态要带 {"status": "...", "note": "..."}）。
+    let body = read_body(&mut stream, &buffer[header_end + 4..], &header_text);
 
         // 浏览器自动请求 favicon 且不带 token；放鉴权前 204 收掉，别给 DevTools 留 401 噪音。
         if method == "GET" && (path == "/favicon.ico" || path == "/apple-touch-icon.png") {
-            return write_response(&mut stream, 204, "text/plain", "");
+            return write_response(&mut stream, 204, "text/plain", "", &[]);
         }
 
         let (path, query) = split_query(&path);
-        // 两条门路：Authorization: Bearer 头，或 ?token=（只有浏览器进门用）。
-        let authorized = self.authorized(&auth) || self.query_token_authorized(query);
+        // 三条门路：Authorization: Bearer 头、浏览器 cookie（进门时种下的）、
+        // ?token=（登录表单跳转用）。cookie 是刷新后不掉登录的关键：localStorage
+        // 在某些嵌入环境（沙箱 iframe）里会被禁/清掉，cookie 由浏览器自己管。
+        let query_ok = query_token_matches(query, &self.token);
+        let authorized = self.authorized(&auth)
+            || query_ok
+            || cookie_token_matches(&cookie, &self.token);
 
         if !authorized {
             // 页面本身：没 token 时给登录页（不是 JSON），人才能输 token 进来。
             if method == "GET" && path == "/" {
-                return write_response(&mut stream, 401, "text/html; charset=utf-8", LOGIN_HTML);
+                return write_response(&mut stream, 401, "text/html; charset=utf-8", LOGIN_HTML, &[]);
             }
             return write_response(
                 &mut stream,
                 401,
                 "application/json",
                 r#"{"error":"未授权：带 Authorization: Bearer <token>"}"#,
+                &[],
             );
         }
 
-        // 管理页。route 只管 JSON API。
+        // 管理页。route 只管 JSON API。进门带 ?token= 时顺手种个 cookie：
+        // 之后刷新/关掉重开都靠它，不用再输一遍令牌。
         if method == "GET" && path == "/" {
-            return write_response(&mut stream, 200, "text/html; charset=utf-8", CONSOLE_HTML);
+            let set_cookie = if query_ok {
+                format!(
+                    "Set-Cookie: acb_console={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000\r\n",
+                    self.token
+                )
+            } else {
+                String::new()
+            };
+            return write_response(&mut stream, 200, "text/html; charset=utf-8", CONSOLE_HTML, &[&set_cookie]);
         }
 
         let (status, body) = self.route(&method, path, &body);
-        write_response(&mut stream, status, "application/json", &body)
+        write_response(&mut stream, status, "application/json", &body, &[])
     }
 
     fn authorized(&self, auth: &str) -> bool {
         // 常量时间比较，避免时序侧信道（token 是敏感凭据）。
         constant_time_eq(auth, &format!("Bearer {}", self.token))
-    }
-
-    /// `?token=<控制台token>` 形式的鉴权（浏览器进门用）。
-    fn query_token_authorized(&self, query: &str) -> bool {
-        query_token_matches(query, &self.token)
     }
 
     fn route(&self, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -627,6 +642,17 @@ fn query_token_matches(query: &str, token: &str) -> bool {
     }
 }
 
+/// `Cookie: …; acb_console=<token>; …` 鉴权（浏览器进门后种下的，刷新不掉登录）。
+fn cookie_token_matches(cookie_header: &str, token: &str) -> bool {
+    cookie_header.split(';').any(|pair| {
+        let pair = pair.trim();
+        match pair.strip_prefix("acb_console=") {
+            Some(supplied) if !supplied.is_empty() => constant_time_eq(supplied, token),
+            _ => false,
+        }
+    })
+}
+
 /// 有值就遮成 `******`（遮罩本身进 JSON，页面认它画遮蔽样式）；空值如实给 null。
 fn mask_secret(value: &str) -> serde_json::Value {
     if value.is_empty() {
@@ -699,7 +725,13 @@ fn read_body(stream: &mut TcpStream, leftover: &[u8], header_text: &str) -> Stri
     String::from_utf8_lossy(&body).to_string()
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    extra_headers: &[&str],
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
@@ -716,10 +748,14 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
         Cache-Control: no-store\r\n\
         X-Content-Type-Options: nosniff\r\n\
         Referrer-Policy: no-referrer\r\n";
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n",
+    let mut header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}",
         body.len()
     );
+    for extra in extra_headers {
+        header.push_str(extra);
+    }
+    header.push_str("Connection: close\r\n\r\n");
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     stream.flush()
@@ -858,6 +894,18 @@ mod tests {
         assert!(!query_token_matches("token=", "s3cret"));
         assert!(!query_token_matches("no-token-here", "s3cret"));
         assert!(!query_token_matches("token=S3CRET", "s3cret"));
+    }
+
+    #[test]
+    fn cookie_token_matches_reads_acb_console_pair() {
+        assert!(cookie_token_matches("acb_console=s3cret", "s3cret"));
+        assert!(cookie_token_matches("other=1; acb_console=s3cret", "s3cret"));
+        assert!(cookie_token_matches("acb_console=s3cret; extra=2", "s3cret"));
+        assert!(!cookie_token_matches("acb_console=wrong", "s3cret"));
+        assert!(!cookie_token_matches("acb_console=", "s3cret"));
+        assert!(!cookie_token_matches("other=1", "s3cret"));
+        // 别的 cookie 里带了 token= 前缀也不该误命中。
+        assert!(!cookie_token_matches("xacb_console=s3cret", "s3cret"));
     }
 
     /// 一份能通过解析的最小配置。改字段测影响对比用。

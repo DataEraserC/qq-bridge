@@ -21,6 +21,7 @@ dependencies = [
  "acb-kernel",
  "acb-proto",
  "serde_json",
+ "toml_edit",
 ]
 
 [[package]]

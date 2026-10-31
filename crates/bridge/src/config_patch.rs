@@ -24,9 +24,10 @@ pub fn apply_patch(text: &str, ops: &[serde_json::Value]) -> Result<(String, Vec
             "subscription" => subscription_op(&mut doc, op, &mut changes),
             "persona" => persona_op(&mut doc, op, &mut changes),
             "memory" => memory_op(&mut doc, op, &mut changes),
+            "harness" => harness_op(&mut doc, op, &mut changes),
             "connection" => connection_op(&mut doc, op, &mut changes),
             "global" => global_op(&mut doc, op, &mut changes),
-            other => Err(format!("不认识的 op 类型「{other}」（能用的：session / subscription / persona / memory / connection / global）")),
+            other => Err(format!("不认识的 op 类型「{other}」（能用的：session / subscription / persona / memory / harness / connection / global）")),
         }
         .map_err(|error| format!("{where_}：{error}"))?;
     }
@@ -38,18 +39,67 @@ pub fn apply_patch(text: &str, ops: &[serde_json::Value]) -> Result<(String, Vec
 // 各类操作
 // ---------------------------------------------------------------------------
 
-/// 会话级修改：`{"op":"session","id":"main","patch":{"persona":"p2","model":null}}`。
-/// 只改出现的键；`model` 给 null 表示清掉（= 由 harness 侧决定）。
+/// 会话修改或**新建**：
+/// - 修改：`{"op":"session","id":"main","patch":{"persona":"p2","model":null}}`。
+///   只改出现的键；`model` 给 null 表示清掉（= 由 harness 侧决定）。
+/// - 新建：`{"op":"session","id":"new1","create":{"harness":"dsh","token":"t",...},"patch":{...}}`。
+///   `create` 必须带 harness 和 token（接入令牌，harness 连桥全靠它）；
+///   persona / name / model / memories 可选。patch 随后照常应用。
 fn session_op(
     doc: &mut DocumentMut,
     op: &serde_json::Value,
     changes: &mut Vec<String>,
 ) -> Result<(), String> {
     let id = string_field(op, "id")?;
-    let patch = op
-        .get("patch")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("要带 patch 对象")?;
+    if session_table_mut(doc, &id).is_none() {
+        let create = op
+            .get("create")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(format!("没有会话 {id}；要新建请在同一条 op 里带 create（至少 harness 和 token）"))?;
+        let harness = create
+            .get("harness")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("新建会话要带 harness（id）")?;
+        if harness_table(doc, harness).is_none() {
+            return Err(format!("新建会话引用的 harness「{harness}」不存在，先新增它"));
+        }
+        let token = create
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|t| !t.is_empty())
+            .ok_or("新建会话要带 token（接入令牌，给 harness 连桥用）")?;
+
+        let sessions = doc
+            .get_mut("sessions")
+            .and_then(Item::as_array_of_tables_mut)
+            .ok_or("配置里没有 [[sessions]] 段，先用 TOML 编辑器建一个会话")?;
+        let mut table = Table::new();
+        table.insert("id", value(id.clone()));
+        table.insert("harness", value(harness.to_owned()));
+        table.insert("token", value(token.to_owned()));
+        for key in ["name", "persona", "model"] {
+            if let Some(text) = create.get(key).and_then(serde_json::Value::as_str) {
+                if !text.is_empty() {
+                    table.insert(key, value(text.to_owned()));
+                }
+            }
+        }
+        if let Some(list) = create.get("memories") {
+            let memories = str_list(list).map_err(|_| "memories 要是字符串数组".to_owned())?;
+            if !memories.is_empty() {
+                table.insert("memories", str_array(&memories));
+            }
+        }
+        sessions.push(table);
+        changes.push(format!("会话 {id}：新增（harness {harness}）"));
+    }
+
+    let patch = match op.get("patch").map(serde_json::Value::as_object) {
+        Some(Some(patch)) => patch,
+        // create-only 的 op（只建不改）没有 patch，直接完事。
+        Some(None) => return Err("patch 要是对象".into()),
+        None => return Ok(()),
+    };
     let table = session_table_mut(doc, &id).ok_or(format!("没有会话 {id}"))?;
 
     for (key, val) in patch {
@@ -157,18 +207,88 @@ fn memory_op(
     upsert_named_table(doc, "memories", op, &["name", "kind", "location"], changes)
 }
 
-/// 连接修改：`{"op":"connection","id":"qq","patch":{"url":"..","token":"..","account":".."}}`。
-/// 改这些**要重启桥**（守护线程攥着旧连接信息），清单会在保存结果里标出来。
+/// harness 声明新增或更新：`{"op":"harness","id":"dsh2","name":"另一个 DSH"}`。
+fn harness_op(
+    doc: &mut DocumentMut,
+    op: &serde_json::Value,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    upsert_named_table(doc, "harnesses", op, &["name"], changes)
+}
+
+/// 按 id 找 `[[harnesses]]` 里的那张表（新建会话时要校验引用存在）。
+fn harness_table<'a>(doc: &'a mut DocumentMut, id: &str) -> Option<&'a Table> {
+    doc.get("harnesses")
+        .and_then(Item::as_array_of_tables)?
+        .iter()
+        .find(|t| t.get("id").and_then(Item::as_str) == Some(id))
+}
+
+/// 连接修改或**新建**（改这些**要重启桥**——守护线程攥着旧连接信息）：
+/// - 修改：`{"op":"connection","id":"qq","patch":{"url":"..","token":"..","account":".."}}`
+/// - 新建：`{"op":"connection","id":"qq2","create":{"platform":"qq","kind":"onebot11",
+///   "url":"ws://..","account":"10002","token":".."}}`
 fn connection_op(
     doc: &mut DocumentMut,
     op: &serde_json::Value,
     changes: &mut Vec<String>,
 ) -> Result<(), String> {
     let id = string_field(op, "id")?;
-    let patch = op
-        .get("patch")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("要带 patch 对象")?;
+    let exists = doc
+        .get("connections")
+        .and_then(Item::as_array_of_tables)
+        .map(|arr| arr.iter().any(|t| t.get("id").and_then(Item::as_str) == Some(id.as_str())))
+        .unwrap_or(false);
+
+    if !exists {
+        let create = op
+            .get("create")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(format!("没有连接 {id}；要新建请在同一条 op 里带 create（至少 platform / kind / url / account）"))?;
+        let platform = create
+            .get("platform")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("新建连接要带 platform")?;
+        let kind = create
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("新建连接要带 kind")?;
+        let url = create
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|u| !u.is_empty())
+            .ok_or("新建连接要带 url")?;
+        let account = create
+            .get("account")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("新建连接要带 account")?;
+
+        let connections = doc
+            .get_mut("connections")
+            .and_then(Item::as_array_of_tables_mut)
+            .ok_or("配置里没有 [[connections]] 段，先用 TOML 编辑器建一个")?;
+        let mut table = Table::new();
+        table.insert("id", value(id.clone()));
+        table.insert("platform", value(platform.to_owned()));
+        table.insert("kind", value(kind.to_owned()));
+        table.insert("url", value(url.to_owned()));
+        table.insert("account", value(account.to_owned()));
+        if let Some(token) = create.get("token").and_then(serde_json::Value::as_str) {
+            if !token.is_empty() {
+                table.insert("token", value(token.to_owned()));
+            }
+        }
+        connections.push(table);
+        changes.push(format!("连接 {id}：新增（要重启）"));
+    }
+
+    let patch = match op.get("patch") {
+        Some(patch) => patch
+            .as_object()
+            .ok_or("patch 要是对象")?,
+        // create-only 的 op（只建不改）没有 patch，直接完事。
+        None => return Ok(()),
+    };
     let table = doc
         .get_mut("connections")
         .and_then(Item::as_array_of_tables_mut)
@@ -587,5 +707,74 @@ keywords = ["喂"]
         assert!(changes.iter().all(|c| c.contains("要重启")));
         let config = acb_kernel::Config::parse(&new_text).expect("合法");
         assert_eq!(config.connections[0].token, None);
+    }
+
+    #[test]
+    fn session_create_requires_harness_and_token() {
+        let text = base();
+        // 缺 create → 还是报「没有会话」。
+        let error = super::apply_patch(
+            &text,
+            &parse_ops(serde_json::json!([{"op": "session", "id": "new1", "patch": {"name": "x"}}])),
+        )
+        .expect_err("该报错");
+        assert!(error.contains("new1") && error.contains("create"), "{error}");
+        // create 里 harness 不存在 → 报错指名。
+        let error = super::apply_patch(
+            &text,
+            &parse_ops(serde_json::json!([{"op": "session", "id": "new1",
+                "create": {"harness": "ghost", "token": "t"}, "patch": {}}])),
+        )
+        .expect_err("该报错");
+        assert!(error.contains("ghost"), "{error}");
+        // 正常新建：id/harness/token/persona 齐全，patch 随后应用。
+        let (new_text, changes) = super::apply_patch(
+            &text,
+            &parse_ops(serde_json::json!([
+                {"op": "session", "id": "new1",
+                 "create": {"harness": "dsh", "token": "t-new", "persona": "p", "name": "二号"},
+                 "patch": {"model": "some-model"}}
+            ])),
+        )
+        .expect("能建");
+        assert!(changes[0].contains("新增"));
+        let config = acb_kernel::Config::parse(&new_text).expect("合法");
+        let session = config.session("new1").expect("新会话在");
+        assert_eq!(session.harness, "dsh");
+        assert_eq!(session.persona, "p");
+        assert_eq!(session.model.as_deref(), Some("some-model"));
+        assert_eq!(session.token, "t-new");
+        assert!(new_text.contains("# 用户手写的注释"), "注释不丢");
+    }
+
+    #[test]
+    fn connection_create_and_harness_upsert() {
+        let text = base();
+        let (new_text, changes) = super::apply_patch(
+            &text,
+            &parse_ops(serde_json::json!([
+                {"op": "connection", "id": "qq2",
+                 "create": {"platform": "qq", "kind": "onebot11",
+                            "url": "ws://127.0.0.1:3003", "account": "10002", "token": "t2"}},
+                {"op": "harness", "id": "dsh2", "name": "二号 DSH"}
+            ])),
+        )
+        .expect("能建");
+        assert!(changes[0].contains("新增") && changes[1].contains("新增"));
+        let config = acb_kernel::Config::parse(&new_text).expect("合法");
+        assert_eq!(config.connections.len(), 2);
+        assert_eq!(config.connections[1].account, "10002");
+        assert_eq!(config.connections[1].token.as_deref(), Some("t2"));
+        assert_eq!(config.harnesses.len(), 2);
+        assert_eq!(config.harnesses[1].name, "二号 DSH");
+        // 已存在的 harness 再 upsert 一次只改 name。
+        let (new_text, _) = super::apply_patch(
+            &new_text,
+            &parse_ops(serde_json::json!([{"op": "harness", "id": "dsh2", "name": "改名"}])),
+        )
+        .expect("能改");
+        let config = acb_kernel::Config::parse(&new_text).expect("合法");
+        assert_eq!(config.harnesses[1].name, "改名");
+        assert_eq!(config.harnesses.len(), 2, "不重复建");
     }
 }
