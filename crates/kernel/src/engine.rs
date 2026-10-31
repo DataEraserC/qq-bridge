@@ -156,6 +156,11 @@ pub struct Bridge<S: Store> {
     /// 文件中继。配了 `[file_relay]` 才有：发送/平台调用里的本机文件
     /// 换成平台取得到的 URL（ADR-0025）。
     relay: Option<crate::relay::FileRelay>,
+    /// 暂存的新配置（管理员在控制台保存后放这，下一次开轮时换上——ADR-0009
+    /// 轮次边界重载）。正在跑的轮次不受影响：投递批次在开轮时组装，组装完就不变。
+    staged_config: Option<Config>,
+    /// 配置版本号：每换一次配置 +1，控制台靠它展示「配置换过没有」。
+    config_version: u64,
 }
 
 impl<S: Store> Bridge<S> {
@@ -176,11 +181,51 @@ impl<S: Store> Bridge<S> {
             ticket_seq: 0,
             memory,
             relay,
+            staged_config: None,
+            config_version: 0,
         }
     }
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 暂存一份新配置。**不立即生效**：下一次开轮（[`Self::poll_turn`]）时换上
+    /// （ADR-0009 轮次边界重载）。
+    pub fn stage_config(&mut self, config: Config) {
+        self.staged_config = Some(config);
+    }
+
+    /// 有没有暂存着的配置还没生效。
+    pub fn has_staged_config(&self) -> bool {
+        self.staged_config.is_some()
+    }
+
+    /// 丢弃暂存的配置（管理员存错了想撤回）。返回之前有没有暂存。
+    pub fn discard_staged_config(&mut self) -> bool {
+        self.staged_config.take().is_some()
+    }
+
+    /// 配置版本号：每换一次 +1。
+    pub fn config_version(&self) -> u64 {
+        self.config_version
+    }
+
+    /// 轮次边界：把暂存的配置换上来。开轮前必调。
+    ///
+    /// 顺带重建从配置派生的两样东西：记忆仓库（worktrees_root 可能改了）、
+    /// 文件中继发布端（public_base/dir 可能改了）。
+    fn apply_staged_config(&mut self) {
+        let Some(config) = self.staged_config.take() else {
+            return;
+        };
+        self.memory = MemoryRepo::new(config.worktrees_root.clone());
+        self.relay = config
+            .file_relay
+            .as_ref()
+            .map(|cfg| crate::relay::FileRelay::new(&cfg.dir, &cfg.public_base));
+        self.config = config;
+        self.config_version += 1;
     }
 
     /// 只读看存储，给管理页和测试用。
@@ -298,6 +343,10 @@ impl<S: Store> Bridge<S> {
 
     /// 一条入站记录进来。
     pub fn ingest(&mut self, draft: RecordDraft) -> Result<Ingest, BridgeError> {
+        // 收消息也是配置消费点（唤醒判定走订阅），暂存的配置在这里也要换上——
+        // 否则刚保存的新订阅会漏掉紧接着来的第一条消息。开轮（poll）处同样应用：
+        // 保证投递批次组装时用的配置和开轮后工具查询看到的一致。
+        self.apply_staged_config();
         let room = draft.room.clone();
         let subscribers = self.subscribers_of(&room);
 
@@ -375,6 +424,7 @@ impl<S: Store> Bridge<S> {
 
     /// 取下一轮，不管是谁的。没有就返回 `None`。
     pub fn poll_turn(&mut self) -> Result<Option<Delivery>, BridgeError> {
+        self.apply_staged_config();
         let index = (0..self.pending.len())
             .find(|&index| !self.active.contains_key(&self.pending[index].session));
         let Some(index) = index else {
@@ -386,6 +436,7 @@ impl<S: Store> Bridge<S> {
 
     /// 只给这一组会话取活。接入点用这个——一条连接只代表它自己那组会话。
     pub fn poll_turn_for(&mut self, sessions: &[String]) -> Result<Option<Delivery>, BridgeError> {
+        self.apply_staged_config();
         let index = (0..self.pending.len()).find(|&index| {
             let pending = &self.pending[index];
             if !sessions.iter().any(|session| session == &pending.session) {

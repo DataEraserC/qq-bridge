@@ -131,6 +131,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&bridge),
                 controls,
                 console.token.clone(),
+                options.config.clone(),
             ));
             let shutdown = Arc::clone(&shutdown);
             std::thread::spawn(move || {

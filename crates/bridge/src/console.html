@@ -43,6 +43,9 @@
   pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; font-size:12px; }
   .err { color:var(--err); }
   .empty { color:var(--dim); font-style:italic; }
+  textarea { width:100%; min-height:420px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; padding:10px; resize:vertical; }
+  .banner { border:1px solid var(--warn); background:#33290f; color:var(--warn); border-radius:8px; padding:8px 12px; margin-bottom:12px; }
+  .banner button { float:right; }
 </style>
 </head>
 <body>
@@ -59,7 +62,7 @@
   <button data-tab="config">配置</button>
 </nav>
 <main>
-  <section id="tab-status" class="active"><div class="card"><h2>概览</h2><div class="stat" id="status"></div><p class="muted">配置页当前是只读快照（方案 A 第一步）；编辑写回与热重载在第二步。</p></div></section>
+  <section id="tab-status" class="active"><div class="card"><h2>概览</h2><div class="stat" id="status"></div><p class="muted" id="status-note"></p></div></section>
   <section id="tab-sessions"><div id="sessions"></div></section>
   <section id="tab-feedback"><div class="card"><h2>agent 反馈</h2><div id="feedback"></div></div></section>
   <section id="tab-config"><div id="config"></div></section>
@@ -89,7 +92,11 @@ async function loadStatus() {
   $("#status").innerHTML = [
     ["连接", s.connections], ["会话", s.sessions], ["harness", s.harnesses],
     ["忙着的会话", s.busy_sessions], ["排队轮次", s.queued_turns],
+    ["配置版本", s.config_version],
   ].map(([k, v]) => `<div><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("");
+  $("#status-note").innerHTML = s.staged_config
+    ? '<span class="err">有一份暂存的新配置，下一次收消息/开轮时自动生效</span>（去「配置」页可放弃暂存）'
+    : "配置按轮次边界热重载（ADR-0009）：在「配置」页编辑保存后，下一次收消息/开轮自动生效。";
 }
 
 async function loadSessions() {
@@ -158,7 +165,30 @@ function wakeText(w) {
   return parts.join("，") || "（全关）";
 }
 
+let tomlEditorText = null;   // 非 null = 正在编辑 TOML（textarea 的当前内容）
+let tomlResult = null;       // 刚保存完的结果（hot_reload / needs_restart 清单）
+
 async function loadConfig() {
+  const s = await api("/api/status");
+  const banner = s.staged_config
+    ? `<div class="banner">有暂存的新配置，下一次收消息/开轮时自动生效。<button class="act ghost" onclick="discardStaged()">放弃暂存</button><div style="clear:both"></div></div>`
+    : "";
+  if (tomlEditorText !== null) {
+    $("#config").innerHTML = banner + `
+    <div class="card"><h2>编辑配置 TOML</h2>
+      <p class="muted">保存时先校验再落盘：解析不过一个字节都不写；落盘前自动备份成 config.toml.bak。
+      listen 地址、connections（url/token）、storage.path、worktrees_root 改了要重启桥才生效——保存后桥会逐项告诉你。</p>
+      <textarea id="toml-text" spellcheck="false"></textarea>
+      <p>
+        <button class="act" onclick="saveToml()">校验并保存</button>
+        <button class="act ghost" onclick="cancelToml()">取消</button>
+      </p>
+      <div id="toml-result"></div>
+    </div>`;
+    $("#toml-text").value = tomlEditorText;
+    renderTomlResult();
+    return;
+  }
   const c = await api("/api/config");
   const connRows = (c.connections||[]).map((k) => `<tr>
     <td>${esc(k.id)}</td><td>${esc(k.platform)}/${esc(k.kind)}</td><td class="wrap">${esc(k.url)}</td>
@@ -186,7 +216,60 @@ async function loadConfig() {
     <div class="k">保留策略</div><div>每房间 ${esc(c.retention && c.retention.max_records_per_room)} 条 / ${esc(c.retention && c.retention.max_age_days)} 天</div>
     <div class="k">一轮投递上限</div><div>${esc(c.delivery_limit)}</div>
     <div class="k">记忆 worktree 根</div><div>${esc(c.worktrees_root)}</div>
-    <div class="k">失败通知默认动作</div><div>${esc((c.default_on_turn_error||[]).join(", ") || "只记日志")}</div></div></div>`;
+    <div class="k">失败通知默认动作</div><div>${esc((c.default_on_turn_error||[]).join(", ") || "只记日志")}</div></div></div>
+  <div class="card"><h2>编辑配置</h2>
+    <div id="toml-result">${tomlResult ? renderTomlResult() : ""}</div>
+    <p><button class="act" onclick="editToml()">编辑 TOML…</button>
+    <span class="muted">保存先校验后落盘（自动备份 .bak），下一轮自动生效；改了 listen/connections/库路径要重启桥。</span></p>
+  </div>`;
+}
+
+async function editToml() {
+  try {
+    const r = await api("/api/config/toml");
+    tomlEditorText = r.text;
+    tomlResult = null;
+    loadConfig();
+  } catch (e) { alert(e.message); }
+}
+
+function cancelToml() {
+  tomlEditorText = null;
+  tomlResult = null;
+  loadConfig();
+}
+
+async function saveToml() {
+  const text = $("#toml-text").value;
+  try {
+    const r = await api("/api/config/toml", { method: "POST", body: JSON.stringify({ text }) });
+    tomlResult = r;
+    tomlEditorText = null;
+    loadConfig();
+  } catch (e) {
+    // 校验失败：留在编辑器里，错误贴在按钮下面，原文不动。
+    tomlResult = { error: e.message };
+    const box = $("#toml-result");
+    if (box) box.innerHTML = '<p class="err">' + esc(e.message) + "</p>";
+  }
+}
+
+async function discardStaged() {
+  if (!confirm("放弃暂存的新配置？继续用当前生效的这份。")) return;
+  try { await api("/api/config/discard", { method: "POST", body: "{}" }); loadConfig(); }
+  catch (e) { alert(e.message); }
+}
+
+function renderTomlResult() {
+  if (!tomlResult) return "";
+  if (tomlResult.error) return '<p class="err">' + esc(tomlResult.error) + "</p>";
+  const list = (items, cls) => (items||[]).map((i) => `<li class="${cls}">${esc(i)}</li>`).join("");
+  return `<div class="card">
+    <p>✓ ${esc(tomlResult.note || "已保存")}</p>
+    ${(tomlResult.hot_reload||[]).length ? "<p><b>下一轮自动生效：</b></p><ul>" + list(tomlResult.hot_reload, "") + "</ul>" : ""}
+    ${(tomlResult.needs_restart||[]).length ? "<p class='err'><b>要重启桥才生效：</b></p><ul>" + list(tomlResult.needs_restart, "err") + "</ul>" : ""}
+    ${!(tomlResult.hot_reload||[]).length && !(tomlResult.needs_restart||[]).length ? '<p class="muted">配置没变化（或变化不影响行为）。</p>' : ""}
+  </div>`;
 }
 
 const tabs = {

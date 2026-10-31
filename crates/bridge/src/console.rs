@@ -39,14 +39,22 @@ pub struct Console<S: Store> {
     bridge: Arc<Mutex<Bridge<S>>>,
     controls: ControlRegistry,
     token: String,
+    /// 配置文件路径：编辑写回要落到这个文件（ADR-0009）。
+    config_path: String,
 }
 
 impl<S: Store + Send + 'static> Console<S> {
-    pub fn new(bridge: Arc<Mutex<Bridge<S>>>, controls: ControlRegistry, token: String) -> Self {
+    pub fn new(
+        bridge: Arc<Mutex<Bridge<S>>>,
+        controls: ControlRegistry,
+        token: String,
+        config_path: String,
+    ) -> Self {
         Self {
             bridge,
             controls,
             token,
+            config_path,
         }
     }
 
@@ -155,6 +163,18 @@ impl<S: Store + Send + 'static> Console<S> {
             // 配置只读视图（方案 A 第一步）。敏感字段在桥这侧就遮掉，完整原文
             // 永远不发给浏览器。编辑写回 + 热重载是第二步（ADR-0009）。
             ("GET", "/api/config") => (200, self.config_view()),
+            // TOML 原文编辑（方案 A 第二步，ADR-0009）：读原文 → 管理员改 →
+            // 保存时先校验再落盘（备份旧文件），解析通过就暂存进桥，下一轮生效。
+            ("GET", "/api/config/toml") => self.config_toml(),
+            ("POST", "/api/config/toml") => self.save_config_toml(body),
+            ("POST", "/api/config/discard") => {
+                let mut bridge = lock(&self.bridge);
+                let discarded = bridge.discard_staged_config();
+                (
+                    200,
+                    json!({"ok": true, "discarded": discarded}).to_string(),
+                )
+            }
             _ => (404, json!({"error":"没有这个端点"}).to_string()),
         }
     }
@@ -246,8 +266,105 @@ impl<S: Store + Send + 'static> Console<S> {
             "harnesses": config.harnesses.len(),
             "busy_sessions": bridge.busy_sessions(),
             "queued_turns": bridge.queued_turns(),
+            "config_version": bridge.config_version(),
+            "staged_config": bridge.has_staged_config(),
         })
         .to_string()
+    }
+
+    /// 配置 TOML 原文。**只在鉴权之后给**——原文里就是明文密钥，管理员编辑用。
+    fn config_toml(&self) -> (u16, String) {
+        match std::fs::read_to_string(&self.config_path) {
+            Ok(text) => (
+                200,
+                json!({"path": self.config_path, "text": text}).to_string(),
+            ),
+            Err(error) => (
+                500,
+                json!({"error": format!("读配置文件 {} 失败：{error}", self.config_path)})
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// 保存编辑后的配置 TOML（`POST /api/config/toml`，body `{"text": "..."}`）。
+    ///
+    /// 顺序是先校验后落盘：解析不过就原样退回，一个字节都不写——
+    /// 「用户不该需要懂文件格式」的底线是**坏配置永远进不了磁盘**。
+    /// 落盘前把旧文件备份成 `<路径>.bak`（只留最近一份）。
+    /// 解析通过的新配置暂存进桥，下一次开轮换上（ADR-0009 轮次边界重载）。
+    /// 返回里带影响清单：哪些下一轮自动生效、哪些要重启桥。
+    fn save_config_toml(&self, body: &str) -> (u16, String) {
+        let parsed: serde_json::Value = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    400,
+                    json!({"error": format!("body 要是 JSON：{{\"text\": \"…\"}}（{error}）")})
+                        .to_string(),
+                );
+            }
+        };
+        let Some(text) = parsed.get("text").and_then(serde_json::Value::as_str) else {
+            return (400, json!({"error": "body 里要有 text 字段（配置 TOML 原文）"}).to_string());
+        };
+
+        // 1. 校验：解析不过就拒绝，什么都不写。
+        let new_config = match acb_kernel::Config::parse(text) {
+            Ok(config) => config,
+            Err(error) => {
+                return (
+                    400,
+                    json!({
+                        "error": format!("配置解析不过，一个字节都没写：{error}"),
+                        "saved": false,
+                    })
+                    .to_string(),
+                );
+            }
+        };
+
+        // 2. 读旧配置算影响清单（在改桥之前，用的是当前生效的这份）。
+        let (hot, restart) = {
+            let bridge = lock(&self.bridge);
+            reload_impact(bridge.config(), &new_config)
+        };
+
+        // 3. 备份旧文件 → 落盘新文件。备份失败不算致命（首次保存时旧文件可能不存在），
+        //    但落盘失败必须报——不能让「磁盘上和桥里跑的」悄悄分家。
+        let old_text = std::fs::read_to_string(&self.config_path).ok();
+        if let Some(old_text) = &old_text {
+            let backup_path = format!("{}.bak", self.config_path);
+            if let Err(error) = std::fs::write(&backup_path, old_text) {
+                eprintln!("控制台：备份配置到 {backup_path} 失败：{error}");
+            }
+        }
+        if let Err(error) = std::fs::write(&self.config_path, text) {
+            return (
+                500,
+                json!({"error": format!("写配置文件 {} 失败：{error}", self.config_path)})
+                    .to_string(),
+            );
+        }
+
+        // 4. 暂存进桥，下一轮生效。
+        {
+            let mut bridge = lock(&self.bridge);
+            bridge.stage_config(new_config);
+        }
+
+        (
+            200,
+            json!({
+                "ok": true,
+                "saved": true,
+                "note": "已保存并暂存，下一次开轮自动生效（轮次边界重载，ADR-0009）",
+                "hot_reload": hot,
+                "needs_restart": restart,
+                "backup": old_text.map(|_| format!("{}.bak", self.config_path)),
+            })
+            .to_string(),
+        )
     }
 
     fn sessions(&self) -> String {
@@ -558,6 +675,73 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// 比较新旧配置，列出热重载影响（ADR-0009 轮次边界重载的边界在哪）：
+///
+/// - 返回第一项（`hot`）：下一轮自动生效的改动清单；
+/// - 返回第二项（`restart`）：**要重启桥才生效**的改动清单——这些是启动时
+///   就定死的东西：监听地址绑定、守护线程手里攥着的连接信息、打开的库路径。
+///
+/// 注意 `file_relay`：`listen` 变了要重启（HTTP 服务启动时绑定），
+/// 但 `public_base`/`dir` 不用——发布端（桥这边）每轮用当前配置重建。
+fn reload_impact(old: &acb_kernel::Config, new: &acb_kernel::Config) -> (Vec<String>, Vec<String>) {
+    let mut hot = Vec::new();
+    let mut restart = Vec::new();
+
+    if old.sessions != new.sessions {
+        hot.push("sessions（会话/订阅/唤醒策略/人格与记忆挂载）".to_owned());
+    }
+    if old.harnesses != new.harnesses {
+        hot.push("harnesses".to_owned());
+    }
+    if old.personas != new.personas {
+        hot.push("personas（人格）".to_owned());
+    }
+    if old.memories != new.memories {
+        hot.push("memories（记忆仓库声明）".to_owned());
+    }
+    if old.retention != new.retention {
+        hot.push("retention（流水保留）".to_owned());
+    }
+    if old.default_on_turn_error != new.default_on_turn_error {
+        hot.push("default_on_turn_error（默认失败通知）".to_owned());
+    }
+    if old.delivery_limit != new.delivery_limit {
+        hot.push("delivery_limit（单轮投递上限）".to_owned());
+    }
+    match (&old.file_relay, &new.file_relay) {
+        (Some(a), Some(b)) => {
+            if a.public_base != b.public_base || a.dir != b.dir {
+                hot.push("file_relay.public_base/dir（发布端下一轮重建）".to_owned());
+            }
+            if a.listen != b.listen {
+                restart.push("file_relay.listen（文件服务监听在启动时绑定）".to_owned());
+            }
+        }
+        (None, Some(_)) | (Some(_), None) => {
+            restart.push("file_relay（增删要重起/停掉文件服务，监听在启动时定）".to_owned());
+        }
+        (None, None) => {}
+    }
+
+    if old.endpoint != new.endpoint {
+        restart.push("endpoint（接入点监听在启动时绑定）".to_owned());
+    }
+    if old.console != new.console {
+        restart.push("console（控制台监听与令牌在启动时定死）".to_owned());
+    }
+    if old.connections != new.connections {
+        restart.push("connections（连接守护线程持有旧连接信息，改 url/token 要重启）".to_owned());
+    }
+    if old.storage != new.storage {
+        restart.push("storage（状态库启动时打开，换路径等于换了一个桥）".to_owned());
+    }
+    if old.worktrees_root != new.worktrees_root {
+        restart.push("worktrees_root（已有记忆 worktree 在旧根下，换根要重启）".to_owned());
+    }
+
+    (hot, restart)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +787,82 @@ mod tests {
         assert!(!query_token_matches("token=", "s3cret"));
         assert!(!query_token_matches("no-token-here", "s3cret"));
         assert!(!query_token_matches("token=S3CRET", "s3cret"));
+    }
+
+    /// 一份能通过解析的最小配置。改字段测影响对比用。
+    fn toml_with(wake_line: &str, endpoint_listen: &str, connection_url: &str) -> String {
+        format!(
+            r#"
+[[personas]]
+id = "default"
+name = "默认"
+text = "测试。"
+
+[[harnesses]]
+id = "dsh"
+name = "DSH"
+
+[[connections]]
+id = "qq"
+platform = "qq"
+kind = "onebot11"
+url = "{connection_url}"
+account = "10001"
+token = "conn-secret"
+
+[[sessions]]
+id = "main"
+harness = "dsh"
+persona = "default"
+token = "sess-secret"
+
+[[sessions.subscriptions]]
+connection = "qq"
+room = "group/123"
+{wake_line}
+
+[endpoint]
+listen = "{endpoint_listen}"
+
+[console]
+listen = "127.0.0.1:31990"
+token = "ctok123"
+"#
+        )
+    }
+
+    #[test]
+    fn reload_impact_sorts_hot_from_restart() {
+        // 只改唤醒策略 → 热重载；只改监听/连接 → 要重启；什么都不改 → 两边都空。
+        let base = toml_with("", "127.0.0.1:37700", "ws://127.0.0.1:53001/ws");
+        let old = acb_kernel::Config::parse(&base).expect("能解析");
+
+        let hot_only = toml_with(
+            // 注意：at_mention 默认就是 true，改它等于没改；keywords 默认空，一定有差异。
+            "\n[sessions.subscriptions.wake]\nkeywords = [\"喂\"]",
+            "127.0.0.1:37700",
+            "ws://127.0.0.1:53001/ws",
+        );
+        let new = acb_kernel::Config::parse(&hot_only).expect("能解析");
+        let (hot, restart) = reload_impact(&old, &new);
+        assert_eq!(restart, Vec::<String>::new());
+        assert!(hot.iter().any(|item| item.contains("sessions")));
+
+        let restart_only = toml_with("", "127.0.0.1:39999", "ws://127.0.0.1:53001/ws");
+        let new = acb_kernel::Config::parse(&restart_only).expect("能解析");
+        let (hot, restart) = reload_impact(&old, &new);
+        assert_eq!(hot, Vec::<String>::new());
+        assert!(restart.iter().any(|item| item.contains("endpoint")));
+
+        let conn_changed =
+            toml_with("", "127.0.0.1:37700", "ws://127.0.0.1:53002/ws?token=newsecret");
+        let new = acb_kernel::Config::parse(&conn_changed).expect("能解析");
+        let (_, restart) = reload_impact(&old, &new);
+        assert!(restart.iter().any(|item| item.contains("connections")));
+
+        let same = acb_kernel::Config::parse(&base).expect("能解析");
+        let (hot, restart) = reload_impact(&old, &same);
+        assert_eq!(hot, Vec::<String>::new());
+        assert_eq!(restart, Vec::<String>::new());
     }
 }
