@@ -43,16 +43,30 @@ pub const TOOL_NAMES: &[&str] = &[
     "memory_git_branch",
 ];
 
+/// 元素数组的包装：解析走 proto 的人话通道（别名兼容 + 报错带原文），
+/// 不用 serde 的干巴巴缺字段报错。
+#[derive(Debug)]
+pub struct Elements(pub Vec<acb_proto::Element>);
+
+impl<'de> serde::Deserialize<'de> for Elements {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        acb_proto::parse_elements(value)
+            .map(Elements)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// 发给当前轮次房间的参数。
 #[derive(Debug, Deserialize)]
 pub struct SendArgs {
-    pub elements: Vec<acb_proto::Element>,
+    pub elements: Elements,
 }
 
 /// 发到别的房间的参数。形状和 [`SendArgs`] 一样，只多一个目标。
 #[derive(Debug, Deserialize)]
 pub struct SendToArgs {
-    pub elements: Vec<acb_proto::Element>,
+    pub elements: Elements,
     /// 目标房间，形如 `qq:group/123`。必须落在当前会话订阅范围之内。
     pub to: String,
 }

@@ -10,6 +10,9 @@ export const ELEMENTS_DOC = `平台中立的内容段数组，例如
   [{"type":"text","text":"看图"},{"type":"image","url":"https://..."}]
   [{"type":"at","target":"10001"},{"type":"text","text":" 你说啥"}]
 能用的类型：text / at / quote / image / audio / video / file / face / opaque。
+媒体段的 url 可以是 http(s) 地址，也可以是**本机文件路径**——桥会自动中继
+成平台取得到的地址，比你自己拼地址可靠（平台自己去下载，只有你这侧可达的
+地址它拉不到）。字段名 file/path 也认（等价于 url）。
 平台做不了的类型会被适配器降级或明确报错，不会被悄悄丢掉。`
 
 const ELEMENTS_SCHEMA = {

@@ -547,14 +547,14 @@ impl<S: Store> Bridge<S> {
             // 不给目标：接着说当前这一轮的房间，用本轮的身份。
             "send_message" => {
                 let args: SendArgs = parse(args)?;
-                self.deliver_out(&turn_session, &room, args.elements)
+                self.deliver_out(&turn_session, &room, args.elements.0)
             }
             // 给了目标：只能落在当前会话订阅的房间范围内（跨会话发送已砍）。
             "send_message_to" => {
                 let args: SendToArgs = parse(args)?;
                 let target = resolve_room(&args.to)?;
                 self.ensure_session_subscribes(&turn_session, &target)?;
-                self.deliver_out(&turn_session, &target, args.elements)
+                self.deliver_out(&turn_session, &target, args.elements.0)
             }
             "ack_messages" => {
                 let args: AckArgs = parse(args)?;
@@ -1048,10 +1048,25 @@ impl<S: Store> Bridge<S> {
             ));
         }
 
-        let sent = self
-            .outbound
-            .send(room, &elements)
-            .map_err(outbound_error)?;
+        let sent = match self.outbound.send(room, &elements) {
+            Ok(sent) => sent,
+            Err(error) => {
+                // 平台侧拉不到媒体 URL 时的报错只有一句干巴巴的 fetch failed
+                // （平台内部自己的下载失败，桥拿不到它的 errno）。桥补得上的是
+                // 上下文：哪些 URL、很可能只有发消息这侧可达、本机文件该怎么写。
+                let mut tool_error = outbound_error(error);
+                let urls: Vec<&str> = elements.iter().flat_map(|e| e.media_urls()).collect();
+                if !urls.is_empty() {
+                    tool_error.message.push_str(&format!(
+                        "\n[hint] 这条消息带了媒体：{}。平台是自己去下载这个地址的，\
+                         只有你这一侧可达的地址（本机端口、你刚生成的服务的地址）它会拉不到。\
+                         本机文件直接把路径写进 url，桥会自动中继成平台取得到的地址。",
+                        urls.join(", ")
+                    ));
+                }
+                return Err(tool_error);
+            }
+        };
 
         let record = self
             .store

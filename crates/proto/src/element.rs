@@ -54,6 +54,68 @@ impl Element {
             _ => None,
         }
     }
+
+    /// 媒体段（带 url 的那些）的 URL 列表。出站失败时用来补提示。
+    pub fn media_urls(&self) -> Vec<&str> {
+        match self {
+            Self::Image { url, .. } | Self::Audio { url } | Self::Video { url } | Self::File { url, .. } => {
+                vec![url.as_str()]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 把模型给的媒体段字段名归一到标准形状（就地修改）。
+///
+/// 平台原生 API 用 `file`，模型经常混着写（2026-10-31 真机：image 段给了
+/// `file`，换来一句干巴巴的 `missing field url`，反复试错三轮才发出去）。
+/// 既然两边都在上下文里，桥把 `file`/`path`/`src` 当 `url` 的别名收下。
+fn normalize_element(value: &mut serde_json::Value) {
+    let kind = value.get("type").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+    let aliases: &[&str] = match kind.as_str() {
+        "image" | "audio" | "video" => &["file", "path", "src"],
+        "file" => &["path", "src"],
+        _ => return,
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("url") {
+        return;
+    }
+    for alias in aliases {
+        if let Some(url) = obj.remove(*alias) {
+            obj.insert("url".to_owned(), url);
+            return;
+        }
+    }
+}
+
+/// 从工具参数解析元素数组，失败时报人话。
+///
+/// serde 的缺字段报错（`missing field url`）信息量是零——不说该给什么、不贴
+/// 原文。这里补齐：哪一段、什么错、url 能给什么（http(s) 地址 / 本机路径，
+/// 本机路径桥会自动中继）、认哪些别名。
+pub fn parse_elements(value: serde_json::Value) -> Result<Vec<Element>, String> {
+    let serde_json::Value::Array(items) = value else {
+        return Err(format!("elements 要是数组，收到的是：{value}"));
+    };
+    let mut elements = Vec::with_capacity(items.len());
+    for (index, mut item) in items.into_iter().enumerate() {
+        normalize_element(&mut item);
+        let element: Element = serde_json::from_value(item.clone()).map_err(|error| {
+            let kind = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("?");
+            format!(
+                "第 {index} 段（{kind}）解析失败：{error}。\
+                 image/audio/video/file 段要 url 字段——可以是 http(s) 地址，\
+                 也可以是本机文件路径（桥会自动中继成平台取得到的地址）；\
+                 字段名 file/path/src 也认。原文：{item}"
+            )
+        })?;
+        elements.push(element);
+    }
+    Ok(elements)
 }
 
 /// 把一串元素拼成给人看的纯文本（丢掉了 at/quote 等结构，只用于日志与降级）。
@@ -166,5 +228,61 @@ mod tests {
             },
         ];
         assert_eq!(flatten_text(&elements), "看这个 [图片]@10001");
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    #[test]
+    fn file_field_alias_is_accepted_for_media() {
+        // 平台原生写法（file 字段）：要能直接收下，别让人对着 missing field url 试错。
+        let elements: Vec<Element> =
+            parse_elements(serde_json::json!([
+                {"type": "image", "file": "/tmp/a.png"},
+                {"type": "image", "path": "https://e/b.png"},
+                {"type": "audio", "file": "/tmp/a.mp3"},
+                {"type": "file", "path": "/tmp/a.zip", "name": "a.zip"}
+            ]))
+            .expect("别名要认");
+        assert_eq!(elements[0], Element::Image { url: "/tmp/a.png".into(), alt: None });
+        assert_eq!(elements[1], Element::Image { url: "https://e/b.png".into(), alt: None });
+        assert_eq!(elements[2], Element::Audio { url: "/tmp/a.mp3".into() });
+        assert_eq!(
+            elements[3],
+            Element::File { url: "/tmp/a.zip".into(), name: "a.zip".into() }
+        );
+    }
+
+    #[test]
+    fn url_field_wins_over_aliases_and_missing_url_talks_human() {
+        // 已有 url 时别的字段不抢座。
+        let elements: Vec<Element> = parse_elements(serde_json::json!([
+            {"type": "image", "url": "https://e/a.png", "file": "/tmp/x.png"}
+        ]))
+        .expect("能解析");
+        assert_eq!(elements[0], Element::Image { url: "https://e/a.png".into(), alt: None });
+
+        // 缺 url：报错要说清给什么、认哪些别名、原文是什么。
+        let error = parse_elements(serde_json::json!([
+            {"type": "image", "note": "没给地址"}
+        ]))
+        .expect_err("缺 url 要报错");
+        assert!(error.contains("第 0 段（image）"), "{error}");
+        assert!(error.contains("本机文件路径"), "{error}");
+        assert!(error.contains("file/path/src"), "{error}");
+        assert!(error.contains("没给地址"), "{error}");
+    }
+
+    #[test]
+    fn media_urls_lists_every_bearing_element() {
+        let elements = vec![
+            Element::text("看"),
+            Element::Image { url: "a.png".into(), alt: None },
+            Element::Video { url: "b.mp4".into() },
+        ];
+        let urls: Vec<&str> = elements.iter().flat_map(|e| e.media_urls()).collect();
+        assert_eq!(urls, vec!["a.png", "b.mp4"]);
     }
 }
