@@ -29,16 +29,10 @@ const devItems = [
   { text: '存储', link: '/07-storage' },
 ]
 
-export default withMermaid(
-  // mermaidOptions：跟随 VitePress 的明暗切换（dark 模式下用 dark 主题画图）。
-  {
-    mermaidPlugin: { class: 'mermaid' },
-    mermaidOptions: {
-      look: 'classic',
-      fontFamily: 'inherit',
-    },
-  },
-  {
+export default withMermaid({
+  // mermaid 画图配置：mermaidPlugin.class 是渲染容器的 CSS 类；
+  // 暗色主题由插件自动跟随（body 类名带 dark 就切 dark 画图主题）。
+  mermaidPlugin: { class: 'mermaid' },
   base: '/qq-bridge/',
   lang: 'zh-CN',
   title: 'acb-bridge',
@@ -88,5 +82,4 @@ export default withMermaid(
     returnToTopLabel: '回到顶部',
     sidebarMenuLabel: '目录',
   },
-  },
-)
+})
