@@ -43,6 +43,7 @@ export default {
       harness: config.harness,
       log,
       onTurn: (delivery) => driver.run(delivery, link),
+      onControl: (frame) => driver.handleControl(frame, link),
     })
 
     // 工具面先挂上：轮次来之前模型就该看得见它们。
@@ -61,7 +62,12 @@ export default {
 
     void link
       .connect()
-      .then(() => log("info", `已接入桥，绑定会话组 ${link.sessions.join("、")}`))
+      .then(async () => {
+        log("info", `已接入桥，绑定会话组 ${link.sessions.join("、")}`)
+        // 把 storage 里还活着的映射主动报给桥：控制台的「harness 侧映射」
+        // 靠 report_map 落盘，不报的话页面上永远是空、也没法断开。
+        await driver.reportStoredMaps(link)
+      })
       .catch((error) => log("warn", `暂时连不上桥：${error.message}，会一直重试`))
 
     return async () => {
@@ -111,8 +117,78 @@ class TurnDriver {
     this.log = log
     this.pinned = pinned || ""
     this.sessions = new Map()
+    /** 已向桥 report_map 过的会话 → opencode 会话 id，防重复回报。 */
+    this.reported = new Map()
     /** 串行链：同一会话本来就串行，这里再兜一层，免得两轮叠在一起。 */
     this.chain = Promise.resolve()
+  }
+
+  /**
+   * 把 storage 里还活着的映射主动报给桥（report_map）。连接建立后调一次，
+   * 让控制台立刻看得见 harness 侧映射——哪怕一个轮次都还没跑过。
+   */
+  async reportStoredMaps(link) {
+    for (const session of link.sessions) {
+      if (this.pinned) continue
+      try {
+        const stored = await this.#storageGet(`session:${session}`)
+        if (!stored || !(await this.#alive(stored))) continue
+        this.sessions.set(session, stored)
+        this.#reportMap(session, stored, link)
+      } catch (error) {
+        this.log("warn", `回报会话 ${session} 的映射失败：${error?.message ?? error}`)
+      }
+    }
+  }
+
+  /** 向桥回报映射（桥侧落盘，控制台可见）。同一个 (会话, id) 只报一次。 */
+  #reportMap(session, id, link) {
+    if (this.reported.get(session) === id) return
+    this.reported.set(session, id)
+    try {
+      link.controlResult({
+        // proto 里 control_result 的 id 是必需字段（缺了整帧被拒、连接被掐）；
+        // 主动回报没有原帧可配对，学 dsh 用合成 id。
+        id: `map-${Date.now()}`,
+        session,
+        command: "report_map",
+        result: { session_id: id, meta: { title: `acb:${session}` } },
+      })
+      this.log("info", `已向桥回报映射 ${session} → ${id}`)
+    } catch (error) {
+      this.log("warn", `回报映射失败：${error?.message ?? error}`)
+    }
+  }
+
+  /**
+   * 桥推来的控制指令。目前只认 `reset`：忘掉旧映射（storage 一起清），
+   * 立刻新建一条干净的 opencode 会话并把新 id 报回桥——桥删旧映射、
+   * 存新映射，控制台马上能看到换好的映射。
+   */
+  async handleControl(frame, link) {
+    const { id, session, command } = frame
+    try {
+      if (command !== "reset") throw new Error(`不认识的指令 ${command}`)
+      this.#forget(session)
+      let newId = ""
+      if (this.pinned) {
+        this.log("warn", `会话 ${session} 钉死了 opencode 会话（${this.pinned}），reset 不换会话`)
+      } else {
+        // storage 刚清掉，#session 在这里必然走新建分支。
+        newId = await this.#session(session)
+      }
+      link.controlResult({
+        id,
+        session,
+        command,
+        result: { ok: true, ...(newId ? { session_id: newId } : {}) },
+      })
+      this.log("info", `会话 ${session} 已重置${newId ? ` → 新会话 ${newId}` : ""}`)
+    } catch (error) {
+      const message = error?.message ?? String(error)
+      this.log("error", `重置会话 ${session} 失败：${message}`)
+      link.controlResult({ id, session, command, error: message })
+    }
   }
 
   run(delivery, link) {
@@ -125,6 +201,8 @@ class TurnDriver {
     let failure = null
     try {
       const sessionID = await this.#session(delivery.session)
+      // 映射（新建或接上的）报给桥，控制台才看得到 harness 侧映射。
+      this.#reportMap(delivery.session, sessionID, link)
       const text = renderTurn(delivery) + CODE_MODE_HINT
       const info = delivery.session_info ?? {}
       const model = info.model ?? "(opencode 默认)"
@@ -192,6 +270,7 @@ class TurnDriver {
 
   #forget(session) {
     this.sessions.delete(session)
+    this.reported.delete(session)
     void this.#storageSet(`session:${session}`, null)
   }
 
