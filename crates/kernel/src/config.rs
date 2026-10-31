@@ -243,6 +243,9 @@ pub struct ConsoleConfig {
 /// 换成平台取得到的 URL。没配就不起文件服务，本机路径原样透传。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileRelayConfig {
+    /// 中继方式。当前唯一实现 `file-server`（桥自带文件服务器）；
+    /// 留着这个字段是为了将来加别的收发方式（比如反向推送到平台）时不用改配置结构。
+    pub mode: String,
     /// 监听地址，如 `0.0.0.0:3131`。
     pub listen: String,
     /// 平台那边访问桥用的基地址（不含尾斜杠），如 `http://10.89.0.1:3131`。
@@ -251,6 +254,9 @@ pub struct FileRelayConfig {
     /// 收下的文件落盘位置。
     pub dir: String,
 }
+
+/// `FileRelayConfig.mode` 当前唯一合法值。
+pub const FILE_RELAY_MODE_FILE_SERVER: &str = "file-server";
 
 /// 一张人格卡：纯文本人设。
 #[derive(Debug, Clone, PartialEq)]
@@ -605,6 +611,22 @@ impl Config {
 
         let file_relay = match raw.file_relay {
             Some(raw) => {
+                let mode = raw
+                    .mode
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|mode| !mode.is_empty())
+                    .unwrap_or(FILE_RELAY_MODE_FILE_SERVER)
+                    .to_owned();
+                if mode != FILE_RELAY_MODE_FILE_SERVER {
+                    return Err(ConfigError::BadListen {
+                        address: mode.clone(),
+                        detail: format!(
+                            "file_relay.mode 只认 \"{FILE_RELAY_MODE_FILE_SERVER}\"（当前唯一实现）。\
+                             留空或写 file-server 都行，别的方式还没做"
+                        ),
+                    });
+                }
                 let address = raw.listen.trim().to_owned();
                 if address.parse::<std::net::SocketAddr>().is_err() {
                     return Err(ConfigError::BadListen {
@@ -622,6 +644,7 @@ impl Config {
                     });
                 }
                 Some(FileRelayConfig {
+                    mode,
                     listen: address,
                     public_base,
                     dir: raw.dir.unwrap_or_else(|| DEFAULT_RELAY_DIR.to_owned()),
@@ -1276,6 +1299,8 @@ struct RawConsole {
 
 #[derive(Debug, Deserialize)]
 struct RawFileRelay {
+    /// 中继方式，缺省 `file-server`。写别的值启动即报错。
+    mode: Option<String>,
     listen: String,
     public_base: String,
     dir: Option<String>,
@@ -1360,6 +1385,39 @@ mod tests {
     fn transport_defaults_to_forward_websocket() {
         let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
         assert_eq!(config.connections[0].transport.as_str(), "ws-client");
+    }
+
+    /// relay 方式可配置（用户 2026-10-31 要求）：缺省 = 当前唯一实现 file-server。
+    #[test]
+    fn file_relay_mode_defaults_to_file_server() {
+        let text = format!(
+            "{}\n[file_relay]\nlisten = \"0.0.0.0:3131\"\npublic_base = \"http://10.89.0.1:3131\"",
+            config_with(ONE_CONNECTION, ONE_SESSION)
+        );
+        let config = Config::parse(&text).expect("能解析");
+        let relay = config.file_relay.expect("应解析出 file_relay");
+        assert_eq!(relay.mode, "file-server");
+    }
+
+    #[test]
+    fn file_relay_accepts_explicit_file_server_mode() {
+        let text = format!(
+            "{}\n[file_relay]\nmode = \"file-server\"\nlisten = \"0.0.0.0:3131\"\npublic_base = \"http://10.89.0.1:3131\"",
+            config_with(ONE_CONNECTION, ONE_SESSION)
+        );
+        let config = Config::parse(&text).expect("能解析");
+        assert_eq!(config.file_relay.unwrap().mode, "file-server");
+    }
+
+    /// 写了还不存在的方式要启动即报错，别等发文件时才炸。
+    #[test]
+    fn file_relay_rejects_unknown_mode() {
+        let text = format!(
+            "{}\n[file_relay]\nmode = \"carrier-pigeon\"\nlisten = \"0.0.0.0:3131\"\npublic_base = \"http://10.89.0.1:3131\"",
+            config_with(ONE_CONNECTION, ONE_SESSION)
+        );
+        let error = Config::parse(&text).expect_err("应当报错");
+        assert!(error.to_string().contains("file_relay.mode"), "{error}");
     }
 
     /// 破坏性方法默认全关：AI 能做人也做的事，但那道闸默认是落下的。

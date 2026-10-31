@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>acb-bridge 控制台</title>
+<style>
+  :root { --bg:#14161a; --panel:#1e2127; --line:#33373f; --text:#d8dce3; --dim:#8b919c; --accent:#4f9cf9; --ok:#59c37f; --warn:#e0a33e; --err:#e06c6c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 18px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .spacer { flex:1; }
+  header button { background:none; border:1px solid var(--line); color:var(--dim); border-radius:6px; padding:3px 10px; cursor:pointer; }
+  nav { display:flex; gap:4px; padding:8px 18px 0; }
+  nav button { background:none; border:1px solid transparent; border-bottom:none; color:var(--dim); padding:6px 14px; border-radius:8px 8px 0 0; cursor:pointer; font-size:14px; }
+  nav button.active { background:var(--panel); color:var(--text); border-color:var(--line); }
+  main { padding:16px 18px 40px; max-width:1100px; }
+  section { display:none; }
+  section.active { display:block; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  .card h2 { font-size:14px; margin:0 0 10px; color:var(--accent); font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; white-space:nowrap; }
+  td.wrap { word-break:break-all; }
+  .pill { display:inline-block; padding:0 8px; border-radius:10px; font-size:12px; margin-right:4px; }
+  .pill.open { background:#3a2b2b; color:var(--err); }
+  .pill.acked { background:#3a342b; color:var(--warn); }
+  .pill.resolved { background:#2b3a2e; color:var(--ok); }
+  .pill.wontfix { background:#2b2d3a; color:var(--dim); }
+  button.act { background:var(--accent); border:none; color:#fff; border-radius:6px; padding:4px 12px; cursor:pointer; font-size:13px; }
+  button.act.danger { background:var(--err); }
+  button.act.ghost { background:none; border:1px solid var(--line); color:var(--dim); }
+  .stat { display:flex; gap:18px; flex-wrap:wrap; }
+  .stat div { min-width:120px; }
+  .stat b { display:block; font-size:22px; font-weight:600; }
+  .stat span { color:var(--dim); font-size:12px; }
+  .kv { display:grid; grid-template-columns:180px 1fr; gap:2px 12px; font-size:13px; }
+  .kv .k { color:var(--dim); }
+  .secret { color:var(--warn); letter-spacing:2px; }
+  .muted { color:var(--dim); }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; font-size:12px; }
+  .err { color:var(--err); }
+  .empty { color:var(--dim); font-style:italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>acb-bridge 控制台</h1>
+  <span class="muted" id="conn-note"></span>
+  <div class="spacer"></div>
+  <button id="logout">退出</button>
+</header>
+<nav>
+  <button data-tab="status" class="active">概览</button>
+  <button data-tab="sessions">会话</button>
+  <button data-tab="feedback">反馈</button>
+  <button data-tab="config">配置</button>
+</nav>
+<main>
+  <section id="tab-status" class="active"><div class="card"><h2>概览</h2><div class="stat" id="status"></div><p class="muted">配置页当前是只读快照（方案 A 第一步）；编辑写回与热重载在第二步。</p></div></section>
+  <section id="tab-sessions"><div id="sessions"></div></section>
+  <section id="tab-feedback"><div class="card"><h2>agent 反馈</h2><div id="feedback"></div></div></section>
+  <section id="tab-config"><div id="config"></div></section>
+</main>
+<script>
+"use strict";
+const $ = (s, el=document) => el.querySelector(s);
+const token = (() => {
+  const m = location.search.match(/[?&]token=([^&]*)/);
+  if (m) { localStorage.setItem("acb-console-token", decodeURIComponent(m[1])); history.replaceState(null, "", location.pathname); }
+  return localStorage.getItem("acb-console-token") || "";
+})();
+if (!token) { location.href = "/?login=1"; }
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { ...options, headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json", ...(options.headers||{}) } });
+  if (res.status === 401) { localStorage.removeItem("acb-console-token"); location.href = "/?login=1"; throw new Error("未授权"); }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const secret = (v) => '<span class="secret">******</span>';
+
+async function loadStatus() {
+  const s = await api("/api/status");
+  $("#status").innerHTML = [
+    ["连接", s.connections], ["会话", s.sessions], ["harness", s.harnesses],
+    ["忙着的会话", s.busy_sessions], ["排队轮次", s.queued_turns],
+  ].map(([k, v]) => `<div><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("");
+}
+
+async function loadSessions() {
+  const { sessions } = await api("/api/sessions");
+  $("#sessions").innerHTML = sessions.length ? sessions.map((s) => {
+    const map = s.map;
+    return `<div class="card"><h2>${esc(s.name || s.id)} <span class="muted">(${esc(s.id)})</span></h2>
+    <div class="kv">
+      <div class="k">harness</div><div>${esc(s.harness)}</div>
+      <div class="k">人格</div><div>${esc(s.persona || "—")}</div>
+      <div class="k">模型</div><div>${esc(s.model || "由 harness 侧决定")}</div>
+      <div class="k">记忆</div><div>${esc((s.memories||[]).join(", ") || "无")}</div>
+      <div class="k">订阅</div><div>${(s.subscriptions||[]).map(esc).join("<br>") || "无"}</div>
+      <div class="k">harness 侧映射</div><div>${map ? esc(map.harness_session) + '<br><span class="muted">更新于 ' + esc(new Date(map.updated_at).toLocaleString()) + '</span>' : '<span class="muted">还没有（harness 连上后声明）</span>'}</div>
+    </div>
+    <p><button class="act danger" onclick="resetSession('${esc(s.id)}')">断开映射并重置会话</button></p>
+    <div id="reset-note-${esc(s.id)}" class="muted"></div></div>`;
+  }).join("") : '<div class="card"><p class="empty">没有会话</p></div>';
+}
+
+async function resetSession(id) {
+  if (!confirm("确定重置会话 " + id + " ？harness 侧会收到 reset，桥侧映射断开。")) return;
+  const note = $("#reset-note-" + id);
+  try {
+    const r = await api("/api/session/" + encodeURIComponent(id) + "/reset", { method: "POST", body: "{}" });
+    note.textContent = "✓ " + (r.note || "reset 指令已发出");
+    setTimeout(loadSessions, 1500);
+  } catch (e) { note.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+}
+
+async function loadFeedback() {
+  const { feedback } = await api("/api/feedback?limit=50");
+  $("#feedback").innerHTML = feedback.length ? `<table>
+    <tr><th>#</th><th>状态</th><th>类型</th><th>标题</th><th>来源</th><th>次数</th><th>最近</th><th></th></tr>
+    ${feedback.map((f) => `<tr>
+      <td>${f.id}</td>
+      <td><span class="pill ${esc(f.status)}">${esc(f.status)}</span></td>
+      <td>${esc(f.kind || "—")}${f.severity && f.severity !== "info" ? '<br><span class="muted">' + esc(f.severity) + "</span>" : ""}</td>
+      <td class="wrap">${esc(f.title)}${f.body ? '<br><span class="muted">' + esc(String(f.body).slice(0, 160)) + "</span>" : ""}${f.suggestion ? '<br><span class="muted">建议：' + esc(String(f.suggestion).slice(0, 120)) + "</span>" : ""}</td>
+      <td class="wrap">${esc(f.tool || "—")}${f.session ? '<br><span class="muted">' + esc(f.session) + "</span>" : ""}</td>
+      <td>${f.occurrences || 1}${f.repeats ? "（重复）" : ""}</td>
+      <td class="muted">${esc(new Date(f.last_at).toLocaleString())}</td>
+      <td><button class="act ghost" onclick="resolveFeedback(${f.id})">标记</button></td>
+    </tr>`).join("")}</table>` : '<p class="empty">没有反馈记录</p>';
+}
+
+async function resolveFeedback(id) {
+  const status = prompt("改成什么状态？open / acked / resolved / wontfix", "resolved");
+  if (!status) return;
+  const note = prompt("备注（可空）", "") ?? "";
+  try { await api("/api/feedback/" + id + "/status", { method: "POST", body: JSON.stringify({ status, note }) }); loadFeedback(); }
+  catch (e) { alert(e.message); }
+}
+
+function wakeText(w) {
+  if (!w) return "—";
+  const parts = [];
+  if (w.at_mention) parts.push("@我");
+  if (w.reply) parts.push("引用我");
+  if (w.name_mention && (w.names||[]).length) parts.push("叫名字(" + w.names.join("/") + ")");
+  if (w.poke) parts.push("拍我");
+  if (w.accumulate) parts.push("攒" + w.accumulate + "条");
+  if ((w.events||[]).length) parts.push("事件:" + w.events.join("/"));
+  if ((w.keywords||[]).length) parts.push("关键词:" + w.keywords.join("/"));
+  if ((w.ignore_speakers||[]).length) parts.push("无视:" + w.ignore_speakers.join("/"));
+  return parts.join("，") || "（全关）";
+}
+
+async function loadConfig() {
+  const c = await api("/api/config");
+  const connRows = (c.connections||[]).map((k) => `<tr>
+    <td>${esc(k.id)}</td><td>${esc(k.platform)}/${esc(k.kind)}</td><td class="wrap">${esc(k.url)}</td>
+    <td>${k.token === null ? '<span class="muted">无</span>' : secret(k.token)}</td>
+    <td>${esc(k.account)}</td><td>${esc(k.allow_destructive)}</td></tr>`).join("");
+  const sessRows = (c.sessions||[]).map((s) => `<tr>
+    <td>${esc(s.id)}${s.name && s.name !== s.id ? '<br><span class="muted">' + esc(s.name) + "</span>" : ""}</td>
+    <td>${esc(s.harness)}</td><td>${esc(s.persona || "—")}</td>
+    <td>${s.token === null ? "" : secret(s.token)}</td>
+    <td class="wrap">${(s.subscriptions||[]).map((sub) => esc(sub.room) + '<br><span class="muted">唤醒：' + esc(wakeText(sub.wake)) + "</span>").join("<br>") || "无"}</td></tr>`).join("");
+  $("#config").innerHTML = `
+  <div class="card"><h2>连接（一个账号一条）</h2><table>
+    <tr><th>id</th><th>平台</th><th>地址</th><th>令牌</th><th>账号</th><th>破坏性放行</th></tr>${connRows}</table></div>
+  <div class="card"><h2>harness 会话</h2><table>
+    <tr><th>id</th><th>harness</th><th>人格</th><th>接入令牌</th><th>订阅与唤醒</th></tr>${sessRows}</table></div>
+  <div class="card"><h2>人格</h2>${(c.personas||[]).map((p) => `<div class="kv"><div class="k">${esc(p.id)}（${esc(p.name)}）</div><pre>${esc(p.text)}</pre></div>`).join("") || '<p class="empty">无</p>'}</div>
+  <div class="card"><h2>记忆</h2>${(c.memories||[]).map((m) => `<div class="kv"><div class="k">${esc(m.id)}（${esc(m.name)}）</div><div>${esc(m.kind)} @ <span class="wrap">${esc(m.location)}</span></div></div>`).join("") || '<p class="empty">无</p>'}</div>
+  <div class="card"><h2>文件中继</h2>${c.file_relay ? `<div class="kv">
+    <div class="k">mode</div><div>${esc(c.file_relay.mode)}</div>
+    <div class="k">listen</div><div>${esc(c.file_relay.listen)}</div>
+    <div class="k">public_base</div><div class="wrap">${esc(c.file_relay.public_base)}</div>
+    <div class="k">dir</div><div>${esc(c.file_relay.dir)}</div></div>` : '<p class="empty">没配（本机路径原样透传）</p>'}</div>
+  <div class="card"><h2>运行参数</h2><div class="kv">
+    <div class="k">库文件</div><div>${esc(c.storage && c.storage.path)}</div>
+    <div class="k">保留策略</div><div>每房间 ${esc(c.retention && c.retention.max_records_per_room)} 条 / ${esc(c.retention && c.retention.max_age_days)} 天</div>
+    <div class="k">一轮投递上限</div><div>${esc(c.delivery_limit)}</div>
+    <div class="k">记忆 worktree 根</div><div>${esc(c.worktrees_root)}</div>
+    <div class="k">失败通知默认动作</div><div>${esc((c.default_on_turn_error||[]).join(", ") || "只记日志")}</div></div></div>`;
+}
+
+const tabs = {
+  status: loadStatus,
+  sessions: loadSessions,
+  feedback: loadFeedback,
+  config: loadConfig,
+};
+document.querySelectorAll("nav button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
+    document.querySelectorAll("main section").forEach((sec) => sec.classList.toggle("active", sec.id === "tab-" + btn.dataset.tab));
+    tabs[btn.dataset.tab]().catch((e) => console.error(e));
+  });
+});
+$("#logout").addEventListener("click", () => { localStorage.removeItem("acb-console-token"); location.href = "/?login=1"; });
+$("#conn-note").textContent = "token 已从本页保存，只存在浏览器 localStorage";
+loadStatus().catch((e) => console.error(e));
+</script>
+</body>
+</html>

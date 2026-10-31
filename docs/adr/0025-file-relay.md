@@ -37,12 +37,29 @@ agent ── send_message(image, url="/home/.../a.png") ──→ 桥
 
 ```toml
 [file_relay]
+mode = "file-server"                 # 中继方式，缺省即 file-server（当前唯一实现，写别的值启动即报错）
 listen = "0.0.0.0:3131"              # 桥自己监听
 public_base = "http://10.89.0.1:3131" # 平台那边访问桥的地址（不含尾斜杠）
 dir = "state/relay"                   # 收下的文件放哪（默认 state/relay）
 ```
 
-`public_base` 是唯一需要按部署环境填的东西。**本机实测**（rootless podman 5.8 + pasta + netavark，让容器里的 QQ 直接 fetch 验证）：
+`mode` 留着是为了将来加别的收发方式（比如反向推送）不动配置结构；现在只有 `file-server`。
+
+`public_base` 是唯一需要按部署环境填的东西。**OneBot 怎么部署的都有**（用户 2026-10-31 明确：docker / podman / 本机 / 另一台服务器），每个环境下「容器/进程能解析到桥」的名字不一样：
+
+| OneBot 部署方式 | public_base 该填什么 | 前提 |
+|---|---|---|
+| rootless/rootful **podman**（Linux） | `http://host.containers.internal:3131` | podman 4+ 自动注入，开箱即用 |
+| **docker 原生 Linux** | `http://host.docker.internal:3131` | 必须在 compose 加 `extra_hosts: ["host.docker.internal:host-gateway"]`（Docker 20.10+）；默认没有这个名字 |
+| **Docker Desktop**（Windows/macOS） | `http://host.docker.internal:3131` | 开箱即用 |
+| **本机裸跑**（无容器） | `http://127.0.0.1:3131` | 桥和 OneBot 同机即可 |
+| **另一台服务器/机器** | `http://<桥机 IP>:3131`（局域网 / zerotier / 公网） | 桥 listen 必须是 `0.0.0.0`，防火墙放行端口 |
+
+**两个常见的坑**（docker 上第一坑实测级别的常见）：
+1. **Docker 不认识 `host.containers.internal`**——那是 Podman 专属注入名。反过来说 Podman 其实两个名字都注入，所以 compose 里把两个名字都加进 `extra_hosts` 是跨引擎通吃写法（示例见 `deploy/relay-examples.md`）。
+2. **DNS 解析对了不等于连得上**——桥必须 `listen = "0.0.0.0:3131"`，只听 `127.0.0.1` 时容器里照样 connection refused。
+
+本机实测（rootless podman 5.8 + pasta + netavark，让容器里的 QQ 直接 fetch 验证）：
 
 | 候选地址 | 结果 |
 |---|---|

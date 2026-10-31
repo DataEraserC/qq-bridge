@@ -1,7 +1,13 @@
 //! 桥侧统一控制台：一个极简 HTTP 服务（ADR-0018）。
 //!
-//! 只处理几个端点，用标准库手写 HTTP（不引依赖）：读会话/映射状态、重置会话、看概览。
-//! 可远程访问，所以所有请求都要 token 鉴权（`Authorization: Bearer <token>`）。
+//! webapi + webui（用户 2026-10-31 裁定：配置页面要有，做成 webapi + webui 且带鉴权；
+//! 参考旧 Node 版 bridge.js 控制台的安全做法）。用标准库手写 HTTP（不引依赖）：
+//! - `GET /`：单文件管理页（`console.html`，include 进二进制）。浏览器没法随手发
+//!   Authorization 头，所以页面用 `/?token=<控制台token>` 进门，JS 把 token 存进
+//!   localStorage，之后所有 `/api/*` 请求都带 `Authorization: Bearer`。
+//! - `/api/*`：状态、会话（含桥↔harness 映射与重置）、反馈、配置只读视图。
+//! - 鉴权：每条请求都要 token（Bearer 头或 `?token=`，常量时间比较）。
+//! - 安全响应头（X-Frame-Options / CSP / nosniff / no-store / no-referrer）照抄旧版。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -11,6 +17,22 @@ use std::sync::{Arc, Mutex};
 use acb_kernel::{Bridge, ControlRegistry, Store};
 use acb_proto::Frame;
 use serde_json::json;
+
+/// 管理页。单文件、零外部依赖：改页面就是改这个 HTML，编译时嵌进二进制。
+const CONSOLE_HTML: &str = include_str!("console.html");
+
+/// 没带 token 打开 `/` 时给的一小块登录页：弹窗要 token，拼进 URL 重进。
+/// 跟旧 Node 版同一招——不让完整页面在未授权时先渲染出来。
+const LOGIN_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>需要令牌</title>
+<body style="font-family:system-ui;background:#14161a;color:#d8dce3;display:grid;place-items:center;height:100vh">
+<div style="text-align:center">
+<p>请输入控制台访问令牌</p>
+<input id="t" type="password" style="padding:6px 10px;border-radius:6px;border:1px solid #33373f;background:#1e2127;color:#d8dce3">
+<button onclick="go()" style="padding:6px 14px;margin-left:8px;cursor:pointer">进入</button>
+</div>
+<script>function go(){var t=document.getElementById('t').value;if(t)location.href='/?token='+encodeURIComponent(t)}
+document.getElementById('t').addEventListener('keydown',function(e){if(e.key==='Enter')go()})</script>
+</body>"#;
 
 /// 控制台服务。桥本体之外的一条 HTTP 服务，跟接入点（TCP 7700）互不相干。
 pub struct Console<S: Store> {
@@ -80,7 +102,20 @@ impl<S: Store + Send + 'static> Console<S> {
         // 读 body（反馈改状态要带 {"status": "...", "note": "..."}）。
         let body = read_body(&mut stream, &buffer[header_end + 4..], &header_text);
 
-        if !self.authorized(&auth) {
+        // 浏览器自动请求 favicon 且不带 token；放鉴权前 204 收掉，别给 DevTools 留 401 噪音。
+        if method == "GET" && (path == "/favicon.ico" || path == "/apple-touch-icon.png") {
+            return write_response(&mut stream, 204, "text/plain", "");
+        }
+
+        let (path, query) = split_query(&path);
+        // 两条门路：Authorization: Bearer 头，或 ?token=（只有浏览器进门用）。
+        let authorized = self.authorized(&auth) || self.query_token_authorized(query);
+
+        if !authorized {
+            // 页面本身：没 token 时给登录页（不是 JSON），人才能输 token 进来。
+            if method == "GET" && path == "/" {
+                return write_response(&mut stream, 401, "text/html; charset=utf-8", LOGIN_HTML);
+            }
             return write_response(
                 &mut stream,
                 401,
@@ -89,13 +124,23 @@ impl<S: Store + Send + 'static> Console<S> {
             );
         }
 
-        let (status, body) = self.route(&method, &path, &body);
+        // 管理页。route 只管 JSON API。
+        if method == "GET" && path == "/" {
+            return write_response(&mut stream, 200, "text/html; charset=utf-8", CONSOLE_HTML);
+        }
+
+        let (status, body) = self.route(&method, path, &body);
         write_response(&mut stream, status, "application/json", &body)
     }
 
     fn authorized(&self, auth: &str) -> bool {
         // 常量时间比较，避免时序侧信道（token 是敏感凭据）。
         constant_time_eq(auth, &format!("Bearer {}", self.token))
+    }
+
+    /// `?token=<控制台token>` 形式的鉴权（浏览器进门用）。
+    fn query_token_authorized(&self, query: &str) -> bool {
+        query_token_matches(query, &self.token)
     }
 
     fn route(&self, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -107,19 +152,89 @@ impl<S: Store + Send + 'static> Console<S> {
             ("GET", "/api/feedback") => self.feedback(query),
             ("POST", p) if p.starts_with("/api/feedback/") => self.set_feedback(p, body),
             ("POST", p) if p.starts_with("/api/session/") => self.reset(p),
-            ("GET", "/") => (200, json!({
-                "name": "acb-bridge console",
-                "api": [
-                    "/api/status",
-                    "/api/sessions",
-                    "/api/session/:id/reset",
-                    "/api/feedback?status=open&limit=20",
-                    "/api/feedback/:id/status"
-                ],
-            })
-            .to_string()),
+            // 配置只读视图（方案 A 第一步）。敏感字段在桥这侧就遮掉，完整原文
+            // 永远不发给浏览器。编辑写回 + 热重载是第二步（ADR-0009）。
+            ("GET", "/api/config") => (200, self.config_view()),
             _ => (404, json!({"error":"没有这个端点"}).to_string()),
         }
+    }
+
+    /// 当前配置的只读 JSON 视图。遮蔽规则：
+    /// - 字段名按 `_`/`-` 切段后命中敏感词（token/password/secret/cookie/credential/key）
+    ///   的整值换成 `******`（有值才遮，没有如实给 null）；
+    /// - 连接 url 里查询参数名敏感的值同样遮掉（`ws://…?token=xxx` 是常见写法）；
+    /// - 控制台自己的 token 根本不进这个视图。
+    fn config_view(&self) -> String {
+        let bridge = lock(&self.bridge);
+        let config = bridge.config();
+        use acb_kernel::config::DestructivePolicy;
+        json!({
+            "personas": config.personas.iter().map(|p| json!({
+                "id": p.id, "name": p.name, "text": p.text,
+            })).collect::<Vec<_>>(),
+            "memories": config.memories.iter().map(|m| json!({
+                "id": m.id, "name": m.name, "kind": m.kind, "location": m.location,
+            })).collect::<Vec<_>>(),
+            "harnesses": config.harnesses.iter().map(|h| json!({
+                "id": h.id, "name": h.name,
+            })).collect::<Vec<_>>(),
+            "sessions": config.sessions.iter().map(|s| json!({
+                "id": s.id,
+                "name": s.name,
+                "harness": s.harness,
+                "persona": s.persona,
+                "model": s.model,
+                "memories": s.memories,
+                "token": mask_secret(&s.token),
+                "subscriptions": s.subscriptions.iter().map(|sub| json!({
+                    "room": sub.room.to_string(),
+                    "wake": json!({
+                        "at_mention": sub.wake.at_mention,
+                        "reply": sub.wake.reply,
+                        "name_mention": sub.wake.name_mention,
+                        "names": sub.wake.names,
+                        "accumulate": sub.wake.accumulate,
+                        "poke": sub.wake.poke,
+                        "events": sub.wake.events,
+                        "keywords": sub.wake.keywords,
+                        "ignore_speakers": sub.wake.ignore_speakers,
+                    }),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "connections": config.connections.iter().map(|c| json!({
+                "id": c.id,
+                "platform": c.platform,
+                "kind": c.kind,
+                "transport": c.transport.as_str(),
+                "url": mask_url_query(&c.url),
+                "token": c.token.as_deref().map(mask_secret),
+                "account": c.account,
+                "admin_qqs": c.admin_qqs,
+                "allow_destructive": match &c.allow_destructive {
+                    DestructivePolicy::None => json!("默认全拒"),
+                    DestructivePolicy::All => json!("全部放行"),
+                    DestructivePolicy::Only(methods) => json!(methods),
+                },
+            })).collect::<Vec<_>>(),
+            "file_relay": config.file_relay.as_ref().map(|r| json!({
+                "mode": r.mode,
+                "listen": r.listen,
+                "public_base": r.public_base,
+                "dir": r.dir,
+            })),
+            "storage": { "path": config.storage.path },
+            "retention": {
+                "max_records_per_room": config.retention.max_records_per_room,
+                "max_age_days": config.retention.max_age_days,
+            },
+            "worktrees_root": config.worktrees_root,
+            "delivery_limit": config.delivery_limit,
+            "default_on_turn_error": config.default_on_turn_error.iter().map(|action| match action {
+                acb_kernel::config::TurnErrorAction::Log => json!("log"),
+                acb_kernel::config::TurnErrorAction::Send { room } => json!(format!("send:{room}")),
+            }).collect::<Vec<_>>(),
+        })
+        .to_string()
     }
 
     fn status(&self) -> String {
@@ -291,6 +406,66 @@ fn split_query(path: &str) -> (&str, &str) {
     }
 }
 
+/// 敏感字段名黑名单。字段名按 `_`/`-` 切段后逐段对——`keywords` 里虽然含
+/// 「key」字样，但切段后是 `keywords` 整段，不匹配 `key`，不会误伤。
+const SENSITIVE_KEY_PARTS: &[&str] = &[
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "cookie",
+    "credential",
+    "credentials",
+    "privatekey",
+    "private",
+    "apikey",
+    "api",
+    "key",
+    "accesskey",
+];
+
+/// 字段名是否敏感。
+fn is_sensitive_key(field: &str) -> bool {
+    field
+        .split(['_', '-'])
+        .any(|part| SENSITIVE_KEY_PARTS.contains(&part))
+}
+
+/// `?token=<…>` 查询串鉴权。自由函数：纯逻辑，直接可测。
+fn query_token_matches(query: &str, token: &str) -> bool {
+    match query_param(query, "token") {
+        Some(supplied) if !supplied.is_empty() => constant_time_eq(supplied, token),
+        _ => false,
+    }
+}
+
+/// 有值就遮成 `******`（遮罩本身进 JSON，页面认它画遮蔽样式）；空值如实给 null。
+fn mask_secret(value: &str) -> serde_json::Value {
+    if value.is_empty() {
+        serde_json::Value::Null
+    } else {
+        json!("******")
+    }
+}
+
+/// 把 URL 查询串里敏感参数的值遮掉（`ws://h:3001/ws?token=x` → `?token=******`）。
+/// 非 http(s)/ws(s) 或没有查询串时原样返回。路径与主机部分不动。
+fn mask_url_query(url: &str) -> String {
+    let Some((head, query)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) if is_sensitive_key(name) && !value.is_empty() => {
+                format!("{name}=******")
+            }
+            _ => pair.to_owned(),
+        })
+        .collect();
+    format!("{head}?{}", masked.join("&"))
+}
+
 /// 从查询串里取一个参数（`a=1&b=2`）。不引 url 库：只认 `k=v`，够用。
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
@@ -339,14 +514,22 @@ fn read_body(stream: &mut TcpStream, leftover: &[u8], header_text: &str) -> Stri
 fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
         _ => "Error",
     };
+    // 安全响应头照抄旧 Node 版控制台：管理页不许被别处 iframe/引脚本，缓存一律不留。
+    // 不再给 `Access-Control-Allow-Origin: *`——token 鉴权的服务不该跨域放行。
+    const SECURITY_HEADERS: &str = "X-Frame-Options: DENY\r\n\
+        Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'\r\n\
+        Cache-Control: no-store\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        Referrer-Policy: no-referrer\r\n";
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
@@ -373,4 +556,52 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|e| e.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_key_matches_parts_not_substrings() {
+        assert!(is_sensitive_key("token"));
+        assert!(is_sensitive_key("access_token"));
+        assert!(is_sensitive_key("api-key"));
+        assert!(is_sensitive_key("console_token"));
+        // keywords 不是密钥——别因为含 key 字样就误伤。
+        assert!(!is_sensitive_key("keywords"));
+        assert!(!is_sensitive_key("url"));
+    }
+
+    #[test]
+    fn mask_secret_masks_only_when_present() {
+        assert_eq!(mask_secret("abc"), json!("******"));
+        assert_eq!(mask_secret(""), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn mask_url_query_masks_sensitive_params_only() {
+        assert_eq!(
+            mask_url_query("ws://127.0.0.1:3001/ws?token=abc&flag=1"),
+            "ws://127.0.0.1:3001/ws?token=******&flag=1"
+        );
+        assert_eq!(
+            mask_url_query("ws://127.0.0.1:3001/ws"),
+            "ws://127.0.0.1:3001/ws"
+        );
+        // 空值不遮——没有秘密可保。
+        assert_eq!(
+            mask_url_query("http://h/p?token=&a=1"),
+            "http://h/p?token=&a=1"
+        );
+    }
+
+    #[test]
+    fn query_token_authorized_accepts_exact_match_only() {
+        assert!(query_token_matches("a=1&token=s3cret", "s3cret"));
+        assert!(!query_token_matches("token=wrong", "s3cret"));
+        assert!(!query_token_matches("token=", "s3cret"));
+        assert!(!query_token_matches("no-token-here", "s3cret"));
+        assert!(!query_token_matches("token=S3CRET", "s3cret"));
+    }
 }
