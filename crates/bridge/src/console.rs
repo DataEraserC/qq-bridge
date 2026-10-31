@@ -167,6 +167,10 @@ impl<S: Store + Send + 'static> Console<S> {
             // 保存时先校验再落盘（备份旧文件），解析通过就暂存进桥，下一轮生效。
             ("GET", "/api/config/toml") => self.config_toml(),
             ("POST", "/api/config/toml") => self.save_config_toml(body),
+            // 结构化表单补丁（主入口，ADR-0009「用户不该需要懂文件格式」）：
+            // 页面表单 → 一组 op → toml_edit 在原文档上改键（注释排版不丢）→
+            // 同一条「校验 → 备份 → 落盘 → 暂存」流水线。
+            ("POST", "/api/config/patch") => self.save_config_patch(body),
             ("POST", "/api/config/discard") => {
                 let mut bridge = lock(&self.bridge);
                 let discarded = bridge.discard_staged_config();
@@ -324,14 +328,86 @@ impl<S: Store + Send + 'static> Console<S> {
             }
         };
 
-        // 2. 读旧配置算影响清单（在改桥之前，用的是当前生效的这份）。
+        // 2. 收尾（共用）：算影响清单 → 备份 → 落盘 → 暂存。
+        match self.finish_config_save(new_config, text, Vec::new()) {
+            Ok(value) => (200, value.to_string()),
+            Err((status, value)) => (status, value.to_string()),
+        }
+    }
+
+    /// 结构化表单补丁保存：`POST /api/config/patch`，body `{"ops":[...]}`。
+    /// 表单改动的**主入口**（ADR-0009「用户不该需要懂文件格式」）：
+    /// toml_edit 在原 TOML 上外科手术式改键——注释、排版、没碰过的键全都不动。
+    /// 之后走同一条「校验 → 备份 → 落盘 → 暂存」流水线，任何一步失败整体报错。
+    fn save_config_patch(&self, body: &str) -> (u16, String) {
+        let parsed: serde_json::Value = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    400,
+                    json!({"error": format!("body 要是 JSON：{{\"ops\":[…]}}（{error}）")})
+                        .to_string(),
+                );
+            }
+        };
+        let Some(ops) = parsed.get("ops").and_then(serde_json::Value::as_array) else {
+            return (400, json!({"error": "body 里要有 ops 数组"}).to_string());
+        };
+        if ops.is_empty() {
+            return (400, json!({"error": "ops 是空的，没有可保存的改动"}).to_string());
+        }
+
+        let text = match std::fs::read_to_string(&self.config_path) {
+            Ok(text) => text,
+            Err(error) => {
+                return (
+                    500,
+                    json!({"error": format!("读配置文件 {} 失败：{error}", self.config_path)})
+                        .to_string(),
+                );
+            }
+        };
+        let (new_text, changes) = match crate::config_patch::apply_patch(&text, ops) {
+            Ok(result) => result,
+            Err(error) => {
+                return (400, json!({"error": error, "saved": false}).to_string());
+            }
+        };
+        let new_config = match acb_kernel::Config::parse(&new_text) {
+            Ok(config) => config,
+            Err(error) => {
+                return (
+                    400,
+                    json!({
+                        "error": format!("补丁后的配置解析不过，一个字节都没写：{error}"),
+                        "saved": false,
+                    })
+                    .to_string(),
+                );
+            }
+        };
+        match self.finish_config_save(new_config, &new_text, changes) {
+            Ok(value) => (200, value.to_string()),
+            Err((status, value)) => (status, value.to_string()),
+        }
+    }
+
+    /// 保存收尾（解析已通过）：算影响清单 → 备份旧文件 → 落盘 → 暂存进桥。
+    /// `changes` 是表单/补丁的人话改动清单，回给页面展示。
+    fn finish_config_save(
+        &self,
+        new_config: acb_kernel::Config,
+        text: &str,
+        changes: Vec<String>,
+    ) -> Result<serde_json::Value, (u16, serde_json::Value)> {
+        // 影响清单在改桥之前算（用的是当前生效的这份）。
         let (hot, restart) = {
             let bridge = lock(&self.bridge);
             reload_impact(bridge.config(), &new_config)
         };
 
-        // 3. 备份旧文件 → 落盘新文件。备份失败不算致命（首次保存时旧文件可能不存在），
-        //    但落盘失败必须报——不能让「磁盘上和桥里跑的」悄悄分家。
+        // 备份失败不算致命（首次保存时旧文件可能不存在），但落盘失败必须报——
+        // 不能让「磁盘上和桥里跑的」悄悄分家。
         let old_text = std::fs::read_to_string(&self.config_path).ok();
         if let Some(old_text) = &old_text {
             let backup_path = format!("{}.bak", self.config_path);
@@ -340,31 +416,26 @@ impl<S: Store + Send + 'static> Console<S> {
             }
         }
         if let Err(error) = std::fs::write(&self.config_path, text) {
-            return (
+            return Err((
                 500,
-                json!({"error": format!("写配置文件 {} 失败：{error}", self.config_path)})
-                    .to_string(),
-            );
+                json!({"error": format!("写配置文件 {} 失败：{error}", self.config_path), "saved": false}),
+            ));
         }
 
-        // 4. 暂存进桥，下一轮生效。
         {
             let mut bridge = lock(&self.bridge);
             bridge.stage_config(new_config);
         }
 
-        (
-            200,
-            json!({
-                "ok": true,
-                "saved": true,
-                "note": "已保存并暂存，下一次开轮自动生效（轮次边界重载，ADR-0009）",
-                "hot_reload": hot,
-                "needs_restart": restart,
-                "backup": old_text.map(|_| format!("{}.bak", self.config_path)),
-            })
-            .to_string(),
-        )
+        Ok(json!({
+            "ok": true,
+            "saved": true,
+            "note": "已保存并暂存，下一次收消息/开轮自动生效（轮次边界重载，ADR-0009）",
+            "changes": changes,
+            "hot_reload": hot,
+            "needs_restart": restart,
+            "backup": old_text.map(|_| format!("{}.bak", self.config_path)),
+        }))
     }
 
     fn sessions(&self) -> String {

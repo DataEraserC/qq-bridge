@@ -13,3 +13,6 @@ acb-kernel = { path = "../kernel" }
 acb-adapter-onebot11 = { path = "../adapters/onebot11" }
 acb-proto = { path = "../proto" }
 serde_json = { workspace = true }
+# 配置补丁用：在原 TOML 文档上外科手术式改键，注释排版不丢（ADR-0009）。
+# 版本跟 kernel 的 toml 0.8 同族（toml 0.8 内部就是它）。
+toml_edit = "0.22"

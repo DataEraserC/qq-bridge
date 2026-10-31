@@ -19,6 +19,7 @@ use acb_kernel::{
     Bridge, Config, ControlRegistry, FileRelay, Outbounds, SqliteStore, serve,
 };
 
+mod config_patch;
 mod console;
 use console::Console;
 
