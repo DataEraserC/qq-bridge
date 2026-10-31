@@ -7,6 +7,10 @@
 # Node
 node_modules/
 
+# 文档站构建产物与缓存
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+
 # 运行时状态与本机配置（永不入库）
 /state/
 config.toml

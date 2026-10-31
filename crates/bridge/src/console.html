@@ -124,10 +124,11 @@ async function loadStatus() {
 }
 
 async function loadSessions() {
-  const { sessions } = await api("/api/sessions");
+  const [{ sessions }, status] = await Promise.all([api("/api/sessions"), api("/api/status")]);
+  const busy = new Set(status.busy_sessions || []);
   $("#sessions").innerHTML = sessions.length ? sessions.map((s) => {
     const map = s.map;
-    return `<div class="card"><h2>${esc(s.name || s.id)} <span class="muted">(${esc(s.id)})</span></h2>
+    return `<div class="card"><h2>${esc(s.name || s.id)} <span class="muted">(${esc(s.id)})</span>${busy.has(s.id) ? ' <span class="warn">● 正在跑一轮</span>' : ""}</h2>
     <div class="kv">
       <div class="k">harness</div><div>${esc(s.harness)}</div>
       <div class="k">人格</div><div>${esc(s.persona || "—")}</div>
@@ -136,9 +137,20 @@ async function loadSessions() {
       <div class="k">订阅</div><div>${(s.subscriptions||[]).map(esc).join("<br>") || "无"}</div>
       <div class="k">harness 侧映射</div><div>${map ? esc(map.harness_session) + '<br><span class="muted">更新于 ' + esc(new Date(map.updated_at).toLocaleString()) + '</span>' : '<span class="muted">还没有（harness 连上后声明）</span>'}</div>
     </div>
-    <p><button class="act danger" onclick="resetSession('${esc(s.id)}')">断开映射并重置会话</button></p>
+    <p><button class="act" onclick="interruptSession('${esc(s.id)}')" ${busy.has(s.id) ? "" : "disabled"}>打断当前轮</button>
+    <button class="act danger" onclick="resetSession('${esc(s.id)}')">断开映射并重置会话</button></p>
     <div id="reset-note-${esc(s.id)}" class="muted"></div></div>`;
   }).join("") : '<div class="card"><p class="empty">没有会话</p></div>';
+}
+
+async function interruptSession(id) {
+  if (!confirm("打断会话 " + id + " 正在跑的这一轮？dsh 侧会被取消（aborted），桥按失败发通知。")) return;
+  const note = $("#reset-note-" + id);
+  try {
+    const r = await api("/api/session/" + encodeURIComponent(id) + "/interrupt", { method: "POST", body: "{}" });
+    note.textContent = "✓ " + (r.note || "interrupt 指令已发出");
+    setTimeout(loadSessions, 1500);
+  } catch (e) { note.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
 }
 
 async function resetSession(id) {

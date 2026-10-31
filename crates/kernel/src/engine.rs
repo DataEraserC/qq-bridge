@@ -959,6 +959,8 @@ impl<S: Store> Bridge<S> {
             memories,
             session_info,
             more,
+            // 0 = 配置里关了超时，harness 收到就别自己掐。
+            turn_timeout_ms: Some(self.config.turn_timeout_ms()),
         })
     }
 

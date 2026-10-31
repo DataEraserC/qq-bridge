@@ -536,11 +536,15 @@ impl<S: Store + Send + 'static> Console<S> {
     }
 
     fn reset(&self, path: &str) -> (u16, String) {
-        // path 形如 /api/session/:id/reset
-        let session = path
-            .trim_start_matches("/api/session/")
-            .trim_end_matches("/reset")
-            .to_owned();
+        // path 形如 /api/session/:id/reset 或 /api/session/:id/interrupt。
+        // 两者同一套转发逻辑，只是指令名不同：reset 重置映射，interrupt 打断当前轮。
+        let rest = path.trim_start_matches("/api/session/");
+        let (session, command) = if let Some(s) = rest.strip_suffix("/interrupt") {
+            (s, "interrupt")
+        } else {
+            (rest.trim_end_matches("/reset"), "reset")
+        };
+        let session = session.to_owned();
         if session.is_empty() {
             return (400, json!({"error":"会话 id 不能为空"}).to_string());
         }
@@ -552,16 +556,19 @@ impl<S: Store + Send + 'static> Console<S> {
         if !exists {
             return (404, json!({"error": format!("没有会话 {session}")}).to_string());
         }
-        // 发 control{reset} 帧给管理这个会话的 harness。
+        // 发 control 帧（reset / interrupt）给管理这个会话的 harness。
         let frame = Frame::Control {
             id: format!("ctl-{}", now_millis()),
             session: session.clone(),
-            command: "reset".into(),
+            command: command.into(),
             args: json!({}),
         };
         let delivered = self.controls.send_control(frame);
         if delivered {
-            (200, json!({"ok": true, "session": session, "note": "reset 指令已发出"}).to_string())
+            (
+                200,
+                json!({"ok": true, "session": session, "note": format!("{command} 指令已发出")}).to_string(),
+            )
         } else {
             (
                 409,

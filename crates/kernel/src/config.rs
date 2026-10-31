@@ -36,6 +36,9 @@ pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
 /// 超过这个数就只投前这么多条，末尾提示「还有 N 条，用 fetch_records 抓」。
 pub const DEFAULT_DELIVERY_LIMIT: usize = 30;
 
+/// 一轮的默认超时：5 分钟。沿用 dsh 驱动原来的写死值，只是现在可配、可关。
+pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 300;
+
 /// `[file_relay].dir` 不写时的默认值。跟 [storage].path 一样相对启动目录。
 pub const DEFAULT_RELAY_DIR: &str = "state/relay";
 
@@ -75,6 +78,18 @@ pub struct Config {
     /// 一轮投递最多塞多少条新记录。超过就只投前 `delivery_limit` 条，并在末尾附一句
     /// 「还有 N 条没投，用 fetch_records 抓」。0 或不配 = 不截断（照旧投满 MAX_DELIVERY）。
     pub delivery_limit: usize,
+    /// 一轮最多跑多久（秒）。0 = 关闭超时——模型想跑多久跑多久，桥不掐、harness 也不许
+    /// 自己掐；n > 0 = 超时后 harness 侧**主动打断**本侧会话（dsh 有队列能打断；不支持
+    /// 打断的 harness 按各自兜底），打断算这轮失败、走 `on_turn_error` 通知。
+    /// 之前 dsh 驱动里写死 5 分钟、到点干等，长任务必被腰斩（2026-10-31 用户裁定可配）。
+    pub turn_timeout_secs: u64,
+}
+
+impl Config {
+    /// 超时换算成毫秒给协议帧。0 = 关闭（帧里带 0，harness 收到就别自己兜底）。
+    pub fn turn_timeout_ms(&self) -> u64 {
+        self.turn_timeout_secs.saturating_mul(1000)
+    }
 }
 
 /// 一轮失败后要做的通知动作。
@@ -889,6 +904,7 @@ impl Config {
             worktrees_root,
             default_on_turn_error,
             delivery_limit: raw.delivery_limit.unwrap_or(DEFAULT_DELIVERY_LIMIT),
+            turn_timeout_secs: raw.turn_timeout_secs.unwrap_or(DEFAULT_TURN_TIMEOUT_SECS),
         })
     }
 
@@ -1177,6 +1193,9 @@ struct RawConfig {
     /// 一轮投递最多塞多少条。0 = 不截断。
     #[serde(default)]
     delivery_limit: Option<usize>,
+    /// 一轮最多跑多久（秒）。0 = 关闭超时。不配 = 默认 300 秒。
+    #[serde(default)]
+    turn_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1379,6 +1398,29 @@ mod tests {
         assert_eq!(subscription.wake.accumulate, Some(DEFAULT_ACCUMULATE));
         assert!(subscription.wake.keywords.is_empty());
         assert_eq!(config.connections[0].transport, Transport::WsClient);
+        // 超时默认 5 分钟（dsh 驱动原来的写死值），协议帧里带毫秒。
+        assert_eq!(config.turn_timeout_secs, DEFAULT_TURN_TIMEOUT_SECS);
+        assert_eq!(config.turn_timeout_ms(), 300_000);
+    }
+
+    #[test]
+    fn turn_timeout_is_configurable_and_disablable() {
+        // 0 = 关闭：桥不掐，帧里带 0，harness 也不许自己兜底。
+        let config = Config::parse(&format!(
+            "turn_timeout_secs = 0\n{}",
+            config_with(ONE_CONNECTION, ONE_SESSION)
+        ))
+        .expect("应当能解析");
+        assert_eq!(config.turn_timeout_secs, 0);
+        assert_eq!(config.turn_timeout_ms(), 0);
+
+        // 自定义值原样进帧。
+        let config = Config::parse(&format!(
+            "turn_timeout_secs = 3600\n{}",
+            config_with(ONE_CONNECTION, ONE_SESSION)
+        ))
+        .expect("应当能解析");
+        assert_eq!(config.turn_timeout_ms(), 3_600_000);
     }
 
     #[test]

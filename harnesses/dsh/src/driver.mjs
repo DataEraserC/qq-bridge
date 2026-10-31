@@ -218,6 +218,28 @@ class TurnDriver {
       }
       return
     }
+    if (command === "interrupt") {
+      // 人工打断：cancel 当前 dsh 会话里在跑的那轮。正在 #waitTurnEnd 等的
+      // #one 会收到 turn/end(aborted)，自然以失败收场、桥走失败通知。
+      const sid = this.sessions.get(session)
+      if (!sid) {
+        link.controlResult({
+          id,
+          session,
+          command,
+          error: `会话 ${session} 没有 dsh 侧映射（还没开过轮）`,
+        })
+        return
+      }
+      try {
+        await this.dsh.cancel(sid)
+        link.controlResult({ id, session, command, result: { ok: true, dsh_session: sid } })
+      } catch (error) {
+        this.log("error", `打断会话 ${session} 失败：${error?.message ?? error}`)
+        link.controlResult({ id, session, command, error: String(error?.message ?? error) })
+      }
+      return
+    }
     // 不认识的指令：报错，别默默吞掉。
     this.log("warn", `不认识的 control 指令：${command}`)
     link.controlResult({ id, session, command, error: `不认识的指令 ${command}` })
@@ -243,7 +265,11 @@ class TurnDriver {
       )
       // prompt 投话，follow 等这一轮真正结束（turn/end）。
       await this.dsh.prompt(sessionId, [{ type: "text", text }])
-      const turnFailure = await this.#waitTurnEnd(sessionId)
+      // 超时跟着桥的配置走：0 = 关闭（跑多久都等）；不带 = 旧桥，用 5 分钟兜底。
+      const turnFailure = await this.#waitTurnEnd(
+        sessionId,
+        typeof delivery.turn_timeout_ms === "number" ? delivery.turn_timeout_ms : 5 * 60 * 1000,
+      )
       if (turnFailure) {
         failure = turnFailure
         this.log("error", `这一轮失败了：${failure}`)
@@ -372,29 +398,66 @@ class TurnDriver {
   }
 
   /**
-   * 订阅会话事件流，等到 turn/end 就返回。加个超时兜底，避免 follow 流断了
-   * （dsh 重启、网络抖动）导致这一轮永远卡住。
+   * 订阅会话事件流，等到 turn/end 就返回。
+   *
+   * 超时语义（timeoutMs，跟桥的 turn_timeout_secs 走）：
+   * - 0 = 关闭：等到天荒地老，唯一兜底是事件流断掉（dsh 重启、网络抖动）；
+   * - n > 0 = 到点还没结束就**主动打断**（dsh 的 session/cancel 让这轮以 aborted
+   *   收场），打断算这轮失败、桥那边走失败通知。打断后再给 30 秒宽限等 turn/end，
+   *   还不来才放弃——不能把「打断没生效」和「这轮真的结束了」混为一谈。
    *
    * 返回这一轮的失败信息（`null` 表示正常结束）。turn/end 事件的 reason 会带出
    * 为什么结束：`completed` 是正常，`error`/`blocked`/`aborted`/`max-tokens` 都是
    * 失败。尤其「模型回了 completed 但没有内容」（no content）在 dsh 里也被映射成
    * `error`，不读 reason 就会把它当成成功、失败信息被吞掉。
    */
-  async #waitTurnEnd(sessionId) {
-    const timeout = 5 * 60 * 1000 // 5 分钟兜底
+  async #waitTurnEnd(sessionId, timeoutMs = 5 * 60 * 1000) {
     const stream = await this.dsh.follow(sessionId)
-    const deadline = Date.now() + timeout
-    for await (const event of stream) {
+    const iterator = stream[Symbol.asyncIterator]()
+    // 打断前：等满 timeoutMs；打断后：再给 30 秒宽限。null = 对应阶段没有死线。
+    let deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null
+    let interrupted = false
+    for (;;) {
+      const waitMs = deadline === null ? null : Math.max(0, deadline - Date.now())
+      const next = await this.#nextWithTimeout(iterator, waitMs)
+      if (next.timeout) {
+        if (!interrupted) {
+          interrupted = true
+          this.log(
+            "warn",
+            `本轮超过 ${Math.round(timeoutMs / 1000)}s 没结束（${sessionId}），主动打断 dsh 会话`,
+          )
+          try {
+            await this.dsh.cancel(sessionId)
+          } catch (error) {
+            // 打断失败不代表这轮失败了：继续等 turn/end，宽限期内到就算数。
+            this.log("warn", `打断没发出去（继续等 turn/end）：${error?.message ?? error}`)
+          }
+          deadline = Date.now() + 30_000
+          continue
+        }
+        return "本轮超时：打断后 30 秒内没等到 turn/end，按失败处理"
+      }
+      if (next.done) {
+        return "事件流断了，没等到 turn/end"
+      }
+      const event = next.value
       if (event.type === "turn/end") {
         return renderTurnFailure(event.data?.reason)
       }
-      if (Date.now() > deadline) {
-        this.log("warn", `等 turn/end 超时（${sessionId}），按本轮结束处理`)
-        return "本轮超时：模型 5 分钟内没有结束这一轮"
-      }
     }
-    // 流断了但没等到 turn/end：也当结束，别让轮次挂死。
-    return "事件流断了，没等到 turn/end"
+  }
+
+  /** 等迭代器的下一个值，超过 ms 没等到就返回 {timeout:true}（不消费迭代器）。 */
+  #nextWithTimeout(iterator, ms) {
+    if (!(ms > 0)) return iterator.next()
+    let timer
+    return Promise.race([
+      iterator.next(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ timeout: true }), ms)
+      }),
+    ]).finally(() => clearTimeout(timer))
   }
 }
 

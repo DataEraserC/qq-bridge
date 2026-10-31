@@ -389,6 +389,14 @@ export class DshClient {
   }
 
   /**
+   * 打断会话正在跑（或排在队列里）的轮次。dsh 会立刻让这一轮以
+   * aborted 收场（follow 流里推 turn/end）。超时打断和人工打断都走这里。
+   */
+  async cancel(sessionId, { requestId } = {}) {
+    return this.callUnary("session/cancel", { sessionId, requestId })
+  }
+
+  /**
    * 给会话选模型（会话级）。
    *
    * 为什么必须显式调：dsh 把「上次用的模型」存在会话记录里（modelSelection.lastUsed），

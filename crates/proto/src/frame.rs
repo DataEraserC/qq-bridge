@@ -48,6 +48,12 @@ pub struct Delivery {
     /// harness 渲染时据此提示模型「用 fetch_records 抓剩下的」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub more: Option<usize>,
+    /// 这一轮最多跑多久（毫秒）。`None` = 桥没带（harness 用自己的默认兜底）；
+    /// `Some(0)` = 桥明确关闭了超时，harness 别自己掐——等到 turn/end 为止；
+    /// `Some(n)` = 超过 n 毫秒还没结束就**主动打断**本侧会话（能打断的打断，
+    /// 打断不了的按各自兜底处理），打断算这轮失败，走桥的失败通知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_timeout_ms: Option<u64>,
 }
 
 /// 一个会话在本轮投递里的身份信息。
