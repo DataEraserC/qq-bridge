@@ -68,6 +68,12 @@ fn session_op(
             .and_then(serde_json::Value::as_str)
             .filter(|t| !t.is_empty())
             .ok_or("新建会话要带 token（接入令牌，给 harness 连桥用）")?;
+        let persona = create
+            .get("persona")
+            .and_then(serde_json::Value::as_str)
+            .filter(|p| !p.is_empty())
+            .ok_or("新建会话要带 persona（配置里 persona 是必填的，先建个人格）")?;
+        let persona_id = persona.to_owned();
 
         let sessions = doc
             .get_mut("sessions")
@@ -77,7 +83,8 @@ fn session_op(
         table.insert("id", value(id.clone()));
         table.insert("harness", value(harness.to_owned()));
         table.insert("token", value(token.to_owned()));
-        for key in ["name", "persona", "model"] {
+        table.insert("persona", value(persona_id));
+        for key in ["name", "model"] {
             if let Some(text) = create.get(key).and_then(serde_json::Value::as_str) {
                 if !text.is_empty() {
                     table.insert(key, value(text.to_owned()));

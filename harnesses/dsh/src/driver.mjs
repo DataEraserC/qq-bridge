@@ -28,7 +28,7 @@
 //   DSH_BASE_URL  dsh webui 地址，默认 http://127.0.0.1:3080
 //   DSH_TOKEN     dsh 启动 token（可选，没有就走离线铸造 Cookie）
 //   ACB_CWD       会话工作目录：dsh 按它把会话归进某个 workspace（Workspaces 分组）
-//   ACB_WORKSPACE_TITLE  新建 workspace 时给它起的显示标题（如「QQ 聊天」）
+//   ACB_WORKSPACE_TITLE  新建 workspace 时给它起的显示标题（默认「ACB」）
 
 import { BridgeLink, BridgeError, normalizeToolArgs, renderTurn } from "../../opencode/plugin/acb-wire.mjs"
 import { TOOLS } from "../../shared/tools.mjs"
@@ -167,8 +167,7 @@ class TurnDriver {
     this.cwd = cwd
     this.preset = preset
     // 配了就把 cwd 对应的 dsh workspace 命名成这个标题（只在新建 workspace 时命名，
-    // 不覆盖用户在 dsh 里手改过的名字）。dsh UI 的 Workspaces 列表就按它显示，
-    // 类似旧实现的「QQ 聊天」。
+    // 不覆盖用户在 dsh 里手改过的名字）。dsh UI 的 Workspaces 列表就按它显示。
     this.workspaceTitle = workspaceTitle
     // 要钉住的模型 {provider, model, reasoningEffort}；provider/model 任一为空就不干预。
     this.model = model && model.provider && model.model ? model : null

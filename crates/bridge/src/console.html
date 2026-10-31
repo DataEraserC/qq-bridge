@@ -523,7 +523,7 @@ function addSession() {
   formFrame("新增 harness 会话", `
     <div class="form-row"><label>会话 id</label><input type="text" id="ns-id" placeholder="dsh-group3"></div>
     <div class="form-row"><label>harness</label><select id="ns-harness">${harnesses.map((h) => `<option>${esc(h.id)}</option>`).join("")}</select></div>
-    <div class="form-row"><label>人格</label><select id="ns-persona"><option value="">（不设）</option>${personas.map((p) => `<option>${esc(p.id)}</option>`).join("")}</select></div>
+    <div class="form-row"><label>人格</label><select id="ns-persona">${personas.map((p) => `<option>${esc(p.id)}</option>`).join("")}</select><span class="hint">必填；没有就先去建一个</span></div>
     <div class="form-row"><label>显示名</label><input type="text" id="ns-name" placeholder="可选"></div>
     <div class="form-row"><label>接入令牌</label><input type="text" id="ns-token" value="${randToken()}" style="width:340px"><span class="hint">harness 连桥用；驱动要重启才能拿到新会话的令牌</span></div>
     <p class="hint">建好后去「订阅」给它加房间；驱动侧要在 start-drivers.sh 里登记这个会话 id 才会被驱动。</p>`,
@@ -536,7 +536,8 @@ function addSession() {
         token: g("ns-token"),
       };
       if (!create.token) { alert("接入令牌不能为空"); return false; }
-      if (document.getElementById("ns-persona").value) create.persona = document.getElementById("ns-persona").value;
+      create.persona = document.getElementById("ns-persona").value;
+      if (!create.persona) { alert("人格必填（配置里 persona 是必填项）"); return false; }
       if (g("ns-name")) create.name = g("ns-name");
       return submitPatch([{ op: "session", id, create }]);
     });

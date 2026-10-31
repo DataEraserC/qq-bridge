@@ -43,11 +43,14 @@ fi
 
 # 会话的归组与命名：cwd 决定 dsh UI 里归进哪个 workspace（Workspaces 列表按它分组），
 # 标题只在 workspace 第一次被创建时命名，不覆盖已有标题。
-# 所有驱动都归同一个 workspace，dsh 侧看起来就是旧实现那样的「QQ 聊天」一组。
+# **cwd 必须是给 agent 的独立目录，绝不能指到真实项目**（模型在那个目录里有文件工具，
+# 指 nix-config 等于把配置仓库交给群里）。照旧 node 实现的做法：state 下的专用目录。
+# 所有驱动都归同一个 workspace，dsh 侧就是一组，标题平台中立。
 # 注意：改 ACB_CWD 会让旧会话 id 的 cwd 对不上（dsh 报 belongs to … not …），
 # 驱动会自动换新 id 重建（driver.mjs 的冲突兜底），历史上下文留在旧 workspace 里。
-ACB_CWD="${ACB_CWD:-$HOME/nix-config}"
-ACB_WORKSPACE_TITLE="${ACB_WORKSPACE_TITLE:-QQ 聊天}"
+ACB_CWD="${ACB_CWD:-$REPO/state/agents}"
+ACB_WORKSPACE_TITLE="${ACB_WORKSPACE_TITLE:-ACB}"
+mkdir -p "$ACB_CWD"
 export ACB_CWD ACB_WORKSPACE_TITLE
 echo "dsh 会话归组：$ACB_CWD（workspace 标题：$ACB_WORKSPACE_TITLE）"
 
