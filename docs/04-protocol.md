@@ -27,7 +27,7 @@
 | `ready` | 桥 → harness | 握手成功：`sessions` = 这条连接代表哪几个会话（配置顺序）+ `maps` = 已落盘的会话映射（harness 重启后据此复用旧会话，ADR-0018） |
 | `turn_start` | 桥 → harness | 开一轮：回合票 + 会话 + 记忆 + 房间 + 本次投递的记录 + 开轮原因 + 轮次超时 |
 | `turn_end` | harness → 桥 | 本轮收工（可带错误） |
-| `tool_call` | harness → 桥 | 调用工具：票 + 工具名 + 参数 |
+| `tool_call` | harness → 桥 | 调用**桥的工具面**（ADR-0006：发送/读取/笔记这些 acb 内置工具）：票 + 工具名 + 参数。harness 自己挂的工具（如 dsh 的 MCP）不经桥 |
 | `tool_result` | 桥 → harness | 工具结果或错误 |
 | `control` | 桥 → harness | 控制指令（如重置会话映射）。桥只转发，语义由 harness 决定（ADR-0018） |
 | `control_result` | harness → 桥 | 控制指令的执行结果 |
