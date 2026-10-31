@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
 const SRC = path.dirname(fileURLToPath(import.meta.url)) // docs/.vitepress
 const DOCS = path.resolve(SRC, '..')
@@ -28,7 +29,16 @@ const devItems = [
   { text: '存储', link: '/07-storage' },
 ]
 
-export default {
+export default withMermaid(
+  // mermaidOptions：跟随 VitePress 的明暗切换（dark 模式下用 dark 主题画图）。
+  {
+    mermaidPlugin: { class: 'mermaid' },
+    mermaidOptions: {
+      look: 'classic',
+      fontFamily: 'inherit',
+    },
+  },
+  {
   base: '/qq-bridge/',
   lang: 'zh-CN',
   title: 'acb-bridge',
@@ -78,4 +88,5 @@ export default {
     returnToTopLabel: '回到顶部',
     sidebarMenuLabel: '目录',
   },
-}
+  },
+)
