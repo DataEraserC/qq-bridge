@@ -268,6 +268,7 @@ impl<S: Store + Send + 'static> Console<S> {
             },
             "worktrees_root": config.worktrees_root,
             "delivery_limit": config.delivery_limit,
+            "turn_timeout_secs": config.turn_timeout_secs,
             "default_on_turn_error": config.default_on_turn_error.iter().map(|action| match action {
                 acb_kernel::config::TurnErrorAction::Log => json!("log"),
                 acb_kernel::config::TurnErrorAction::Send { room } => json!(format!("send:{room}")),
@@ -821,6 +822,9 @@ fn reload_impact(old: &acb_kernel::Config, new: &acb_kernel::Config) -> (Vec<Str
     }
     if old.delivery_limit != new.delivery_limit {
         hot.push("delivery_limit（单轮投递上限）".to_owned());
+    }
+    if old.turn_timeout_secs != new.turn_timeout_secs {
+        hot.push("turn_timeout_secs（单轮自动超时，0=关）".to_owned());
     }
     match (&old.file_relay, &new.file_relay) {
         (Some(a), Some(b)) => {

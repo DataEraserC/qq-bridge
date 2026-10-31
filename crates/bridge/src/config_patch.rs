@@ -347,6 +347,9 @@ fn global_op(
             "delivery_limit" => {
                 set_or_remove_int(doc, "delivery_limit", val, "单轮投递上限", changes)?;
             }
+            "turn_timeout_secs" => {
+                set_or_remove_int(doc, "turn_timeout_secs", val, "单轮自动超时（秒，0=关）", changes)?;
+            }
             "max_records_per_room" | "max_age_days" => {
                 if doc.get("retention").is_none() {
                     doc.insert("retention", Item::Table(Table::new()));
@@ -376,7 +379,7 @@ fn global_op(
                 doc.insert("default_on_turn_error", str_array(&list));
                 changes.push(format!("默认失败通知 → [{}]", list.join(", ")));
             }
-            other => return Err(format!("global patch 不认识字段 {other}（能改：delivery_limit / max_records_per_room / max_age_days / default_on_turn_error）")),
+            other => return Err(format!("global patch 不认识字段 {other}（能改：delivery_limit / turn_timeout_secs / max_records_per_room / max_age_days / default_on_turn_error）")),
         }
     }
     Ok(())
@@ -731,15 +734,17 @@ keywords = ["喂"]
     fn global_scalars_and_errors() {
         let text = base();
         let ops = parse_ops(serde_json::json!([
-            {"op": "global", "patch": {"delivery_limit": 50, "max_age_days": 7}}
+            {"op": "global", "patch": {"delivery_limit": 50, "max_age_days": 7, "turn_timeout_secs": 0}}
         ]));
         let (new_text, changes) = super::apply_patch(&text, &ops).expect("能打");
         assert!(new_text.contains("delivery_limit = 50"));
         assert!(new_text.contains("max_age_days = 7"));
-        assert_eq!(changes.len(), 2);
+        assert!(new_text.contains("turn_timeout_secs = 0"));
+        assert_eq!(changes.len(), 3);
         let config = acb_kernel::Config::parse(&new_text).expect("合法");
         assert_eq!(config.delivery_limit, 50);
         assert_eq!(config.retention.max_age_days, 7);
+        assert_eq!(config.turn_timeout_secs, 0);
 
         // 不认识的 op 整体报错。
         let ops = parse_ops(serde_json::json!([

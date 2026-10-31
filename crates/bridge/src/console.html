@@ -259,6 +259,7 @@ async function loadConfig() {
     <div class="k">库文件</div><div>${esc(c.storage && c.storage.path)}</div>
     <div class="k">保留策略</div><div>每房间 ${esc(c.retention && c.retention.max_records_per_room)} 条 / ${esc(c.retention && c.retention.max_age_days)} 天</div>
     <div class="k">一轮投递上限</div><div>${esc(c.delivery_limit)}</div>
+    <div class="k">单轮自动超时</div><div>${c.turn_timeout_secs > 0 ? esc(c.turn_timeout_secs) + " 秒" : "关（跑多久都等）"}</div>
     <div class="k">记忆 worktree 根</div><div>${esc(c.worktrees_root)}</div>
     <div class="k">失败通知默认动作</div><div>${esc((c.default_on_turn_error||[]).join(", ") || "只记日志")}</div></div>
     <p><button class="mini" onclick="editGlobals()">编辑运行参数</button></p></div>
@@ -495,14 +496,16 @@ function editGlobals() {
   const c = cfgCache;
   formFrame("运行参数", `
     <div class="form-row"><label>单轮投递上限</label><input type="text" id="g-limit" value="${esc(c?.delivery_limit ?? "")}" style="width:80px"></div>
+    <div class="form-row"><label>单轮自动超时</label><input type="text" id="g-timeout" value="${esc(c?.turn_timeout_secs ?? "")}" style="width:80px"><span class="hint">秒；0 = 关（跑多久都等）</span></div>
     <div class="form-row"><label>每房间留条数</label><input type="text" id="g-count" value="${esc(c?.retention?.max_records_per_room ?? "")}" style="width:80px"><span class="hint">0 = 不按条数清</span></div>
     <div class="form-row"><label>最多留天数</label><input type="text" id="g-days" value="${esc(c?.retention?.max_age_days ?? "")}" style="width:80px"><span class="hint">0 = 不按天数清</span></div>
     <div class="form-row"><label>默认失败通知</label><input type="text" id="g-err" value="${esc((c?.default_on_turn_error||[]).join(", "))}" placeholder="log 或 send:qq:group/123，逗号分隔"><span class="hint">留空 = 只记日志</span></div>`,
     () => {
       const patch = {};
       const num = (id) => { const v = document.getElementById(id).value.trim(); return v === "" ? undefined : Number(v); };
-      const limit = num("g-limit"), count = num("g-count"), days = num("g-days");
+      const limit = num("g-limit"), count = num("g-count"), days = num("g-days"), timeout = num("g-timeout");
       if (limit !== undefined) patch.delivery_limit = limit;
+      if (timeout !== undefined) patch.turn_timeout_secs = timeout;
       if (count !== undefined) patch.max_records_per_room = count;
       if (days !== undefined) patch.max_age_days = days;
       patch.default_on_turn_error = csv(document.getElementById("g-err").value);
