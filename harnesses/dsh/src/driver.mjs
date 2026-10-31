@@ -328,8 +328,9 @@ class TurnDriver {
     try {
       sessionId = await this.dsh.createSession({
         sessionId: fixed,
-        ...(this.cwd ? { cwd: this.cwd } : {}),
-        ...(workspaceId ? { workspaceId } : {}),
+        // 二选一：workspaceId 和 cwd 不能同时传（dsh 报 gateway/bad-request，
+        // 2026-10-31 真机踩过）。有 workspaceId 用它（能归组）；备不出来才退 cwd。
+        ...(workspaceId ? { workspaceId } : this.cwd ? { cwd: this.cwd } : {}),
         ...(this.preset ? { agentPreset: this.preset } : {}),
       })
     } catch (error) {
@@ -341,8 +342,7 @@ class TurnDriver {
         this.log("warn", `dsh 会话 ${fixed} 有 id/cwd 冲突，改用 ${fallback} 新建：${message}`)
         sessionId = await this.dsh.createSession({
           sessionId: fallback,
-          ...(this.cwd ? { cwd: this.cwd } : {}),
-          ...(workspaceId ? { workspaceId } : {}),
+          ...(workspaceId ? { workspaceId } : this.cwd ? { cwd: this.cwd } : {}),
           ...(this.preset ? { agentPreset: this.preset } : {}),
         })
       } else {
