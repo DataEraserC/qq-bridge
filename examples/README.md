@@ -70,25 +70,28 @@ keep = 20
 before = ["lua.signature"]
 after = []
 
-# 失败通知：超时只记日志
+# 失败通知：超时只记日志，其余失败发到 ops 房间
 [sessions.turn_error]
 provider = "lua.timeout_log_only"
+
+[sessions.turn_error.options]
+ops_room = "qq:group/ops"
 ```
 
 注意：Lua 每次调用最多 50ms；脚本拿不到 Store / 流水 / 配置写入，脚本里的计数器只活在
 内存里，桥重启就清零。需要跨重启的统计，等 provider 状态/历史接口补齐后再做。
 
-插件专属参数走 `.options` 自由表：wake / access / delivery / clock / receive 都支持。
-脚本收到时统一放在 `options.extra`（receive 的第二个参数也是 options 表）：
+插件专属参数走 `.options` 自由表：wake / access / delivery / turn_error / clock / receive
+都支持。脚本收到时统一放在 `options.extra`：
 
 ```lua
 -- wake / access / clock / delivery
 decide = function(options, context) ... options.extra.min_count ... end
+-- turn_error（request 在前，旧的单参数写法仍然可用）
+decide = function(request, options) ... options.extra.ops_room ... end
 -- receive
 decide = function(request, options) ... options.extra.blocked ... end
 ```
-
-Lua 的 `turn_error` 目前只收到 `request`；动态库载体的 `turn_error` 才支持 `.options`。
 
 ## 外置进程适配器
 
@@ -117,7 +120,32 @@ command = ["node", "examples/process/adapter.mjs"]
 
 ## 动态库
 
-动态库示例是 Rust 的 conformance fixture，直接当参考实现看：
+`dynamic/wake-provider/` 是一个可独立构建的 Rust 示例：实现一个 wake provider，
+关键词或 @/回复命中就醒。它不是根 workspace 的成员，构建它不会拖慢主仓库：
+
+```bash
+cargo build --manifest-path examples/dynamic/wake-provider/Cargo.toml
+```
+
+产物在 `examples/dynamic/wake-provider/target/debug/` 下（Linux 是
+`libacb_example_wake.so`，macOS 是 `.dylib`）。配置：
+
+```toml
+[[plugins]]
+path = "/绝对路径/到/libacb_example_wake.so"
+
+[sessions.subscriptions.wake]
+provider = "example.wake"
+
+[sessions.subscriptions.wake.options]
+keyword = "在吗"
+```
+
+示例只依赖 `acb-adapter-api`：manifest 声明 `extension = "wake"`，`create` 按
+`WireInstanceConfig::Provider` 建实例，`invoke` 处理 `CoreMessage::Decide`，最后在
+`destroy` 里释放。报错按 `stay` 兜底，不会误叫醒会话。
+
+更完整的 conformance fixture（覆盖平台适配器和七种策略扩展点）仍然在：
 
 - 平台适配器：`crates/adapters/dynamic-fixture`
 - wake / access / delivery / send / turn_error / receive / clock 策略：`crates/plugins/wake-fixture`

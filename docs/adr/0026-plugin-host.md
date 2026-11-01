@@ -124,7 +124,7 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
 - **Phase 5a（2026-11-01）**：turn-error provider 化。
   - 会话新增 `[sessions.turn_error] provider = ...`，默认 `acb.turn_error.default`；默认实现保持原行为：会话 `on_turn_error` 非空就用它，否则回退全局 `default_on_turn_error`。
   - provider 只返回动作列表（log / send:房间）；文本组装、发送和锁外执行仍归 core。未知 provider 启动时拒绝。
-  - Lua 增加 `extension = "turn_error"`：`decide(request)` 返回 `{ {kind="log"}, {kind="send", room="qq:group/ops"} }`；报错回退默认选择，并累计 health。
+  - Lua 增加 `extension = "turn_error"`：`decide(request, options)` 返回 `{ {kind="log"}, {kind="send", room="qq:group/ops"} }`；旧的单参数 `decide(request)` 仍然可用。报错回退默认选择，并累计 health。
 - **Phase 5b（2026-11-01）**：clock provider 化（ADR-0011 落地）。
   - 订阅新增 `[sessions.subscriptions.clock]`：`provider` + `interval_secs` / `idle_secs`；默认 `acb.clock.off`，写了阈值但没写 provider 时自动用 `acb.clock.interval_idle`。
   - 内置 `acb.clock.interval_idle`：固定间隔或房间空闲任一命中就开一轮；`TurnReason::Clock`，投递可以为空。

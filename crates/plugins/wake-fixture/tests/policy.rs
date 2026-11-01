@@ -239,7 +239,10 @@ fn decision_providers_use_the_shared_wire() {
         let provider = plugins
             .resolve_turn_error(&id, &only_log)
             .expect("能解析 turn_error provider");
-        assert_eq!(provider.decide(&request), vec![TurnErrorAction::Log]);
+        assert_eq!(
+            provider.decide(&only_log, &request),
+            vec![TurnErrorAction::Log]
+        );
 
         let prefer_default = TurnErrorPolicy {
             provider: id.clone(),
@@ -248,7 +251,7 @@ fn decision_providers_use_the_shared_wire() {
         let provider = plugins
             .resolve_turn_error(&id, &prefer_default)
             .expect("同一个 provider 能复用");
-        assert_eq!(provider.decide(&request), default_actions);
+        assert_eq!(provider.decide(&prefer_default, &request), default_actions);
     }
 
     // send：before 改写元素，after 只观察回执。

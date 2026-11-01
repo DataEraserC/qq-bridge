@@ -766,14 +766,22 @@ pub struct TurnErrorRequest<'a> {
 
 /// 失败通知 provider。默认实现保持原来的选择：会话动作非空就用它，否则用全局默认。
 pub trait TurnErrorProvider: Send + Sync {
-    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction>;
+    fn decide(
+        &self,
+        options: &TurnErrorPolicy,
+        request: &TurnErrorRequest<'_>,
+    ) -> Vec<TurnErrorAction>;
 }
 
 #[derive(Debug, Default)]
 pub struct DefaultTurnErrorProvider;
 
 impl TurnErrorProvider for DefaultTurnErrorProvider {
-    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+    fn decide(
+        &self,
+        _options: &TurnErrorPolicy,
+        request: &TurnErrorRequest<'_>,
+    ) -> Vec<TurnErrorAction> {
         if request.actions.is_empty() {
             request.default_actions.to_vec()
         } else {
@@ -3014,20 +3022,30 @@ mod tests {
             actions: &session_actions,
             default_actions: &default_actions,
         };
-        assert_eq!(DefaultTurnErrorProvider.decide(&request), session_actions);
+        assert_eq!(
+            DefaultTurnErrorProvider.decide(&TurnErrorPolicy::default(), &request),
+            session_actions
+        );
 
         let empty: Vec<TurnErrorAction> = Vec::new();
         let request = TurnErrorRequest {
             actions: &empty,
             ..request
         };
-        assert_eq!(DefaultTurnErrorProvider.decide(&request), default_actions);
+        assert_eq!(
+            DefaultTurnErrorProvider.decide(&TurnErrorPolicy::default(), &request),
+            default_actions
+        );
     }
 
     struct NoopTurnErrorProvider;
 
     impl TurnErrorProvider for NoopTurnErrorProvider {
-        fn decide(&self, _request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+        fn decide(
+            &self,
+            _options: &TurnErrorPolicy,
+            _request: &TurnErrorRequest<'_>,
+        ) -> Vec<TurnErrorAction> {
             Vec::new()
         }
     }
@@ -3083,7 +3101,11 @@ mod tests {
             actions: &[],
             default_actions: &[],
         };
-        assert!(provider.decide(&request).is_empty());
+        assert!(
+            provider
+                .decide(&TurnErrorPolicy::default(), &request)
+                .is_empty()
+        );
     }
 
     #[test]

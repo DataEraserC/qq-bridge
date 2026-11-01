@@ -15,7 +15,7 @@
 - **开发者文档**（架构、协议、ADR）：https://dataeraserc.github.io/qq-bridge/03-architecture
   ——本仓库 `docs/` 目录的渲染版，想改代码从这里进。
 - **插件示例**：[examples/README.md](examples/README.md)
-  ——Lua 策略、外置进程适配器、动态库参考实现。
+  ——Lua 策略、外置进程适配器、可独立构建的动态库 wake 插件。
 
 ## 现在是什么状态
 

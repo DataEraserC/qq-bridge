@@ -1,0 +1,17 @@
+[package]
+name = "acb-example-wake"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+description = "可独立构建的动态库 wake provider 示例"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+acb-adapter-api = { path = "../../../crates/adapter-api" }
+serde_json = "1"
+
+# 故意不加入根 workspace：示例可以单独构建，不拖慢主仓库。
+[workspace]

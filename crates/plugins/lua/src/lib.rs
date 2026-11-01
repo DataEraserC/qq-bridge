@@ -34,10 +34,10 @@
 //!   after = function(context, sent) end,
 //! }
 //!
-//! -- turn_error：返回要执行的动作列表
+//! -- turn_error：返回要执行的动作列表；options 在第二个参数
 //! return {
 //!   extension = "turn_error",
-//!   decide = function(request)
+//!   decide = function(request, options)
 //!     return { { kind = "log" }, { kind = "send", room = "qq:group/ops" } }
 //!   end,
 //! }
@@ -83,7 +83,8 @@ use acb_kernel::{
     ManagerManifest, ManagerPlugin, Omitted, PluginError, PluginLoader, PluginManager,
     PluginMetadata, PluginSource, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, ReceiveDecision,
     ReceivePolicy, ReceiveProvider, ReceiveRequest, Record, RecordKind, ReloadScope, RoomId,
-    SendContext, SendHook, SenderRole, Sent, TurnErrorAction, TurnErrorProvider, TurnErrorRequest,
+    SendContext, SendHook, SenderRole, Sent, TurnErrorAction, TurnErrorPolicy,
+    TurnErrorProvider, TurnErrorRequest,
     WakeContext,
     WakeDecision, WakePolicy, WakeProvider, WakeVerdict, default_delivery_plan, PLUGIN_API_VERSION,
 };
@@ -292,22 +293,28 @@ struct LuaTurnErrorProvider {
 }
 
 impl TurnErrorProvider for LuaTurnErrorProvider {
-    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+    fn decide(
+        &self,
+        policy: &TurnErrorPolicy,
+        request: &TurnErrorRequest<'_>,
+    ) -> Vec<TurnErrorAction> {
         let result = self.caller.call(|lua, function| {
             let request = turn_error_request_table(lua, request)?;
-            function.call::<Value>(request)
+            let options = turn_error_options_table(lua, policy)?;
+            // request 在前、options 在后：旧的 `decide(request)` 脚本照样能用。
+            function.call::<Value>((request, options))
         });
         match result {
             Ok(value) => match interpret_turn_error_actions(value) {
                 Ok(actions) => actions,
                 Err(error) => {
                     self.caller.record_failure(&error);
-                    DefaultTurnErrorProvider.decide(request)
+                    DefaultTurnErrorProvider.decide(policy, request)
                 }
             },
             Err(error) => {
                 self.caller.record_failure(&error);
-                DefaultTurnErrorProvider.decide(request)
+                DefaultTurnErrorProvider.decide(policy, request)
             }
         }
     }
@@ -412,7 +419,7 @@ enum LoadedInstance {
     Access(Arc<dyn AccessProvider>),
     Delivery(Arc<dyn DeliveryComposer>),
     Send(Arc<dyn SendHook>),
-    TurnError(Arc<dyn TurnErrorProvider>),
+    TurnError(Arc<LuaTurnErrorProvider>),
     Clock(Arc<dyn ClockProvider>),
     Receive(Arc<dyn ReceiveProvider>),
 }
@@ -424,7 +431,10 @@ impl LoadedProvider {
             LoadedInstance::Access(provider) => ProviderInstance::Access(provider.clone()),
             LoadedInstance::Delivery(composer) => ProviderInstance::Delivery(composer.clone()),
             LoadedInstance::Send(hook) => ProviderInstance::Send(hook.clone()),
-            LoadedInstance::TurnError(provider) => ProviderInstance::TurnError(provider.clone()),
+            LoadedInstance::TurnError(provider) => {
+                let provider: Arc<dyn TurnErrorProvider> = provider.clone();
+                ProviderInstance::TurnError(provider)
+            }
             LoadedInstance::Clock(provider) => ProviderInstance::Clock(provider.clone()),
             LoadedInstance::Receive(provider) => ProviderInstance::Receive(provider.clone()),
         }
@@ -1195,6 +1205,16 @@ fn turn_error_request_table(
         "default_actions",
         turn_error_actions_table(lua, request.default_actions)?,
     )?;
+    Ok(table)
+}
+
+fn turn_error_options_table(
+    lua: &Lua,
+    policy: &TurnErrorPolicy,
+) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("provider", policy.provider.to_string())?;
+    table.set("extra", json_to_lua(lua, &policy.options)?)?;
     Ok(table)
 }
 

@@ -117,8 +117,8 @@ provider = "acb.turn_error.default"
 - `before` 按列表顺序执行，任一钩子报错就让这次发送失败；`after` 不影响已经发出去的消息。
 - turn_error 的 provider 只挑动作，不直接发消息；空列表 = 什么都不做。报错时回退
   会话 `on_turn_error` / 全局 `default_on_turn_error`。
-- `.options` 是自由表：wake / access / delivery / clock / receive 都生效；turn_error
-  的 `.options` 目前只在动态库载体传入（Lua 的 `decide(request)` 没有 options 参数）。
+- `.options` 是自由表：wake / access / delivery / turn_error / clock / receive 都生效。
+  Lua 的 `turn_error` 写法是 `decide(request, options)`；旧的 `decide(request)` 仍然可用。
 
 可直接照抄的 Lua 示例：`examples/lua/recent_only.lua`（delivery）、
 `examples/lua/signature.lua`（send）、`examples/lua/timeout_log_only.lua`（turn_error）。

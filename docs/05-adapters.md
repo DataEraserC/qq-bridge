@@ -131,7 +131,9 @@ kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
   报错按安全侧兜底：access 拒绝、receive 接收、clock 不触发、delivery 回退内置、
   turn_error 回退默认选择；send 的 `before` 报错则这次发送失败。
 - 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`；策略插件参考
-  `crates/plugins/wake-fixture`。用户可读的示例总览见 [`examples/README.md`](../examples/README.md)。
+  `crates/plugins/wake-fixture`。想直接抄一个可独立构建的示例，见
+  `examples/dynamic/wake-provider`。用户可读的示例总览见
+  [`examples/README.md`](../examples/README.md)。
 
 ### 适配器 manifest 声明什么
 
@@ -168,7 +170,8 @@ threshold = 5
 ```
 
 access / receive / clock / delivery / turn_error 的策略配置也有同名的 `.options` 自由表；
-`options_schema` 目前只是说明，core 不做强制校验。
+`options_schema` 目前只是说明，core 不做强制校验。Lua 的 `turn_error` 收到
+`decide(request, options)`；动态库的 `turn_error` 每次 `Decide` 也带最新 options。
 
 插件通过 `CoreMessage::Decide` 收到 `WireWakeRequest`（发送者、正文、@/引用/拍、
 标签、未读数），返回 `WireResult::Decision { decision = "wake" | "stay" }`。

@@ -165,8 +165,8 @@ InboundEvent:
   - delivery 的 `request` 带本轮候选流水，返回 `WireResult::Delivery`（`plan = null`
     表示回退内置选批）；turn_error 返回 `WireResult::Actions`；send 用 `phase`
     区分 `before` / `after`，`before` 返回 `WireResult::Elements` 改写正文。
-  - `TurnErrorPolicy` 增加 `.options` 自由表；因为 `TurnErrorProvider::decide` 的 trait
-    不带 options，动态库 manager 在每次实例化时把最新配置推进已缓存的 provider。
+  - `TurnErrorPolicy` 增加 `.options` 自由表；`TurnErrorProvider::decide` 现在接收
+    `&TurnErrorPolicy`，每次判定都能拿到最新配置，不依赖实例级缓存。
   - 报错兜底：delivery 回退内置 composer、turn_error 回退默认选择、send 的
     `before` 报错则这次发送失败，`after` 只记录失败数。
 

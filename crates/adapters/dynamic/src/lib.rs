@@ -767,16 +767,6 @@ impl ManagerPlugin for DylibDecisionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(provider) = cached.as_ref() {
-            // turn_error 的 trait 不带 options，实例化时把最新配置推进已有 provider。
-            if let CachedDecision::TurnError(turn_error) = provider {
-                *turn_error
-                    .options
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = options_json
-                    .get("extra")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-            }
             return Ok(provider.instance());
         }
 
@@ -806,13 +796,6 @@ impl ManagerPlugin for DylibDecisionManager {
             })),
             "turn_error" => CachedDecision::TurnError(Arc::new(DylibTurnErrorProvider {
                 channel: Arc::clone(&channel),
-                provider: id.to_string(),
-                options: Mutex::new(
-                    options_json
-                        .get("extra")
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                ),
             })),
             "receive" => CachedDecision::Receive(Arc::new(DylibReceiveProvider {
                 channel: Arc::clone(&channel),
@@ -1032,14 +1015,14 @@ impl DeliveryComposer for DylibDeliveryComposer {
 
 struct DylibTurnErrorProvider {
     channel: Arc<DecisionChannel>,
-    provider: String,
-    /// 实例化时拿到的插件专属配置；TurnErrorProvider 的 trait 不带 options 参数，
-    /// 所以由 manager 在每次实例化时更新。
-    options: Mutex<Value>,
 }
 
 impl TurnErrorProvider for DylibTurnErrorProvider {
-    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+    fn decide(
+        &self,
+        policy: &TurnErrorPolicy,
+        request: &TurnErrorRequest<'_>,
+    ) -> Vec<TurnErrorAction> {
         let wire = WireTurnErrorRequest {
             session: request.session.to_owned(),
             room: request.room.to_string(),
@@ -1058,14 +1041,7 @@ impl TurnErrorProvider for DylibTurnErrorProvider {
         let message = CoreMessage::Decide {
             id: self.channel.next(),
             point: "turn_error".into(),
-            options: json!({
-                "provider": self.provider,
-                "extra": self
-                    .options
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-            }),
+            options: turn_error_options(policy),
             request: serde_json::to_value(wire).unwrap_or(Value::Null),
         };
         match self.channel.call(&message) {
@@ -1079,11 +1055,11 @@ impl TurnErrorProvider for DylibTurnErrorProvider {
             Ok(other) => {
                 self.channel
                     .note_failure(&format!("回执不是失败通知动作：{other:?}"));
-                DefaultTurnErrorProvider.decide(request)
+                DefaultTurnErrorProvider.decide(policy, request)
             }
             Err(detail) => {
                 self.channel.note_failure(&detail);
-                DefaultTurnErrorProvider.decide(request)
+                DefaultTurnErrorProvider.decide(policy, request)
             }
         }
     }

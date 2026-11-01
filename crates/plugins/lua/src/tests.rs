@@ -647,7 +647,7 @@ return {
         actions: &[],
         default_actions: &[],
     };
-    let actions = provider.decide(&request);
+    let actions = provider.decide(&TurnErrorPolicy::default(), &request);
     assert_eq!(
         actions,
         vec![
@@ -687,7 +687,7 @@ return {
         default_actions: &[],
     };
     assert_eq!(
-        provider.decide(&request),
+        provider.decide(&TurnErrorPolicy::default(), &request),
         session_actions,
         "脚本返回坏动作时回退默认选择"
     );
@@ -943,12 +943,39 @@ fn shipped_examples_load_and_behave() {
         actions: &configured,
         default_actions: &defaults,
     };
-    assert_eq!(provider.decide(&timed_out), vec![TurnErrorAction::Log]);
+    assert_eq!(
+        provider.decide(&turn_error_policy, &timed_out),
+        vec![TurnErrorAction::Log]
+    );
     let failed = TurnErrorRequest {
         error: "boom",
         ..timed_out
     };
-    assert_eq!(provider.decide(&failed), configured);
+    assert_eq!(
+        provider.decide(&turn_error_policy, &failed),
+        configured
+    );
+
+    // options 在第二个参数：会话没配动作时发到 ops_room。
+    let with_ops = TurnErrorPolicy {
+        provider: timeout_log.clone(),
+        options: serde_json::json!({ "ops_room": "qq:group/ops" }),
+    };
+    let provider = plugins
+        .resolve_turn_error(&timeout_log, &with_ops)
+        .expect("配置变化能推进已装载的 provider");
+    let no_actions = TurnErrorRequest {
+        error: "boom",
+        actions: &[],
+        default_actions: &[],
+        ..timed_out
+    };
+    assert_eq!(
+        provider.decide(&with_ops, &no_actions),
+        vec![TurnErrorAction::Send {
+            room: RoomId::new("qq", "group/ops").expect("合法")
+        }]
+    );
 }
 
 #[test]

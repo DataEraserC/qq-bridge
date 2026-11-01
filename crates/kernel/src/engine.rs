@@ -735,16 +735,19 @@ impl<S: Store> Bridge<S> {
                 Arc::new(DefaultTurnErrorProvider)
             }
         };
-        let actions = provider.decide(&TurnErrorRequest {
-            session,
-            room,
-            error,
-            actions: config
-                .session(session)
-                .map(|session| session.on_turn_error.as_slice())
-                .unwrap_or(&[]),
-            default_actions: &config.default_on_turn_error,
-        });
+        let actions = provider.decide(
+            &policy,
+            &TurnErrorRequest {
+                session,
+                room,
+                error,
+                actions: config
+                    .session(session)
+                    .map(|session| session.on_turn_error.as_slice())
+                    .unwrap_or(&[]),
+                default_actions: &config.default_on_turn_error,
+            },
+        );
         for action in actions {
             match action {
                 // `log` 由 endpoint 的 Log 帧负责（见 turn_end 处理），这里无需重复。

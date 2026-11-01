@@ -11,7 +11,7 @@ use acb_kernel::{
     MemoryStore, NoteKey, NoteKind, Notes, Omitted, Outbound, OutboundError, PluginError,
     PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, ReceiveDecision,
     ReceiveProvider, ReceiveRequest, RecordDraft, RoomId, SendContext, SendHook, Sender, Sent,
-    Transcript, TurnErrorAction, TurnErrorProvider,
+    Transcript, TurnErrorAction, TurnErrorPolicy, TurnErrorProvider,
     TurnErrorRequest, TurnReason, Watermarks, unread, PLUGIN_API_VERSION,
 };
 use serde_json::{Value, json};
@@ -255,7 +255,11 @@ impl ManagerPlugin for SignHookManager {
 struct RedirectTurnError;
 
 impl TurnErrorProvider for RedirectTurnError {
-    fn decide(&self, _request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+    fn decide(
+        &self,
+        _options: &TurnErrorPolicy,
+        _request: &TurnErrorRequest<'_>,
+    ) -> Vec<TurnErrorAction> {
         vec![TurnErrorAction::Send {
             room: room("qq:group/ops"),
         }]
