@@ -149,9 +149,16 @@ transport / 平台方法目录外，还声明入站语义能力：
 [[plugins]]
 path = "/path/to/libwake.so"
 
-[[sessions.subscriptions.wake]]
+[sessions.subscriptions.wake]
 provider = "vendor.wake"
+
+# 插件专属参数：core 不解释，原样交给 provider（wire / Lua 里是 options.extra）
+[sessions.subscriptions.wake.options]
+threshold = 5
 ```
+
+access / receive / clock / delivery 的策略配置也有同名的 `.options` 自由表；
+`options_schema` 目前只是说明，core 不做强制校验。
 
 插件通过 `CoreMessage::Decide` 收到 `WireWakeRequest`（发送者、正文、@/引用/拍、
 标签、未读数），返回 `WireResult::Decision { decision = "wake" | "stay" }`。

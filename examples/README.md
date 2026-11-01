@@ -42,6 +42,11 @@ systemctl --user restart acb-bridge
 [sessions.subscriptions.wake]
 provider = "lua.quiet_hours"
 
+# 插件专属参数：core 不解释，原样交给 provider（脚本里是 options.extra）
+[sessions.subscriptions.wake.options]
+start_hour = 23
+end_hour = 8
+
 # 访问策略：按会话
 [sessions.access]
 provider = "lua.allow_read_only"
@@ -53,6 +58,16 @@ provider = "lua.drop_noise"
 
 注意：Lua 每次调用最多 50ms；脚本拿不到 Store / 流水 / 配置写入，脚本里的计数器只活在
 内存里，桥重启就清零。需要跨重启的统计，等 provider 状态/历史接口补齐后再做。
+
+插件专属参数走 `.options` 自由表：wake / access / delivery / clock / receive 都支持。
+脚本收到时统一放在 `options.extra`（receive 的第二个参数也是 options 表）：
+
+```lua
+-- wake / access / clock / delivery
+decide = function(options, context) ... options.extra.min_count ... end
+-- receive
+decide = function(request, options) ... options.extra.blocked ... end
+```
 
 ## 外置进程适配器
 

@@ -720,6 +720,7 @@ return {
         provider: id.clone(),
         interval_secs: Some(60),
         idle_secs: None,
+        ..Default::default()
     };
     let provider = plugins
         .resolve_clock(&id, &policy)
@@ -846,6 +847,92 @@ fn shipped_examples_load_and_behave() {
     };
     assert_eq!(
         receive.decide(&ReceivePolicy::default(), &normal),
+        ReceiveDecision::Record
+    );
+}
+
+#[test]
+fn plugin_options_reach_lua_providers() {
+    let dir = TempDir::new("options");
+    dir.write(
+        "keyword.lua",
+        r#"
+return {
+  extension = "wake",
+  decide = function(options, context)
+    if context.text == options.extra.keyword then return "wake" end
+    return "stay"
+  end,
+}
+"#,
+    );
+    dir.write(
+        "blocked.lua",
+        r#"
+return {
+  extension = "receive",
+  decide = function(request, options)
+    if request.sender.id == options.extra.blocked then return "drop" end
+    return "record"
+  end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+
+    let wake_id = ProviderId::parse("lua.keyword").expect("合法");
+    let wake_policy = WakePolicy {
+        options: serde_json::json!({ "keyword": "ping" }),
+        ..Default::default()
+    };
+    let wake = plugins
+        .resolve_wake(&wake_id, &wake_policy)
+        .expect("能解析 keyword");
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let hit = wake_context(&room, false, "ping");
+    let miss = wake_context(&room, false, "pong");
+    assert_eq!(wake.decide(&wake_policy, &hit), WakeDecision::Wake);
+    assert_eq!(wake.decide(&wake_policy, &miss), WakeDecision::Stay);
+
+    let receive_id = ProviderId::parse("lua.blocked").expect("合法");
+    let receive_policy = ReceivePolicy {
+        provider: receive_id.clone(),
+        options: serde_json::json!({ "blocked": "bot" }),
+    };
+    let receive = plugins
+        .resolve_receive(&receive_id, &receive_policy)
+        .expect("能解析 blocked");
+    let bot = Sender {
+        id: "bot".to_owned(),
+        name: "Bot".to_owned(),
+        role: None,
+    };
+    let human = Sender {
+        id: "10001".to_owned(),
+        name: "老王".to_owned(),
+        role: None,
+    };
+    let elements = vec![Element::text("你好")];
+    let blocked = ReceiveRequest {
+        connection: "qq",
+        platform: "qq",
+        room: &room,
+        sender: &bot,
+        kind: &RecordKind::Message,
+        elements: &elements,
+        text: "你好",
+        at_self: false,
+    };
+    assert_eq!(
+        receive.decide(&receive_policy, &blocked),
+        ReceiveDecision::Drop
+    );
+    let allowed = ReceiveRequest {
+        sender: &human,
+        ..blocked
+    };
+    assert_eq!(
+        receive.decide(&receive_policy, &allowed),
         ReceiveDecision::Record
     );
 }

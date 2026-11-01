@@ -2141,6 +2141,7 @@ mod tests {
         let elevated_policy = AccessPolicy {
             provider: ProviderId::builtin_elevated_access(),
             rooms: vec![inside.clone()],
+            ..Default::default()
         };
         assert_eq!(
             ElevatedInRoomsAccessProvider.check(
@@ -2183,6 +2184,7 @@ mod tests {
         let elevated_policy = AccessPolicy {
             provider: ProviderId::builtin_elevated_access(),
             rooms: vec![RoomId::new("dc", "channel/9").expect("合法")],
+            ..Default::default()
         };
         assert_eq!(
             ElevatedInRoomsAccessProvider.check(&elevated_policy, &request),
@@ -2910,6 +2912,7 @@ mod tests {
             provider: ProviderId::builtin_clock_interval_idle(),
             interval_secs: Some(60),
             idle_secs: Some(120),
+            ..Default::default()
         };
         let context = ClockContext {
             session: "main",

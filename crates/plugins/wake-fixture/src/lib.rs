@@ -116,7 +116,7 @@ unsafe extern "C" fn wake_invoke(handle: *mut c_void, request_json: *const c_cha
             id,
             point,
             request,
-            ..
+            options,
         } => {
             let reply = match point.as_str() {
                 "wake" => {
@@ -124,11 +124,16 @@ unsafe extern "C" fn wake_invoke(handle: *mut c_void, request_json: *const c_cha
                         Ok(request) => request,
                         Err(_) => return std::ptr::null_mut(),
                     };
-                    // 简单规则：冲我来，或者话里带 fixture，就醒。
-                    let wake = request.at_self || request.text.contains("fixture");
+                    // 简单规则：冲我来，或者话里带关键词（默认 fixture）就醒。
+                    let keyword = options
+                        .get("extra")
+                        .and_then(|extra| extra.get("keyword"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("fixture");
+                    let wake = request.at_self || request.text.contains(keyword);
                     WireResult::Decision {
                         decision: if wake { "wake" } else { "stay" }.into(),
-                        reason: wake.then(|| "fixture：@ 或关键词命中".to_owned()),
+                        reason: wake.then(|| format!("fixture：@ 或关键词 {keyword} 命中")),
                     }
                 }
                 "access" => {

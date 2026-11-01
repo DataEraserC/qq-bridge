@@ -355,10 +355,11 @@ struct LuaReceiveProvider {
 }
 
 impl ReceiveProvider for LuaReceiveProvider {
-    fn decide(&self, _options: &ReceivePolicy, request: &ReceiveRequest<'_>) -> ReceiveDecision {
+    fn decide(&self, options: &ReceivePolicy, request: &ReceiveRequest<'_>) -> ReceiveDecision {
         let result = self.caller.call(|lua, function| {
             let request = receive_request_table(lua, request)?;
-            function.call::<Value>(request)
+            let options = receive_options_table(lua, options)?;
+            function.call::<Value>((request, options))
         });
         match result {
             Ok(Value::Boolean(record)) => {
@@ -866,6 +867,7 @@ fn wake_options_table(lua: &Lua, options: &WakePolicy) -> mlua::Result<Table> {
     table.set("events", string_list(lua, &options.events)?)?;
     table.set("keywords", string_list(lua, &options.keywords)?)?;
     table.set("ignore_speakers", string_list(lua, &options.ignore_speakers)?)?;
+    table.set("extra", json_to_lua(lua, &options.options)?)?;
     Ok(table)
 }
 
@@ -894,6 +896,7 @@ fn access_options_table(lua: &Lua, options: &AccessPolicy) -> mlua::Result<Table
         rooms.set(index + 1, room.to_string())?;
     }
     table.set("rooms", rooms)?;
+    table.set("extra", json_to_lua(lua, &options.options)?)?;
     Ok(table)
 }
 
@@ -911,6 +914,36 @@ fn access_request_table(lua: &Lua, request: &AccessRequest<'_>) -> mlua::Result<
     Ok(table)
 }
 
+/// JSON（插件专属 options）→ Lua table。core 不解释这些键，只做形状转换。
+fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Nil),
+        serde_json::Value::Bool(flag) => Ok(Value::Boolean(*flag)),
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                Ok(Value::Integer(integer))
+            } else {
+                Ok(Value::Number(number.as_f64().unwrap_or_default()))
+            }
+        }
+        serde_json::Value::String(text) => Ok(Value::String(lua.create_string(text)?)),
+        serde_json::Value::Array(items) => {
+            let table = lua.create_table()?;
+            for (index, item) in items.iter().enumerate() {
+                table.set(index + 1, json_to_lua(lua, item)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+        serde_json::Value::Object(map) => {
+            let table = lua.create_table()?;
+            for (key, item) in map {
+                table.set(key.as_str(), json_to_lua(lua, item)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+    }
+}
+
 fn string_list(lua: &Lua, items: &[impl AsRef<str>]) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     for (index, item) in items.iter().enumerate() {
@@ -922,6 +955,7 @@ fn string_list(lua: &Lua, items: &[impl AsRef<str>]) -> mlua::Result<Table> {
 fn delivery_options_table(lua: &Lua, options: &DeliveryPolicy) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("provider", options.provider.to_string())?;
+    table.set("extra", json_to_lua(lua, &options.options)?)?;
     Ok(table)
 }
 
@@ -1218,11 +1252,19 @@ fn interpret_turn_error_actions(value: Value) -> mlua::Result<Vec<TurnErrorActio
     Ok(actions)
 }
 
+fn receive_options_table(lua: &Lua, options: &ReceivePolicy) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("provider", options.provider.to_string())?;
+    table.set("extra", json_to_lua(lua, &options.options)?)?;
+    Ok(table)
+}
+
 fn clock_options_table(lua: &Lua, options: &ClockPolicy) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("provider", options.provider.to_string())?;
     table.set("interval_secs", options.interval_secs)?;
     table.set("idle_secs", options.idle_secs)?;
+    table.set("extra", json_to_lua(lua, &options.options)?)?;
     Ok(table)
 }
 

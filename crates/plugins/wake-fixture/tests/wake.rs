@@ -94,7 +94,7 @@ fn wake_provider_uses_the_shared_wire() {
     assert_eq!(verdict.decision, WakeDecision::Wake);
     assert_eq!(
         verdict.reason.as_deref(),
-        Some("fixture：@ 或关键词命中")
+        Some("fixture：@ 或关键词 fixture 命中")
     );
 
     let plain = WakeContext {
@@ -108,4 +108,20 @@ fn wake_provider_uses_the_shared_wire() {
         ..context
     };
     assert_eq!(provider.decide(&policy, &named), WakeDecision::Wake);
+
+    // 插件专属 options 走 wire 的 options.extra，原样到动态库里。
+    let custom = WakePolicy {
+        options: serde_json::json!({ "keyword": "needle" }),
+        ..WakePolicy::default()
+    };
+    let needle = WakeContext {
+        text: "带 needle 的话",
+        ..context
+    };
+    assert_eq!(provider.decide(&custom, &needle), WakeDecision::Wake);
+    let old_keyword = WakeContext {
+        text: "只说 fixture 不算",
+        ..context
+    };
+    assert_eq!(provider.decide(&custom, &old_keyword), WakeDecision::Stay);
 }

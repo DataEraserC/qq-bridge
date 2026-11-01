@@ -391,6 +391,8 @@ pub struct AccessPolicy {
     pub provider: ProviderId,
     /// 额外豁免的房间。
     pub rooms: Vec<RoomId>,
+    /// 插件专属配置；内置 access 忽略它。
+    pub options: serde_json::Value,
 }
 
 impl Default for AccessPolicy {
@@ -398,6 +400,7 @@ impl Default for AccessPolicy {
         Self {
             provider: ProviderId::builtin_access(),
             rooms: Vec::new(),
+            options: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 }
@@ -407,12 +410,15 @@ impl Default for AccessPolicy {
 pub struct DeliveryPolicy {
     /// composer 的 provider id。不写就用内置「最旧一小段 + 最新一批」。
     pub provider: ProviderId,
+    /// 插件专属配置；内置 composer 忽略它。
+    pub options: serde_json::Value,
 }
 
 impl Default for DeliveryPolicy {
     fn default() -> Self {
         Self {
             provider: ProviderId::builtin_delivery(),
+            options: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 }
@@ -448,6 +454,8 @@ pub struct ClockPolicy {
     pub interval_secs: Option<u64>,
     /// 房间安静多久（秒）后评估；0 / 不写 = 不看空闲。
     pub idle_secs: Option<u64>,
+    /// 插件专属配置；内置时钟忽略它。
+    pub options: serde_json::Value,
 }
 
 impl Default for ClockPolicy {
@@ -456,6 +464,7 @@ impl Default for ClockPolicy {
             provider: ProviderId::builtin_clock_off(),
             interval_secs: None,
             idle_secs: None,
+            options: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 }
@@ -464,12 +473,15 @@ impl Default for ClockPolicy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReceivePolicy {
     pub provider: ProviderId,
+    /// 插件专属配置；内置「全部接收」忽略它。
+    pub options: serde_json::Value,
 }
 
 impl Default for ReceivePolicy {
     fn default() -> Self {
         Self {
             provider: ProviderId::builtin_receive_all(),
+            options: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 }
@@ -559,6 +571,9 @@ pub struct WakePolicy {
     pub keywords: Vec<String>,
     /// 这些人说话不叫醒（只挡唤醒，不挡记录）。
     pub ignore_speakers: Vec<String>,
+    /// 插件专属配置：TOML 里 `[... .wake.options]` 的自由表，core 不解释，原样交给
+    /// provider。内置 wake 忽略它。
+    pub options: serde_json::Value,
 }
 
 impl Default for WakePolicy {
@@ -575,6 +590,7 @@ impl Default for WakePolicy {
             events: Vec::new(),
             keywords: Vec::new(),
             ignore_speakers: Vec::new(),
+            options: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 }
@@ -651,6 +667,16 @@ impl WakePolicy {
         }
         WakeVerdict::stay()
     }
+}
+
+/// TOML 的自由表 → JSON，原样交给 provider。core 不解释里面的键。
+fn policy_options(
+    table: toml::value::Table,
+    label: &str,
+) -> Result<serde_json::Value, ConfigError> {
+    serde_json::to_value(table).map_err(|error| ConfigError::ParseFailed {
+        detail: format!("{label} 的 options 读不懂：{error}"),
+    })
 }
 
 fn normalize_list(values: Vec<String>) -> Vec<String> {
@@ -1416,7 +1442,10 @@ fn build_receive(
         })?,
         None => ProviderId::builtin_receive_all(),
     };
-    Ok(ReceivePolicy { provider })
+    Ok(ReceivePolicy {
+        provider,
+        options: policy_options(raw.options, "入站策略")?,
+    })
 }
 
 fn build_subscription(session: &str, raw: RawSubscription) -> Result<Subscription, ConfigError> {
@@ -1461,6 +1490,7 @@ fn build_clock(
         provider,
         interval_secs: raw.interval_secs,
         idle_secs: raw.idle_secs,
+        options: policy_options(raw.options, "时钟策略")?,
     })
 }
 
@@ -1510,7 +1540,11 @@ fn build_access(
         rooms.push(room);
     }
 
-    Ok(AccessPolicy { provider, rooms })
+    Ok(AccessPolicy {
+        provider,
+        rooms,
+        options: policy_options(raw.options, "访问策略")?,
+    })
 }
 
 fn build_delivery(session: &str, raw: RawDelivery) -> Result<DeliveryPolicy, ConfigError> {
@@ -1529,7 +1563,10 @@ fn build_delivery(session: &str, raw: RawDelivery) -> Result<DeliveryPolicy, Con
         }
         None => ProviderId::builtin_delivery(),
     };
-    Ok(DeliveryPolicy { provider })
+    Ok(DeliveryPolicy {
+        provider,
+        options: policy_options(raw.options, "投递策略")?,
+    })
 }
 
 fn build_outbound(session: &str, raw: RawOutbound) -> Result<OutboundPolicy, ConfigError> {
@@ -1619,6 +1656,7 @@ fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, 
         events: normalize_list(raw.events.unwrap_or(default.events)),
         keywords: raw.keywords.unwrap_or(default.keywords),
         ignore_speakers: raw.ignore_speakers.unwrap_or(default.ignore_speakers),
+        options: policy_options(raw.options, "唤醒策略")?,
     })
 }
 
@@ -1784,6 +1822,9 @@ struct RawSession {
 #[derive(Debug, Default, Deserialize)]
 struct RawDelivery {
     provider: Option<String>,
+    /// 插件专属配置；core 原样交给 provider。
+    #[serde(default)]
+    options: toml::value::Table,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1806,6 +1847,8 @@ struct RawAccess {
     /// 额外豁免的房间（完整写法 `连接:路径`，如 `qq:group/123`）。
     #[serde(default)]
     rooms: Vec<String>,
+    #[serde(default)]
+    options: toml::value::Table,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1855,6 +1898,8 @@ struct RawConnection {
 #[derive(Debug, Default, Deserialize)]
 struct RawReceive {
     provider: Option<String>,
+    #[serde(default)]
+    options: toml::value::Table,
 }
 
 /// `allow_destructive` 有两种写法：布尔，或方法名数组。
@@ -1928,6 +1973,8 @@ struct RawClock {
     provider: Option<String>,
     interval_secs: Option<u64>,
     idle_secs: Option<u64>,
+    #[serde(default)]
+    options: toml::value::Table,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1946,6 +1993,8 @@ struct RawWake {
     events: Option<Vec<String>>,
     keywords: Option<Vec<String>>,
     ignore_speakers: Option<Vec<String>>,
+    #[serde(default)]
+    options: toml::value::Table,
 }
 
 #[cfg(test)]
@@ -2469,6 +2518,26 @@ mod tests {
         let wake = &config.sessions[0].subscriptions[0].wake;
         assert_eq!(wake.event_tags, vec!["reaction"]);
         assert_eq!(wake.events, vec!["qq.poke", "qq.*"]);
+    }
+
+    #[test]
+    fn plugin_options_are_parsed_and_passed_through() {
+        let text = format!(
+            "{ONE_CONNECTION}\n{ONE_SESSION}\n[sessions.subscriptions.wake]\n\
+             provider = \"lua.frequent_speaker\"\n\
+             [sessions.subscriptions.wake.options]\n\
+             min_count = 5\n"
+        );
+        let config = Config::parse(&text).expect("能解析");
+        let wake = &config.sessions[0].subscriptions[0].wake;
+        assert_eq!(wake.provider.to_string(), "lua.frequent_speaker");
+        assert_eq!(wake.options["min_count"], 5);
+
+        let access = session_with_access(
+            "        provider = \"lua.allow_read_only\"\n        [sessions.access.options]\n        allow_send = false",
+        );
+        let config = Config::parse(&config_with(ONE_CONNECTION, &access)).expect("能解析");
+        assert_eq!(config.sessions[0].access.options["allow_send"], false);
     }
 
     #[test]

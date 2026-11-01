@@ -147,6 +147,11 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - `before` 钩子执行前后比对元素数组；真的改了正文的钩子按执行顺序记进发送回执的 `modified_by`（provider id 列表），没改的不列。
   - agent 由此知道「群里看到的不完全是我写的原文」；`after` 钩子只观察，不参与改写明细。
 
+- **Phase 6c（2026-11-02）**：策略专属 options。
+  - `WakePolicy` / `AccessPolicy` / `DeliveryPolicy` / `ClockPolicy` / `ReceivePolicy` 增加 `options` 自由表；TOML 写 `[sessions.subscriptions.wake.options]`、`[sessions.access.options]` 等，core 不解释内容。
+  - Lua / 动态库 provider 收到的 options 里统一放进 `extra`；receive 脚本签名扩展为 `decide(request, options)`，旧脚本忽略第二个参数照样工作。
+  - `options_schema` 目前仍是给 agent/控制台看的说明，不做强制校验；接入真正的 schema 校验在后续阶段。
+
 ## 参考
 
 - 平台适配器注册与队列：[ADR-0027](0027-platform-adapter-registration.md)

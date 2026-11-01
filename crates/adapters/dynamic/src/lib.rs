@@ -611,6 +611,7 @@ fn wake_options(policy: &WakePolicy) -> Value {
         "events": policy.events,
         "keywords": policy.keywords,
         "ignore_speakers": policy.ignore_speakers,
+        "extra": policy.options,
     })
 }
 
@@ -993,11 +994,15 @@ fn access_options(policy: &AccessPolicy) -> Value {
     json!({
         "provider": policy.provider.to_string(),
         "rooms": policy.rooms.iter().map(|room| room.to_string()).collect::<Vec<_>>(),
+        "extra": policy.options,
     })
 }
 
 fn receive_options(policy: &ReceivePolicy) -> Value {
-    json!({ "provider": policy.provider.to_string() })
+    json!({
+        "provider": policy.provider.to_string(),
+        "extra": policy.options,
+    })
 }
 
 fn clock_options(policy: &ClockPolicy) -> Value {
@@ -1005,6 +1010,7 @@ fn clock_options(policy: &ClockPolicy) -> Value {
         "provider": policy.provider.to_string(),
         "interval_secs": policy.interval_secs,
         "idle_secs": policy.idle_secs,
+        "extra": policy.options,
     })
 }
 

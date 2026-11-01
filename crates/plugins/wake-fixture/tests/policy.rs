@@ -83,6 +83,7 @@ fn decision_providers_use_the_shared_wire() {
         let policy = AccessPolicy {
             provider: id.clone(),
             rooms: Vec::new(),
+            ..Default::default()
         };
         let provider = plugins
             .resolve_access(&id, &policy)
@@ -107,7 +108,10 @@ fn decision_providers_use_the_shared_wire() {
     {
         let plugins = load(&path);
         let id = ProviderId::parse("fixture.receive").expect("id 合法");
-        let policy = ReceivePolicy { provider: id.clone() };
+        let policy = ReceivePolicy {
+            provider: id.clone(),
+            ..Default::default()
+        };
         let provider = plugins
             .resolve_receive(&id, &policy)
             .expect("能解析 receive provider");
@@ -140,6 +144,7 @@ fn decision_providers_use_the_shared_wire() {
             provider: id.clone(),
             interval_secs: None,
             idle_secs: None,
+            ..Default::default()
         };
         let provider = plugins
             .resolve_clock(&id, &policy)
