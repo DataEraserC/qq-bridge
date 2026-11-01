@@ -8,6 +8,7 @@
 --        [sessions.subscriptions.wake.options]
 --        at_mention = true
 --        poke = true
+--        reply = true
 --        accumulate = 30
 --        idle_hours = 3
 --

@@ -96,6 +96,7 @@ fn record(id: u64, text: &str) -> Record {
         reply_to_self: false,
         platform_id: None,
         quote_ref: None,
+        labels: Vec::new(),
         redelivery: None,
         note: None,
     }
@@ -989,6 +990,7 @@ fn shipped_examples_load_and_behave() {
         options: serde_json::json!({
             "at_mention": true,
             "poke": true,
+            "reply": true,
             "accumulate": 30,
             "idle_hours": 3
         }),
@@ -1018,6 +1020,22 @@ fn shipped_examples_load_and_behave() {
         ..base
     };
     assert_eq!(wake.decide(&policy, &aimed), WakeDecision::Wake);
+    let replied = WakeContext {
+        reply_to_self: true,
+        ..base
+    };
+    assert_eq!(wake.decide(&policy, &replied), WakeDecision::Wake);
+    // 没配 reply 时引用不叫醒：这是 opt-in，不是默认。
+    let no_reply_policy = WakePolicy {
+        provider: wake_policy.clone(),
+        options: serde_json::json!({ "at_mention": true, "poke": true }),
+        ..Default::default()
+    };
+    assert_eq!(
+        wake.decide(&no_reply_policy, &replied),
+        WakeDecision::Stay,
+        "未配置 reply 时引用不该叫醒"
+    );
     let poked = WakeContext {
         event: Some("poke"),
         tags: &["poke"],

@@ -45,6 +45,13 @@ pub struct RecordDraft {
     pub platform_id: Option<String>,
     /// 是不是引用了我发的某条消息。由调度层在入库前填（要查库才判得出）。
     pub reply_to_self: bool,
+    /// 事件指向的平台对象编号。撤回事件用它指向被撤回的那条消息；
+    /// 消息记录不用这个字段。
+    pub target_platform_id: Option<String>,
+    /// 给目标记录追加的标签（如 `recall`）。只有带 target 的事件才用得到。
+    pub target_labels: Vec<String>,
+    /// 只进流水，不投递、不唤醒、不计未读。适配器自己决定哪些事件属于这一类。
+    pub suppressed: bool,
 }
 
 impl RecordDraft {
@@ -65,6 +72,9 @@ impl RecordDraft {
             at_self,
             platform_id: None,
             reply_to_self: false,
+            target_platform_id: None,
+            target_labels: Vec::new(),
+            suppressed: false,
         }
     }
 
@@ -91,6 +101,9 @@ impl RecordDraft {
             at_self,
             platform_id: None,
             reply_to_self: false,
+            target_platform_id: None,
+            target_labels: Vec::new(),
+            suppressed: false,
         }
     }
 
@@ -123,6 +136,30 @@ impl RecordDraft {
         if !platform_id.is_empty() {
             self.platform_id = Some(platform_id);
         }
+        self
+    }
+
+    /// 事件指向的平台对象编号（例如撤回事件指向被撤回的消息）。
+    #[must_use]
+    pub fn with_target_platform_id(mut self, target: impl Into<String>) -> Self {
+        let target = target.into();
+        if !target.is_empty() {
+            self.target_platform_id = Some(target);
+        }
+        self
+    }
+
+    /// 事件给目标记录追加的标签。只有带 target 的事件才用得到。
+    #[must_use]
+    pub fn with_target_labels(mut self, labels: impl IntoIterator<Item = String>) -> Self {
+        self.target_labels = labels.into_iter().collect();
+        self
+    }
+
+    /// 只存流水，不进未读、不投递、不唤醒。适配器按自己的语义决定。
+    #[must_use]
+    pub fn suppressed(mut self, suppressed: bool) -> Self {
+        self.suppressed = suppressed;
         self
     }
 
@@ -168,6 +205,15 @@ pub trait Transcript {
     /// 两个用处：判「是不是在回我的话」，以及把引用里的平台编号翻成本房间编号
     /// （ADR-0024）。同一编号出现两条时给最新的那条——平台会复用编号，取最近的才合理。
     fn located(&self, room: &RoomId, platform_id: &str) -> Result<Option<Record>, StorageError>;
+
+    /// 给房间里平台编号为 `platform_id` 的最新一条记录追加标签。
+    /// 找不到就返回 `false`；已有标签不重复添加。
+    fn add_labels(
+        &mut self,
+        room: &RoomId,
+        platform_id: &str,
+        labels: &[String],
+    ) -> Result<bool, StorageError>;
 }
 
 /// 一次清理的判据。三条**同时**成立才删——这是「宁可少删」的意思。
@@ -527,6 +573,7 @@ impl Transcript for MemoryStore {
             platform_id: draft.platform_id,
             // 引用对齐是投递时算的（要查库），流水里只留事实本身。
             quote_ref: None,
+            labels: Vec::new(),
             redelivery: None,
             // 流水里存的是原话，旁白只在投递时由调度层补（见 engine::open_turn）。
             note: None,
@@ -625,6 +672,33 @@ impl Transcript for MemoryStore {
                 .find(|record| record.platform_id.as_deref() == Some(platform_id))
                 .cloned()
         }))
+    }
+
+    fn add_labels(
+        &mut self,
+        room: &RoomId,
+        platform_id: &str,
+        labels: &[String],
+    ) -> Result<bool, StorageError> {
+        if platform_id.is_empty() || labels.is_empty() {
+            return Ok(false);
+        }
+        let Some(records) = self.records.get_mut(room) else {
+            return Ok(false);
+        };
+        let Some(index) = records
+            .iter()
+            .rposition(|record| record.platform_id.as_deref() == Some(platform_id))
+        else {
+            return Ok(false);
+        };
+        let before = records[index].labels.len();
+        for label in labels {
+            if !records[index].labels.contains(label) {
+                records[index].labels.push(label.clone());
+            }
+        }
+        Ok(records[index].labels.len() > before)
     }
 }
 

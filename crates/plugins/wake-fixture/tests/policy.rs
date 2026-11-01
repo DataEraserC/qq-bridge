@@ -55,6 +55,7 @@ fn record(id: u64, text: &str, room: &RoomId, sender: &Sender) -> Record {
         reply_to_self: false,
         platform_id: None,
         quote_ref: None,
+        labels: Vec::new(),
         redelivery: None,
         note: None,
     }

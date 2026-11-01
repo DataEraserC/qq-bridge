@@ -45,6 +45,9 @@ fn main() -> std::io::Result<()> {
                 at_self: false,
                 platform_id: Some("fx-event".into()),
                 reply_to_self: false,
+                target_platform_id: None,
+                target_labels: Vec::new(),
+                suppressed: false,
             },
         },
     )?;

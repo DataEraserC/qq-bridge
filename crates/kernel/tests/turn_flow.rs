@@ -496,6 +496,72 @@ fn mention_wakes_then_reply_and_ack_advance_the_watermark() {
 }
 
 #[test]
+fn recall_notice_is_not_unread_but_marks_the_original() {
+    let (mut bridge, _sends) = bridge();
+
+    let original = message("qq:group/123", "10001", "会被撤回的话", false)
+        .with_platform_id("m-1");
+    assert_eq!(
+        bridge.ingest(original).expect("能记下来"),
+        Ingest::Recorded {
+            id: 1,
+            woke: Vec::new()
+        }
+    );
+
+    let recall = RecordDraft::event(
+        room_of("qq:group/123"),
+        Sender {
+            id: "10001".to_owned(),
+            name: "老王".to_owned(),
+            role: None,
+        },
+        AT + 1,
+        "group_recall",
+        vec![Element::text("[group_recall] 撤回了一条消息")],
+        false,
+    )
+    .with_event_meta(
+        vec![
+            "notice".to_owned(),
+            "group_recall".to_owned(),
+            "recall".to_owned(),
+        ],
+        Some(json!({"message_id": "m-1"})),
+        Some("[group_recall] 撤回了一条消息".to_owned()),
+    )
+    .with_target_platform_id("m-1")
+    .with_target_labels(vec!["recall".to_owned()])
+    .suppressed(true);
+    assert_eq!(
+        bridge.ingest(recall).expect("能记下来"),
+        Ingest::Recorded {
+            id: 2,
+            woke: Vec::new()
+        },
+        "撤回事件不该叫醒会话"
+    );
+
+    // 撤回事件进流水（可查），但不进未读/投递：未读里只剩原消息。
+    let pending = unread(bridge.store(), &cursor("main", "qq:group/123"), 100).expect("可读");
+    assert_eq!(
+        pending.iter().map(|record| record.id).collect::<Vec<_>>(),
+        vec![1]
+    );
+
+    let stored = bridge
+        .store()
+        .since(&room("qq:group/123"), 0, 10)
+        .expect("能读");
+    assert_eq!(stored.len(), 2, "撤回事件本身也要留在流水里");
+    assert!(
+        stored[0].labels.contains(&"recall".to_owned()),
+        "原消息要有已撤回标记"
+    );
+    assert!(stored[1].is_event("group_recall"));
+}
+
+#[test]
 fn own_messages_never_come_back_as_unread() {
     let (mut bridge, _sends) = bridge();
 

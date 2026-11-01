@@ -126,6 +126,9 @@ impl From<WireRecord> for RecordDraft {
             at_self: record.at_self,
             platform_id: record.platform_id,
             reply_to_self: record.reply_to_self,
+            target_platform_id: record.target_platform_id,
+            target_labels: record.target_labels,
+            suppressed: record.suppressed,
         }
     }
 }
@@ -419,6 +422,9 @@ mod tests {
             at_self: true,
             platform_id: None,
             reply_to_self: false,
+            target_platform_id: None,
+            target_labels: Vec::new(),
+            suppressed: false,
         };
         let draft = RecordDraft::from(record);
         assert!(draft.at_self);

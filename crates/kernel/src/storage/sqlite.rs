@@ -32,7 +32,8 @@ use super::{
 ///         适配器判得出来才填，判不出留空。
 /// 6 → 7：加 `feedback` 表——agent 的反馈通道（ADR-0021）。新表由建表语句建，不用搬数据。
 /// 7 → 8：事件记录加 `event_meta` JSON（tags / payload / summary），老记录回填空值。
-pub const SCHEMA_VERSION: i64 = 8;
+/// 8 → 9：`records` 加 `labels` JSON；适配器可以给记录追加通用标签（如 recall）。
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS records (
     platform_id TEXT,               -- 平台自己的消息编号，反查引用对象用
     elements    TEXT    NOT NULL,   -- 内容元素的 JSON 数组
     event_meta  TEXT,               -- 仅 kind = event：{tags, payload, summary} JSON
+    labels      TEXT,               -- 记录级通用标签 JSON 数组（如 ["recall"]）
     PRIMARY KEY (connection, room_key, record_id)
 );
 
@@ -283,6 +285,13 @@ impl SqliteStore {
             self.add_column_if_missing("records", "event_meta", "TEXT")?;
         }
 
+        // 8 → 9：记录级通用标签。老记录没有就留空。
+        if version < 9 {
+            self.add_column_if_missing("records", "labels", "TEXT")?;
+        }
+        // 兼容这一版早期试验库：结构版本已是 9，但只有 recalled 没有 labels。
+        self.add_column_if_missing("records", "labels", "TEXT")?;
+
         self.conn
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -426,8 +435,8 @@ impl Transcript for SqliteStore {
             .execute(
                 "INSERT INTO records
                  (connection, room_key, room_json, record_id, kind, event, sender_id, sender_name,
-                  sender_role, at, at_self, reply_to_self, platform_id, elements, event_meta)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  sender_role, at, at_self, reply_to_self, platform_id, elements, event_meta, labels)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL)",
                 params![
                     draft.room.connection,
                     draft.room.key(),
@@ -460,6 +469,7 @@ impl Transcript for SqliteStore {
             reply_to_self: draft.reply_to_self,
             platform_id: draft.platform_id,
             quote_ref: None,
+            labels: Vec::new(),
             // 流水里只有原话；重投的旁白由投递时补（见 engine::open_turn）。
             redelivery: None,
             note: None,
@@ -471,7 +481,7 @@ impl Transcript for SqliteStore {
             .conn
             .prepare(
                 "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
-                        reply_to_self, platform_id, elements, event_meta
+                        reply_to_self, platform_id, elements, event_meta, labels
                  FROM records
                  WHERE connection = ?1 AND room_key = ?2 AND record_id > ?3
                  ORDER BY record_id
@@ -496,6 +506,7 @@ impl Transcript for SqliteStore {
                         platform_id: row.get(9)?,
                         elements: row.get(10)?,
                         event_meta: row.get(11)?,
+                        labels: row.get(12)?,
                     })
                 },
             )
@@ -570,7 +581,7 @@ impl Transcript for SqliteStore {
                 // 于是引用一条很老的消息时要一条条往回扫。这里相等条件命中的通常只有
                 // 一行，多一次微小的排序换「不扫全房间」是划算的。
                 "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
-                        reply_to_self, platform_id, elements, event_meta
+                        reply_to_self, platform_id, elements, event_meta, labels
                  FROM records INDEXED BY records_platform
                  WHERE connection = ?1 AND room_key = ?2 AND platform_id = ?3
                  ORDER BY record_id DESC
@@ -590,6 +601,7 @@ impl Transcript for SqliteStore {
                         platform_id: row.get(9)?,
                         elements: row.get(10)?,
                         event_meta: row.get(11)?,
+                        labels: row.get(12)?,
                     })
                 },
             )
@@ -600,6 +612,57 @@ impl Transcript for SqliteStore {
             Some(raw) => Ok(Some(raw.into_record(room)?)),
             None => Ok(None),
         }
+    }
+
+    fn add_labels(
+        &mut self,
+        room: &RoomId,
+        platform_id: &str,
+        labels: &[String],
+    ) -> Result<bool, StorageError> {
+        if platform_id.is_empty() || labels.is_empty() {
+            return Ok(false);
+        }
+        let row: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT record_id, labels FROM records
+                 WHERE connection = ?1 AND room_key = ?2 AND platform_id = ?3
+                 ORDER BY record_id DESC
+                 LIMIT 1",
+                params![room.connection, room.key(), platform_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(io_error)?;
+        let Some((record_id, raw)) = row else {
+            return Ok(false);
+        };
+        let mut current: Vec<String> = raw
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| backend(format!("记录标签读不出来：{error}")))?
+            .unwrap_or_default();
+        let before = current.len();
+        for label in labels {
+            if !current.contains(label) {
+                current.push(label.clone());
+            }
+        }
+        if current.len() == before {
+            return Ok(false);
+        }
+        let text = serde_json::to_string(&current)
+            .map_err(|error| backend(format!("记录标签存不进库：{error}")))?;
+        self.conn
+            .execute(
+                "UPDATE records SET labels = ?4
+                 WHERE connection = ?1 AND room_key = ?2 AND record_id = ?3",
+                params![room.connection, room.key(), record_id, text],
+            )
+            .map_err(io_error)?;
+        Ok(true)
     }
 
     fn prune(&mut self, room: &RoomId, plan: &PrunePlan) -> Result<u64, StorageError> {
@@ -700,6 +763,7 @@ struct RawRow {
     platform_id: Option<String>,
     elements: String,
     event_meta: Option<String>,
+    labels: Option<String>,
 }
 
 impl RawRow {
@@ -725,6 +789,13 @@ impl RawRow {
         };
         let elements: Vec<Element> = serde_json::from_str(&self.elements)
             .map_err(|error| backend(format!("内容元素读不出来：{error}")))?;
+        let labels: Vec<String> = self
+            .labels
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| backend(format!("记录标签读不出来：{error}")))?
+            .unwrap_or_default();
 
         Ok(Record {
             id: self.id,
@@ -741,6 +812,7 @@ impl RawRow {
             reply_to_self: self.reply_to_self,
             platform_id: self.platform_id,
             quote_ref: None,
+            labels,
             redelivery: None,
             note: None,
         })

@@ -87,6 +87,7 @@ sequenceDiagram
   "at_self": false,
   "reply_to_self": false,
   "platform_id": "592852179",
+  "labels": [],
   "redelivery": null
 }
 ```
@@ -104,6 +105,11 @@ sequenceDiagram
   就当不是——宁可少叫醒一次，也不凭编号长相猜。
 - `platform_id`：平台自己的消息编号（QQ 的 `message_id`）。留着只有一个用途：别人引用某条时，
   靠它反查「被引用的是谁发的」。我方发出去的消息也带，所以「引用了我」才判得出来。
+- `labels`：记录级通用标签，由适配器或插件追加（如撤回事件给原消息加 `recall`）。
+  core 不解释标签含义，只负责存储和透传；harness 看到 `labels` 里有 `recall` 时应在展示时
+  标出「已撤回」，不能把撤回的话当成还能看到的内容。撤回事件本身也是一条记录（事件记录带
+  `recall` 标签），但适配器会把它声明为只进流水：不进未读、不投递、不唤醒，agent 需要时用
+  `get_platform_events` 查。
 - `redelivery`：非空表示「第 N 次投递」。
 - `note`：桥附在**这次投递**上的旁白，不是发送者说的话。目前只在重投时出现，内容是
   「第 2 次投递；调 ack_messages 确认 #5 之后就不再重复投递」。

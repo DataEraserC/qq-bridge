@@ -276,6 +276,18 @@ test("引用的是本房间没有的消息时要说实话，不能瞎给编号",
   assert.match(text, /\[引用 #gone，本房间历史里没有这条\]/)
 })
 
+test("被撤回的消息在轮次里明确标记", () => {
+  const record = {
+    ...delivery().records[0],
+    id: 8,
+    labels: ["recall"],
+    elements: [{ type: "text", text: "这条后来被撤回了" }],
+  }
+  const text = renderTurn({ ...delivery(), records: [record] }, { now: Date.now() })
+
+  assert.match(text, /已撤回/, "撤回标记丢了，模型会把撤回的话当成还能看到的内容")
+})
+
 test("桥的旁白单独一行，不拼进对方说的话里", () => {
   const record = {
     ...delivery().records[0],

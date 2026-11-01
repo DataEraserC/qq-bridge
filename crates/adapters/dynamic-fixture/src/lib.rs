@@ -121,6 +121,9 @@ unsafe extern "C" fn fixture_create(config_json: *const c_char, host: *const Hos
                 at_self: false,
                 platform_id: Some("dyn-event".into()),
                 reply_to_self: false,
+                target_platform_id: None,
+                target_labels: Vec::new(),
+                suppressed: false,
             },
         };
         let json = encode_line(&event).expect("事件可序列化");

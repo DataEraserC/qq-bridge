@@ -301,6 +301,15 @@ pub struct WireRecord {
     pub platform_id: Option<String>,
     #[serde(default)]
     pub reply_to_self: bool,
+    /// 事件指向的平台对象编号（例如撤回事件指向被撤回的消息）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_platform_id: Option<String>,
+    /// 给目标记录追加的标签（如 `recall`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_labels: Vec<String>,
+    /// 只进流水，不投递、不唤醒、不计未读。
+    #[serde(default)]
+    pub suppressed: bool,
 }
 
 /// 一个方法参数的 wire 形状。
@@ -615,6 +624,9 @@ mod tests {
                 at_self: false,
                 platform_id: Some("m1".into()),
                 reply_to_self: false,
+                target_platform_id: None,
+                target_labels: Vec::new(),
+                suppressed: false,
             },
         };
         let line = encode_line(&event).expect("能编码");

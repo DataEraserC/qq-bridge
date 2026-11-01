@@ -350,6 +350,7 @@ mod tests {
                 reply_to_self: false,
                 platform_id: None,
                 quote_ref: None,
+                labels: Vec::new(),
                 redelivery: None,
                 note: None,
             }],

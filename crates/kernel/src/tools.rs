@@ -127,10 +127,11 @@ pub const RECORD_COLUMNS: &[&str] = &[
     "quote_ref",
     "at_self",
     "reply_to_self",
+    "labels",
 ];
 
 /// 不指定 `columns` 时的精简默认：够 agent 读内容、知道是谁、什么时候说的。
-pub const DEFAULT_COLUMNS: &[&str] = &["id", "at", "sender", "elements"];
+pub const DEFAULT_COLUMNS: &[&str] = &["id", "at", "sender", "elements", "labels"];
 
 /// 查笔记。
 #[derive(Debug, Default, Deserialize)]

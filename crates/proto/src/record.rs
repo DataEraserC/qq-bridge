@@ -96,6 +96,10 @@ pub struct Record {
     /// 这条消息引用了本房间里的哪条。桥算出来的，不落盘（见 [`QuoteRef`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote_ref: Option<QuoteRef>,
+    /// 桥或适配器给这条记录打的标签（如 `recall`）。只做展示/查询提示，
+    /// core 不解释标签含义。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     /// 非空表示「第 N 次投递」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redelivery: Option<u32>,
@@ -151,6 +155,7 @@ mod tests {
             reply_to_self: false,
             platform_id: None,
             quote_ref: None,
+            labels: Vec::new(),
             redelivery: None,
             note: None,
         }

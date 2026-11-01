@@ -368,6 +368,65 @@ fn delivery_counts_survive_restart() {
 }
 
 #[test]
+fn recall_marker_survives_reopen() {
+    let db = TempDb::new("recalled");
+    let qq = room("qq:group/1");
+
+    {
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
+        store
+            .append(message(&qq, "会被撤回的话").with_platform_id("m-1"))
+            .expect("可写");
+        assert!(
+            store
+                .add_labels(&qq, "m-1", &["recall".to_owned()])
+                .expect("能标记")
+        );
+        assert!(
+            !store
+                .add_labels(&qq, "不存在", &["recall".to_owned()])
+                .expect("能查"),
+            "找不到目标时不该假装标记成功"
+        );
+    }
+
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let stored = store
+        .located(&qq, "m-1")
+        .expect("能查")
+        .expect("记录还在");
+    assert!(stored.labels.contains(&"recall".to_owned()), "撤回标记要落盘");
+
+    // 撤回事件本身也在流水里，供 agent 事后查询。
+    store
+        .append(
+            RecordDraft::event(
+                qq.clone(),
+                Sender {
+                    id: "10001".into(),
+                    name: "老王".into(),
+                    role: None,
+                },
+                AT + 1,
+                "group_recall",
+                vec![Element::text("撤回了一条消息")],
+                false,
+            )
+            .with_event_meta(
+                vec!["notice".into(), "recall".into()],
+                None,
+                Some("撤回了一条消息".into()),
+            )
+            .with_target_platform_id("m-1"),
+        )
+        .expect("可写");
+    let all = store.since(&qq, 0, 10).expect("可读");
+    assert_eq!(all.len(), 2);
+    assert!(all[0].labels.contains(&"recall".to_owned()));
+    assert!(all[1].is_event("group_recall"));
+}
+
+#[test]
 fn a_newer_schema_is_refused_instead_of_being_written_to() {
     let db = TempDb::new("schema");
     {

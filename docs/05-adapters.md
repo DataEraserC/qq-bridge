@@ -203,7 +203,8 @@ access / receive / clock / delivery / turn_error 的策略配置也有同名的 
 | `post_type=message`，`message_type=group` | 一条消息，房间 `qq:group/<群号>`（连接名是 `qq` 时）| 发送者名字优先用群名片，其次昵称 |
 | `post_type=message`，`message_type=private` | 一条消息，房间 `qq:private/<号>`（同理） | |
 | `post_type=notice`，`notice_type=notify`，`sub_type=poke` | 平台事件 `poke`，tags `["poke", "notice"]`，payload 原始事件，正文「[拍了拍我]」 | 拍的是我则标记「冲我来」，唤醒策略据此判定 |
-| 其它 `notice` | 平台事件（事件类型就是 `notice_type`），tags `["notice", notice_type]` | 进退群、禁言、撤回等，正文是一句人话，原始事件进 payload |
+| `post_type=notice`，`notice_type=group_recall` / `friend_recall` | 平台事件，tags `["notice", notice_type, "recall"]`，`target_platform_id` 指向被撤回的消息 | 事件本身声明为 `suppressed`：只进流水备查，不进未读/投递、不唤醒；同时给原消息追加 `target_labels: ["recall"]` |
+| 其它 `notice` | 平台事件（事件类型就是 `notice_type`），tags `["notice", notice_type]` | 进退群、禁言等，正文是一句人话，原始事件进 payload |
 | `post_type=request` | 平台事件 `request_<类型>`，tags `["request", request_type]` | 加好友、加群邀请 |
 | `post_type=meta_event` | **不记** | 心跳每几秒一次，记下来只会把流水撑爆 |
 | `post_type=message_sent` | **不记** | 自己发出消息的回执，桥在发送时已经记过 |
@@ -212,6 +213,13 @@ access / receive / clock / delivery / turn_error 的策略配置也有同名的 
 算未读、要不要叫醒。core 不认识平台事件名——适配器给事件打 `tags`，唤醒策略按
 `event_tags` 匹配；要精确到平台事件名就写 `events = ["qq.poke"]`，带前缀的名字必须
 属于该房间的连接平台（`qq.*` 匹配整个平台），配错在启动时就报错。
+
+适配器还可以给记录声明两个通用动作，core 不解释它们的平台语义：
+
+- `suppressed: true`：只进流水，不投递、不唤醒、不计未读。适配器自己决定哪些事件属于
+  这一类（比如撤回通知）。
+- `target_platform_id` + `target_labels`：给这个房间里某条旧记录追加标签。撤回通知用它
+  给原消息打 `recall`；harness 看到 `labels` 里有 `recall` 就显示「已撤回」。
 
 ## 内容元素怎么翻译
 

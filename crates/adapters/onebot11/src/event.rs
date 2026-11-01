@@ -171,13 +171,22 @@ fn notice(
             Some(text)
         }
     };
-    Ok(Parsed::Record(
-        RecordDraft::event(room, sender, at, notice_type, elements, false).with_event_meta(
-            vec!["notice".to_owned(), notice_type.to_owned()],
-            Some(event.clone()),
-            summary,
-        ),
-    ))
+    let recall = matches!(notice_type, "group_recall" | "friend_recall");
+    let mut tags = vec!["notice".to_owned(), notice_type.to_owned()];
+    if recall {
+        // 跨平台标签：适配器认 `recall`，core 不解释标签，只按 target 追加。
+        tags.push("recall".to_owned());
+    }
+    let mut draft = RecordDraft::event(room, sender, at, notice_type, elements, false)
+        .with_event_meta(tags, Some(event.clone()), summary);
+    if recall {
+        // 撤回事件只进流水备查，不投递/不唤醒；core 只看到通用的 suppressed 和 target。
+        draft = draft
+            .with_target_platform_id(id_of(event.get("message_id")))
+            .with_target_labels(vec!["recall".to_owned()])
+            .suppressed(true);
+    }
+    Ok(Parsed::Record(draft))
 }
 
 fn request(
@@ -534,6 +543,31 @@ mod tests {
                     && tags.iter().any(|tag| tag == "group_increase")
         ));
         assert!(matches!(draft.elements[0], Element::Text { .. }));
+    }
+
+    #[test]
+    fn recall_events_carry_a_generic_tag_and_target() {
+        let event = json!({
+            "post_type": "notice",
+            "notice_type": "group_recall",
+            "self_id": 999,
+            "group_id": 456,
+            "user_id": 10001,
+            "operator_id": 10001,
+            "message_id": 592852179
+        });
+        let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
+            panic!("撤回也要记");
+        };
+        assert_eq!(draft.target_platform_id.as_deref(), Some("592852179"));
+        assert_eq!(draft.target_labels, vec!["recall".to_owned()]);
+        assert!(draft.suppressed, "撤回事件不该进未读/投递");
+        assert!(matches!(
+            &draft.kind,
+            acb_proto::RecordKind::Event { event, tags, .. }
+                if event == "group_recall"
+                    && tags.iter().any(|tag| tag == "recall")
+        ));
     }
 
     /// 没有解析实现的事件：降级存原始 JSON（ADR-0004 补充裁定 2026-10-31）。

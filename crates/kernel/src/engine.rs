@@ -545,7 +545,18 @@ impl<S: Store> Bridge<S> {
         let reply_to_self = self.quotes_own_message(&draft, &account)?;
         let draft = draft.with_reply_to_self(reply_to_self);
 
+        // 适配器可以声明「这条事件只进流水」：不投递、不唤醒、不计未读。
+        // 也可以让它指向某条旧记录并追加标签（例如撤回标记）。core 只执行这两个
+        // 通用动作，不解释标签或事件名的平台语义。
+        let suppressed = draft.suppressed;
+        let target = draft.target_platform_id.clone();
+        let target_labels = draft.target_labels.clone();
         let record = self.store.append(draft)?;
+        if let Some(target) = target {
+            if !target_labels.is_empty() {
+                self.store.add_labels(&room, &target, &target_labels)?;
+            }
+        }
         let event = match &record.kind {
             RecordKind::Event { event, .. } => Some(event.as_str()),
             RecordKind::Message => None,
@@ -559,6 +570,12 @@ impl<S: Store> Bridge<S> {
         let now = now_millis();
         for (subscriber, provider) in subscribers.into_iter().zip(wake_providers) {
             let cursor = Cursor::new(subscriber.session.clone(), room.clone());
+
+            // 只存不投递的事件：自动确认，不进未读/投递，也不叫醒会话。
+            if suppressed {
+                self.store.ack(&cursor, &[record.id])?;
+                continue;
+            }
 
             // 平台把我们自己说的话回传回来：记下来，但不是未读，也不叫醒自己。
             if record.sender.id == subscriber.account {
@@ -3340,6 +3357,7 @@ fn record_columns(record: &Record, columns: &[&str]) -> Value {
             "quote_ref" => json!(record.quote_ref),
             "at_self" => json!(record.at_self),
             "reply_to_self" => json!(record.reply_to_self),
+            "labels" => json!(record.labels),
             _ => continue,
         };
         out.insert((*column).to_owned(), value);

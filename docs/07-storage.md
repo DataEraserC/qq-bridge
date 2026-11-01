@@ -39,6 +39,7 @@ erDiagram
         integer at_self
         integer reply_to_self
         text platform_id
+        text labels
     }
     watermarks {
         text session
@@ -169,6 +170,7 @@ EOF
 | 1 → 2 | `records` 加 `reply_to_self`、`platform_id` 与对应索引 | 判「别人引用的是不是我发的消息」，靠平台编号反查 |
 | 2 → 3 | 五张表的 `platform` 列改名 `connection`、`room` 列改名 `room_key`；`records` 加 `room_json`；顺手删掉第 1 版留下的重复索引 `records_platform_id` | 房间从「平台 + 房间号」改成「连接 + 路径」。只改名不搬数据，老库照旧读得出来；`room_json` 是后路——以后房间要换成更自由的形状，原始结构还在 |
 | 7 → 8 | `records` 加 `event_meta`（JSON：`tags` / `payload` / `summary`） | 平台事件不只存一个类型名；老事件记录该列为空，读出来按「无标签、无载荷、无摘要」处理 |
+| 8 → 9 | `records` 加 `labels`（JSON 数组） | 适配器给记录追加通用标签（如撤回事件给原消息加 `recall`）；老记录默认空 |
 
 ## 已知限制
 
