@@ -32,6 +32,22 @@
             lockFile = ./Cargo.lock;
           };
         };
+
+        # 仅供当前测试环境使用：把 Lua 目录固化在 store 路径里，
+        # 不依赖手工 drop-in 或宿主环境变量。实际部署应另行决定用户、权限和配置来源。
+        acb-bridge-test = pkgs.writeShellApplication {
+          name = "acb-bridge-test";
+          runtimeInputs = [ acb-bridge ];
+          text = ''
+            export ACB_LUA_DIR="${self}/examples/lua"
+            exec acb-bridge "$@"
+          '';
+        };
+      };
+
+      apps.${system}.acb-bridge-test = {
+        type = "app";
+        program = "${self.packages.${system}.acb-bridge-test}/bin/acb-bridge-test";
       };
 
       devShells.${system}.default = pkgs.mkShell {

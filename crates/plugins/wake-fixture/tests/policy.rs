@@ -172,6 +172,7 @@ fn decision_providers_use_the_shared_wire() {
             room: &room,
             now: 60_000,
             last_clock_at: 0,
+            last_wake_at: 0,
             last_record_at: None,
         };
         assert!(provider.is_due(&policy, &context));

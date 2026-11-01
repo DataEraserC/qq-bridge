@@ -81,6 +81,7 @@ fn wake_provider_uses_the_shared_wire() {
         event: None,
         tags: &[],
         unread: 1,
+        last_wake_at: 0,
         now: 0,
     };
     let policy = WakePolicy::default();

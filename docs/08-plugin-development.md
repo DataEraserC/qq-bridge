@@ -141,6 +141,12 @@ return {
 | clock | `is_due(options, context)` |
 | receive | `decide(request, options)` |
 
+`WakeContext` 和 `ClockContext` 都带 `last_wake_at`（这个会话×房间上一次因任何原因
+开轮的时间）。做「多久没醒就醒一次」时，wake 端只能覆盖「有入站记录时」的判定；
+没人说话也要到点开轮，必须再配一个 clock provider。参考
+[`examples/lua/wake_policy.lua`](../examples/lua/wake_policy.lua) 和
+[`examples/lua/three_hour_clock.lua`](../examples/lua/three_hour_clock.lua)。
+
 每次调用最多 50ms，超时按安全侧兜底；脚本拿不到 Store / Bridge / 配置写入。
 可抄的示例在 [`examples/lua`](../examples/lua)，总览见
 [`examples/README.md`](../examples/README.md)。

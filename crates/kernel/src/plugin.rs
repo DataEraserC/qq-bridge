@@ -428,6 +428,8 @@ pub struct WakeContext<'a> {
     pub event: Option<&'a str>,
     pub tags: &'a [&'a str],
     pub unread: u32,
+    /// 上一次唤醒（开轮）的 Unix 毫秒；没唤醒过就是本桥第一次见到该订阅的时间。
+    pub last_wake_at: i64,
     pub now: i64,
 }
 
@@ -799,6 +801,8 @@ pub struct ClockContext<'a> {
     pub now: i64,
     /// 上一次开时钟轮的时间；第一次 tick 时初始化成当前时间。
     pub last_clock_at: i64,
+    /// 上一次唤醒（任意原因开轮）的 Unix 毫秒；没唤醒过时同第一次 tick 的时间。
+    pub last_wake_at: i64,
     /// 房间里最后一条记录的时间；房间没记录就是 `None`。
     pub last_record_at: Option<i64>,
 }
@@ -2042,6 +2046,7 @@ mod tests {
             event: None,
             tags: &[],
             unread: 1,
+            last_wake_at: 0,
             now: 0,
         }
     }
@@ -2927,6 +2932,7 @@ mod tests {
             room: &room,
             now: 0,
             last_clock_at: 0,
+            last_wake_at: 0,
             last_record_at: None,
         };
         assert!(!ClockOffProvider.is_due(&policy, &context));

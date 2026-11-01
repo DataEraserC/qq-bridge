@@ -6,7 +6,9 @@ After=network.target
 Type=simple
 WorkingDirectory=/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch
 Environment=PATH=/run/current-system/sw/bin:/etc/profiles/per-user/nixos/bin:/run/wrappers/bin
-ExecStart=/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/result/bin/acb-bridge --config config.toml
+# 当前测试环境：用 flake 的 acb-bridge-test 包装器（ACB_LUA_DIR 已指向仓库 examples/lua）。
+# 实际部署不沿用这个本地路径，另行决定运行用户、权限和配置来源。
+ExecStart=/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/result-lua/bin/acb-bridge-test --config config.toml
 Restart=always
 RestartSec=5
 StandardOutput=append:/home/nixos/Documents/code/qq-bridge-fork/.agents/worktrees/qqab-arch/state/logs/bridge.log

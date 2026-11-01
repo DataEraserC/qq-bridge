@@ -144,6 +144,7 @@ mod tests {
             event: None,
             tags: &[],
             unread,
+            last_wake_at: 0,
             now: 0,
         }
     }

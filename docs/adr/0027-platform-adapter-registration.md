@@ -167,6 +167,8 @@ InboundEvent:
     区分 `before` / `after`，`before` 返回 `WireResult::Elements` 改写正文。
   - `TurnErrorPolicy` 增加 `.options` 自由表；`TurnErrorProvider::decide` 现在接收
     `&TurnErrorPolicy`，每次判定都能拿到最新配置，不依赖实例级缓存。
+  - `WakeContext` / `ClockContext` 与对应 wire 增加 `last_wake_at`：core 在每次
+    开轮时记下时间（只在内存里），策略可以用它实现「多久没醒就醒一次」。
   - 报错兜底：delivery 回退内置 composer、turn_error 回退默认选择、send 的
     `before` 报错则这次发送失败，`after` 只记录失败数。
 

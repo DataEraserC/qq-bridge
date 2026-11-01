@@ -21,23 +21,21 @@ examples/lua/
   recent_only.lua      delivery：只投最新 N 条，中间标成跳过
   signature.lua        send：发送前给正文追加签名
   timeout_log_only.lua turn_error：超时只记日志，其余沿用会话/全局动作
+  wake_policy.lua      wake：@、poke、未读阈值、长时间未唤醒（参数全在 options）
+  three_hour_clock.lua clock：距上次唤醒满 N 小时开一轮（默认 3）
 ```
 
-让桥装上 LuaLoader（systemd 用户服务）：
-
-```bash
-systemctl --user edit acb-bridge
-```
-
-```ini
-[Service]
-Environment=ACB_LUA_DIR=/绝对路径/到/仓库/examples/lua
-```
+测试环境（本仓库 flake）提供一个把 `ACB_LUA_DIR` 固化进去的包装器，不依赖手工
+drop-in 或宿主环境变量：
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user restart acb-bridge
+nix build .#acb-bridge-test -o result-lua
+result-lua/bin/acb-bridge-test --config config.toml
 ```
+
+`deploy/systemd/acb-bridge.service` 在当前测试环境也指向这个包装器。实际部署不要照抄
+本地 `result-lua` 路径：运行用户、权限、配置来源和 Lua 目录都应由部署层决定，
+是否与 dsh 共用生产 profile 也属于部署策略，不在测试 flake 里预设。
 
 然后在配置里引用：
 
@@ -77,6 +75,23 @@ provider = "lua.timeout_log_only"
 
 [sessions.turn_error.options]
 ops_room = "qq:group/ops"
+
+# 唤醒：@、poke、30 条未读、3 小时未唤醒；参数都在 options 里
+[sessions.subscriptions.wake]
+provider = "lua.wake_policy"
+
+[sessions.subscriptions.wake.options]
+at_mention = true
+poke = true
+accumulate = 30
+idle_hours = 3
+
+# 没人说话也要到点醒：clock 在同一份 idle_hours 上做静默检查
+[sessions.subscriptions.clock]
+provider = "lua.three_hour_clock"
+
+[sessions.subscriptions.clock.options]
+idle_hours = 3
 ```
 
 注意：Lua 每次调用最多 50ms；脚本拿不到 Store / 流水 / 配置写入，脚本里的计数器只活在

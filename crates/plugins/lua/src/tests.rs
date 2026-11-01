@@ -65,6 +65,7 @@ fn wake_context<'a>(room: &'a RoomId, at_self: bool, text: &'a str) -> WakeConte
         event: None,
         tags: &[],
         unread: 1,
+        last_wake_at: 0,
         now: 0,
     }
 }
@@ -732,6 +733,7 @@ return {
         room: &room,
         now: 30_000,
         last_clock_at: 0,
+        last_wake_at: 0,
         last_record_at: None,
     };
     assert!(!provider.is_due(&policy, &context));
@@ -763,6 +765,8 @@ fn shipped_examples_load_and_behave() {
         "lua.recent_only",
         "lua.signature",
         "lua.timeout_log_only",
+        "lua.wake_policy",
+        "lua.three_hour_clock",
     ] {
         assert!(
             ids.iter().any(|id| id == expected),
@@ -789,6 +793,7 @@ fn shipped_examples_load_and_behave() {
         event: None,
         tags: &[],
         unread: 10,
+        last_wake_at: 0,
         now: 0,
     };
     assert_eq!(wake.decide(&WakePolicy::default(), &day), WakeDecision::Wake);
@@ -976,6 +981,84 @@ fn shipped_examples_load_and_behave() {
             room: RoomId::new("qq", "group/ops").expect("合法")
         }]
     );
+
+    // wake_policy：@、poke、30 条未读、3 小时未唤醒；参数全部来自 options。
+    let wake_policy = ProviderId::parse("lua.wake_policy").expect("合法");
+    let policy = WakePolicy {
+        provider: wake_policy.clone(),
+        options: serde_json::json!({
+            "at_mention": true,
+            "poke": true,
+            "accumulate": 30,
+            "idle_hours": 3
+        }),
+        ..Default::default()
+    };
+    let wake = plugins
+        .resolve_wake(&wake_policy, &policy)
+        .expect("能解析 wake_policy");
+    let base = WakeContext {
+        session: "main",
+        room: &room,
+        connection: "qq",
+        platform: "qq",
+        sender_id: "10001",
+        text: "闲聊",
+        at_self: false,
+        reply_to_self: false,
+        event: None,
+        tags: &[],
+        unread: 0,
+        last_wake_at: 0,
+        now: 0,
+    };
+    assert_eq!(wake.decide(&policy, &base), WakeDecision::Stay);
+    let aimed = WakeContext {
+        at_self: true,
+        ..base
+    };
+    assert_eq!(wake.decide(&policy, &aimed), WakeDecision::Wake);
+    let poked = WakeContext {
+        event: Some("poke"),
+        tags: &["poke"],
+        ..base
+    };
+    assert_eq!(wake.decide(&policy, &poked), WakeDecision::Wake);
+    let busy = WakeContext {
+        unread: 30,
+        ..base
+    };
+    assert_eq!(wake.decide(&policy, &busy), WakeDecision::Wake);
+    let idle = WakeContext {
+        now: 3 * 3_600_000,
+        ..base
+    };
+    assert_eq!(wake.decide(&policy, &idle), WakeDecision::Wake);
+
+    // three_hour_clock：距上次唤醒满 3 小时才开轮。
+    let clock_id = ProviderId::parse("lua.three_hour_clock").expect("合法");
+    let clock_policy = ClockPolicy {
+        provider: clock_id.clone(),
+        options: serde_json::json!({ "idle_hours": 3 }),
+        ..Default::default()
+    };
+    let clock = plugins
+        .resolve_clock(&clock_id, &clock_policy)
+        .expect("能解析 three_hour_clock");
+    let clock_context = ClockContext {
+        session: "main",
+        room: &room,
+        now: 3 * 3_600_000,
+        last_clock_at: 0,
+        last_wake_at: 0,
+        last_record_at: None,
+    };
+    assert!(clock.is_due(&clock_policy, &clock_context));
+    let early = ClockContext {
+        now: 3_600_000,
+        ..clock_context
+    };
+    assert!(!clock.is_due(&clock_policy, &early));
 }
 
 #[test]

@@ -235,6 +235,9 @@ pub struct Bridge<S: Store> {
     pending_notices: Vec<PreparedSend>,
     /// (会话, 房间) → 上次时钟轮时间（Unix 毫秒）。只活在本进程，重启后重新计间隔。
     clock_last: HashMap<(String, RoomId), i64>,
+    /// (会话, 房间) → 上次唤醒（任意原因开轮）时间。只活在本进程；
+    /// 唤醒策略可以用它实现「多久没醒就醒一次」。
+    wake_last: HashMap<(String, RoomId), i64>,
     /// 记忆仓库管理器：负责裸仓库 init 与 worktree checkout。
     memory: MemoryRepo,
     /// 文件中继。配了 `[file_relay]` 才有：发送/平台调用里的本机文件
@@ -303,6 +306,7 @@ impl<S: Store> Bridge<S> {
             ticket_prefix: ticket_prefix(),
             pending_notices: Vec::new(),
             clock_last: HashMap::new(),
+            wake_last: HashMap::new(),
             memory,
             relay,
             staged_config: None,
@@ -552,6 +556,7 @@ impl<S: Store> Bridge<S> {
         };
 
         let mut woke = Vec::new();
+        let now = now_millis();
         for (subscriber, provider) in subscribers.into_iter().zip(wake_providers) {
             let cursor = Cursor::new(subscriber.session.clone(), room.clone());
 
@@ -564,6 +569,11 @@ impl<S: Store> Bridge<S> {
             let pending = self
                 .pending_records(&subscriber.session, &room, &subscriber.account)?
                 .len() as u32;
+            let last_wake_at = self
+                .wake_last
+                .get(&(subscriber.session.clone(), room.clone()))
+                .copied()
+                .unwrap_or(now);
             let context = WakeContext {
                 session: &subscriber.session,
                 room: &room,
@@ -576,7 +586,8 @@ impl<S: Store> Bridge<S> {
                 event,
                 tags: &tags,
                 unread: pending,
-                now: now_millis(),
+                last_wake_at,
+                now,
             };
             let verdict = provider.decide_with_reason(&subscriber.wake, &context);
             if verdict.decision == WakeDecision::Wake {
@@ -586,6 +597,7 @@ impl<S: Store> Bridge<S> {
                     room.clone(),
                     TurnReason::Wake,
                     verdict.reason,
+                    now,
                 );
             }
         }
@@ -1426,7 +1438,8 @@ impl<S: Store> Bridge<S> {
                 let key = (session.clone(), room.clone());
                 let Some(last_clock_at) = self.clock_last.get(&key).copied() else {
                     // 第一次见到这个订阅：从这一 tick 开始计间隔，不立刻开轮。
-                    self.clock_last.insert(key, now);
+                    self.clock_last.insert(key.clone(), now);
+                    self.wake_last.entry(key).or_insert(now);
                     continue;
                 };
                 // 会话正在跑，或这个房间已经排着队：等它空下来再说，别叠轮次。
@@ -1455,15 +1468,17 @@ impl<S: Store> Bridge<S> {
                         None
                     }
                 };
+                let last_wake_at = self.wake_last.get(&key).copied().unwrap_or(now);
                 let context = ClockContext {
                     session: &session,
                     room: &room,
                     now,
                     last_clock_at,
+                    last_wake_at,
                     last_record_at,
                 };
                 if provider.is_due(&policy, &context) {
-                    self.enqueue(session.clone(), room.clone(), TurnReason::Clock, None);
+                    self.enqueue(session.clone(), room.clone(), TurnReason::Clock, None, now);
                     self.clock_last.insert(key, now);
                     queued += 1;
                 }
@@ -1493,7 +1508,10 @@ impl<S: Store> Bridge<S> {
         room: RoomId,
         reason: TurnReason,
         wake_reason: Option<String>,
+        at: i64,
     ) {
+        self.wake_last
+            .insert((session.clone(), room.clone()), at);
         let already = self
             .pending
             .iter()

@@ -185,6 +185,8 @@ pub struct WireWakeRequest {
     #[serde(default)]
     pub unread: u32,
     #[serde(default)]
+    pub last_wake_at: i64,
+    #[serde(default)]
     pub now: i64,
 }
 
@@ -223,6 +225,8 @@ pub struct WireClockRequest {
     pub room: String,
     pub now: i64,
     pub last_clock_at: i64,
+    #[serde(default)]
+    pub last_wake_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_record_at: Option<i64>,
 }

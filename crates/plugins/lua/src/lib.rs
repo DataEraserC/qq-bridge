@@ -894,6 +894,7 @@ fn wake_context_table(lua: &Lua, context: &WakeContext<'_>) -> mlua::Result<Tabl
     table.set("event", context.event)?;
     table.set("tags", string_list(lua, context.tags)?)?;
     table.set("unread", context.unread)?;
+    table.set("last_wake_at", context.last_wake_at)?;
     table.set("now", context.now)?;
     Ok(table)
 }
@@ -1294,6 +1295,7 @@ fn clock_context_table(lua: &Lua, context: &ClockContext<'_>) -> mlua::Result<Ta
     table.set("room", context.room.to_string())?;
     table.set("now", context.now)?;
     table.set("last_clock_at", context.last_clock_at)?;
+    table.set("last_wake_at", context.last_wake_at)?;
     table.set("last_record_at", context.last_record_at)?;
     Ok(table)
 }

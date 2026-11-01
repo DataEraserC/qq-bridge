@@ -3,6 +3,7 @@
 
 # nix 构建产物
 /result
+/result-*
 
 # Node
 node_modules/

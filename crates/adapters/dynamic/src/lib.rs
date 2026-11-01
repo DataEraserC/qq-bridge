@@ -575,6 +575,7 @@ impl WakeProvider for DylibWakeProvider {
             event: context.event.map(str::to_owned),
             tags: context.tags.iter().map(|tag| (*tag).to_owned()).collect(),
             unread: context.unread,
+            last_wake_at: context.last_wake_at,
             now: context.now,
         };
         let request = serde_json::to_value(request).unwrap_or(Value::Null);
@@ -1231,6 +1232,7 @@ impl ClockProvider for DylibClockProvider {
             room: context.room.to_string(),
             now: context.now,
             last_clock_at: context.last_clock_at,
+            last_wake_at: context.last_wake_at,
             last_record_at: context.last_record_at,
         };
         let message = CoreMessage::Decide {

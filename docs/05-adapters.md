@@ -174,7 +174,7 @@ access / receive / clock / delivery / turn_error 的策略配置也有同名的 
 `decide(request, options)`；动态库的 `turn_error` 每次 `Decide` 也带最新 options。
 
 插件通过 `CoreMessage::Decide` 收到 `WireWakeRequest`（发送者、正文、@/引用/拍、
-标签、未读数），返回 `WireResult::Decision { decision = "wake" | "stay" }`。
+标签、未读数、上次唤醒时间），返回 `WireResult::Decision { decision = "wake" | "stay" }`。
 解析失败或插件报错按 `stay` 兜底，不会误把会话叫醒。wake 判定在 core 的入库路径里，
 所以这一版只开放动态库载体；外置进程会在 core 锁内做 I/O，等以后有异步判定再开。
 
