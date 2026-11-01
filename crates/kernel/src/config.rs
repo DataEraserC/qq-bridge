@@ -38,8 +38,9 @@ pub const DEFAULT_MAX_AGE_DAYS: u64 = 90;
 /// 超过这个数就只投前这么多条，末尾提示「还有 N 条，用 fetch_records 抓」。
 pub const DEFAULT_DELIVERY_LIMIT: usize = 30;
 
-/// 一轮的默认超时：5 分钟。沿用 dsh 驱动原来的写死值，只是现在可配、可关。
-pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 300;
+/// 一轮的默认超时：关闭。模型想跑多久跑多久，桥和 harness 都不自动掐；
+/// 需要钳制时在配置里写 `turn_timeout_secs = n`。
+pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 0;
 
 /// `[file_relay].dir` 不写时的默认值。跟 [storage].path 一样相对启动目录。
 pub const DEFAULT_RELAY_DIR: &str = "state/relay";
@@ -1767,7 +1768,7 @@ struct RawConfig {
     /// 一轮投递最多塞多少条。0 = 不截断。
     #[serde(default)]
     delivery_limit: Option<usize>,
-    /// 一轮最多跑多久（秒）。0 = 关闭超时。不配 = 默认 300 秒。
+    /// 一轮最多跑多久（秒）。0 = 关闭超时。不配 = 默认关闭。
     #[serde(default)]
     turn_timeout_secs: Option<u64>,
 }
@@ -2057,9 +2058,9 @@ mod tests {
         assert_eq!(subscription.wake.accumulate, Some(DEFAULT_ACCUMULATE));
         assert!(subscription.wake.keywords.is_empty());
         assert_eq!(config.connections[0].transport, Transport::WsClient);
-        // 超时默认 5 分钟（dsh 驱动原来的写死值），协议帧里带毫秒。
+        // 超时默认关闭，协议帧里带 0 表示 harness 不许自己掐。
         assert_eq!(config.turn_timeout_secs, DEFAULT_TURN_TIMEOUT_SECS);
-        assert_eq!(config.turn_timeout_ms(), 300_000);
+        assert_eq!(config.turn_timeout_ms(), 0);
     }
 
     #[test]

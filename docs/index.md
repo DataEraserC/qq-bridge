@@ -13,8 +13,11 @@ hero:
       text: 快速开始
       link: /guide/getting-started
     - theme: alt
-      text: 开发者文档
+      text: ACB 开发者
       link: /03-architecture
+    - theme: alt
+      text: 插件开发者
+      link: /08-plugin-development
 
 features:
   - icon: 🔌

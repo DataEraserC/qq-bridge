@@ -42,11 +42,11 @@ path = "state/acb.db"
 # 桥只负责第一次把 worktree 建出来，之后文件读写和 git 操作全交给 harness。
 worktrees_root = "state/worktrees"
 
-# 一轮最多跑多久（秒）。不配 = 300（沿用 dsh 原来的兜底值）。
+# 一轮最多跑多久（秒）。不配 = 默认关闭（跑多久都等）。
 #   0 = 关闭超时：模型想跑多久跑多久，桥不掐、harness 也不许自己掐。
 #   n > 0 = 到点还没结束，harness 主动打断本侧会话（dsh 有队列能打断；不支持
 #   打断的 harness 按各自兜底）。打断算这轮失败，走 on_turn_error 通知。
-# turn_timeout_secs = 300
+turn_timeout_secs = 0
 
 [retention]
 # 旧流水什么时候可以删。只削**已经读过**的那一段：任何在册会话还没读到的记录，

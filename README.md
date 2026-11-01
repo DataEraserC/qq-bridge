@@ -8,14 +8,17 @@
 
 ## 文档
 
-两套入口，写给不同的人：
+三类入口，写给不同的人：
 
 - **使用指南**（给人看，不看代码也能上手）：https://dataeraserc.github.io/qq-bridge/guide/
   ——快速开始、配置手册、网页控制台、日常使用、排障手册；
-- **开发者文档**（架构、协议、ADR）：https://dataeraserc.github.io/qq-bridge/03-architecture
-  ——本仓库 `docs/` 目录的渲染版，想改代码从这里进。
-- **插件示例**：[examples/README.md](examples/README.md)
-  ——Lua 策略、外置进程适配器、可独立构建的动态库 wake 插件。
+- **ACB 开发者**（架构、协议、存储、harness 适配器、ADR）：
+  https://dataeraserc.github.io/qq-bridge/03-architecture
+  ——本仓库 `docs/` 的渲染版，想改桥本身从这里进；
+- **插件开发者**（平台适配器、Lua/进程/动态库插件）：
+  https://dataeraserc.github.io/qq-bridge/08-plugin-development
+  ——从扩展点选择、manifest、生命周期到测试；可运行示例见
+  [examples/README.md](examples/README.md)。
 
 ## 现在是什么状态
 
