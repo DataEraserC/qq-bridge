@@ -134,14 +134,21 @@ fn notice(
         } else {
             format!("[拍了拍 {target}]")
         };
-        return Ok(Parsed::Record(RecordDraft::event(
-            room,
-            sender,
-            at,
-            "poke",
-            vec![Element::text(body)],
-            at_self,
-        )));
+        return Ok(Parsed::Record(
+            RecordDraft::event(
+                room,
+                sender,
+                at,
+                "poke",
+                vec![Element::text(body.clone())],
+                at_self,
+            )
+            .with_event_meta(
+                vec!["poke".to_owned(), "notice".to_owned()],
+                Some(event.clone()),
+                Some(body),
+            ),
+        ));
     }
 
     // 其它通知（进退群、禁言、撤回……）也是房间里发生的事，记一条可读的。
@@ -149,24 +156,28 @@ fn notice(
     // 原始事件 JSON 装进 Opaque 一并存流水。投递时渲染层不给载荷、只给流水
     // 编号，agent 想看细节用 fetch_records 按编号拉（ADR-0004 补充裁定）。
     let mut elements = Vec::new();
-    match describe_notice(notice_type, event) {
-        Some(body) => elements.push(Element::text(body)),
+    let summary = match describe_notice(notice_type, event) {
+        Some(body) => {
+            elements.push(Element::text(body.clone()));
+            Some(body)
+        }
         None => {
-            elements.push(Element::text(format!("[{notice_type}]（未解析事件）")));
+            let text = format!("[{notice_type}]（未解析事件）");
+            elements.push(Element::text(text.clone()));
             elements.push(Element::Opaque {
                 platform: "qq".to_owned(),
                 payload: event.clone(),
             });
+            Some(text)
         }
-    }
-    Ok(Parsed::Record(RecordDraft::event(
-        room,
-        sender,
-        at,
-        notice_type,
-        elements,
-        false,
-    )))
+    };
+    Ok(Parsed::Record(
+        RecordDraft::event(room, sender, at, notice_type, elements, false).with_event_meta(
+            vec!["notice".to_owned(), notice_type.to_owned()],
+            Some(event.clone()),
+            summary,
+        ),
+    ))
 }
 
 fn request(
@@ -183,14 +194,21 @@ fn request(
     let room = notice_room(connection, event, &sender_id)?;
     let body = format!("[请求 {request_type}] {}", comment_of(event));
 
-    Ok(Parsed::Record(RecordDraft::event(
-        room,
-        sender_of(event, &sender_id, admin_qqs),
-        at,
-        format!("request_{request_type}"),
-        vec![Element::text(body)],
-        false,
-    )))
+    Ok(Parsed::Record(
+        RecordDraft::event(
+            room,
+            sender_of(event, &sender_id, admin_qqs),
+            at,
+            format!("request_{request_type}"),
+            vec![Element::text(body.clone())],
+            false,
+        )
+        .with_event_meta(
+            vec!["request".to_owned(), request_type.to_owned()],
+            Some(event.clone()),
+            Some(body),
+        ),
+    ))
 }
 
 /// 事件发生在哪个房间：有群号就是群，否则算私聊。
@@ -429,12 +447,13 @@ mod tests {
         let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
             panic!("拍一拍要记下来");
         };
-        assert_eq!(
-            draft.kind,
-            acb_proto::RecordKind::Event {
-                event: "poke".into()
-            }
-        );
+        assert!(matches!(
+            &draft.kind,
+            acb_proto::RecordKind::Event { event, tags, summary, .. }
+                if event == "poke"
+                    && tags.iter().any(|tag| tag == "poke")
+                    && summary.as_deref() == Some("[拍了拍我]")
+        ));
         assert!(draft.at_self);
         assert_eq!(draft.elements, vec![Element::text("[拍了拍我]")]);
     }
@@ -508,12 +527,12 @@ mod tests {
         let Parsed::Record(draft) = parse("qq", &event, &[]).expect("能解析") else {
             panic!("进退群也要记");
         };
-        assert_eq!(
-            draft.kind,
-            acb_proto::RecordKind::Event {
-                event: "group_increase".into()
-            }
-        );
+        assert!(matches!(
+            &draft.kind,
+            acb_proto::RecordKind::Event { event, tags, .. }
+                if event == "group_increase"
+                    && tags.iter().any(|tag| tag == "group_increase")
+        ));
         assert!(matches!(draft.elements[0], Element::Text { .. }));
     }
 

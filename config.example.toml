@@ -186,7 +186,9 @@ reply = true          # 引用我发的某条消息也算对我说话（QQ 的�
 name_mention = true
 names = ["小助手"]
 accumulate = 5
-poke = true
+poke = true           # 旧语法糖：默认「冲我来的事件」就醒，true 等同不配
+# event_tags = ["poke"]                    # 跨平台语义标签：换个平台只要标签一样也生效
+# events = ["qq.group_increase", "qq.*"]   # 点名平台事件；带前缀必须属于这个 QQ 房间
 
 # 时钟策略（ADR-0011）：没有新消息也定期开一轮例行检查。默认关闭。
 # 写了 interval_secs / idle_secs 但没写 provider 时，自动用内置时钟。
@@ -204,5 +206,5 @@ at_mention = true
 reply = true
 name_mention = false
 accumulate = 20
-poke = false
+poke = false          # 旧语法糖，等价于 ignore_event_tags = ["poke"]：私聊里被拍不醒
 ignore_speakers = ["987654321"]

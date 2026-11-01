@@ -51,8 +51,20 @@ pub struct QuoteRef {
 pub enum RecordKind {
     /// 一条聊天消息。
     Message,
-    /// 一个平台事件，`event` 是事件类型（如 `poke`）。
-    Event { event: String },
+    /// 一个平台事件，`event` 是事件类型（建议写成 `平台.事件`，如 `qq.poke`）。
+    ///
+    /// `tags` 是平台无关的语义标签（`poke` / `reaction` / `member_join` …），
+    /// 唤醒策略和查询可以按它匹配；`payload` 是平台原始结构化数据，core 不解释；
+    /// `summary` 是适配器生成的一句人话，渲染时直接用。
+    Event {
+        event: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
 }
 
 /// 投递给 harness 的最小单位。
@@ -104,7 +116,7 @@ impl Record {
 
     /// 是不是指定类型的事件。
     pub fn is_event(&self, kind: &str) -> bool {
-        matches!(&self.kind, RecordKind::Event { event } if event == kind)
+        matches!(&self.kind, RecordKind::Event { event, .. } if event == kind)
     }
 
     /// 这条消息引用的是哪条平台消息（取第一个引用段）。
@@ -164,6 +176,9 @@ mod tests {
         let mut record = sample();
         record.kind = RecordKind::Event {
             event: "poke".into(),
+            tags: vec!["poke".into()],
+            payload: None,
+            summary: Some("拍了拍我".into()),
         };
         record.at_self = true;
         assert!(record.is_event("poke"));

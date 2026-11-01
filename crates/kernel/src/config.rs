@@ -487,6 +487,10 @@ pub struct WakeInput<'a> {
     pub reply_to_self: bool,
     /// 平台事件类型；普通消息为 `None`。
     pub event: Option<&'a str>,
+    /// 这条连接所属平台（`qq` / `discord` …），用于匹配 `qq.poke` 这种限定事件名。
+    pub platform: &'a str,
+    /// 事件语义标签；普通消息为空。
+    pub tags: &'a [&'a str],
     /// 这条进来之后，该房间待处理的未读条数。
     pub unread: u32,
 }
@@ -540,9 +544,16 @@ pub struct WakePolicy {
     pub names: Vec<String>,
     /// 未读攒到这么多条就醒；`None` 表示不看条数。
     pub accumulate: Option<u32>,
-    /// 被拍就醒（事件 `poke` 且冲着自己）。
-    pub poke: bool,
-    /// 额外的事件类型，命中就醒。
+    /// 平台事件语义标签，命中就醒（如 `poke`、`reaction`、`member_join`）。
+    ///
+    /// 这是跨平台维度：适配器把平台事件翻译成标签，core 不需要知道平台名。
+    pub event_tags: Vec<String>,
+    /// 命中这些标签的事件**不**叫醒（只挡唤醒，不挡记录）。
+    ///
+    /// 旧配置的 `poke = false` 等价于在这里加 `poke`。
+    pub ignore_event_tags: Vec<String>,
+    /// 额外的事件类型，命中就醒。可以写 `qq.poke` 这种带平台前缀的名字，
+    /// 也可以写 `qq.*` 匹配该平台全部事件。
     pub events: Vec<String>,
     /// 文本命中关键词就醒。默认空。
     pub keywords: Vec<String>,
@@ -559,7 +570,8 @@ impl Default for WakePolicy {
             name_mention: true,
             names: Vec::new(),
             accumulate: Some(DEFAULT_ACCUMULATE),
-            poke: true,
+            event_tags: Vec::new(),
+            ignore_event_tags: Vec::new(),
             events: Vec::new(),
             keywords: Vec::new(),
             ignore_speakers: Vec::new(),
@@ -585,12 +597,36 @@ impl WakePolicy {
             return WakeVerdict::stay();
         }
 
+        // 语义标签优先：适配器把“拍一拍 / reaction / 入群”翻译成跨平台标签。
+        if let Some(tag) = self
+            .ignore_event_tags
+            .iter()
+            .find(|tag| input.tags.iter().any(|candidate| candidate == tag))
+        {
+            return WakeVerdict::stay();
+        }
+        if let Some(tag) = self
+            .event_tags
+            .iter()
+            .find(|tag| input.tags.iter().any(|candidate| candidate == tag))
+        {
+            return WakeVerdict::wake(format!("命中标签 {tag}"));
+        }
+
         if let Some(event) = input.event {
-            if event == "poke" && self.poke && input.at_self {
-                return WakeVerdict::wake("被拍了一下");
+            let qualified = format!("{}.{}", input.platform, event);
+            let wildcard = format!("{}.*", input.platform);
+            if self
+                .events
+                .iter()
+                .any(|wanted| wanted == event || wanted == &qualified || wanted == &wildcard)
+            {
+                return WakeVerdict::wake(format!("命中事件 {event}"));
             }
-            if self.events.iter().any(|wanted| wanted == event) {
-                return WakeVerdict::wake(format!("事件 {event}"));
+            // 没点名的事件：只有冲我来的（拍到我）才按 at_mention 醒。
+            // 这就是旧 `poke = true` 的语义；`poke = false` 由 ignore_event_tags 表达。
+            if self.at_mention && input.at_self {
+                return WakeVerdict::wake(format!("事件 {event} 指向我"));
             }
             return WakeVerdict::stay();
         }
@@ -615,6 +651,17 @@ impl WakePolicy {
         }
         WakeVerdict::stay()
     }
+}
+
+fn normalize_list(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim().to_owned();
+        if !value.is_empty() && !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    normalized
 }
 
 fn matches_any(names: &[String], text: &str) -> bool {
@@ -651,6 +698,13 @@ pub enum ConfigError {
     },
     #[error("会话 {session} 的房间 {room} 的 accumulate 必须是正整数")]
     BadAccumulate { session: String, room: String },
+    #[error("会话 {session} 的房间 {room} 的唤醒事件 {event} 不属于该房间的平台 {platform}")]
+    BadWakeEvent {
+        session: String,
+        room: String,
+        event: String,
+        platform: String,
+    },
     #[error("会话 {session} 的房间 {room} 的唤醒策略 provider 不合法：{provider}（{detail}）")]
     BadWakeProvider {
         session: String,
@@ -1074,16 +1128,18 @@ impl Config {
             for raw_subscription in raw_session.subscriptions {
                 let subscription = build_subscription(&id, raw_subscription)?;
                 // 订阅连的连接必须真的存在，否则这个房间永远发不出去。
-                if !connections
+                let Some(connection) = connections
                     .iter()
-                    .any(|connection| connection.id == subscription.room.connection)
-                {
+                    .find(|connection| connection.id == subscription.room.connection)
+                else {
                     return Err(ConfigError::UnknownConnection {
                         session: id.clone(),
                         room: subscription.room.to_string(),
                         connection: subscription.room.connection.clone(),
                     });
-                }
+                };
+                // 唤醒事件里带平台前缀的，必须属于这个房间所属的平台。
+                validate_wake_events(&id, &subscription.room, &subscription.wake, &connection.platform)?;
                 if seen_rooms.iter().any(|room| room == &subscription.room) {
                     return Err(ConfigError::DuplicateRoom {
                         session: id.clone(),
@@ -1548,11 +1604,47 @@ fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, 
         name_mention: raw.name_mention.unwrap_or(default.name_mention),
         names: raw.names.unwrap_or(default.names),
         accumulate: raw.accumulate.map(Some).unwrap_or(default.accumulate),
-        poke: raw.poke.unwrap_or(default.poke),
-        events: raw.events.unwrap_or(default.events),
+        event_tags: normalize_list(raw.event_tags.unwrap_or(default.event_tags)),
+        ignore_event_tags: {
+            let mut tags = normalize_list(
+                raw.ignore_event_tags.unwrap_or(default.ignore_event_tags),
+            );
+            // 旧配置 `poke = false` 的语法糖：不再因为 `poke` 标签/拍我而醒。
+            // `poke = true` 不必再做事——at_mention 默认就覆盖「冲我来的事件」。
+            if raw.poke == Some(false) && !tags.iter().any(|tag| tag == "poke") {
+                tags.push("poke".to_owned());
+            }
+            tags
+        },
+        events: normalize_list(raw.events.unwrap_or(default.events)),
         keywords: raw.keywords.unwrap_or(default.keywords),
         ignore_speakers: raw.ignore_speakers.unwrap_or(default.ignore_speakers),
     })
+}
+
+/// 唤醒事件名带平台前缀时（`qq.poke` / `qq.*`），前缀必须等于该房间连接的 platform。
+///
+/// 唤醒配置是按房间存的，所以 `events = ["qq.poke"]` 配在 discord 房间会永远不生效；
+/// 这种配置在启动时就拒掉，而不是等用户发现「怎么叫都不醒」。
+fn validate_wake_events(
+    session: &str,
+    room: &RoomId,
+    wake: &WakePolicy,
+    platform: &str,
+) -> Result<(), ConfigError> {
+    for event in &wake.events {
+        if let Some((prefix, _)) = event.split_once('.') {
+            if prefix != platform {
+                return Err(ConfigError::BadWakeEvent {
+                    session: session.to_owned(),
+                    room: room.to_string(),
+                    event: event.clone(),
+                    platform: platform.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_not_blank(value: &str, field: &'static str) -> Result<(), &'static str> {
@@ -1847,7 +1939,10 @@ struct RawWake {
     name_mention: Option<bool>,
     names: Option<Vec<String>>,
     accumulate: Option<u32>,
+    /// 旧配置的“被拍醒”开关；`false` 会转成 `ignore_event_tags` 里的 `poke`。
     poke: Option<bool>,
+    event_tags: Option<Vec<String>>,
+    ignore_event_tags: Option<Vec<String>>,
     events: Option<Vec<String>>,
     keywords: Option<Vec<String>>,
     ignore_speakers: Option<Vec<String>>,
@@ -1900,7 +1995,7 @@ mod tests {
         assert!(subscription.wake.at_mention);
         assert!(subscription.wake.reply);
         assert!(subscription.wake.name_mention);
-        assert!(subscription.wake.poke);
+        assert!(subscription.wake.event_tags.is_empty());
         assert_eq!(subscription.wake.accumulate, Some(DEFAULT_ACCUMULATE));
         assert!(subscription.wake.keywords.is_empty());
         assert_eq!(config.connections[0].transport, Transport::WsClient);
@@ -2337,10 +2432,11 @@ mod tests {
     }
 
     #[test]
-    fn wake_defaults_are_the_five_documented_switches() {
+    fn wake_defaults_are_the_documented_switches() {
         let policy = WakePolicy::default();
         assert_eq!(policy.provider, ProviderId::builtin_wake());
-        assert!(policy.at_mention && policy.reply && policy.name_mention && policy.poke);
+        assert!(policy.at_mention && policy.reply && policy.name_mention);
+        assert!(policy.event_tags.is_empty() && policy.ignore_event_tags.is_empty());
         assert_eq!(policy.accumulate, Some(DEFAULT_ACCUMULATE));
     }
 
@@ -2360,6 +2456,71 @@ mod tests {
             Config::parse(&bad),
             Err(ConfigError::BadWakeProvider { .. })
         ));
+    }
+
+    #[test]
+    fn wake_events_are_parsed_and_normalized() {
+        let text = format!(
+            "{ONE_CONNECTION}\n{ONE_SESSION}\n[sessions.subscriptions.wake]\n\
+             event_tags = [\"reaction\", \" reaction \"]\n\
+             events = [\"qq.poke\", \"qq.*\"]\n"
+        );
+        let config = Config::parse(&text).expect("能解析");
+        let wake = &config.sessions[0].subscriptions[0].wake;
+        assert_eq!(wake.event_tags, vec!["reaction"]);
+        assert_eq!(wake.events, vec!["qq.poke", "qq.*"]);
+    }
+
+    #[test]
+    fn wake_events_must_belong_to_the_room_platform() {
+        // 唤醒配置按房间存：discord 的事件写在 qq 房间里永远不生效，启动就拒掉。
+        let bad = format!(
+            "{ONE_CONNECTION}\n{ONE_SESSION}\n[sessions.subscriptions.wake]\n\
+             events = [\"discord.reaction_add\"]\n"
+        );
+        assert!(matches!(
+            Config::parse(&bad),
+            Err(ConfigError::BadWakeEvent { .. })
+        ));
+
+        // 同一会话的两个房间各配自己平台的事件。
+        let discord = r#"
+            [[connections]]
+            id = "dc"
+            platform = "discord"
+            kind = "process"
+            transport = "process"
+            account = "bot"
+        "#;
+        let session = ONE_SESSION.replace(
+            "        room = \"group/123\"",
+            "        room = \"group/123\"\n\n        [[sessions.subscriptions]]\n        connection = \"dc\"\n        room = \"channel/456\"",
+        );
+        let text = format!(
+            "{ONE_CONNECTION}\n{discord}\n{session}\n\
+             [sessions.subscriptions.wake]\n\
+             events = [\"discord.reaction_add\", \"discord.*\"]\n"
+        );
+        // 这个 wake 表落在最后一个订阅（discord 房间）上；qq 房间没有配事件。
+        let config = Config::parse(&text).expect("每个房间配自己平台的事件应当能解析");
+        let subscriptions = &config.sessions[0].subscriptions;
+        assert!(subscriptions[0].wake.events.is_empty());
+        assert_eq!(
+            subscriptions[1].wake.events,
+            vec!["discord.reaction_add", "discord.*"]
+        );
+    }
+
+    #[test]
+    fn legacy_poke_false_becomes_an_ignored_tag() {
+        let text = format!(
+            "{ONE_CONNECTION}\n{ONE_SESSION}\n[sessions.subscriptions.wake]\npoke = false\n"
+        );
+        let config = Config::parse(&text).expect("能解析");
+        assert_eq!(
+            config.sessions[0].subscriptions[0].wake.ignore_event_tags,
+            vec!["poke"]
+        );
     }
 
     #[test]
@@ -2383,6 +2544,8 @@ mod tests {
             at_self: false,
             reply_to_self: true,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 1,
         };
         assert_eq!(policy.decide(&input), WakeDecision::Wake);
@@ -2400,6 +2563,8 @@ mod tests {
             at_self: false,
             reply_to_self: true,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 1,
         };
         assert_eq!(policy.decide(&input), WakeDecision::Stay);
@@ -2419,6 +2584,8 @@ mod tests {
             at_self: false,
             reply_to_self: false,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 1,
         };
         let miss = WakeInput {
@@ -2441,6 +2608,8 @@ mod tests {
             at_self: false,
             reply_to_self: false,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 2,
         };
         assert_eq!(policy.decide(&input), WakeDecision::Stay);
@@ -2461,6 +2630,8 @@ mod tests {
             at_self: false,
             reply_to_self: false,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 999,
         };
         // 不看条数：攒再多也不醒，得靠 @ / 引用 / 关键词这些。
@@ -2479,6 +2650,8 @@ mod tests {
             at_self: false,
             reply_to_self: false,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 1,
         };
         // 没配昵称就等于没法点名：默认开着也不能凭空认出一个名字。
@@ -2500,6 +2673,8 @@ mod tests {
             at_self: true,
             reply_to_self: false,
             event: Some("poke"),
+            platform: "qq",
+            tags: &["poke", "notice"],
             unread: 1,
         };
         let elsewhere = WakeInput {
@@ -2511,10 +2686,60 @@ mod tests {
         assert_eq!(policy.decide(&elsewhere), WakeDecision::Stay);
 
         let deaf = WakePolicy {
-            poke: false,
+            ignore_event_tags: vec!["poke".into()],
             ..policy
         };
         assert_eq!(deaf.decide(&aimed), WakeDecision::Stay);
+    }
+
+    #[test]
+    fn event_tags_and_platform_qualified_events_wake() {
+        let policy = WakePolicy {
+            event_tags: vec!["reaction".into()],
+            events: vec!["qq.poke".into()],
+            accumulate: None,
+            ..WakePolicy::default()
+        };
+
+        // 跨平台标签：不管哪个平台，适配器打上 reaction 就醒。
+        let tagged = WakeInput {
+            sender_id: "someone",
+            text: "",
+            at_self: false,
+            reply_to_self: false,
+            event: Some("reaction_add"),
+            platform: "discord",
+            tags: &["reaction", "notice"],
+            unread: 1,
+        };
+        assert_eq!(policy.decide(&tagged), WakeDecision::Wake);
+
+        // 平台限定名只在对应平台生效。
+        let qualified = WakeInput {
+            event: Some("poke"),
+            platform: "qq",
+            tags: &[],
+            ..tagged
+        };
+        assert_eq!(policy.decide(&qualified), WakeDecision::Wake);
+        let other_platform = WakeInput {
+            platform: "discord",
+            ..qualified
+        };
+        assert_eq!(policy.decide(&other_platform), WakeDecision::Stay);
+
+        // 旧配置 poke = false 转成的忽略标签：拍了也不醒。
+        let muted = WakePolicy {
+            ignore_event_tags: vec!["poke".into()],
+            ..policy.clone()
+        };
+        let aimed = WakeInput {
+            event: Some("poke"),
+            at_self: true,
+            tags: &["poke", "notice"],
+            ..tagged
+        };
+        assert_eq!(muted.decide(&aimed), WakeDecision::Stay);
     }
 
     #[test]
@@ -2529,6 +2754,8 @@ mod tests {
             at_self: false,
             reply_to_self: false,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 1,
         };
         // 默认策略不能变成「谁说话都回」，否则群里没法待。
@@ -2547,6 +2774,8 @@ mod tests {
             at_self: true,
             reply_to_self: true,
             event: None,
+            platform: "qq",
+            tags: &[],
             unread: 99,
         };
         assert_eq!(policy.decide(&input), WakeDecision::Stay);

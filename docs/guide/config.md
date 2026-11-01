@@ -54,12 +54,20 @@ reply = true           # 被回复（引用我发的消息）醒
 name_mention = true    # 被叫名字醒
 names = ["小助手"]      # name_mention 开了才看这个列表
 accumulate = 5         # 都没触发时，攒满 5 条新消息也醒
-poke = true            # 被戳一戳醒
+event_tags = []        # 跨平台语义标签，命中就醒（如 ["reaction"]）
+events = ["qq.poke"]   # 平台事件名；带平台前缀的必须属于这个房间的连接平台
+ignore_event_tags = [] # 命中这些标签的事件不叫醒（旧 poke = false 等价于 ["poke"]）
+poke = true            # 旧语法糖：true 等同默认（冲我来的事件醒），false 转成上面忽略 poke
 ignore_speakers = []   # 这些人的发言不叫醒（但照样记账）
 ```
 
 要点：
 
+- **唤醒配置是按房间存的**：同一个会话订阅 QQ 房间和 Discord 房间时，QQ 房间写
+  `events = ["qq.poke"]`，Discord 房间写 `events = ["discord.reaction_add"]`；带前缀的事件
+  配错平台会在启动时直接报错，不会「配了却永远不生效」。
+- **`event_tags` 是跨平台维度**：适配器把平台事件翻译成语义标签（`poke`、`reaction`、
+  `notice` …），换个平台只要标签名一样，策略照旧生效。`events` 里也可以写 `qq.*` 匹配该平台全部事件。
 - **私聊建议只留 `at_mention`/`reply`**（示例配置就是这么写的），不然对方每句话都叫醒；
 - `accumulate` 调小反应快但费 token，调大省钱但「攒话」；
 - 两个会话订同一个群完全合法（比如一个主会话 + 一个备用），各自的水位互不干扰。

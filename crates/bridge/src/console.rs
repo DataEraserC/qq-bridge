@@ -242,7 +242,10 @@ impl<S: Store + Send + 'static> Console<S> {
                         "name_mention": sub.wake.name_mention,
                         "names": sub.wake.names,
                         "accumulate": sub.wake.accumulate,
-                        "poke": sub.wake.poke,
+                        // 「被拍醒」是旧开关：现在等价于没有把 poke 放进忽略标签。
+                        "poke": !sub.wake.ignore_event_tags.iter().any(|tag| tag == "poke"),
+                        "event_tags": sub.wake.event_tags,
+                        "ignore_event_tags": sub.wake.ignore_event_tags,
                         "events": sub.wake.events,
                         "keywords": sub.wake.keywords,
                         "ignore_speakers": sub.wake.ignore_speakers,

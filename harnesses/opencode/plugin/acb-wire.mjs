@@ -8,7 +8,7 @@
 import net from "node:net"
 
 /// 协议版本。和 `acb_proto::frame::PROTOCOL_VERSION` 必须一致。
-export const PROTOCOL_VERSION = 5
+export const PROTOCOL_VERSION = 6
 
 const MAX_FRAME_BYTES = 1024 * 1024
 const HANDSHAKE_TIMEOUT_MS = 10_000
@@ -376,7 +376,12 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
     const role = roleLabel(record.sender.role)
     if (role) marks.push(role)
     if (record.kind?.kind === "event") {
-      marks.push(`事件 ${record.kind.event}`)
+      // 事件带跨平台语义标签（poke / reaction / notice …）：标签是配置唤醒策略用的，
+      // 也给模型一个「这大概是什么事」的提示。
+      const tags = record.kind.tags ?? []
+      marks.push(
+        tags.length ? `事件 ${record.kind.event}（标签 ${tags.join("、")}）` : `事件 ${record.kind.event}`,
+      )
     }
     if (record.at_self) marks.push("冲你来的")
     // 引用我发的某条消息 = 在跟我说，但不是 @。分两个词，模型才知道对方是在追问哪件事。

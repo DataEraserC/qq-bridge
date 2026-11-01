@@ -231,6 +231,57 @@ fn events_keep_their_type() {
 }
 
 #[test]
+fn event_meta_survives_a_restart() {
+    let db = TempDb::new("event-meta");
+    let qq = room("qq:1");
+
+    {
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
+        store
+            .append(
+                RecordDraft::event(
+                    qq.clone(),
+                    Sender {
+                        id: "1".into(),
+                        name: "老王".into(),
+                        role: None,
+                    },
+                    AT,
+                    "poke",
+                    vec![Element::text("[拍了拍我]")],
+                    true,
+                )
+                .with_event_meta(
+                    vec!["poke".into(), "notice".into()],
+                    Some(serde_json::json!({ "notice_type": "notify", "sub_type": "poke" })),
+                    Some("[拍了拍我]".into()),
+                ),
+            )
+            .expect("可写");
+    }
+
+    let store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let back = store.since(&qq, 0, 10).expect("可读");
+    match &back[0].kind {
+        acb_proto::RecordKind::Event {
+            event,
+            tags,
+            payload,
+            summary,
+        } => {
+            assert_eq!(event, "poke");
+            assert_eq!(tags, &["poke".to_string(), "notice".to_string()]);
+            assert_eq!(
+                payload.as_ref().and_then(|value| value.get("sub_type")).and_then(|value| value.as_str()),
+                Some("poke")
+            );
+            assert_eq!(summary.as_deref(), Some("[拍了拍我]"));
+        }
+        other => panic!("应当是事件记录，实际是 {other:?}"),
+    }
+}
+
+#[test]
 fn restart_keeps_notes_with_all_their_parts() {
     let db = TempDb::new("restart-notes");
     let qq = room("qq:1");

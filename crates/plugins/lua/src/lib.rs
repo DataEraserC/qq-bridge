@@ -862,7 +862,7 @@ fn wake_options_table(lua: &Lua, options: &WakePolicy) -> mlua::Result<Table> {
     table.set("name_mention", options.name_mention)?;
     table.set("names", string_list(lua, &options.names)?)?;
     table.set("accumulate", options.accumulate)?;
-    table.set("poke", options.poke)?;
+    table.set("event_tags", options.event_tags.clone())?;
     table.set("events", string_list(lua, &options.events)?)?;
     table.set("keywords", string_list(lua, &options.keywords)?)?;
     table.set("ignore_speakers", string_list(lua, &options.ignore_speakers)?)?;
@@ -961,7 +961,7 @@ fn record_table(lua: &Lua, record: &Record) -> mlua::Result<Table> {
             table.set("kind", "message")?;
             table.set("event", Option::<String>::None)?;
         }
-        RecordKind::Event { event } => {
+        RecordKind::Event { event, .. } => {
             table.set("kind", "event")?;
             table.set("event", event.clone())?;
         }
@@ -1253,7 +1253,7 @@ fn receive_request_table(lua: &Lua, request: &ReceiveRequest<'_>) -> mlua::Resul
             table.set("kind", "message")?;
             table.set("event", Option::<String>::None)?;
         }
-        RecordKind::Event { event } => {
+        RecordKind::Event { event, .. } => {
             table.set("kind", "event")?;
             table.set("event", event.clone())?;
         }

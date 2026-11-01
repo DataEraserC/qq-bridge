@@ -391,6 +391,9 @@ mod tests {
             room: RoomId::new("demo", "group/1").expect("合法"),
             kind: RecordKind::Event {
                 event: "poke".into(),
+                tags: vec!["poke".into()],
+                payload: None,
+                summary: None,
             },
             sender: Sender {
                 id: "10001".into(),

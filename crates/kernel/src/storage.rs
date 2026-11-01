@@ -81,6 +81,9 @@ impl RecordDraft {
             room,
             kind: RecordKind::Event {
                 event: event.into(),
+                tags: Vec::new(),
+                payload: None,
+                summary: None,
             },
             sender,
             at,
@@ -89,6 +92,28 @@ impl RecordDraft {
             platform_id: None,
             reply_to_self: false,
         }
+    }
+
+    /// 给事件补语义标签、原始载荷和一句人话。对消息记录无效果。
+    #[must_use]
+    pub fn with_event_meta(
+        mut self,
+        tags: Vec<String>,
+        payload: Option<serde_json::Value>,
+        summary: Option<String>,
+    ) -> Self {
+        if let RecordKind::Event {
+            tags: current_tags,
+            payload: current_payload,
+            summary: current_summary,
+            ..
+        } = &mut self.kind
+        {
+            *current_tags = tags;
+            *current_payload = payload;
+            *current_summary = summary;
+        }
+        self
     }
 
     /// 带上平台消息编号。适配器解析消息时填，用来反查「被引用的是谁」。

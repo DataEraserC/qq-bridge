@@ -45,8 +45,12 @@ fn example_config_demonstrates_per_subscription_wake_rules() {
         .find(|subscription| subscription.room.key().starts_with("private/"))
         .expect("应当有私聊订阅");
 
-    assert!(group.wake.poke, "群里被拍要醒");
-    assert!(!private.wake.poke, "私聊那边被拍不醒");
+    assert!(group.wake.ignore_event_tags.is_empty(), "群里被拍要醒");
+    assert_eq!(
+        private.wake.ignore_event_tags,
+        vec!["poke".to_string()],
+        "私聊那边 poke = false，不因被拍而醒"
+    );
     assert_ne!(
         group.wake.accumulate, private.wake.accumulate,
         "两个房间的攒条阈值可以不同"

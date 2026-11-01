@@ -19,7 +19,9 @@ use crate::ticket::Ticket;
 /// 4：加控制面——`control`（桥→harness 发指令）和 `control_result`（harness 回报），
 /// 供桥侧统一控制台触达 harness 内部（ADR-0018）。
 /// 5：`delivery` 增加可选 `wake_reason`，让 agent 知道「这次为什么醒」。
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6：事件记录带 `tags` / `payload` / `summary`——平台事件不再只有一个类型名，
+///    agent 和唤醒策略都能看到跨平台语义标签（`RecordKind::Event` 扩字段）。
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 单帧上限：1 MiB。超了直接断连，不做截断。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;

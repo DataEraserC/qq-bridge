@@ -144,8 +144,8 @@ provider = "vendor.wake"
 
 轮次开头也会带 `wake_reason`：内置/trusted/动态库 wake 策略命中时给出具体原因
 （如「有新消息（@ 了我）」），agent 不用猜自己为什么被叫醒。Lua 脚本可以返回
-`{ decision = "wake", reason = "..." }` 表；只返回布尔/字符串时原因为空。协议版本
-因此升到 5。
+`{ decision = "wake", reason = "..." }` 表；只返回布尔/字符串时原因为空（协议版本 5）。
+事件记录扩了 `tags` / `payload` / `summary` 后，协议版本升到 6。
 
 ## 事件怎么映射
 
@@ -153,14 +153,16 @@ provider = "vendor.wake"
 |-------------|----------|------|
 | `post_type=message`，`message_type=group` | 一条消息，房间 `qq:group/<群号>`（连接名是 `qq` 时）| 发送者名字优先用群名片，其次昵称 |
 | `post_type=message`，`message_type=private` | 一条消息，房间 `qq:private/<号>`（同理） | |
-| `post_type=notice`，`notice_type=notify`，`sub_type=poke` | 平台事件 `poke`，正文「[拍了拍我]」 | 拍的是我则标记「冲我来」，唤醒策略据此判定 |
-| 其它 `notice` | 平台事件，事件类型就是 `notice_type` | 进退群、禁言、撤回等，正文是一句人话 |
-| `post_type=request` | 平台事件 `request_<类型>` | 加好友、加群邀请 |
+| `post_type=notice`，`notice_type=notify`，`sub_type=poke` | 平台事件 `poke`，tags `["poke", "notice"]`，payload 原始事件，正文「[拍了拍我]」 | 拍的是我则标记「冲我来」，唤醒策略据此判定 |
+| 其它 `notice` | 平台事件（事件类型就是 `notice_type`），tags `["notice", notice_type]` | 进退群、禁言、撤回等，正文是一句人话，原始事件进 payload |
+| `post_type=request` | 平台事件 `request_<类型>`，tags `["request", request_type]` | 加好友、加群邀请 |
 | `post_type=meta_event` | **不记** | 心跳每几秒一次，记下来只会把流水撑爆 |
 | `post_type=message_sent` | **不记** | 自己发出消息的回执，桥在发送时已经记过 |
 
 消息、拍一拍、其它事件走的是同一条路（ADR-0005）：都变成一条记录，交给桥决定要不要
-算未读、要不要叫醒。拍一拍没有特殊逻辑。
+算未读、要不要叫醒。core 不认识平台事件名——适配器给事件打 `tags`，唤醒策略按
+`event_tags` 匹配；要精确到平台事件名就写 `events = ["qq.poke"]`，带前缀的名字必须
+属于该房间的连接平台（`qq.*` 匹配整个平台），配错在启动时就报错。
 
 ## 内容元素怎么翻译
 

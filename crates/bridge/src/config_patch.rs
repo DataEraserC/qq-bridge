@@ -465,7 +465,8 @@ fn fill_wake(
                 }
                 _ => return Err("wake.accumulate 要是数字或 null".into()),
             },
-            "names" | "events" | "keywords" | "ignore_speakers" => match val {
+            "names" | "events" | "event_tags" | "ignore_event_tags" | "keywords"
+            | "ignore_speakers" => match val {
                 serde_json::Value::Null => {
                     wake_table.remove(key.as_str());
                 }

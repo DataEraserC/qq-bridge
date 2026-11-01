@@ -551,7 +551,7 @@ fn wake_options(policy: &WakePolicy) -> Value {
         "name_mention": policy.name_mention,
         "names": policy.names,
         "accumulate": policy.accumulate,
-        "poke": policy.poke,
+        "event_tags": policy.event_tags,
         "events": policy.events,
         "keywords": policy.keywords,
         "ignore_speakers": policy.ignore_speakers,

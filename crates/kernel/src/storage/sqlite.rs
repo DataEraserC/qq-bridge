@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use acb_proto::{Element, Record, RecordKind, RoomId, Sender, SenderRole};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use super::{
     Cursor, Deliveries, FEEDBACK_CAP, Feedback, FeedbackDraft, Feedbacks, MIN_KEPT, Note, NoteKey,
@@ -30,7 +31,8 @@ use super::{
 /// 5 → 6：`records` 加 `sender_role` 列——发送者身份（系统管理员/群主/群管理员），
 ///         适配器判得出来才填，判不出留空。
 /// 6 → 7：加 `feedback` 表——agent 的反馈通道（ADR-0021）。新表由建表语句建，不用搬数据。
-pub const SCHEMA_VERSION: i64 = 7;
+/// 7 → 8：事件记录加 `event_meta` JSON（tags / payload / summary），老记录回填空值。
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -54,6 +56,7 @@ CREATE TABLE IF NOT EXISTS records (
     reply_to_self INTEGER NOT NULL DEFAULT 0, -- 0 / 1，引用的是我发的消息
     platform_id TEXT,               -- 平台自己的消息编号，反查引用对象用
     elements    TEXT    NOT NULL,   -- 内容元素的 JSON 数组
+    event_meta  TEXT,               -- 仅 kind = event：{tags, payload, summary} JSON
     PRIMARY KEY (connection, room_key, record_id)
 );
 
@@ -275,6 +278,11 @@ impl SqliteStore {
             self.add_column_if_missing("records", "sender_role", "TEXT")?;
         }
 
+        // 7 → 8：事件语义标签 / 原始载荷 / 人话摘要。老记录没有就留空。
+        if version < 8 {
+            self.add_column_if_missing("records", "event_meta", "TEXT")?;
+        }
+
         self.conn
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -376,9 +384,25 @@ fn io_error(error: rusqlite::Error) -> StorageError {
 
 impl Transcript for SqliteStore {
     fn append(&mut self, draft: RecordDraft) -> Result<Record, StorageError> {
-        let (kind, event) = match &draft.kind {
-            RecordKind::Message => ("message", None),
-            RecordKind::Event { event } => ("event", Some(event.clone())),
+        let (kind, event, event_meta) = match &draft.kind {
+            RecordKind::Message => ("message", None, None),
+            RecordKind::Event {
+                event,
+                tags,
+                payload,
+                summary,
+            } => (
+                "event",
+                Some(event.clone()),
+                Some(
+                    serde_json::to_string(&StoredEventMeta {
+                        tags: tags.clone(),
+                        payload: payload.clone(),
+                        summary: summary.clone(),
+                    })
+                    .map_err(|error| backend(format!("事件元数据存不进库：{error}")))?,
+                ),
+            ),
         };
         let elements = serde_json::to_string(&draft.elements)
             .map_err(|error| backend(format!("内容元素存不进库：{error}")))?;
@@ -402,8 +426,8 @@ impl Transcript for SqliteStore {
             .execute(
                 "INSERT INTO records
                  (connection, room_key, room_json, record_id, kind, event, sender_id, sender_name,
-                  sender_role, at, at_self, reply_to_self, platform_id, elements)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  sender_role, at, at_self, reply_to_self, platform_id, elements, event_meta)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     draft.room.connection,
                     draft.room.key(),
@@ -419,6 +443,7 @@ impl Transcript for SqliteStore {
                     if draft.reply_to_self { 1 } else { 0 },
                     draft.platform_id,
                     elements,
+                    event_meta,
                 ],
             )
             .map_err(io_error)?;
@@ -446,7 +471,7 @@ impl Transcript for SqliteStore {
             .conn
             .prepare(
                 "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
-                        reply_to_self, platform_id, elements
+                        reply_to_self, platform_id, elements, event_meta
                  FROM records
                  WHERE connection = ?1 AND room_key = ?2 AND record_id > ?3
                  ORDER BY record_id
@@ -470,6 +495,7 @@ impl Transcript for SqliteStore {
                         reply_to_self: row.get::<_, i64>(8)? != 0,
                         platform_id: row.get(9)?,
                         elements: row.get(10)?,
+                        event_meta: row.get(11)?,
                     })
                 },
             )
@@ -544,7 +570,7 @@ impl Transcript for SqliteStore {
                 // 于是引用一条很老的消息时要一条条往回扫。这里相等条件命中的通常只有
                 // 一行，多一次微小的排序换「不扫全房间」是划算的。
                 "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
-                        reply_to_self, platform_id, elements
+                        reply_to_self, platform_id, elements, event_meta
                  FROM records INDEXED BY records_platform
                  WHERE connection = ?1 AND room_key = ?2 AND platform_id = ?3
                  ORDER BY record_id DESC
@@ -563,6 +589,7 @@ impl Transcript for SqliteStore {
                         reply_to_self: row.get::<_, i64>(8)? != 0,
                         platform_id: row.get(9)?,
                         elements: row.get(10)?,
+                        event_meta: row.get(11)?,
                     })
                 },
             )
@@ -648,6 +675,17 @@ fn role_from_str(text: &str) -> Option<SenderRole> {
     }
 }
 
+/// 事件记录附加的语义信息（`event_meta` 列）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StoredEventMeta {
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+}
+
 /// 从库里读出来的一行，还没变回 [`Record`]。
 struct RawRow {
     id: u64,
@@ -661,15 +699,28 @@ struct RawRow {
     reply_to_self: bool,
     platform_id: Option<String>,
     elements: String,
+    event_meta: Option<String>,
 }
 
 impl RawRow {
     fn into_record(self, room: &RoomId) -> Result<Record, StorageError> {
         let kind = match self.kind.as_str() {
             "message" => RecordKind::Message,
-            "event" => RecordKind::Event {
-                event: self.event.unwrap_or_default(),
-            },
+            "event" => {
+                let meta: StoredEventMeta = self
+                    .event_meta
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| backend(format!("事件元数据读不出来：{error}")))?
+                    .unwrap_or_default();
+                RecordKind::Event {
+                    event: self.event.unwrap_or_default(),
+                    tags: meta.tags,
+                    payload: meta.payload,
+                    summary: meta.summary,
+                }
+            }
             other => return Err(backend(format!("库里有不认识的记录种类：{other}"))),
         };
         let elements: Vec<Element> = serde_json::from_str(&self.elements)

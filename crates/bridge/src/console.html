@@ -195,6 +195,7 @@ function wakeText(w) {
   if (w.name_mention && (w.names||[]).length) parts.push("叫名字(" + w.names.join("/") + ")");
   if (w.poke) parts.push("拍我");
   if (w.accumulate) parts.push("攒" + w.accumulate + "条");
+  if ((w.event_tags||[]).length) parts.push("标签:" + w.event_tags.join("/"));
   if ((w.events||[]).length) parts.push("事件:" + w.events.join("/"));
   if ((w.keywords||[]).length) parts.push("关键词:" + w.keywords.join("/"));
   if ((w.ignore_speakers||[]).length) parts.push("无视:" + w.ignore_speakers.join("/"));
@@ -384,7 +385,8 @@ const wakeFormHtml = (w) => `
     <input type="text" id="w-names" placeholder="名字列表，逗号分隔" value="${esc((w?.names||[]).join(", "))}"></div>
   <div class="form-row"><label>攒条数</label><input type="text" id="w-acc" placeholder="不按条数就留空" value="${w?.accumulate ?? ""}" style="width:80px"></div>
   <div class="form-row"><label>被拍醒</label><input type="checkbox" id="w-poke" ${w?.poke ? "checked" : ""}></div>
-  <div class="form-row"><label>额外事件</label><input type="text" id="w-events" placeholder="事件类型，逗号分隔" value="${esc((w?.events||[]).join(", "))}"></div>
+  <div class="form-row"><label>事件标签</label><input type="text" id="w-etags" placeholder="跨平台语义标签，逗号分隔" value="${esc((w?.event_tags||[]).join(", "))}"></div>
+  <div class="form-row"><label>额外事件</label><input type="text" id="w-events" placeholder="事件类型（可写 qq.poke / qq.*），逗号分隔" value="${esc((w?.events||[]).join(", "))}"></div>
   <div class="form-row"><label>关键词</label><input type="text" id="w-kw" placeholder="命中就醒，逗号分隔" value="${esc((w?.keywords||[]).join(", "))}"></div>
   <div class="form-row"><label>无视这些人</label><input type="text" id="w-ign" placeholder="发送者 id，逗号分隔" value="${esc((w?.ignore_speakers||[]).join(", "))}"></div>`;
 
@@ -398,7 +400,7 @@ function wakeOpsFromForm(session, room, connection) {
       at_mention: chk("w-at"), reply: chk("w-reply"),
       name_mention: chk("w-nm"), names: csv(val("w-names")),
       accumulate: acc === "" ? null : Number(acc),
-      poke: chk("w-poke"), events: csv(val("w-events")),
+      poke: chk("w-poke"), event_tags: csv(val("w-etags")), events: csv(val("w-events")),
       keywords: csv(val("w-kw")), ignore_speakers: csv(val("w-ign")),
     },
   }];

@@ -470,6 +470,8 @@ impl WakeProvider for DefaultWakeProvider {
             at_self: context.at_self,
             reply_to_self: context.reply_to_self,
             event: context.event,
+            platform: context.platform,
+            tags: context.tags,
             unread: context.unread,
         };
         options.decide_with_reason(&input)

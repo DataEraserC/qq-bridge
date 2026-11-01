@@ -114,6 +114,17 @@ InboundEvent:
   - 配置表 `[[adapters]]` 更名为 `[[plugins]]`，同一份清单可以装适配器和策略插件。wake 只支持动态库载体：策略判定在 core 的 ingest 路径里，外置进程会在 core 锁内做 I/O，违反 ADR-0027 的队列原则。
   - conformance 测试用 wake fixture cdylib 真加载并验证 `at_self` / 关键词判定。
 - **尚未做**：access 等其它策略扩展点的动态库载体。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
+- **Phase 4 P5（2026-11-01，事件一等公民）**：平台事件不再只有一个类型名。
+  - `RecordKind::Event` 扩 `tags` / `payload` / `summary`；SQLite `SCHEMA_VERSION` 7 → 8 加
+    `event_meta` 列，老记录回填空值。协议版本 5 → 6。
+  - `WakePolicy` 去掉 QQ 专用的 `poke` 布尔：`event_tags` 按跨平台语义标签匹配，
+    `events` 支持裸事件名、`qq.poke` 和 `qq.*`；`poke = true/false` 作为旧语法糖保留
+    （false 转成 `ignore_event_tags` 里的 `poke`）。默认「冲我来的事件」（`at_self`）照旧醒。
+  - 唤醒事件带平台前缀时按**房间所属连接**的平台校验（`ConfigError::BadWakeEvent`）；
+    每个 `[[sessions.subscriptions]]` 各自一份 `wake`，QQ 房间和 Discord 房间可以各写各的事件名。
+  - `get_platform_events` 的 kind 输出带 `tags` / `payload` / `summary`；OneBot 的
+    poke / notice / request 都补齐元数据。core 仍然没有 `poke` / `notice_type` 的 match 分支，
+    事件名只是字符串匹配，平台语义由适配器打的标签承载。
 
 ## 参考
 

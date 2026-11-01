@@ -180,7 +180,7 @@ test("一轮摊成给模型看的文本", () => {
         {
           id: 13,
           room: { connection: "qq", path: ["group", "158296748"] },
-          kind: { kind: "event", event: "poke" },
+          kind: { kind: "event", event: "poke", tags: ["poke", "notice"], summary: "[拍了拍我]" },
           sender: { id: "10002", name: "小明" },
           at: Date.now(),
           elements: [{ type: "text", text: "[拍了拍我]" }],
@@ -197,7 +197,7 @@ test("一轮摊成给模型看的文本", () => {
   assert.match(text, /老王\(10001\)/)
   assert.match(text, /冲你来的/)
   assert.match(text, /在吗/)
-  assert.match(text, /事件 poke/)
+  assert.match(text, /事件 poke（标签 poke、notice）/)
   assert.match(text, /第 2 次投递/)
   assert.match(text, /ack_messages/)
 })
@@ -360,7 +360,7 @@ test("事件记录里的原始载荷不摊开，只给流水编号让 agent 自�
   const record = {
     id: 87,
     room: { connection: "qq", path: ["group", "158296748"] },
-    kind: { kind: "event", event: "group_msg_emoji_like" },
+    kind: { kind: "event", event: "group_msg_emoji_like", tags: ["notice", "reaction"] },
     sender: { id: "10002", name: "小明" },
     at: Date.now(),
     elements: [

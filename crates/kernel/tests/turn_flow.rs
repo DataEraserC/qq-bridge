@@ -399,6 +399,11 @@ fn poke(room: &str, at_self: bool) -> RecordDraft {
         vec![Element::text("[拍了拍我]")],
         at_self,
     )
+    .with_event_meta(
+        vec!["poke".to_owned(), "notice".to_owned()],
+        Some(json!({ "post_type": "notice", "sub_type": "poke" })),
+        Some("[拍了拍我]".to_owned()),
+    )
 }
 
 fn cursor(session: &str, room: &str) -> Cursor {
@@ -1042,6 +1047,9 @@ fn history_and_events_read_from_the_transcript() {
     let events = events["events"].as_array().expect("是数组");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["kind"]["event"], "poke");
+    assert_eq!(events[0]["kind"]["tags"], json!(["poke", "notice"]));
+    assert_eq!(events[0]["kind"]["summary"], "[拍了拍我]");
+    assert_eq!(events[0]["kind"]["payload"]["sub_type"], "poke");
 
     let rooms = bridge
         .tool_call(&ticket, &sessions(), "list_rooms", json!({}))

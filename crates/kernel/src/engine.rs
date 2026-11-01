@@ -540,8 +540,12 @@ impl<S: Store> Bridge<S> {
 
         let record = self.store.append(draft)?;
         let event = match &record.kind {
-            RecordKind::Event { event } => Some(event.as_str()),
+            RecordKind::Event { event, .. } => Some(event.as_str()),
             RecordKind::Message => None,
+        };
+        let tags: Vec<&str> = match &record.kind {
+            RecordKind::Event { tags, .. } => tags.iter().map(String::as_str).collect(),
+            RecordKind::Message => Vec::new(),
         };
 
         let mut woke = Vec::new();
@@ -567,8 +571,7 @@ impl<S: Store> Bridge<S> {
                 at_self: record.at_self,
                 reply_to_self: record.reply_to_self,
                 event,
-                // 平台适配器还没有把 hints/tags 接进来；Phase 1 先给空切片。
-                tags: &[],
+                tags: &tags,
                 unread: pending,
                 now: now_millis(),
             };
@@ -3123,7 +3126,17 @@ fn record_columns(record: &Record, columns: &[&str]) -> Value {
             "room" => json!(record.room),
             "kind" => match &record.kind {
                 RecordKind::Message => json!("message"),
-                RecordKind::Event { event } => json!({ "event": event }),
+                RecordKind::Event {
+                    event,
+                    tags,
+                    payload,
+                    summary,
+                } => json!({
+                    "event": event,
+                    "tags": tags,
+                    "payload": payload,
+                    "summary": summary,
+                }),
             },
             "sender" => json!(record.sender),
             "at" => json!(record.at),
