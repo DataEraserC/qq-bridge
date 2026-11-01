@@ -48,7 +48,7 @@
   两个方法、都带默认实现，所以现有测试 mock 一个都没改。
 - **库 schema 6**（`state/acb.db`），records 有 `sender_role` 列。
 - **真机在跑**：桥 + 两个 dsh driver 进程都在运行，会话复用正常。
-- **工具面 24 个**：原 22 个 + `platform_methods` / `platform_call`（ADR-0020）。两个 harness 现在共用
+- **工具面 25 个**：原 22 个 + `platform_methods` / `platform_call`（ADR-0020）+ `describe_plugins`（ADR-0026 Phase 6）。两个 harness 现在共用
   `harnesses/shared/tools.mjs` 这一份定义（opencode 原来手抄了一份副本，已删——见第 3 节）。
 
 ### 真机配置（`config.toml`，已被 .gitignore 忽略）

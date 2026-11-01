@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use acb_kernel::{
     Capability, ExtensionPoint, Health, LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin,
-    PluginError, PluginLoader, PluginManager, ProviderDescriptor, ProviderId, ProviderInstance,
+    PluginError, PluginLoader, PluginManager, PluginMetadata, PluginSource, ProviderDescriptor,
+    ProviderId, ProviderInstance,
     ProviderOptions, WakeContext, WakeDecision, WakePolicy, WakeProvider, PLUGIN_API_VERSION,
 };
 
@@ -38,6 +39,22 @@ impl WakeProvider for AccumulateOnlyWake {
     }
 }
 
+fn trusted_metadata() -> PluginMetadata {
+    PluginMetadata {
+        title: Some("trusted 示例 manager".into()),
+        summary: Some("树外 native manager：只按攒条数唤醒，演示 provider 注册".into()),
+        description: None,
+        tags: Vec::new().into(),
+        effects: vec![
+            acb_kernel::PluginEffect::MayWake,
+            acb_kernel::PluginEffect::MayStaySilent,
+        ]
+        .into(),
+        docs_url: None,
+        options_schema: None,
+    }
+}
+
 /// 树外 manager 本体。它只声明一个 wake provider，生命周期都用默认真实现。
 #[derive(Debug, Default)]
 pub struct TrustedManager;
@@ -49,6 +66,7 @@ impl ManagerPlugin for TrustedManager {
             PLUGIN_API_VERSION,
             vec![Capability::WakeDecision],
         )
+        .with_metadata(trusted_metadata())
     }
 
     fn descriptors(&self) -> Vec<ProviderDescriptor> {
@@ -57,7 +75,9 @@ impl ManagerPlugin for TrustedManager {
             ExtensionPoint::Wake,
             PLUGIN_API_VERSION,
             vec![Capability::WakeDecision],
-        )]
+        )
+        .with_metadata(trusted_metadata())
+        .with_source(PluginSource::Trusted)]
     }
 
     fn instantiate(

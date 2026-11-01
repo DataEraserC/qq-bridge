@@ -58,6 +58,7 @@
 | `get_notes` / `set_note` / `del_note` | room, kind, key, value | 房间级笔记（term / member / topic） |
 | `get_platform_events` | room, limit, offset | 查平台事件，带 `total` / `has_more` |
 | `platform_methods` | group, tag, query | 平台能力目录：不给条件给清单，给条件连参数表（JSON Schema）+ 可照抄的 `example`（ADR-0024） |
+| `describe_plugins` | scope, extension | 插件/策略目录：默认本会话实际生效的 provider 和适配器，`scope=global` 看整个 Root；只读（ADR-0026 Phase 6） |
 | `platform_call` | method, params, limit, offset, where, fields, order_by, group_by | 调平台方法。分页与查询都在桥这层做（ADR-0022 / 0023）；合并转发在适配器里递归摊平（ADR-0024） |
 | `report_feedback` | text, refs, count, kind, severity, suggestion | 写一条反馈（ADR-0021）：哪一步卡住、出处编号、撞了几次 |
 | `ack_messages` | ids | 确认消息处理完毕，水位前推。**幂等**；未确认的下轮重投（ADR-0010 修订） |

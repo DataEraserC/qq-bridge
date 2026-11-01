@@ -34,9 +34,10 @@ use acb_kernel::{
     AdapterError, AdapterFactory, AdapterHost, AdapterInstance, AdapterManifest, CallError,
     CallOutcome, Capability, Connection, Element, EventQueue, ExtensionPoint, Health, LoaderKind,
     LoaderManifest, ManagerManifest, ManagerPlugin, MethodSpec, Outbound, OutboundError,
-    OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager, ProviderDescriptor,
-    ProviderId, ProviderInstance, ProviderOptions, RoomId, Sent, WakeContext, WakeDecision,
-    WakePolicy, WakeProvider, PLUGIN_API_VERSION, validate_manifest,
+    OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager, PluginMetadata,
+    PluginSource, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, RoomId,
+    Sent, WakeContext, WakeDecision, WakePolicy, WakeProvider, PLUGIN_API_VERSION,
+    validate_manifest,
 };
 use libloading::Library;
 use serde_json::{Value, json};
@@ -73,7 +74,7 @@ impl PluginLoader for DynamicLoader {
                 })?;
             match loaded {
                 LoadedPlugin::Adapter(factory) => manager
-                    .register_adapter(Arc::new(factory))
+                    .register_adapter_with_source(Arc::new(factory), PluginSource::Dynamic)
                     .map_err(|error| PluginError::Loader(error.to_string()))?,
                 LoadedPlugin::Wake(wake) => manager
                     .install_manager(Arc::new(wake))
@@ -149,12 +150,15 @@ impl LoadedPlugin {
                         wire.api_version
                     ));
                 }
+                let metadata = PluginMetadata::try_from(wire.metadata)
+                    .map_err(|detail| format!("metadata 不合法：{detail}"))?;
                 Ok(Self::Wake(DylibWakeManager::new(
                     Arc::new(library),
                     table,
                     provider,
                     wire.platform,
                     wire.id,
+                    metadata,
                 )))
             }
             other => Err(format!("不认识的插件扩展点：{other}")),
@@ -289,6 +293,7 @@ struct DylibWakeManager {
     provider: ProviderId,
     platform: String,
     plugin_id: String,
+    metadata: PluginMetadata,
     cached: Mutex<Option<Arc<DylibWakeProvider>>>,
 }
 
@@ -299,6 +304,7 @@ impl DylibWakeManager {
         provider: ProviderId,
         platform: String,
         plugin_id: String,
+        metadata: PluginMetadata,
     ) -> Self {
         Self {
             library,
@@ -306,6 +312,7 @@ impl DylibWakeManager {
             provider,
             platform,
             plugin_id,
+            metadata,
             cached: Mutex::new(None),
         }
     }
@@ -318,6 +325,7 @@ impl ManagerPlugin for DylibWakeManager {
             PLUGIN_API_VERSION,
             vec![Capability::WakeDecision],
         )
+        .with_metadata(self.metadata.clone())
     }
 
     fn descriptors(&self) -> Vec<ProviderDescriptor> {
@@ -326,7 +334,9 @@ impl ManagerPlugin for DylibWakeManager {
             ExtensionPoint::Wake,
             PLUGIN_API_VERSION,
             vec![Capability::WakeDecision],
-        )]
+        )
+        .with_metadata(self.metadata.clone())
+        .with_source(PluginSource::Dynamic)]
     }
 
     fn instantiate(

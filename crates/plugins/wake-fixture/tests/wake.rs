@@ -2,7 +2,8 @@
 
 use acb_adapter_dynamic::DynamicLoader;
 use acb_kernel::{
-    PluginConfig, PluginManager, ProviderId, RoomId, WakeContext, WakeDecision, WakePolicy,
+    PluginConfig, PluginManager, PluginSource, ProviderId, RoomId, WakeContext, WakeDecision,
+    WakePolicy,
 };
 
 fn fixture_path() -> std::path::PathBuf {
@@ -51,6 +52,18 @@ fn wake_provider_uses_the_shared_wire() {
         .expect("能装载 wake 插件");
 
     let id = ProviderId::parse("fixture.wake").expect("provider id 合法");
+    let info = plugins
+        .catalog()
+        .into_iter()
+        .find(|info| info.id == id)
+        .expect("目录里有 wake provider");
+    assert_eq!(info.metadata.title.as_deref(), Some("wake 夹具"));
+    assert_eq!(info.source, PluginSource::Dynamic);
+    assert_eq!(
+        info.metadata.effects.iter().map(|effect| effect.as_str()).collect::<Vec<_>>(),
+        vec!["may_wake", "may_stay_silent"]
+    );
+
     let provider = plugins
         .resolve_wake(&id, &WakePolicy::default())
         .expect("能解析 wake provider");

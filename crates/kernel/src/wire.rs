@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 use acb_adapter_api::{
     WireConnection, WireError, WireManifest, WireMethodSpec, WireOutgoingKind,
-    WireOutgoingRecord, WireParamSpec, WireRecord, WireTargetSpec,
+    WireOutgoingRecord, WireParamSpec, WirePluginMetadata, WireRecord, WireTargetSpec,
 };
 
 use crate::adapter::{AdapterCapability, AdapterManifest};
 use crate::config::Connection;
+use crate::plugin_meta::{PluginEffect, PluginMetadata};
 use crate::outbound::{
     CallError, Effect, MethodSpec, OutboundError, OutgoingKind, OutgoingRecord, ParamSpec,
     ParamType, RecordMode, Risk, Scope, TargetRole, TargetSpec,
@@ -42,6 +43,8 @@ impl TryFrom<WireManifest> for AdapterManifest {
             .into_iter()
             .map(Cow::Owned)
             .collect::<Vec<_>>();
+        let metadata =
+            PluginMetadata::try_from(manifest.metadata).map_err(|detail| format!("metadata：{detail}"))?;
         Ok(AdapterManifest {
             id: Cow::Owned(manifest.id),
             platform: Cow::Owned(manifest.platform),
@@ -49,6 +52,35 @@ impl TryFrom<WireManifest> for AdapterManifest {
             transports: transports.into(),
             api_version: manifest.api_version,
             capabilities: capabilities.into(),
+            metadata,
+        })
+    }
+}
+
+impl TryFrom<WirePluginMetadata> for PluginMetadata {
+    type Error = String;
+
+    fn try_from(metadata: WirePluginMetadata) -> Result<Self, Self::Error> {
+        let mut effects = Vec::with_capacity(metadata.effects.len());
+        for effect in &metadata.effects {
+            effects.push(
+                PluginEffect::parse(effect)
+                    .ok_or_else(|| format!("不认识的插件效果：{effect}"))?,
+            );
+        }
+        Ok(Self {
+            title: metadata.title.map(Cow::Owned),
+            summary: metadata.summary.map(Cow::Owned),
+            description: metadata.description.map(Cow::Owned),
+            tags: metadata
+                .tags
+                .into_iter()
+                .map(Cow::Owned)
+                .collect::<Vec<_>>()
+                .into(),
+            effects: effects.into(),
+            docs_url: metadata.docs_url.map(Cow::Owned),
+            options_schema: metadata.options_schema,
         })
     }
 }
@@ -409,6 +441,7 @@ mod tests {
             api_version: 1,
             capabilities: vec!["receive_events".into(), "send".into()],
             extension: "platform_adapter".into(),
+            metadata: acb_adapter_api::WirePluginMetadata::default(),
         })
         .expect("能转换");
         assert_eq!(manifest.kind, "demo");

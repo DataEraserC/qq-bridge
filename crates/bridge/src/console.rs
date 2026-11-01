@@ -172,6 +172,14 @@ impl<S: Store + Send + 'static> Console<S> {
         match (method, path) {
             ("GET", "/api/status") => (200, self.status()),
             ("GET", "/api/sessions") => (200, self.sessions()),
+            // 插件目录：只读，描述由插件作者声明；不暴露实际 options / 路径 / token。
+            ("GET", "/api/plugins") => {
+                let plugins = lock(&self.bridge).plugin_catalog();
+                (
+                    200,
+                    json!({ "count": plugins.len(), "plugins": plugins }).to_string(),
+                )
+            }
             ("GET", "/api/feedback") => self.feedback(query),
             ("POST", p) if p.starts_with("/api/feedback/") => self.set_feedback(p, body),
             ("POST", p) if p.starts_with("/api/session/") => self.reset(p),

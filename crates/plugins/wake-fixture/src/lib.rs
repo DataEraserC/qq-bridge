@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, HostV1};
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireError, WireInstanceConfig, WireManifest, WireResult,
-    WireWakeRequest, decode_line, encode_line,
+    AdapterMessage, CoreMessage, WireError, WireInstanceConfig, WireManifest, WirePluginMetadata,
+    WireResult, WireWakeRequest, decode_line, encode_line,
 };
 
 struct Fixture {
@@ -41,6 +41,15 @@ unsafe extern "C" fn wake_manifest() -> *mut c_char {
         api_version: 1,
         capabilities: vec!["wake_decision".into()],
         extension: "wake".into(),
+        metadata: WirePluginMetadata {
+            title: Some("wake 夹具".into()),
+            summary: Some("被 @ 或正文含 fixture 时唤醒".into()),
+            description: None,
+            tags: vec!["fixture".into(), "wake".into()],
+            effects: vec!["may_wake".into(), "may_stay_silent".into()],
+            docs_url: None,
+            options_schema: None,
+        },
     };
     let json = serde_json::to_string(&manifest).expect("manifest 可序列化");
     CString::new(json).expect("manifest 没有 NUL").into_raw()

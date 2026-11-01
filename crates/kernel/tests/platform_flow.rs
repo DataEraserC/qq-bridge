@@ -335,6 +335,69 @@ fn open_turn(bridge: &mut Bridge<MemoryStore>) -> Ticket {
 
 // ── 目录 ────────────────────────────────────────────────────────────────
 
+/// 插件目录：默认给本会话实际生效的 provider + 描述；global 给整个 Root。
+#[test]
+fn describe_plugins_shows_effective_session_providers() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let session = bridge
+        .tool_call(&ticket, &sessions(), "describe_plugins", json!({}))
+        .expect("能查插件目录");
+    assert_eq!(session["scope"], "session");
+    assert_eq!(session["session"], "main");
+    assert_eq!(session["providers"]["access"]["id"], "acb.access.subscribed");
+    assert_eq!(
+        session["providers"]["access"]["metadata"]["title"],
+        "只访问订阅房间"
+    );
+    assert_eq!(session["providers"]["delivery"]["id"], "acb.delivery.default");
+    assert_eq!(
+        session["providers"]["turn_error"]["id"],
+        "acb.turn_error.default"
+    );
+    assert_eq!(session["providers"]["receive"]["id"], "acb.receive.all");
+
+    let subscriptions = session["subscriptions"].as_array().expect("有订阅");
+    assert_eq!(subscriptions.len(), 2);
+    assert_eq!(subscriptions[0]["wake"]["id"], "acb.wake.default");
+    assert_eq!(subscriptions[0]["clock"]["id"], "acb.clock.off");
+    assert_eq!(
+        subscriptions[0]["wake"]["metadata"]["effects"][0],
+        "may_wake"
+    );
+
+    assert_eq!(session["adapter"]["kind"], "onebot11");
+    assert_eq!(session["adapter"]["method_count"], 8);
+
+    let global = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "describe_plugins",
+            json!({ "scope": "global", "extension": "wake" }),
+        )
+        .expect("能查全局目录");
+    assert_eq!(global["scope"], "global");
+    let plugins = global["plugins"].as_array().expect("有插件");
+    assert!(plugins
+        .iter()
+        .any(|plugin| plugin["id"] == "acb.wake.default"));
+    assert!(plugins
+        .iter()
+        .all(|plugin| plugin["extension"] == "wake"));
+
+    let bad_scope = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "describe_plugins",
+            json!({ "scope": "nope" }),
+        )
+        .expect_err("scope 不合法");
+    assert_eq!(bad_scope.code, ErrorCode::BadRequest);
+}
+
 /// 什么都不给：逐条清单。够模型决定调哪个，但不带参数表——带表就等于全倒出来了。
 #[test]
 fn catalog_lists_every_method_without_dumping_params() {

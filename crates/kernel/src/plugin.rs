@@ -27,6 +27,7 @@ use crate::config::{
 };
 use crate::event_queue::EventQueue;
 use crate::outbound::Sent;
+use crate::plugin_meta::{PluginEffect, PluginInfo, PluginMetadata, PluginSource};
 
 /// 插件 API 版本。provider / manager / loader 的 manifest 都要对得上。
 pub const PLUGIN_API_VERSION: u32 = 1;
@@ -239,8 +240,8 @@ impl Capability {
     }
 }
 
-/// provider 的描述。Root 用它做全局 id/版本/能力审计。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// provider 的描述。Root 用它做全局 id/版本/能力审计，也给 agent 看用途。
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub extension_point: ExtensionPoint,
@@ -248,6 +249,10 @@ pub struct ProviderDescriptor {
     pub capabilities: Vec<Capability>,
     /// 平台适配器的配置 `kind`（如 `onebot11` / `process`）；其他扩展点为 None。
     pub kind: Option<String>,
+    /// 插件作者声明的说明。
+    pub metadata: PluginMetadata,
+    /// 插件来源，由 Root 标注。
+    pub source: PluginSource,
 }
 
 impl ProviderDescriptor {
@@ -263,6 +268,8 @@ impl ProviderDescriptor {
             api_version,
             capabilities,
             kind: None,
+            metadata: PluginMetadata::EMPTY,
+            source: PluginSource::Builtin,
         }
     }
 
@@ -271,20 +278,30 @@ impl ProviderDescriptor {
         self.kind = Some(kind.into());
         self
     }
+
+    pub fn with_metadata(mut self, metadata: PluginMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_source(mut self, source: PluginSource) -> Self {
+        self.source = source;
+        self
+    }
 }
 
 /// manager 子树最多几层（Root 算第 0 层）。超过就拒绝——防止一棵树无限往下长。
 pub const MAX_MANAGER_DEPTH: usize = 4;
 
 /// 一棵 manager 子树自己的 manifest。Root 用它做 namespace、版本和能力审计。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ManagerManifest {
     pub namespace: String,
     pub api_version: u32,
     /// 子树里所有 provider 需要的能力并集。Root 要求每个 descriptor 所需能力都在这里。
     pub capabilities: Vec<Capability>,
-    /// 控制台按它生成 options 表单。Phase 3 只原样携带，不执行 schema。
-    pub options_schema: Option<Value>,
+    /// manager 自己的说明；descriptor 缺字段时由 Root 用它补全。
+    pub metadata: PluginMetadata,
 }
 
 impl ManagerManifest {
@@ -297,8 +314,13 @@ impl ManagerManifest {
             namespace: namespace.into(),
             api_version,
             capabilities,
-            options_schema: None,
+            metadata: PluginMetadata::EMPTY,
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: PluginMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -937,6 +959,22 @@ pub trait PluginLoader: Send + Sync {
     }
 }
 
+fn native_meta(
+    title: &'static str,
+    summary: &'static str,
+    effects: &[PluginEffect],
+) -> PluginMetadata {
+    PluginMetadata {
+        title: Some(title.into()),
+        summary: Some(summary.into()),
+        description: None,
+        tags: Vec::new().into(),
+        effects: effects.to_vec().into(),
+        docs_url: None,
+        options_schema: None,
+    }
+}
+
 /// 内置 loader。它不读文件，只把编译进来的 provider 注册到 Root。
 #[derive(Debug, Default)]
 pub struct NativeLoader;
@@ -964,7 +1002,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Wake,
                 PLUGIN_API_VERSION,
                 vec![Capability::WakeDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "默认唤醒",
+                "被 @、引用、点名或关键词命中时叫醒会话",
+                &[PluginEffect::MayWake, PluginEffect::MayStaySilent],
+            )),
             Arc::new(DefaultWakeProvider),
         )?;
         manager.register_access(
@@ -973,7 +1016,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Access,
                 PLUGIN_API_VERSION,
                 vec![Capability::AccessDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "只访问订阅房间",
+                "允许读写当前会话已订阅的房间；拒绝其它房间",
+                &[],
+            )),
             Arc::new(SubscribedAccessProvider),
         )?;
         manager.register_access(
@@ -982,7 +1030,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Access,
                 PLUGIN_API_VERSION,
                 vec![Capability::AccessDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "全房间访问",
+                "允许访问任意房间，不受订阅列表限制（高风险）",
+                &[],
+            )),
             Arc::new(AllRoomsAccessProvider),
         )?;
         manager.register_access(
@@ -991,7 +1044,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Access,
                 PLUGIN_API_VERSION,
                 vec![Capability::AccessDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "订阅房间内提升权限",
+                "在已订阅房间内允许破坏性操作（踢人、禁言、改群名等）",
+                &[],
+            )),
             Arc::new(ElevatedInRoomsAccessProvider),
         )?;
         manager.register_delivery(
@@ -1000,7 +1058,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Delivery,
                 PLUGIN_API_VERSION,
                 vec![Capability::DeliverPlan],
-            ),
+            )
+            .with_metadata(native_meta(
+                "默认投递",
+                "按水位顺序投递未读；不改写正文，不额外延迟",
+                &[],
+            )),
             Arc::new(DefaultDeliveryComposer),
         )?;
         manager.register_turn_error(
@@ -1009,7 +1072,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::TurnError,
                 PLUGIN_API_VERSION,
                 vec![Capability::TurnErrorDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "默认轮次错误策略",
+                "按配置动作处理轮次失败：记录、反馈或中止",
+                &[],
+            )),
             Arc::new(DefaultTurnErrorProvider),
         )?;
         manager.register_clock(
@@ -1018,7 +1086,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Clock,
                 PLUGIN_API_VERSION,
                 vec![Capability::ClockDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "关闭定时唤醒",
+                "不主动开新轮次，只由入站消息触发",
+                &[PluginEffect::MayStaySilent],
+            )),
             Arc::new(ClockOffProvider),
         )?;
         manager.register_clock(
@@ -1027,7 +1100,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Clock,
                 PLUGIN_API_VERSION,
                 vec![Capability::ClockDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "空闲定时唤醒",
+                "会话空闲一段时间后主动开新轮次",
+                &[PluginEffect::MayWake],
+            )),
             Arc::new(IntervalIdleClockProvider),
         )?;
         manager.register_receive(
@@ -1036,7 +1114,12 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Receive,
                 PLUGIN_API_VERSION,
                 vec![Capability::ReceiveDecision],
-            ),
+            )
+            .with_metadata(native_meta(
+                "接收全部入站",
+                "所有入站记录都入库",
+                &[],
+            )),
             Arc::new(AcceptAllReceiveProvider),
         )
     }
@@ -1122,6 +1205,15 @@ impl PluginManager {
     ///
     /// 适配器也走 Root 的 manifest / 版本 / 能力审计，和 provider 一样。
     pub fn register_adapter(&mut self, factory: Arc<dyn AdapterFactory>) -> Result<(), AdapterError> {
+        self.register_adapter_with_source(factory, PluginSource::Builtin)
+    }
+
+    /// 带来源注册适配器。动态库 loader 用它标注 `Dynamic`。
+    pub fn register_adapter_with_source(
+        &mut self,
+        factory: Arc<dyn AdapterFactory>,
+        source: PluginSource,
+    ) -> Result<(), AdapterError> {
         let manifest = factory.manifest();
         validate_manifest(&manifest)?;
         let kind = manifest.kind.as_ref().to_owned();
@@ -1142,10 +1234,53 @@ impl PluginManager {
                 PLUGIN_API_VERSION,
                 vec![Capability::PlatformCatalog],
             )
-            .with_kind(kind.clone()),
+            .with_kind(kind.clone())
+            .with_metadata(manifest.metadata.clone())
+            .with_source(source),
         );
         self.adapters.insert(kind, factory);
         Ok(())
+    }
+
+    /// Root 目录：所有 provider / 适配器的只读说明，按扩展点和 id 排序。
+    ///
+    /// 描述由插件作者声明，core 不靠它做行为判断；health 来自 manager 子树。
+    pub fn catalog(&self) -> Vec<PluginInfo> {
+        let mut infos: Vec<PluginInfo> = self
+            .descriptors
+            .values()
+            .map(|descriptor| {
+                let health = self
+                    .managers
+                    .get(descriptor.id.namespace())
+                    .map(|manager| manager.health())
+                    .unwrap_or(Health::Healthy);
+                PluginInfo {
+                    id: descriptor.id.clone(),
+                    extension: descriptor.extension_point,
+                    metadata: descriptor.metadata.clone(),
+                    capabilities: descriptor.capabilities.clone(),
+                    kind: descriptor.kind.clone(),
+                    source: descriptor.source,
+                    health,
+                }
+            })
+            .collect();
+        infos.sort_by(|left, right| {
+            (left.extension.as_str(), left.id.to_string())
+                .cmp(&(right.extension.as_str(), right.id.to_string()))
+        });
+        infos
+    }
+
+    /// 目录的 JSON 视图（控制台 / 测试用）。
+    pub fn catalog_json(&self) -> Vec<Value> {
+        self.catalog().iter().map(PluginInfo::to_json).collect()
+    }
+
+    /// 按 provider id 查一条目录。找不到返回 None（配置引用错误由启动校验先报）。
+    pub fn info(&self, id: &ProviderId) -> Option<PluginInfo> {
+        self.catalog().into_iter().find(|info| &info.id == id)
     }
 
     /// 按连接配置实例化适配器。先查直接注册的工厂，再按 `kind` 委托 manager 子树。
@@ -1407,7 +1542,10 @@ impl PluginManager {
             });
         }
 
-        let descriptors = manager.descriptors();
+        let mut descriptors = manager.descriptors();
+        for descriptor in &mut descriptors {
+            descriptor.metadata.merge_missing(&manifest.metadata);
+        }
         for descriptor in &descriptors {
             if descriptor.id.namespace() != namespace {
                 return Err(PluginError::Manager {

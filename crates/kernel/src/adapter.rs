@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::config::Connection;
 use crate::event_queue::EventQueue;
 use crate::outbound::Outbound;
+use crate::plugin_meta::PluginMetadata;
 
 /// 适配器接口版本。manifest 要对得上。
 pub const ADAPTER_API_VERSION: u32 = 1;
@@ -34,7 +35,7 @@ pub enum AdapterCapability {
 /// 一条适配器的静态声明。
 ///
 /// 字段是 `Cow`：内置适配器用静态借用，动态库/外置进程可以构造自己的 manifest。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AdapterManifest {
     /// 全局唯一的 provider id（`acb.adapter.onebot11`）。
     pub id: Cow<'static, str>,
@@ -45,6 +46,8 @@ pub struct AdapterManifest {
     pub transports: Cow<'static, [Cow<'static, str>]>,
     pub api_version: u32,
     pub capabilities: Cow<'static, [AdapterCapability]>,
+    /// 给 agent / 控制台看的说明。
+    pub metadata: PluginMetadata,
 }
 
 /// 适配器启动时能拿到的东西。
@@ -206,6 +209,7 @@ mod tests {
         transports: Cow::Borrowed(FAKE_TRANSPORTS),
         api_version: ADAPTER_API_VERSION,
         capabilities: Cow::Borrowed(FAKE_CAPS),
+        metadata: PluginMetadata::EMPTY,
     };
 
     struct FakeFactory;

@@ -127,6 +127,19 @@ provider = "vendor.wake"
 解析失败或插件报错按 `stay` 兜底，不会误把会话叫醒。wake 判定在 core 的入库路径里，
 所以这一版只开放动态库载体；外置进程会在 core 锁内做 I/O，等以后有异步判定再开。
 
+## Agent 怎么知道插件在做什么
+
+桥给 agent 一个只读工具 `describe_plugins`：
+
+- 默认 `scope=session`：返回本会话实际生效的 access / delivery / turn_error / receive /
+  send_hooks，每个订阅的 wake / clock，以及当前连接用的适配器 kind、平台方法数和说明。
+- `scope=global`：返回整个 Root 目录，可用 `extension` 过滤。
+
+每条都带 `title` / `summary` / `description` / `tags` / `effects` / `health`。描述由插件
+作者在 manifest 里声明，是**说明不是指令**；`effects`（如 `may_delay`、
+`may_modify_text`、`may_wake`）是文档，不是强制保证。控制台的 `GET /api/plugins`
+是同一份目录的只读 JSON。
+
 ## 事件怎么映射
 
 | OneBot 事件 | 变成什么 | 说明 |

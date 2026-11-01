@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use acb_kernel::{
     AdapterCapability, AdapterError, AdapterFactory, AdapterHost, AdapterInstance,
-    AdapterManifest, Connection, EventQueue, ADAPTER_API_VERSION,
+    AdapterManifest, Connection, EventQueue, PluginEffect, PluginMetadata, ADAPTER_API_VERSION,
 };
 
 use crate::{LinkSlot, OneBotOutbound, supervise};
@@ -28,6 +28,18 @@ pub static MANIFEST: AdapterManifest = AdapterManifest {
     transports: Cow::Borrowed(TRANSPORTS),
     api_version: ADAPTER_API_VERSION,
     capabilities: Cow::Borrowed(CAPABILITIES),
+    metadata: PluginMetadata {
+        title: Some(Cow::Borrowed("OneBot 11")),
+        summary: Some(Cow::Borrowed("QQ 群与私聊：收消息、发消息、平台方法目录")),
+        description: None,
+        tags: Cow::Borrowed(&[]),
+        effects: Cow::Borrowed(&[
+            PluginEffect::ExternalCall,
+            PluginEffect::Nondeterministic,
+        ]),
+        docs_url: None,
+        options_schema: None,
+    },
 };
 
 /// OneBot 11 的工厂。一个连接一个 `LinkSlot`，`launch` 里起守护线程。

@@ -12,8 +12,8 @@ use std::time::Duration;
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, HostV1};
 use acb_adapter_api::{
     AdapterMessage, CoreMessage, WireConnection, WireError, WireInstanceConfig, WireManifest,
-    WireMethodSpec, WireOutgoingKind, WireOutgoingRecord, WireParamSpec, WireRecord, WireResult,
-    decode_line, encode_line,
+    WireMethodSpec, WireOutgoingKind, WireOutgoingRecord, WireParamSpec, WirePluginMetadata,
+    WireRecord, WireResult, decode_line, encode_line,
 };
 use acb_proto::{Element, RecordKind, RoomId, Sender};
 use serde_json::{Value, json};
@@ -62,6 +62,15 @@ unsafe extern "C" fn fixture_manifest() -> *mut c_char {
             "catalog".into(),
         ],
         extension: "platform_adapter".into(),
+        metadata: WirePluginMetadata {
+            title: Some("动态库夹具".into()),
+            summary: Some("测试用：hello/describe/事件/发送/调用".into()),
+            description: None,
+            tags: vec!["fixture".into()],
+            effects: vec!["external_call".into()],
+            docs_url: None,
+            options_schema: None,
+        },
     };
     let json = serde_json::to_string(&manifest).expect("manifest 可序列化");
     CString::new(json)

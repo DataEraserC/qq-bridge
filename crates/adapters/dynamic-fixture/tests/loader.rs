@@ -11,7 +11,7 @@ use std::time::Duration;
 use acb_adapter_dynamic::DynamicLoader;
 use acb_kernel::{
     AdapterHost, AdapterInstance, CallError, Connection, Element, EventQueue, PluginConfig,
-    PluginManager, RoomId, Transport,
+    PluginManager, PluginSource, RoomId, Transport,
 };
 use serde_json::json;
 
@@ -80,6 +80,14 @@ fn dynamic_adapter_loads_and_speaks_the_wire_protocol() {
             kind: Some("demo".into()),
         }]))
         .expect("能装载动态库");
+
+    let info = plugins
+        .catalog()
+        .into_iter()
+        .find(|info| info.kind.as_deref() == Some("demo"))
+        .expect("目录里有动态适配器");
+    assert_eq!(info.metadata.title.as_deref(), Some("动态库夹具"));
+    assert_eq!(info.source, PluginSource::Dynamic);
 
     let (events, receiver) = EventQueue::channel();
     let instance = plugins

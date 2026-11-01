@@ -92,6 +92,30 @@ pub struct WireManifest {
     /// `platform_adapter`（默认）或 `wake`。
     #[serde(default = "default_extension")]
     pub extension: String,
+    /// 给 agent / 控制台看的说明。描述不是保证，效果由 core 审计。
+    #[serde(default)]
+    pub metadata: WirePluginMetadata,
+}
+
+/// 插件作者声明的描述；core 原样搬进 Root 目录。
+#[derive(Debug, Clone, Default, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WirePluginMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// `may_wake` / `may_stay_silent` / `may_delay` / `may_modify_text` /
+    /// `may_drop` / `external_call` / `nondeterministic`。
+    #[serde(default)]
+    pub effects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_schema: Option<Value>,
 }
 
 /// 一条连接的 wire 形状（动态库接管适配器实例化时用）。

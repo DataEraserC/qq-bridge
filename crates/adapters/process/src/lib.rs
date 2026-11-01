@@ -43,7 +43,8 @@ use acb_kernel::wire::{call_error, convert_catalog, send_error};
 use acb_kernel::{
     AdapterCapability, AdapterError, AdapterFactory, AdapterHost, AdapterInstance,
     AdapterManifest, CallError, CallOutcome, Connection, Element, EventQueue, MethodSpec,
-    Outbound, OutboundError, OutgoingRecord, RoomId, Sent, ADAPTER_API_VERSION,
+    Outbound, OutboundError, OutgoingRecord, PluginEffect, PluginMetadata, RoomId, Sent,
+    ADAPTER_API_VERSION,
 };
 
 /// 等子进程回一条动作结果的上限。
@@ -69,6 +70,18 @@ pub static MANIFEST: AdapterManifest = AdapterManifest {
     transports: Cow::Borrowed(TRANSPORTS),
     api_version: ADAPTER_API_VERSION,
     capabilities: Cow::Borrowed(CAPABILITIES),
+    metadata: PluginMetadata {
+        title: Some(Cow::Borrowed("外置进程适配器")),
+        summary: Some(Cow::Borrowed("按连接的 options 启动子进程，stdio JSON 行协议")),
+        description: None,
+        tags: Cow::Borrowed(&[]),
+        effects: Cow::Borrowed(&[
+            PluginEffect::ExternalCall,
+            PluginEffect::Nondeterministic,
+        ]),
+        docs_url: None,
+        options_schema: None,
+    },
 };
 
 /// 外置进程适配器工厂。

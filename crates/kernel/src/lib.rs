@@ -11,6 +11,7 @@ pub mod engine;
 pub mod memory;
 pub mod outbound;
 pub mod plugin;
+pub mod plugin_meta;
 pub mod query;
 pub mod relay;
 pub mod render;
@@ -25,6 +26,7 @@ pub use adapter::{
     validate_manifest,
 };
 pub use event_queue::{drain_events, EventQueue, EventReceiver};
+pub use plugin_meta::{PluginEffect, PluginInfo, PluginMetadata, PluginSource};
 pub use config::{
     AccessPolicy, ClockPolicy, Config, Connection, ConsoleConfig, DEFAULT_MAX_AGE_DAYS,
     PluginConfig,

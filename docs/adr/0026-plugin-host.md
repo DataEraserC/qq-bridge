@@ -135,6 +135,12 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - 被丢掉的记录不写流水、不叫醒任何人，也不会让水位出现空洞；provider 拿不到 Store / 票 / 配置写入。
   - Lua 增加 `extension = "receive"`：`decide(request)` 返回 record/drop 或布尔；报错按「接收」兜底，避免误丢消息。
 
+- **Phase 6（2026-11-01）**：插件目录与描述（让 agent 能“察觉”策略）。
+  - 新增 `PluginMetadata`（title / summary / description / tags / effects / docs_url / options_schema），接入 `ProviderDescriptor`、`ManagerManifest`、`AdapterManifest` 和 `WireManifest`；`effects` 是文档，不是强制保证。
+  - Root 新增 `catalog()` / `catalog_json()` / `info()`：合并 manager 说明、标注 `source`（builtin / trusted / lua / dynamic）和 manager health；内置 provider、OneBot、process、动态库 fixture 都带描述。
+  - agent 新增只读工具 `describe_plugins`：默认返回本会话实际生效的 access / delivery / turn_error / receive / send_hooks / 订阅 wake/clock / 当前适配器；`scope=global` 看整个目录，可按 extension 过滤。
+  - 控制台新增 `GET /api/plugins`；只给 options schema，不给实际 options、路径或 token。描述可能不可信（插件作者写的），按数据处理、限长、转义。
+
 ## 参考
 
 - 平台适配器注册与队列：[ADR-0027](0027-platform-adapter-registration.md)

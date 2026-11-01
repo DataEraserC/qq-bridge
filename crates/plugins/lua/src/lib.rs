@@ -81,7 +81,7 @@ use acb_kernel::{
     ClockPolicy, ClockProvider, DefaultTurnErrorProvider, DeliveryComposer, DeliveryPlan,
     DeliveryPolicy, DeliveryRequest, Element, ExtensionPoint, Health, LoaderKind, LoaderManifest,
     ManagerManifest, ManagerPlugin, Omitted, PluginError, PluginLoader, PluginManager,
-    ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, ReceiveDecision,
+    PluginMetadata, PluginSource, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, ReceiveDecision,
     ReceivePolicy, ReceiveProvider, ReceiveRequest, Record, RecordKind, ReloadScope, RoomId,
     SendContext, SendHook, SenderRole, Sent, TurnErrorAction, TurnErrorProvider, TurnErrorRequest,
     WakeContext,
@@ -461,6 +461,15 @@ impl ManagerPlugin for LuaManager {
                 Capability::ReceiveDecision,
             ],
         )
+        .with_metadata(PluginMetadata {
+            title: Some("Lua 脚本插件".into()),
+            summary: Some("ACB_LUA_DIR 下的 *.lua 脚本；每个脚本注册一个 provider".into()),
+            description: None,
+            tags: Vec::new().into(),
+            effects: Vec::new().into(),
+            docs_url: None,
+            options_schema: None,
+        })
     }
 
     fn descriptors(&self) -> Vec<ProviderDescriptor> {
@@ -608,12 +617,15 @@ fn load_scripts(
                 });
             }
         };
-        descriptors.push(ProviderDescriptor::new(
-            loaded.id.clone(),
-            loaded.extension,
-            PLUGIN_API_VERSION,
-            vec![capability],
-        ));
+        descriptors.push(
+            ProviderDescriptor::new(
+                loaded.id.clone(),
+                loaded.extension,
+                PLUGIN_API_VERSION,
+                vec![capability],
+            )
+            .with_source(PluginSource::Lua),
+        );
         providers.insert(loaded.id.clone(), loaded);
     }
     Ok((descriptors, providers))

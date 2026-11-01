@@ -25,6 +25,8 @@ pub const TOOL_NAMES: &[&str] = &[
     // 平台能力：一个目录 + 一个通用调用口（ADR-0020）。core 不认识任何方法名。
     "platform_methods",
     "platform_call",
+    // 插件目录：本会话实际用了哪些 wake/access/delivery 策略，它们声称做什么。
+    "describe_plugins",
     // 反馈：把「哪里卡住了」写回桥里（ADR-0021）。活干不下去时用它，不要直接摸平台端口。
     "report_feedback",
     // 记忆：文件层
@@ -205,6 +207,18 @@ pub struct PlatformMethodsArgs {
     /// 按关键词找方法（名字、说明、标签都会搜，中英都认）。
     #[serde(default)]
     pub query: Option<String>,
+}
+
+/// 查插件/策略目录。默认只看当前会话实际用到的 provider。
+#[derive(Debug, Default, Deserialize)]
+pub struct DescribePluginsArgs {
+    /// `session`（默认）或 `global`。
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// 只看某个扩展点（`wake` / `access` / `delivery` / `turn_error` / `clock` /
+    /// `receive` / `platform_adapter`）。只对 `scope=global` 生效。
+    #[serde(default)]
+    pub extension: Option<String>,
 }
 
 /// 调一个平台方法。`params` 是任意 map，core 不认识里面任何字段，原样转给适配器。
