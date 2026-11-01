@@ -6,6 +6,8 @@ members = [
     "crates/kernel",
     "crates/adapters/onebot11",
     "crates/adapters/process",
+    "crates/adapters/dynamic",
+    "crates/adapters/dynamic-fixture",
     "crates/plugins/trusted",
     "crates/plugins/lua",
     "crates/bridge",

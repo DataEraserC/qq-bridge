@@ -1,0 +1,19 @@
+[package]
+name = "acb-adapter-dynamic-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "动态库适配器 conformance fixture"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+acb-adapter-api = { path = "../../adapter-api" }
+acb-proto = { path = "../../proto" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+acb-adapter-dynamic = { path = "../dynamic" }
+acb-kernel = { path = "../../kernel" }

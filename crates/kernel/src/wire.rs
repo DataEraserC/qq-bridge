@@ -12,11 +12,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use acb_adapter_api::{
-    WireError, WireManifest, WireMethodSpec, WireOutgoingKind, WireOutgoingRecord, WireParamSpec,
-    WireRecord, WireTargetSpec,
+    WireConnection, WireError, WireManifest, WireMethodSpec, WireOutgoingKind,
+    WireOutgoingRecord, WireParamSpec, WireRecord, WireTargetSpec,
 };
 
 use crate::adapter::{AdapterCapability, AdapterManifest};
+use crate::config::Connection;
 use crate::outbound::{
     CallError, Effect, MethodSpec, OutboundError, OutgoingKind, OutgoingRecord, ParamSpec,
     ParamType, RecordMode, Risk, Scope, TargetRole, TargetSpec,
@@ -49,6 +50,22 @@ impl TryFrom<WireManifest> for AdapterManifest {
             api_version: manifest.api_version,
             capabilities: capabilities.into(),
         })
+    }
+}
+
+impl From<&Connection> for WireConnection {
+    fn from(connection: &Connection) -> Self {
+        Self {
+            id: connection.id.clone(),
+            platform: connection.platform.clone(),
+            kind: connection.kind.clone(),
+            transport: connection.transport.as_str().to_owned(),
+            url: connection.url.clone(),
+            token: connection.token.clone(),
+            account: connection.account.clone(),
+            admin_qqs: connection.admin_qqs.clone(),
+            options: connection.options.clone(),
+        }
     }
 }
 

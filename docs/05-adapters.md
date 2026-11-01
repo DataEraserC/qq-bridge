@@ -39,7 +39,8 @@ account = "10001"      # 这个号登录的是谁，必填
 
 - **一个账号一条连接**，同一个平台可以配多条（这是用户裁定的模型，见
   [ADR-0012](adr/0012-platform-connections.md)）。连接名重复、`kind` / `transport` 写错、
-  地址不是 `ws://`、`account` 空，都在启动时报错。
+  `account` 空、`ws-client` 没给合法地址，都会在启动时报错；未知适配器 kind 在 Root
+  装载适配器时拒绝启动。
 - 只支持 `ws://`。`wss://` 要额外拉 TLS 依赖，等真有需要再加。
 - 地址里可以带查询串，比如 `ws://127.0.0.1:3001?access_token=xxx`——查询串会原样带到
   握手请求里，很多 OneBot 实现就是这么鉴权的。
@@ -89,6 +90,24 @@ command = ["/path/to/adapter", "--stdio"]
 - 入站事件发 `event`；`send` / `call` 按 `id` 回 `reply`，错误用 `kind` 分类（`bad_params` / `forbidden` / `unavailable` …）。
 - 子进程崩溃后，未完成的请求明确报「通道不可用」；桥退出时发 `shutdown`，2 秒内不收尾就 kill。
 - 一个最小的参考实现见 `crates/adapters/process/src/bin/fixture.rs`。
+
+## 动态库适配器（`[[adapters]]`）
+
+适配器也可以编成 `.so` / `.dylib`，由桥用 libloading 装载、在桥进程内运行：
+
+```toml
+[[adapters]]
+path = "/path/to/libdemo_adapter.so"
+kind = "demo"          # 可选：插件 manifest 的 kind 必须等于它
+```
+
+动态库只导出 `acb_adapter_entry_v1`，返回一张 C 函数表；manifest、连接配置、
+入站事件、发送/调用请求和回执都是 JSON，形状与 `kind = "process"` 完全一致
+（`crates/adapter-api`）。插件通过回调 `submit_event` 把入站记录交给桥。
+
+- 动态库和桥同进程：插件 panic、死循环或内存错误会带倒整座桥。需要崩溃隔离就用
+  `kind = "process"`。P3 对动态库调用不加超时（in-process 打断不了）。
+- 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`。
 
 ## 事件怎么映射
 

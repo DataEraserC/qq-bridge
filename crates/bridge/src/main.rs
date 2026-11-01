@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use acb_adapter_onebot11::OneBotAdapterFactory;
+use acb_adapter_dynamic::DynamicLoader;
 use acb_adapter_process::ProcessAdapterFactory;
 use acb_kernel::{
     AdapterHost, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds, PluginManager,
@@ -83,7 +84,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(lua) = LuaLoader::from_env() {
         plugins.install_loader(&lua)?;
     }
-    // 平台适配器也登记在 Root 里：内置 OneBot、外置进程（动态库在 P3 走同一张表）。
+    // 动态库适配器：配了 [[adapters]] 才装载；插件自己报 manifest。
+    if !config.adapters.is_empty() {
+        plugins.install_loader(&DynamicLoader::new(&config.adapters))?;
+    }
+    // 平台适配器也登记在 Root 里：内置 OneBot、外置进程、动态库走同一张表。
     plugins.register_adapter(Arc::new(OneBotAdapterFactory))?;
     plugins.register_adapter(Arc::new(ProcessAdapterFactory))?;
 

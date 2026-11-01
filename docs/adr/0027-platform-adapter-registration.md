@@ -102,7 +102,12 @@ InboundEvent:
   - 子进程崩溃或退出后，未完成的请求明确返回「通道不可用」，不会让 core 无限挂着；退出时发 `shutdown`，2 秒内不收尾就 kill。
   - 连接配置的 `url` 改为可选，`kind` / `transport` 不再由 config 写死；是否支持某个 transport 由适配器 manifest 在启动时决定。
   - conformance 测试真启动一个 fixture 子进程，覆盖 hello、入站事件、发送回执、调用回执、错误分类和缺 `command` 的启动失败。
-- **尚未做**：动态库载体（P3）。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
+- **Phase 3 P3（2026-11-01，动态库）**：适配器实现可以编成 `.so` / `.dylib`，在桥进程内运行。
+  - `acb-adapter-api` 增加 C ABI：只导出一个 `acb_adapter_entry_v1`，返回 `AdapterV1` 函数表（manifest / create / invoke / destroy / free_string），core 通过 `HostV1` 回调把事件、日志和退出信号交给插件。跨 ABI 的文本全是 JSON，和外置进程共用同一套 wire。
+  - 新增 `acb-adapter-dynamic`（`DynamicLoader`）：按 `[[adapters]]` 的 `path` / `kind` 用 libloading 装载，插件自己报 manifest，注册进 Root 后与内置/进程适配器完全同构。
+  - 动态库在桥进程内，插件 panic 或挂死会带倒整座桥；需要崩溃隔离时用 `process`。P3 不做调用超时（in-process 无法打断），这是明确取舍。
+  - conformance 测试真的用 libloading 打开一个 fixture cdylib，覆盖 manifest、describe 目录、入站事件、发送/调用回执、错误分类和 shutdown。
+- **尚未做**：P4 把 wake/access 等策略扩展点也接到同一套 wire。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
 
 ## 参考
 

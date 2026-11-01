@@ -58,6 +58,15 @@ fn main() -> std::io::Result<()> {
         };
 
         match message {
+            CoreMessage::Describe { id } => {
+                write_message(
+                    &mut stdout,
+                    &AdapterMessage::Reply {
+                        id,
+                        result: WireResult::Catalog { catalog: catalog() },
+                    },
+                )?;
+            }
             CoreMessage::Send { id, .. } => {
                 write_message(
                     &mut stdout,

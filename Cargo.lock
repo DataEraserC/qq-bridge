@@ -12,6 +12,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "acb-adapter-dynamic"
+version = "0.1.0"
+dependencies = [
+ "acb-adapter-api",
+ "acb-kernel",
+ "acb-proto",
+ "libloading",
+ "serde_json",
+]
+
+[[package]]
+name = "acb-adapter-dynamic-fixture"
+version = "0.1.0"
+dependencies = [
+ "acb-adapter-api",
+ "acb-adapter-dynamic",
+ "acb-kernel",
+ "acb-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "acb-adapter-onebot11"
 version = "0.1.0"
 dependencies = [
@@ -36,6 +58,7 @@ dependencies = [
 name = "acb-bridge"
 version = "0.1.0"
 dependencies = [
+ "acb-adapter-dynamic",
  "acb-adapter-onebot11",
  "acb-adapter-process",
  "acb-kernel",
@@ -467,6 +490,16 @@ dependencies = [
  "libc",
  "libz-sys",
  "pkg-config",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
 ]
 
 [[package]]

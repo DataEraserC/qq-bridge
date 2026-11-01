@@ -1,0 +1,14 @@
+[package]
+name = "acb-adapter-dynamic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "动态库平台适配器装载器：C ABI + 共用 JSON wire"
+
+[dependencies]
+acb-adapter-api = { path = "../../adapter-api" }
+acb-kernel = { path = "../../kernel" }
+acb-proto = { path = "../../proto" }
+libloading = "0.8"
+serde_json = { workspace = true }

@@ -22,6 +22,58 @@ use serde_json::Value;
 /// wire 协议版本。core 与适配器必须对得上。
 pub const WIRE_VERSION: u32 = 1;
 
+/// 动态库适配器的 C ABI。
+///
+/// 只有 `acb_adapter_entry_v1` 一个导出符号；其余函数通过 [`AdapterV1`] 表拿。
+/// 所有跨 ABI 的文本都是 JSON，扩展点靠 `op` / `type` 字段演进，不改 ABI 形状。
+pub mod abi {
+    use std::ffi::{c_char, c_void};
+
+    /// 动态库 ABI 版本。
+    pub const ABI_VERSION: u32 = 1;
+    /// 唯一的导出符号名。
+    pub const ENTRY_SYMBOL: &[u8] = b"acb_adapter_entry_v1\0";
+
+    pub type SubmitEventFn = unsafe extern "C" fn(ctx: *mut c_void, message_json: *const c_char);
+    pub type ShouldStopFn = unsafe extern "C" fn(ctx: *mut c_void) -> i32;
+    pub type LogFn =
+        unsafe extern "C" fn(ctx: *mut c_void, level: *const c_char, message: *const c_char);
+    pub type ManifestFn = unsafe extern "C" fn() -> *mut c_char;
+    pub type CreateFn =
+        unsafe extern "C" fn(config_json: *const c_char, host: *const HostV1) -> *mut c_void;
+    pub type InvokeFn =
+        unsafe extern "C" fn(handle: *mut c_void, request_json: *const c_char) -> *mut c_char;
+    pub type DestroyFn = unsafe extern "C" fn(handle: *mut c_void);
+    pub type FreeStringFn = unsafe extern "C" fn(text: *mut c_char);
+    pub type EntryFn = unsafe extern "C" fn() -> *const AdapterV1;
+
+    /// core 传给插件的回调。插件必须在 `create` 里**复制**这份表，不要保存指针。
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    pub struct HostV1 {
+        pub abi_version: u32,
+        pub ctx: *mut c_void,
+        pub submit_event: Option<SubmitEventFn>,
+        pub should_stop: Option<ShouldStopFn>,
+        pub log: Option<LogFn>,
+    }
+
+    /// 插件导出的函数表。函数指针为 None 表示不支持。
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    pub struct AdapterV1 {
+        pub abi_version: u32,
+        /// 返回 JSON `WireManifest`；调用方用 `free_string` 释放。
+        pub manifest: Option<ManifestFn>,
+        /// 按 `WireConnection` JSON 创建实例；返回不透明的 handle。
+        pub create: Option<CreateFn>,
+        /// 请求是 `CoreMessage` JSON，返回 `AdapterMessage` JSON（`Reply` 或 `Log`）。
+        pub invoke: Option<InvokeFn>,
+        pub destroy: Option<DestroyFn>,
+        pub free_string: Option<FreeStringFn>,
+    }
+}
+
 /// 适配器 manifest 的 wire 形状。
 #[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
 pub struct WireManifest {
@@ -33,6 +85,24 @@ pub struct WireManifest {
     pub api_version: u32,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+/// 一条连接的 wire 形状（动态库接管适配器实例化时用）。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireConnection {
+    pub id: String,
+    pub platform: String,
+    pub kind: String,
+    pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub account: String,
+    #[serde(default)]
+    pub admin_qqs: Vec<String>,
+    #[serde(default)]
+    pub options: Value,
 }
 
 /// 一条入站记录。字段与 kernel 的 `RecordDraft` 对齐，由 core 负责转换。
@@ -139,6 +209,11 @@ pub enum WireError {
 #[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreMessage {
+    /// 动态库版本用：返回 `WireResult::Catalog`。外置进程也可以用它，但启动时
+    /// 通常已经在 hello 里带了目录。
+    Describe {
+        id: u64,
+    },
     Send {
         id: u64,
         room: RoomId,
@@ -159,6 +234,10 @@ pub enum CoreMessage {
 #[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum WireResult {
+    Catalog {
+        #[serde(default)]
+        catalog: Vec<WireMethodSpec>,
+    },
     Sent {
         platform_id: String,
         at: i64,
@@ -249,6 +328,12 @@ mod tests {
         assert!(line.contains("\"type\":\"send\""));
         let back: CoreMessage = decode_line(&line).expect("能解码");
         assert_eq!(back, send);
+
+        let describe = CoreMessage::Describe { id: 9 };
+        let line = encode_line(&describe).expect("能编码");
+        assert!(line.contains("\"type\":\"describe\""));
+        let back: CoreMessage = decode_line(&line).expect("能解码");
+        assert_eq!(back, describe);
 
         let shutdown: CoreMessage = decode_line(r#"{"type":"shutdown"}"#).expect("能解码");
         assert_eq!(shutdown, CoreMessage::Shutdown);
