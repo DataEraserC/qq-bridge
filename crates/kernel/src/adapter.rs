@@ -252,6 +252,7 @@ mod tests {
             account: "10001".into(),
             admin_qqs: Vec::new(),
             allow_destructive: crate::config::DestructivePolicy::None,
+            receive: Default::default(),
         }
     }
 

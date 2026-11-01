@@ -9,8 +9,9 @@ use acb_kernel::{
     Bridge, Capability, Cursor, DeliveryComposer, DeliveryPlan, DeliveryPolicy, DeliveryRequest,
     Element, ErrorCode, ExtensionPoint, Feedbacks, Ingest, ManagerManifest, ManagerPlugin,
     MemoryStore, NoteKey, NoteKind, Notes, Omitted, Outbound, OutboundError, PluginError,
-    PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, RecordDraft,
-    RoomId, SendContext, SendHook, Sender, Sent, Transcript, TurnErrorAction, TurnErrorProvider,
+    PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, ReceiveDecision,
+    ReceiveProvider, ReceiveRequest, RecordDraft, RoomId, SendContext, SendHook, Sender, Sent,
+    Transcript, TurnErrorAction, TurnErrorProvider,
     TurnErrorRequest, TurnReason, Watermarks, unread, PLUGIN_API_VERSION,
 };
 use serde_json::{Value, json};
@@ -292,6 +293,61 @@ impl ManagerPlugin for RedirectTurnErrorManager {
             Err(PluginError::UnknownProvider(id.to_string()))
         }
     }
+}
+
+/// 丢掉正文含「广告」的入站记录。
+struct DropAds;
+
+impl ReceiveProvider for DropAds {
+    fn decide(&self, _options: &acb_kernel::ReceivePolicy, request: &ReceiveRequest<'_>) -> ReceiveDecision {
+        if request.text.contains("广告") {
+            ReceiveDecision::Drop
+        } else {
+            ReceiveDecision::Record
+        }
+    }
+}
+
+struct DropAdsManager;
+
+impl ManagerPlugin for DropAdsManager {
+    fn manifest(&self) -> ManagerManifest {
+        ManagerManifest::new(
+            "test",
+            PLUGIN_API_VERSION,
+            vec![Capability::ReceiveDecision],
+        )
+    }
+
+    fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        vec![ProviderDescriptor::new(
+            ProviderId::parse("test.drop").expect("合法"),
+            ExtensionPoint::Receive,
+            PLUGIN_API_VERSION,
+            vec![Capability::ReceiveDecision],
+        )]
+    }
+
+    fn instantiate(
+        &self,
+        id: &ProviderId,
+        _options: ProviderOptions<'_>,
+    ) -> Result<ProviderInstance, PluginError> {
+        if id.name() == "drop" {
+            Ok(ProviderInstance::Receive(Arc::new(DropAds)))
+        } else {
+            Err(PluginError::UnknownProvider(id.to_string()))
+        }
+    }
+}
+
+/// 在最后一个订阅上挂 60 秒固定间隔时钟。
+fn clock_config() -> String {
+    config().replacen(
+        "        accumulate = 50",
+        "        accumulate = 50\n\n        [sessions.subscriptions.clock]\n        interval_secs = 60",
+        1,
+    )
 }
 
 /// 单轮投递条数上限改小的桥。
@@ -2654,4 +2710,63 @@ fn custom_turn_error_provider_decides_notifications() {
     };
     assert!(text.contains("[一轮失败]"));
     assert!(text.contains("boom"));
+}
+
+#[test]
+fn interval_clock_opens_a_turn_with_no_records() {
+    let text = clock_config();
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let mut bridge = Bridge::new(
+        acb_kernel::Config::parse(&text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder {
+            sends: sends.clone(),
+        }),
+    );
+
+    assert_eq!(bridge.tick_clock(AT), 0, "第一 tick 只开始计时");
+    assert_eq!(bridge.tick_clock(AT + 30_000), 0, "还没到 60 秒");
+    assert_eq!(bridge.tick_clock(AT + 61_000), 1, "到点排一轮");
+
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    assert_eq!(delivery.reason, TurnReason::Clock);
+    assert_eq!(delivery.room, room("dc:channel/456"));
+    assert!(delivery.records.is_empty(), "例行检查可以没有新记录");
+}
+
+#[test]
+fn clock_is_off_by_default() {
+    let (mut bridge, _sends) = bridge();
+    assert_eq!(bridge.tick_clock(AT), 0);
+    assert_eq!(bridge.tick_clock(AT + 3_600_000), 0, "默认不产生定时轮次");
+}
+
+#[test]
+fn custom_receive_provider_can_drop_inbound_records() {
+    let text = config().replacen(
+        "        account = \"bot\"",
+        "        account = \"bot\"\n\n        [connections.receive]\n        provider = \"test.drop\"",
+        1,
+    );
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins
+        .install_manager(Arc::new(DropAdsManager))
+        .expect("能安装入站策略");
+
+    let (mut bridge, _sends) = bridge_with_plugins(&text, plugins);
+    let dropped = bridge
+        .ingest(message("qq:group/123", "10001", "广告", true))
+        .expect("不该崩");
+    assert_eq!(
+        dropped,
+        Ingest::Dropped {
+            room: room("qq:group/123")
+        },
+        "provider 说不收就不写流水"
+    );
+
+    let kept = bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    assert!(matches!(kept, Ingest::Recorded { .. }), "正常消息照常入库");
 }

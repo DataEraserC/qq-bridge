@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::config::{Config, TurnErrorAction, WakeDecision, WakePolicy};
+use crate::config::{ClockPolicy, Config, TurnErrorAction, WakeDecision, WakePolicy};
 use crate::memory::{
     MemoryRepo, git_add, git_blame, git_branch, git_commit, git_diff, git_log, git_push,
     git_status, list_dir, read_file, search, write_file,
@@ -36,9 +36,9 @@ use crate::outbound::{
     OutgoingKind, OutgoingRecord, RecordMode, Risk, Scope, Sent, TargetRole, expand_query,
 };
 use crate::plugin::{
-    AccessAction, AccessDecision, AccessRequest, DefaultDeliveryComposer, DefaultTurnErrorProvider,
-    DeliveryRequest, PluginError, PluginManager, SendContext, SendHook, SendOrigin,
-    TurnErrorRequest, WakeContext,
+    AccessAction, AccessDecision, AccessRequest, ClockContext, DefaultDeliveryComposer,
+    DefaultTurnErrorProvider, DeliveryRequest, PluginError, PluginManager, ReceiveDecision,
+    ReceiveRequest, SendContext, SendHook, SendOrigin, TurnErrorRequest, WakeContext,
 };
 use crate::render;
 use crate::storage::{
@@ -87,6 +87,8 @@ pub enum Ingest {
     Recorded { id: u64, woke: Vec<String> },
     /// 没有任何会话订阅这个房间——什么都不做，连流水都不写。
     NotSubscribed { room: RoomId },
+    /// 被连接的入站策略丢掉了——不写流水，也不叫醒任何人。
+    Dropped { room: RoomId },
 }
 
 /// 一次清理里某个房间的战果，给日志用。
@@ -224,6 +226,8 @@ pub struct Bridge<S: Store> {
     ticket_prefix: String,
     /// 排队等着在锁外发出去的失败通知。endpoint 处理完一帧、放下全局锁后执行。
     pending_notices: Vec<PreparedSend>,
+    /// (会话, 房间) → 上次时钟轮时间（Unix 毫秒）。只活在本进程，重启后重新计间隔。
+    clock_last: HashMap<(String, RoomId), i64>,
     /// 记忆仓库管理器：负责裸仓库 init 与 worktree checkout。
     memory: MemoryRepo,
     /// 文件中继。配了 `[file_relay]` 才有：发送/平台调用里的本机文件
@@ -291,6 +295,7 @@ impl<S: Store> Bridge<S> {
             ticket_seq: 0,
             ticket_prefix: ticket_prefix(),
             pending_notices: Vec::new(),
+            clock_last: HashMap::new(),
             memory,
             relay,
             staged_config: None,
@@ -478,6 +483,36 @@ impl<S: Store> Bridge<S> {
             return Ok(Ingest::NotSubscribed { room });
         }
 
+        // 入站策略：先问这条连接的 provider 收不收。被丢掉的记录不写流水、不叫醒，
+        // 就像它从没到过桥——水位也不会因为它出现空洞。
+        let receive_policy = self
+            .config
+            .connection(&room.connection)
+            .map(|connection| connection.receive.clone())
+            .unwrap_or_default();
+        let receive_provider = self
+            .plugins
+            .resolve_receive(&receive_policy.provider, &receive_policy)?;
+        let text = flatten_text(&draft.elements);
+        let platform = self
+            .config
+            .connection(&room.connection)
+            .map(|connection| connection.platform.clone())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let receive_context = ReceiveRequest {
+            connection: &room.connection,
+            platform: &platform,
+            room: &room,
+            sender: &draft.sender,
+            kind: &draft.kind,
+            elements: &draft.elements,
+            text: &text,
+            at_self: draft.at_self,
+        };
+        if receive_provider.decide(&receive_policy, &receive_context) == ReceiveDecision::Drop {
+            return Ok(Ingest::Dropped { room });
+        }
+
         // 先把这一轮要用的 provider 都解析出来。放 append 之前是有意的：provider id 写错
         // 应该在入库前就报错，不能先写一条流水再发现叫不醒。
         let mut wake_providers = Vec::with_capacity(subscribers.len());
@@ -495,17 +530,10 @@ impl<S: Store> Bridge<S> {
         let draft = draft.with_reply_to_self(reply_to_self);
 
         let record = self.store.append(draft)?;
-        let text = flatten_text(&record.elements);
         let event = match &record.kind {
             RecordKind::Event { event } => Some(event.as_str()),
             RecordKind::Message => None,
         };
-
-        let platform = self
-            .config
-            .connection(&room.connection)
-            .map(|connection| connection.platform.clone())
-            .unwrap_or_else(|| "unknown".to_owned());
 
         let mut woke = Vec::new();
         for (subscriber, provider) in subscribers.into_iter().zip(wake_providers) {
@@ -1359,6 +1387,94 @@ impl<S: Store> Bridge<S> {
             }
         }
         Ok(room)
+    }
+
+    /// 时钟评估：检查每个订阅的时钟策略，到点就把（会话, 房间）排进队列。
+    ///
+    /// 只做廉价检查：解析 provider 时用当前配置快照，到点才开轮。返回本次排了几轮。
+    pub fn tick_clock(&mut self, now: i64) -> usize {
+        // 先把订阅整理出来，避免遍历 config 的同时改 self 的其他字段。
+        let clocks: Vec<(String, Vec<(RoomId, ClockPolicy)>)> = self
+            .config
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session
+                        .subscriptions
+                        .iter()
+                        .map(|subscription| (subscription.room.clone(), subscription.clock.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let mut queued = 0;
+        for (session, subscriptions) in clocks {
+            for (room, policy) in subscriptions {
+                let key = (session.clone(), room.clone());
+                let Some(last_clock_at) = self.clock_last.get(&key).copied() else {
+                    // 第一次见到这个订阅：从这一 tick 开始计间隔，不立刻开轮。
+                    self.clock_last.insert(key, now);
+                    continue;
+                };
+                // 会话正在跑，或这个房间已经排着队：等它空下来再说，别叠轮次。
+                if self.active.contains_key(&session)
+                    || self
+                        .pending
+                        .iter()
+                        .any(|pending| pending.session == session && pending.room == room)
+                {
+                    continue;
+                }
+                let provider = match self.plugins.resolve_clock(&policy.provider, &policy) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        eprintln!(
+                            "时钟策略 {} 解析失败，跳过 {session}（{room}）：{error}",
+                            policy.provider
+                        );
+                        continue;
+                    }
+                };
+                let last_record_at = match self.latest_record_at(&room) {
+                    Ok(at) => at,
+                    Err(error) => {
+                        eprintln!("读 {room} 最后一条记录失败：{error}");
+                        None
+                    }
+                };
+                let context = ClockContext {
+                    session: &session,
+                    room: &room,
+                    now,
+                    last_clock_at,
+                    last_record_at,
+                };
+                if provider.is_due(&policy, &context) {
+                    self.enqueue(session.clone(), room.clone(), TurnReason::Clock);
+                    self.clock_last.insert(key, now);
+                    queued += 1;
+                }
+            }
+        }
+        queued
+    }
+
+    fn latest_record_at(&self, room: &RoomId) -> Result<Option<i64>, BridgeError> {
+        let Some(id) = self.store.latest(room)? else {
+            return Ok(None);
+        };
+        let Some(record) = self
+            .store
+            .since(room, id.saturating_sub(1), 1)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(record.at))
     }
 
     fn enqueue(&mut self, session: String, room: RoomId, reason: TurnReason) {

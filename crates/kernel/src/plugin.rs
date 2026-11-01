@@ -13,13 +13,13 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use acb_proto::{Element, Omitted, Record, RoomId};
+use acb_proto::{Element, Omitted, Record, RecordKind, RoomId, Sender};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::config::{
-    AccessPolicy, Config, DeliveryPolicy, TurnErrorAction, TurnErrorPolicy, WakeDecision, WakeInput,
-    WakePolicy,
+    AccessPolicy, ClockPolicy, Config, DeliveryPolicy, ReceivePolicy, TurnErrorAction,
+    TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy,
 };
 use crate::outbound::Sent;
 
@@ -37,6 +37,15 @@ pub const DEFAULT_DELIVERY_PROVIDER: &str = "acb.delivery.default";
 
 /// 内置失败通知 provider 的 id。会话没有显式写 turn_error provider 时用它。
 pub const DEFAULT_TURN_ERROR_PROVIDER: &str = "acb.turn_error.default";
+
+/// 内置「不启用时钟」provider 的 id。订阅没有显式写 clock provider 时用它。
+pub const DEFAULT_CLOCK_PROVIDER: &str = "acb.clock.off";
+
+/// 内置「固定间隔 / 房间空闲」时钟 provider 的 id。
+pub const CLOCK_INTERVAL_IDLE_PROVIDER: &str = "acb.clock.interval_idle";
+
+/// 内置入站策略：全部接收。
+pub const DEFAULT_RECEIVE_PROVIDER: &str = "acb.receive.all";
 
 /// 每轮从最旧端至少带几条（默认 composer 用）。
 const DELIVERY_OLDEST: usize = 5;
@@ -121,6 +130,21 @@ impl ProviderId {
         Self::parse(DEFAULT_TURN_ERROR_PROVIDER).expect("内置 provider id 必须合法")
     }
 
+    /// 内置「不启用时钟」provider。
+    pub fn builtin_clock_off() -> Self {
+        Self::parse(DEFAULT_CLOCK_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
+    /// 内置「固定间隔 / 房间空闲」时钟 provider。
+    pub fn builtin_clock_interval_idle() -> Self {
+        Self::parse(CLOCK_INTERVAL_IDLE_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
+    /// 内置入站策略：全部接收。
+    pub fn builtin_receive_all() -> Self {
+        Self::parse(DEFAULT_RECEIVE_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
@@ -188,6 +212,8 @@ pub enum Capability {
     DeliverPlan,
     SendHook,
     TurnErrorDecision,
+    ClockDecision,
+    ReceiveDecision,
 }
 
 impl Capability {
@@ -202,6 +228,8 @@ impl Capability {
             Self::DeliverPlan => "deliver_plan",
             Self::SendHook => "send_hook",
             Self::TurnErrorDecision => "turn_error_decision",
+            Self::ClockDecision => "clock_decision",
+            Self::ReceiveDecision => "receive_decision",
         }
     }
 }
@@ -695,6 +723,95 @@ impl TurnErrorProvider for DefaultTurnErrorProvider {
     }
 }
 
+/// 时钟判定的输入。`last_clock_at` 由 core 维护：这个（会话, 房间）上一次开时钟轮的时间。
+#[derive(Debug, Clone, Copy)]
+pub struct ClockContext<'a> {
+    pub session: &'a str,
+    pub room: &'a RoomId,
+    /// 当前 Unix 毫秒。
+    pub now: i64,
+    /// 上一次开时钟轮的时间；第一次 tick 时初始化成当前时间。
+    pub last_clock_at: i64,
+    /// 房间里最后一条记录的时间；房间没记录就是 `None`。
+    pub last_record_at: Option<i64>,
+}
+
+/// 时钟 provider：只回答「现在要不要开例行检查」，不碰消息和票。
+pub trait ClockProvider: Send + Sync {
+    fn is_due(&self, options: &ClockPolicy, context: &ClockContext<'_>) -> bool;
+}
+
+/// 默认时钟：永不触发。
+#[derive(Debug, Default)]
+pub struct ClockOffProvider;
+
+impl ClockProvider for ClockOffProvider {
+    fn is_due(&self, _options: &ClockPolicy, _context: &ClockContext<'_>) -> bool {
+        false
+    }
+}
+
+/// 固定间隔或房间空闲超时。两个阈值都可选，任一命中就开轮。
+#[derive(Debug, Default)]
+pub struct IntervalIdleClockProvider;
+
+impl ClockProvider for IntervalIdleClockProvider {
+    fn is_due(&self, options: &ClockPolicy, context: &ClockContext<'_>) -> bool {
+        if let Some(interval_secs) = options.interval_secs {
+            if interval_secs > 0 {
+                let interval = (interval_secs as i64).saturating_mul(1000);
+                if context.now.saturating_sub(context.last_clock_at) >= interval {
+                    return true;
+                }
+            }
+        }
+        if let Some(idle_secs) = options.idle_secs {
+            if idle_secs > 0 {
+                if let Some(last_record_at) = context.last_record_at {
+                    let idle = (idle_secs as i64).saturating_mul(1000);
+                    if context.now.saturating_sub(last_record_at) >= idle {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// 一条入站记录的判定输入。provider 只能决定收不收，不能改内容或水位。
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiveRequest<'a> {
+    pub connection: &'a str,
+    pub platform: &'a str,
+    pub room: &'a RoomId,
+    pub sender: &'a Sender,
+    pub kind: &'a RecordKind,
+    pub elements: &'a [Element],
+    pub text: &'a str,
+    pub at_self: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveDecision {
+    Record,
+    Drop,
+}
+
+/// 入站策略 provider。默认全部接收；自定义策略可以丢机器人、丢噪声等。
+pub trait ReceiveProvider: Send + Sync {
+    fn decide(&self, options: &ReceivePolicy, request: &ReceiveRequest<'_>) -> ReceiveDecision;
+}
+
+#[derive(Debug, Default)]
+pub struct AcceptAllReceiveProvider;
+
+impl ReceiveProvider for AcceptAllReceiveProvider {
+    fn decide(&self, _options: &ReceivePolicy, _request: &ReceiveRequest<'_>) -> ReceiveDecision {
+        ReceiveDecision::Record
+    }
+}
+
 /// manager 实例化 provider 时能拿到的 options。
 #[derive(Debug, Clone, Copy)]
 pub enum ProviderOptions<'a> {
@@ -702,6 +819,8 @@ pub enum ProviderOptions<'a> {
     Access(&'a AccessPolicy),
     Delivery(&'a DeliveryPolicy),
     TurnError(&'a TurnErrorPolicy),
+    Clock(&'a ClockPolicy),
+    Receive(&'a ReceivePolicy),
     /// 不需要 options 的扩展点（发送钩子）。
     None,
 }
@@ -713,6 +832,8 @@ pub enum ProviderInstance {
     Delivery(Arc<dyn DeliveryComposer>),
     Send(Arc<dyn SendHook>),
     TurnError(Arc<dyn TurnErrorProvider>),
+    Clock(Arc<dyn ClockProvider>),
+    Receive(Arc<dyn ReceiveProvider>),
 }
 
 impl ProviderInstance {
@@ -724,6 +845,8 @@ impl ProviderInstance {
             Self::Delivery(_) => ExtensionPoint::Delivery,
             Self::Send(_) => ExtensionPoint::Send,
             Self::TurnError(_) => ExtensionPoint::TurnError,
+            Self::Clock(_) => ExtensionPoint::Clock,
+            Self::Receive(_) => ExtensionPoint::Receive,
         }
     }
 }
@@ -810,6 +933,8 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Access,
                 ExtensionPoint::Delivery,
                 ExtensionPoint::TurnError,
+                ExtensionPoint::Clock,
+                ExtensionPoint::Receive,
             ],
         )
     }
@@ -868,6 +993,33 @@ impl PluginLoader for NativeLoader {
                 vec![Capability::TurnErrorDecision],
             ),
             Arc::new(DefaultTurnErrorProvider),
+        )?;
+        manager.register_clock(
+            ProviderDescriptor::new(
+                ProviderId::builtin_clock_off(),
+                ExtensionPoint::Clock,
+                PLUGIN_API_VERSION,
+                vec![Capability::ClockDecision],
+            ),
+            Arc::new(ClockOffProvider),
+        )?;
+        manager.register_clock(
+            ProviderDescriptor::new(
+                ProviderId::builtin_clock_interval_idle(),
+                ExtensionPoint::Clock,
+                PLUGIN_API_VERSION,
+                vec![Capability::ClockDecision],
+            ),
+            Arc::new(IntervalIdleClockProvider),
+        )?;
+        manager.register_receive(
+            ProviderDescriptor::new(
+                ProviderId::builtin_receive_all(),
+                ExtensionPoint::Receive,
+                PLUGIN_API_VERSION,
+                vec![Capability::ReceiveDecision],
+            ),
+            Arc::new(AcceptAllReceiveProvider),
         )
     }
 }
@@ -880,6 +1032,8 @@ pub struct PluginManager {
     delivery: HashMap<ProviderId, Arc<dyn DeliveryComposer>>,
     send_hooks: HashMap<ProviderId, Arc<dyn SendHook>>,
     turn_errors: HashMap<ProviderId, Arc<dyn TurnErrorProvider>>,
+    clocks: HashMap<ProviderId, Arc<dyn ClockProvider>>,
+    receives: HashMap<ProviderId, Arc<dyn ReceiveProvider>>,
     managers: HashMap<String, Arc<dyn ManagerPlugin>>,
     /// 安装顺序（含嵌套子树）。reload/health 正序，shutdown 逆序。
     manager_order: Vec<String>,
@@ -929,6 +1083,8 @@ impl PluginManager {
                     | ExtensionPoint::Delivery
                     | ExtensionPoint::Send
                     | ExtensionPoint::TurnError
+                    | ExtensionPoint::Clock
+                    | ExtensionPoint::Receive
             ) {
                 return Err(PluginError::UnsupportedExtensionPoint {
                     id: format!("loader:{}", manifest.kind.as_str()),
@@ -1031,6 +1187,46 @@ impl PluginManager {
         Ok(())
     }
 
+    /// 注册时钟 provider。校验规则同 wake。
+    pub fn register_clock(
+        &mut self,
+        descriptor: ProviderDescriptor,
+        provider: Arc<dyn ClockProvider>,
+    ) -> Result<(), PluginError> {
+        self.check_descriptor(
+            &descriptor,
+            ExtensionPoint::Clock,
+            Capability::ClockDecision,
+        )?;
+        if self.descriptors.contains_key(&descriptor.id) {
+            return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
+        }
+        self.descriptors
+            .insert(descriptor.id.clone(), descriptor.clone());
+        self.clocks.insert(descriptor.id, provider);
+        Ok(())
+    }
+
+    /// 注册入站策略 provider。校验规则同 wake。
+    pub fn register_receive(
+        &mut self,
+        descriptor: ProviderDescriptor,
+        provider: Arc<dyn ReceiveProvider>,
+    ) -> Result<(), PluginError> {
+        self.check_descriptor(
+            &descriptor,
+            ExtensionPoint::Receive,
+            Capability::ReceiveDecision,
+        )?;
+        if self.descriptors.contains_key(&descriptor.id) {
+            return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
+        }
+        self.descriptors
+            .insert(descriptor.id.clone(), descriptor.clone());
+        self.receives.insert(descriptor.id, provider);
+        Ok(())
+    }
+
     /// 安装一棵树外 manager 子树。它拥有自己的 namespace 和子树注册表；Root 只做
     /// namespace / 版本 / 能力 / id 审计，之后把它子树里的 id 委托给它。
     ///
@@ -1124,6 +1320,8 @@ impl PluginManager {
                 ExtensionPoint::Delivery => Capability::DeliverPlan,
                 ExtensionPoint::Send => Capability::SendHook,
                 ExtensionPoint::TurnError => Capability::TurnErrorDecision,
+                ExtensionPoint::Clock => Capability::ClockDecision,
+                ExtensionPoint::Receive => Capability::ReceiveDecision,
                 point => {
                     return Err(PluginError::UnsupportedExtensionPoint {
                         id: descriptor.id.to_string(),
@@ -1373,8 +1571,73 @@ impl PluginManager {
         }
     }
 
+    /// 解析时钟 provider。先查 Root 直接注册的，再按 namespace 委托 manager。
+    pub fn resolve_clock(
+        &self,
+        id: &ProviderId,
+        options: &ClockPolicy,
+    ) -> Result<Arc<dyn ClockProvider>, PluginError> {
+        if let Some(provider) = self.clocks.get(id) {
+            return Ok(provider.clone());
+        }
+        let Some(descriptor) = self.descriptors.get(id) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        if descriptor.extension_point != ExtensionPoint::Clock {
+            return Err(PluginError::UnsupportedExtensionPoint {
+                id: id.to_string(),
+                point: descriptor.extension_point,
+            });
+        }
+        let Some(manager) = self.managers.get(id.namespace()) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        match manager.instantiate(id, ProviderOptions::Clock(options))? {
+            ProviderInstance::Clock(provider) => Ok(provider),
+            other => Err(PluginError::WrongProviderKind {
+                id: id.to_string(),
+                expected: ExtensionPoint::Clock,
+                found: other.extension_point(),
+            }),
+        }
+    }
+
+    /// 解析入站策略 provider。先查 Root 直接注册的，再按 namespace 委托 manager。
+    pub fn resolve_receive(
+        &self,
+        id: &ProviderId,
+        options: &ReceivePolicy,
+    ) -> Result<Arc<dyn ReceiveProvider>, PluginError> {
+        if let Some(provider) = self.receives.get(id) {
+            return Ok(provider.clone());
+        }
+        let Some(descriptor) = self.descriptors.get(id) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        if descriptor.extension_point != ExtensionPoint::Receive {
+            return Err(PluginError::UnsupportedExtensionPoint {
+                id: id.to_string(),
+                point: descriptor.extension_point,
+            });
+        }
+        let Some(manager) = self.managers.get(id.namespace()) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        match manager.instantiate(id, ProviderOptions::Receive(options))? {
+            ProviderInstance::Receive(provider) => Ok(provider),
+            other => Err(PluginError::WrongProviderKind {
+                id: id.to_string(),
+                expected: ExtensionPoint::Receive,
+                found: other.extension_point(),
+            }),
+        }
+    }
+
     /// 启动时校验整份配置引用的 provider 都存在。`main` 在起线程前调用。
     pub fn validate_config(&self, config: &Config) -> Result<(), PluginError> {
+        for connection in &config.connections {
+            self.resolve_receive(&connection.receive.provider, &connection.receive)?;
+        }
         for session in &config.sessions {
             self.resolve_access(&session.access.provider, &session.access)?;
             self.resolve_delivery(&session.delivery.provider, &session.delivery)?;
@@ -1383,6 +1646,7 @@ impl PluginManager {
             self.resolve_turn_error(&session.turn_error.provider, &session.turn_error)?;
             for subscription in &session.subscriptions {
                 self.resolve_wake(&subscription.wake.provider, &subscription.wake)?;
+                self.resolve_clock(&subscription.clock.provider, &subscription.clock)?;
             }
         }
         Ok(())
@@ -2127,7 +2391,7 @@ mod tests {
             LoaderManifest::new(
                 LoaderKind::Process,
                 PLUGIN_API_VERSION,
-                vec![ExtensionPoint::Clock],
+                vec![ExtensionPoint::PlatformAdapter],
             )
         }
         fn install(&self, _manager: &mut PluginManager) -> Result<(), PluginError> {
@@ -2156,7 +2420,7 @@ mod tests {
         assert!(matches!(
             manager.install_loader(&UnsupportedExtensionLoader),
             Err(PluginError::UnsupportedExtensionPoint {
-                point: ExtensionPoint::Clock,
+                point: ExtensionPoint::PlatformAdapter,
                 ..
             })
         ));
@@ -2171,7 +2435,9 @@ mod tests {
                 ExtensionPoint::Wake,
                 ExtensionPoint::Access,
                 ExtensionPoint::Delivery,
-                ExtensionPoint::TurnError
+                ExtensionPoint::TurnError,
+                ExtensionPoint::Clock,
+                ExtensionPoint::Receive
             ]
         );
     }
@@ -2310,6 +2576,102 @@ mod tests {
             manager.validate_config(&config),
             Err(PluginError::UnknownProvider(_))
         ));
+    }
+
+    #[test]
+    fn interval_idle_clock_respects_thresholds() {
+        let room = test_room();
+        let policy = ClockPolicy {
+            provider: ProviderId::builtin_clock_interval_idle(),
+            interval_secs: Some(60),
+            idle_secs: Some(120),
+        };
+        let context = ClockContext {
+            session: "main",
+            room: &room,
+            now: 0,
+            last_clock_at: 0,
+            last_record_at: None,
+        };
+        assert!(!ClockOffProvider.is_due(&policy, &context));
+        assert!(!IntervalIdleClockProvider.is_due(&policy, &context));
+
+        let due_interval = ClockContext {
+            now: 61_000,
+            ..context
+        };
+        assert!(IntervalIdleClockProvider.is_due(&policy, &due_interval));
+
+        let idle_only = ClockPolicy {
+            interval_secs: None,
+            idle_secs: Some(120),
+            ..policy
+        };
+        let due_idle = ClockContext {
+            now: 120_000,
+            last_clock_at: 0,
+            last_record_at: Some(0),
+            ..context
+        };
+        assert!(IntervalIdleClockProvider.is_due(&idle_only, &due_idle));
+        let not_idle = ClockContext {
+            now: 100_000,
+            ..due_idle
+        };
+        assert!(!IntervalIdleClockProvider.is_due(&idle_only, &not_idle));
+    }
+
+    struct NeverDueClock;
+
+    impl ClockProvider for NeverDueClock {
+        fn is_due(&self, _options: &ClockPolicy, _context: &ClockContext<'_>) -> bool {
+            false
+        }
+    }
+
+    struct ClockManager;
+
+    impl ManagerPlugin for ClockManager {
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new(
+                "ticker",
+                PLUGIN_API_VERSION,
+                vec![Capability::ClockDecision],
+            )
+        }
+
+        fn descriptors(&self) -> Vec<ProviderDescriptor> {
+            vec![ProviderDescriptor::new(
+                ProviderId::parse("ticker.never").expect("合法"),
+                ExtensionPoint::Clock,
+                PLUGIN_API_VERSION,
+                vec![Capability::ClockDecision],
+            )]
+        }
+
+        fn instantiate(
+            &self,
+            id: &ProviderId,
+            _options: ProviderOptions<'_>,
+        ) -> Result<ProviderInstance, PluginError> {
+            if id.name() == "never" {
+                Ok(ProviderInstance::Clock(Arc::new(NeverDueClock)))
+            } else {
+                Err(PluginError::UnknownProvider(id.to_string()))
+            }
+        }
+    }
+
+    #[test]
+    fn manager_can_supply_clock_providers() {
+        let mut manager = PluginManager::with_native_builtins();
+        manager
+            .install_manager(Arc::new(ClockManager))
+            .expect("应当能安装");
+        let id = ProviderId::parse("ticker.never").expect("合法");
+        manager
+            .resolve_clock(&id, &ClockPolicy::default())
+            .expect("时钟 provider 应当可解析");
     }
 
     #[test]

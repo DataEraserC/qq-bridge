@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use acb_kernel::{
-    AccessAction, AccessRequest, Config, DeliveryPolicy, DeliveryRequest, Element, PluginManager,
-    ProviderId, Record, RecordKind, ReloadScope, RoomId, SendContext, SendOrigin, Sender, Sent,
+    AccessAction, AccessRequest, ClockContext, ClockPolicy, Config, DeliveryPolicy,
+    DeliveryRequest, Element, PluginManager, ProviderId, ReceiveDecision, ReceivePolicy,
+    ReceiveRequest, Record, RecordKind, ReloadScope, RoomId, SendContext, SendOrigin, Sender, Sent,
     TurnErrorAction, TurnErrorPolicy, TurnErrorRequest, WakeContext, WakeDecision, WakePolicy,
 };
 
@@ -518,6 +519,24 @@ return {
 }
 "#,
     );
+    dir.write(
+        "hourly.lua",
+        r#"
+return {
+  extension = "clock",
+  is_due = function() return false end,
+}
+"#,
+    );
+    dir.write(
+        "no_bots.lua",
+        r#"
+return {
+  extension = "receive",
+  decide = function() return "record" end,
+}
+"#,
+    );
     let plugins = loaded(&dir);
     let text = r#"
         [[connections]]
@@ -554,11 +573,14 @@ return {
         [[sessions.subscriptions]]
         connection = "qq"
         room = "group/1"
+
+        [sessions.subscriptions.clock]
+        provider = "lua.hourly"
     "#;
     let config = Config::parse(text).expect("配置合法");
     plugins
         .validate_config(&config)
-        .expect("lua delivery / send hook 应当能解析");
+        .expect("lua 扩展点应当能解析");
 }
 
 #[test]
@@ -643,4 +665,98 @@ return {
         .find(|entry| entry.namespace == LUA_NAMESPACE)
         .expect("lua manager 应当在");
     assert!(matches!(health.health, Health::Degraded(_)));
+}
+
+#[test]
+fn clock_provider_runs_from_a_lua_script() {
+    let dir = TempDir::new("clock");
+    dir.write(
+        "hourly.lua",
+        r#"
+return {
+  extension = "clock",
+  is_due = function(options, context)
+    local interval = (options.interval_secs or 3600) * 1000
+    return context.now - context.last_clock_at >= interval
+  end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.hourly").expect("合法");
+    let policy = ClockPolicy {
+        provider: id.clone(),
+        interval_secs: Some(60),
+        idle_secs: None,
+    };
+    let provider = plugins
+        .resolve_clock(&id, &policy)
+        .expect("Lua clock provider 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let context = ClockContext {
+        session: "main",
+        room: &room,
+        now: 30_000,
+        last_clock_at: 0,
+        last_record_at: None,
+    };
+    assert!(!provider.is_due(&policy, &context));
+    let due = ClockContext {
+        now: 61_000,
+        ..context
+    };
+    assert!(provider.is_due(&policy, &due));
+}
+
+#[test]
+fn receive_provider_runs_from_a_lua_script() {
+    let dir = TempDir::new("receive");
+    dir.write(
+        "no_bots.lua",
+        r#"
+return {
+  extension = "receive",
+  decide = function(request)
+    if request.sender.id == "bot" then return "drop" end
+    return "record"
+  end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.no_bots").expect("合法");
+    let provider = plugins
+        .resolve_receive(&id, &ReceivePolicy::default())
+        .expect("Lua receive provider 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let bot = Sender {
+        id: "bot".to_owned(),
+        name: "Bot".to_owned(),
+        role: None,
+    };
+    let human = Sender {
+        id: "10001".to_owned(),
+        name: "老王".to_owned(),
+        role: None,
+    };
+    let text = "你好";
+    let elements = vec![Element::text(text)];
+    let request = ReceiveRequest {
+        connection: "qq",
+        platform: "qq",
+        room: &room,
+        sender: &bot,
+        kind: &RecordKind::Message,
+        elements: &elements,
+        text,
+        at_self: false,
+    };
+    assert_eq!(provider.decide(&ReceivePolicy::default(), &request), ReceiveDecision::Drop);
+    let request = ReceiveRequest {
+        sender: &human,
+        ..request
+    };
+    assert_eq!(provider.decide(&ReceivePolicy::default(), &request), ReceiveDecision::Record);
 }

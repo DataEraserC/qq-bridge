@@ -197,6 +197,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // 时钟：每秒评估一次订阅的时钟策略（ADR-0011）。默认全关，不配就不产生轮次。
+    {
+        let bridge = Arc::clone(&bridge);
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as i64)
+                    .unwrap_or(0);
+                let queued = {
+                    let mut guard = bridge
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.tick_clock(now)
+                };
+                if queued > 0 {
+                    println!("时钟：排了 {queued} 轮例行检查");
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
     println!("桥在跑。按 Ctrl-C 停。");
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(3600));

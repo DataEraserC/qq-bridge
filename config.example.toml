@@ -82,6 +82,11 @@ account = "10001"
 # 想让它真顶一个人的位置（能踢人能禁言能改群名），把这行改成 true。
 allow_destructive = false
 
+# 入站策略（ADR-0026）：决定这条连接上的记录收不收。默认全部接收。
+# 被丢掉的记录不写流水、不叫醒任何人，就像从没到过桥。
+# [connections.receive]
+# provider = "acb.receive.all"
+
 # 同一个平台的第二个号：id 换个名字就行。它看到的群是 qq2:group/123，
 # 跟 qq:group/123 是两个房间，各记各的水位，永远不会重复收。
 [[connections]]
@@ -182,6 +187,12 @@ name_mention = true
 names = ["小助手"]
 accumulate = 5
 poke = true
+
+# 时钟策略（ADR-0011）：没有新消息也定期开一轮例行检查。默认关闭。
+# 写了 interval_secs / idle_secs 但没写 provider 时，自动用内置时钟。
+# [sessions.subscriptions.clock]
+# interval_secs = 1800   # 每 30 分钟一次
+# idle_secs = 7200       # 或房间安静满 2 小时
 
 # 第二个号的私聊：只在 @ 我或回复我时醒；那个人说话不叫醒（但照常记录）。
 [[sessions.subscriptions]]

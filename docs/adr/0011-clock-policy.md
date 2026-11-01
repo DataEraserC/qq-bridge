@@ -18,3 +18,10 @@
 ## 成本与默认
 
 时钟策略会凭空产生轮次，每轮都是真实的 token 开销。默认**关闭**，按订阅开启，间隔由订阅配置；实现上时钟评估只做廉价检查（有没有未确认未读、闲够没够），贵的事（开轮次）只在必要时发生。
+
+## 实现记录（2026-11-01）
+
+- 订阅配置 `[sessions.subscriptions.clock]`：`provider`、`interval_secs`、`idle_secs`；默认 `acb.clock.off`。
+- 内置 `acb.clock.interval_idle`：固定间隔（自上次时钟轮起算）或房间空闲超时（按最后一条记录时间）任一命中就开轮。
+- 桥主进程每秒 tick 一次；会话正在跑或该房间已有排队时跳过，不叠轮次。`last_clock_at` 只在内存里，重启后从第一次 tick 重新计时。
+- 时钟轮 `TurnReason::Clock`，投递可以为空；provider 可替换，Lua 脚本也能实现。

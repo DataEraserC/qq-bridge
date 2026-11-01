@@ -207,6 +207,8 @@ pub struct Connection {
     /// 这是「AI 能做任何人也做的事」和「群消息是不可信输入」之间唯一的那道闸：
     /// 白名单挡不住「模型合法地调一个它本来就有权调的方法」，只有默认关才挡得住。
     pub allow_destructive: DestructivePolicy,
+    /// 入站策略（ADR-0026）：决定这条连接上的记录收不收。默认全部接收。
+    pub receive: ReceivePolicy,
 }
 
 /// 破坏性方法的放行策略。
@@ -346,6 +348,8 @@ pub struct Subscription {
     /// 房间（连接名 + 路径）。
     pub room: RoomId,
     pub wake: WakePolicy,
+    /// 时钟策略（ADR-0011）。默认关闭。
+    pub clock: ClockPolicy,
 }
 
 /// 一个会话的访问策略。
@@ -406,6 +410,40 @@ impl Default for TurnErrorPolicy {
     fn default() -> Self {
         Self {
             provider: ProviderId::builtin_turn_error(),
+        }
+    }
+}
+
+/// 一条订阅的时钟策略（ADR-0011）。默认关闭。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClockPolicy {
+    pub provider: ProviderId,
+    /// 固定间隔（秒）；0 / 不写 = 不看间隔。
+    pub interval_secs: Option<u64>,
+    /// 房间安静多久（秒）后评估；0 / 不写 = 不看空闲。
+    pub idle_secs: Option<u64>,
+}
+
+impl Default for ClockPolicy {
+    fn default() -> Self {
+        Self {
+            provider: ProviderId::builtin_clock_off(),
+            interval_secs: None,
+            idle_secs: None,
+        }
+    }
+}
+
+/// 一条连接的入站策略（ADR-0026）。默认全部接收。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceivePolicy {
+    pub provider: ProviderId,
+}
+
+impl Default for ReceivePolicy {
+    fn default() -> Self {
+        Self {
+            provider: ProviderId::builtin_receive_all(),
         }
     }
 }
@@ -604,6 +642,13 @@ pub enum ConfigError {
         provider: String,
         detail: String,
     },
+    #[error("会话 {session} 的房间 {room} 的时钟 provider 不合法：{provider}（{detail}）")]
+    BadClockProvider {
+        session: String,
+        room: String,
+        provider: String,
+        detail: String,
+    },
     #[error("会话 {session} 的接入令牌不能为空")]
     EmptyToken { session: String },
     #[error("会话 {session} 引用了不存在的人格 {persona}")]
@@ -656,6 +701,12 @@ pub enum ConfigError {
     BadUrl { connection: String, url: String },
     #[error("连接 {connection} 的登录账号不能为空——桥要靠它分辨「哪句是我说的」")]
     EmptyAccount { connection: String },
+    #[error("连接 {connection} 的入站策略 provider 不合法：{provider}（{detail}）")]
+    BadReceiveProvider {
+        connection: String,
+        provider: String,
+        detail: String,
+    },
     #[error("存储路径不能为空（不配就用默认的 {DEFAULT_STORAGE_PATH}）")]
     EmptyStoragePath,
     #[error("worktree 根目录不能为空（不配就用默认的 {DEFAULT_WORKTREES_ROOT}）")]
@@ -1185,6 +1236,7 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
         _ => return Err(ConfigError::EmptyAccount { connection: id }),
     };
 
+    let receive = build_receive(&id, raw.receive)?;
     Ok(Connection {
         id,
         platform,
@@ -1206,7 +1258,30 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
             .allow_destructive
             .map(RawDestructive::into_policy)
             .unwrap_or_default(),
+        receive,
     })
+}
+
+fn build_receive(
+    connection: &str,
+    raw: RawReceive,
+) -> Result<ReceivePolicy, ConfigError> {
+    let provider = match raw
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => ProviderId::parse(text).map_err(|error| {
+            ConfigError::BadReceiveProvider {
+                connection: connection.to_owned(),
+                provider: text.to_owned(),
+                detail: error.to_string(),
+            }
+        })?,
+        None => ProviderId::builtin_receive_all(),
+    };
+    Ok(ReceivePolicy { provider })
 }
 
 fn build_subscription(session: &str, raw: RawSubscription) -> Result<Subscription, ConfigError> {
@@ -1219,8 +1294,39 @@ fn build_subscription(session: &str, raw: RawSubscription) -> Result<Subscriptio
     })?;
 
     let wake = build_wake(session, &room, raw.wake.unwrap_or_default())?;
+    let clock = build_clock(session, &room, raw.clock)?;
 
-    Ok(Subscription { room, wake })
+    Ok(Subscription { room, wake, clock })
+}
+
+fn build_clock(
+    session: &str,
+    room: &RoomId,
+    raw: Option<RawClock>,
+) -> Result<ClockPolicy, ConfigError> {
+    let raw = raw.unwrap_or_default();
+    let has_thresholds = raw.interval_secs.is_some() || raw.idle_secs.is_some();
+    let provider = match raw
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => ProviderId::parse(text).map_err(|error| ConfigError::BadClockProvider {
+            session: session.to_owned(),
+            room: room.to_string(),
+            provider: text.to_owned(),
+            detail: error.to_string(),
+        })?,
+        // 写了间隔/空闲却没写 provider：直接当成内置时钟，不用再教一遍。
+        None if has_thresholds => ProviderId::builtin_clock_interval_idle(),
+        None => ProviderId::builtin_clock_off(),
+    };
+    Ok(ClockPolicy {
+        provider,
+        interval_secs: raw.interval_secs,
+        idle_secs: raw.idle_secs,
+    })
 }
 
 fn build_access(
@@ -1556,6 +1662,14 @@ struct RawConnection {
     /// `true` 全开，或写方法名数组只开那几个。不写 = 全关。
     #[serde(default)]
     allow_destructive: Option<RawDestructive>,
+    /// 入站策略（默认全部接收）。
+    #[serde(default)]
+    receive: RawReceive,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawReceive {
+    provider: Option<String>,
 }
 
 /// `allow_destructive` 有两种写法：布尔，或方法名数组。
@@ -1621,6 +1735,14 @@ struct RawSubscription {
     /// 平台侧房间路径，如 `group/123`。
     room: String,
     wake: Option<RawWake>,
+    clock: Option<RawClock>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawClock {
+    provider: Option<String>,
+    interval_secs: Option<u64>,
+    idle_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

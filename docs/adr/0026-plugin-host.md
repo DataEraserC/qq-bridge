@@ -125,6 +125,15 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - 会话新增 `[sessions.turn_error] provider = ...`，默认 `acb.turn_error.default`；默认实现保持原行为：会话 `on_turn_error` 非空就用它，否则回退全局 `default_on_turn_error`。
   - provider 只返回动作列表（log / send:房间）；文本组装、发送和锁外执行仍归 core。未知 provider 启动时拒绝。
   - Lua 增加 `extension = "turn_error"`：`decide(request)` 返回 `{ {kind="log"}, {kind="send", room="qq:group/ops"} }`；报错回退默认选择，并累计 health。
+- **Phase 5b（2026-11-01）**：clock provider 化（ADR-0011 落地）。
+  - 订阅新增 `[sessions.subscriptions.clock]`：`provider` + `interval_secs` / `idle_secs`；默认 `acb.clock.off`，写了阈值但没写 provider 时自动用 `acb.clock.interval_idle`。
+  - 内置 `acb.clock.interval_idle`：固定间隔或房间空闲任一命中就开一轮；`TurnReason::Clock`，投递可以为空。
+  - `main` 每秒调一次 `Bridge::tick_clock`；`last_clock_at` 只存在内存里，重启后重新计间隔。会话正在跑或已有排队时不叠轮次。
+  - Lua 增加 `extension = "clock"`：`is_due(options, context)` 返回布尔（也接受 due/skip）；报错按「不触发」兜底。
+- **Phase 5c（2026-11-01）**：receive provider 化。
+  - 连接新增 `[connections.receive] provider = ...`，默认 `acb.receive.all`；入站策略只回答 `record` / `drop`。
+  - 被丢掉的记录不写流水、不叫醒任何人，也不会让水位出现空洞；provider 拿不到 Store / 票 / 配置写入。
+  - Lua 增加 `extension = "receive"`：`decide(request)` 返回 record/drop 或布尔；报错按「接收」兜底，避免误丢消息。
 
 ## 参考
 

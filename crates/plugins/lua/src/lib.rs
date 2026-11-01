@@ -41,12 +41,30 @@
 //!     return { { kind = "log" }, { kind = "send", room = "qq:group/ops" } }
 //!   end,
 //! }
+//!
+//! -- clock：到点返回 true
+//! return {
+//!   extension = "clock",
+//!   is_due = function(options, context)
+//!     return context.now - context.last_clock_at >= 3600000
+//!   end,
+//! }
+//!
+//! -- receive：决定这条入站记录收不收
+//! return {
+//!   extension = "receive",
+//!   decide = function(request)
+//!     if request.sender.id == "bot" then return "drop" end
+//!     return "record"
+//!   end,
+//! }
 //! ```
 //!
 //! 文件名就是 provider 名，最终 id 是 `lua.<文件名>`。`options` / `context` / `request`
 //! 是普通 table；脚本拿不到 Store、Bridge 或配置写入能力。每次调用最多 50ms，死循环会被
-//! 指令钩子打断：wake/access 按安全侧兜底，delivery/turn_error 回退内置实现，send 的
-//! before 报错则这次发送失败。失败数累计在 manager health 里。
+//! 指令钩子打断：wake/access/clock/receive 按安全侧兜底（receive 出错按接收），
+//! delivery/turn_error 回退内置实现，send 的 before 报错则这次发送失败。
+//! 失败数累计在 manager health 里。
 //!
 //! LuaManager 本身是 native 实现：先有它（以及 mlua 运行时），LuaLoader 才能加载脚本。
 //! 这是 ADR-0026 的 bootstrap 约束——manager 不能由自己管理的格式来加载。
@@ -59,12 +77,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use acb_kernel::{
-    AccessDecision, AccessPolicy, AccessProvider, AccessRequest, Capability,
-    DefaultTurnErrorProvider, DeliveryComposer, DeliveryPlan, DeliveryPolicy, DeliveryRequest,
-    Element, ExtensionPoint, Health, LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin,
-    Omitted, PluginError, PluginLoader, PluginManager, ProviderDescriptor, ProviderId,
-    ProviderInstance, ProviderOptions, Record, RecordKind, ReloadScope, RoomId, SendContext,
-    SendHook, SenderRole, Sent, TurnErrorAction, TurnErrorProvider, TurnErrorRequest, WakeContext,
+    AccessDecision, AccessPolicy, AccessProvider, AccessRequest, Capability, ClockContext,
+    ClockPolicy, ClockProvider, DefaultTurnErrorProvider, DeliveryComposer, DeliveryPlan,
+    DeliveryPolicy, DeliveryRequest, Element, ExtensionPoint, Health, LoaderKind, LoaderManifest,
+    ManagerManifest, ManagerPlugin, Omitted, PluginError, PluginLoader, PluginManager,
+    ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, ReceiveDecision,
+    ReceivePolicy, ReceiveProvider, ReceiveRequest, Record, RecordKind, ReloadScope, RoomId,
+    SendContext, SendHook, SenderRole, Sent, TurnErrorAction, TurnErrorProvider, TurnErrorRequest,
+    WakeContext,
     WakeDecision, WakePolicy, WakeProvider, default_delivery_plan, PLUGIN_API_VERSION,
 };
 use acb_proto::element::flatten_text;
@@ -285,6 +305,85 @@ impl TurnErrorProvider for LuaTurnErrorProvider {
     }
 }
 
+struct LuaClockProvider {
+    caller: LuaCaller,
+}
+
+impl ClockProvider for LuaClockProvider {
+    fn is_due(&self, options: &ClockPolicy, context: &ClockContext<'_>) -> bool {
+        let result = self.caller.call(|lua, function| {
+            let options = clock_options_table(lua, options)?;
+            let context = clock_context_table(lua, context)?;
+            function.call::<Value>((options, context))
+        });
+        match result {
+            Ok(Value::Boolean(due)) => due,
+            Ok(Value::String(text)) => match text.to_string_lossy().as_str() {
+                "due" | "wake" => true,
+                "skip" | "stay" => false,
+                other => {
+                    self.caller.record_failure(&mlua::Error::runtime(format!(
+                        "clock.is_due 返回了不认识的字符串 {other:?}"
+                    )));
+                    false
+                }
+            },
+            Ok(other) => {
+                self.caller.record_failure(&mlua::Error::runtime(format!(
+                    "clock.is_due 要返回布尔值或 due/skip，收到 {other:?}"
+                )));
+                false
+            }
+            Err(error) => {
+                self.caller.record_failure(&error);
+                false
+            }
+        }
+    }
+}
+
+struct LuaReceiveProvider {
+    caller: LuaCaller,
+}
+
+impl ReceiveProvider for LuaReceiveProvider {
+    fn decide(&self, _options: &ReceivePolicy, request: &ReceiveRequest<'_>) -> ReceiveDecision {
+        let result = self.caller.call(|lua, function| {
+            let request = receive_request_table(lua, request)?;
+            function.call::<Value>(request)
+        });
+        match result {
+            Ok(Value::Boolean(record)) => {
+                if record {
+                    ReceiveDecision::Record
+                } else {
+                    ReceiveDecision::Drop
+                }
+            }
+            Ok(Value::String(text)) => match text.to_string_lossy().as_str() {
+                "record" => ReceiveDecision::Record,
+                "drop" => ReceiveDecision::Drop,
+                other => {
+                    self.caller.record_failure(&mlua::Error::runtime(format!(
+                        "receive.decide 返回了不认识的字符串 {other:?}"
+                    )));
+                    ReceiveDecision::Record
+                }
+            },
+            Ok(other) => {
+                self.caller.record_failure(&mlua::Error::runtime(format!(
+                    "receive.decide 要返回 record/drop 或布尔值，收到 {other:?}"
+                )));
+                ReceiveDecision::Record
+            }
+            Err(error) => {
+                self.caller.record_failure(&error);
+                ReceiveDecision::Record
+            }
+        }
+    }
+}
+
 fn provider_error(caller: &LuaCaller, error: &mlua::Error) -> PluginError {
     PluginError::Provider {
         id: caller.label.clone(),
@@ -305,6 +404,8 @@ enum LoadedInstance {
     Delivery(Arc<dyn DeliveryComposer>),
     Send(Arc<dyn SendHook>),
     TurnError(Arc<dyn TurnErrorProvider>),
+    Clock(Arc<dyn ClockProvider>),
+    Receive(Arc<dyn ReceiveProvider>),
 }
 
 impl LoadedProvider {
@@ -315,6 +416,8 @@ impl LoadedProvider {
             LoadedInstance::Delivery(composer) => ProviderInstance::Delivery(composer.clone()),
             LoadedInstance::Send(hook) => ProviderInstance::Send(hook.clone()),
             LoadedInstance::TurnError(provider) => ProviderInstance::TurnError(provider.clone()),
+            LoadedInstance::Clock(provider) => ProviderInstance::Clock(provider.clone()),
+            LoadedInstance::Receive(provider) => ProviderInstance::Receive(provider.clone()),
         }
     }
 }
@@ -354,6 +457,8 @@ impl ManagerPlugin for LuaManager {
                 Capability::DeliverPlan,
                 Capability::SendHook,
                 Capability::TurnErrorDecision,
+                Capability::ClockDecision,
+                Capability::ReceiveDecision,
             ],
         )
     }
@@ -439,6 +544,8 @@ impl PluginLoader for LuaLoader {
                 ExtensionPoint::Delivery,
                 ExtensionPoint::Send,
                 ExtensionPoint::TurnError,
+                ExtensionPoint::Clock,
+                ExtensionPoint::Receive,
             ],
         )
     }
@@ -492,6 +599,8 @@ fn load_scripts(
             ExtensionPoint::Delivery => Capability::DeliverPlan,
             ExtensionPoint::Send => Capability::SendHook,
             ExtensionPoint::TurnError => Capability::TurnErrorDecision,
+            ExtensionPoint::Clock => Capability::ClockDecision,
+            ExtensionPoint::Receive => Capability::ReceiveDecision,
             point => {
                 return Err(PluginError::UnsupportedExtensionPoint {
                     id: loaded.id.to_string(),
@@ -553,9 +662,11 @@ fn load_script(
         "delivery" => ExtensionPoint::Delivery,
         "send" => ExtensionPoint::Send,
         "turn_error" => ExtensionPoint::TurnError,
+        "clock" => ExtensionPoint::Clock,
+        "receive" => ExtensionPoint::Receive,
         other => {
             return Err(PluginError::Loader(format!(
-                "{}：不支持的 extension {other:?}（只支持 wake / access / delivery / send / turn_error）",
+                "{}：不支持的 extension {other:?}（只支持 wake / access / delivery / send / turn_error / clock / receive）",
                 path.display()
             )));
         }
@@ -653,6 +764,36 @@ fn load_script(
                 PluginError::Loader(format!("{}：保存 decide 失败：{error}", path.display()))
             })?;
             LoadedInstance::TurnError(Arc::new(LuaTurnErrorProvider {
+                caller: LuaCaller {
+                    lua: Arc::new(Mutex::new(lua)),
+                    function: key,
+                    timeout: LUA_CALL_TIMEOUT,
+                    failures: failures.clone(),
+                    label: id.to_string(),
+                },
+            }))
+        }
+        ExtensionPoint::Clock => {
+            let function = required_function(&table, "is_due", path)?;
+            let key = lua.create_registry_value(function).map_err(|error| {
+                PluginError::Loader(format!("{}：保存 is_due 失败：{error}", path.display()))
+            })?;
+            LoadedInstance::Clock(Arc::new(LuaClockProvider {
+                caller: LuaCaller {
+                    lua: Arc::new(Mutex::new(lua)),
+                    function: key,
+                    timeout: LUA_CALL_TIMEOUT,
+                    failures: failures.clone(),
+                    label: id.to_string(),
+                },
+            }))
+        }
+        ExtensionPoint::Receive => {
+            let function = required_function(&table, "decide", path)?;
+            let key = lua.create_registry_value(function).map_err(|error| {
+                PluginError::Loader(format!("{}：保存 decide 失败：{error}", path.display()))
+            })?;
+            LoadedInstance::Receive(Arc::new(LuaReceiveProvider {
                 caller: LuaCaller {
                     lua: Arc::new(Mutex::new(lua)),
                     function: key,
@@ -1055,6 +1196,50 @@ fn interpret_turn_error_actions(value: Value) -> mlua::Result<Vec<TurnErrorActio
         }
     }
     Ok(actions)
+}
+
+fn clock_options_table(lua: &Lua, options: &ClockPolicy) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("provider", options.provider.to_string())?;
+    table.set("interval_secs", options.interval_secs)?;
+    table.set("idle_secs", options.idle_secs)?;
+    Ok(table)
+}
+
+fn clock_context_table(lua: &Lua, context: &ClockContext<'_>) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("session", context.session)?;
+    table.set("room", context.room.to_string())?;
+    table.set("now", context.now)?;
+    table.set("last_clock_at", context.last_clock_at)?;
+    table.set("last_record_at", context.last_record_at)?;
+    Ok(table)
+}
+
+fn receive_request_table(lua: &Lua, request: &ReceiveRequest<'_>) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("connection", request.connection)?;
+    table.set("platform", request.platform)?;
+    table.set("room", request.room.to_string())?;
+    table.set("text", request.text)?;
+    table.set("at_self", request.at_self)?;
+    let sender = lua.create_table()?;
+    sender.set("id", request.sender.id.clone())?;
+    sender.set("name", request.sender.name.clone())?;
+    sender.set("role", request.sender.role.as_ref().map(role_name))?;
+    table.set("sender", sender)?;
+    match request.kind {
+        RecordKind::Message => {
+            table.set("kind", "message")?;
+            table.set("event", Option::<String>::None)?;
+        }
+        RecordKind::Event { event } => {
+            table.set("kind", "event")?;
+            table.set("event", event.clone())?;
+        }
+    }
+    table.set("elements", elements_to_table(lua, request.elements)?)?;
+    Ok(table)
 }
 
 fn interpret_wake(value: Value) -> mlua::Result<WakeDecision> {
