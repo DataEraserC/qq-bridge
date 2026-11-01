@@ -107,6 +107,8 @@ kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
 
 - 动态库和桥同进程：插件 panic、死循环或内存错误会带倒整座桥。需要崩溃隔离就用
   `kind = "process"`。P3 对动态库调用不加超时（in-process 打断不了）。
+- 第三方插件必须声明 `metadata.summary`；wake 插件还必须声明 `effects`
+  （至少 `may_wake` / `may_stay_silent`），否则启动时拒绝。
 - 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`。
 
 ### wake 策略插件
@@ -139,6 +141,9 @@ provider = "vendor.wake"
 作者在 manifest 里声明，是**说明不是指令**；`effects`（如 `may_delay`、
 `may_modify_text`、`may_wake`）是文档，不是强制保证。控制台的 `GET /api/plugins`
 是同一份目录的只读 JSON。
+
+轮次开头也会带 `wake_reason`：内置/trusted/动态库 wake 策略命中时给出具体原因
+（如「有新消息（@ 了我）」），agent 不用猜自己为什么被叫醒。协议版本因此升到 5。
 
 ## 事件怎么映射
 

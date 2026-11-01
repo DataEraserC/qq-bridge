@@ -90,6 +90,12 @@ fn wake_provider_uses_the_shared_wire() {
         ..context
     };
     assert_eq!(provider.decide(&policy, &aimed), WakeDecision::Wake);
+    let verdict = provider.decide_with_reason(&policy, &aimed);
+    assert_eq!(verdict.decision, WakeDecision::Wake);
+    assert_eq!(
+        verdict.reason.as_deref(),
+        Some("fixture：@ 或关键词命中")
+    );
 
     let plain = WakeContext {
         text: "今天天气不错",

@@ -140,6 +140,8 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - Root 新增 `catalog()` / `catalog_json()` / `info()`：合并 manager 说明、标注 `source`（builtin / trusted / lua / dynamic）和 manager health；内置 provider、OneBot、process、动态库 fixture 都带描述。
   - agent 新增只读工具 `describe_plugins`：默认返回本会话实际生效的 access / delivery / turn_error / receive / send_hooks / 订阅 wake/clock / 当前适配器；`scope=global` 看整个目录，可按 extension 过滤。
   - 控制台新增 `GET /api/plugins`；只给 options schema，不给实际 options、路径或 token。描述可能不可信（插件作者写的），按数据处理、限长、转义。
+  - wake provider 新增 `decide_with_reason`：内置/trusted/动态库实现返回命中原因（@、引用、名字、关键词、攒条、拍），经 `Delivery.wake_reason` 下发；协议版本升到 5，harness 把原因渲染进轮次开头（如「有新消息（@ 了我）」）。
+  - P5d：`PluginSource` 非 `Builtin` 的适配器和 manager provider 必须声明 `metadata.summary`；动态库 wake 插件还必须声明 `effects`，否则启动失败。描述从“建议”变成第三方插件准入门槛。
 
 ## 参考
 

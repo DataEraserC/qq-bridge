@@ -122,6 +122,8 @@ pub enum AdapterError {
     BadId(String),
     #[error("适配器 {0} 实例化失败：{1}")]
     Create(String, String),
+    #[error("第三方适配器 {0} 没有声明 metadata.summary（agent 需要知道它是干什么的）")]
+    MissingDocs(String),
 }
 
 /// manifest 本身的校验：版本必须对得上，id 必须是 `namespace.name`。
@@ -181,6 +183,7 @@ mod tests {
     use crate::config::Transport;
     use crate::outbound::{OutboundError, Sent};
     use crate::plugin::PluginManager;
+    use crate::plugin_meta::PluginSource;
     use acb_proto::{Element, RoomId};
     use std::sync::Arc;
 
@@ -280,6 +283,45 @@ mod tests {
             .create_adapter(&connection("nope", Transport::WsClient), events())
             .expect_err("kind 不存在");
         assert!(matches!(unknown, AdapterError::UnknownKind(_)));
+    }
+
+    struct NoDocsFactory;
+
+    impl AdapterFactory for NoDocsFactory {
+        fn manifest(&self) -> AdapterManifest {
+            AdapterManifest {
+                id: Cow::Borrowed("acb.adapter.undoc"),
+                platform: Cow::Borrowed("qq"),
+                kind: Cow::Borrowed("undoc"),
+                transports: Cow::Borrowed(FAKE_TRANSPORTS),
+                api_version: ADAPTER_API_VERSION,
+                capabilities: Cow::Borrowed(FAKE_CAPS),
+                metadata: PluginMetadata::EMPTY,
+            }
+        }
+
+        fn create(
+            &self,
+            _connection: &Connection,
+            _events: EventQueue,
+        ) -> Result<AdapterInstance, AdapterError> {
+            Ok(AdapterInstance {
+                outbound: Box::new(FakeOutbound),
+                launch: Box::new(|_host| {}),
+            })
+        }
+    }
+
+    #[test]
+    fn third_party_adapter_needs_docs() {
+        let mut plugins = PluginManager::with_native_builtins();
+        assert!(matches!(
+            plugins.register_adapter_with_source(
+                Arc::new(NoDocsFactory),
+                PluginSource::Dynamic
+            ),
+            Err(AdapterError::MissingDocs(_))
+        ));
     }
 
     #[test]

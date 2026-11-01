@@ -18,7 +18,8 @@ use crate::ticket::Ticket;
 /// `device`/`memory` 合并成 `session`，串行键改成「harness 名 + 会话 id」（ADR-0017）。
 /// 4：加控制面——`control`（桥→harness 发指令）和 `control_result`（harness 回报），
 /// 供桥侧统一控制台触达 harness 内部（ADR-0018）。
-pub const PROTOCOL_VERSION: u32 = 4;
+/// 5：`delivery` 增加可选 `wake_reason`，让 agent 知道「这次为什么醒」。
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// 单帧上限：1 MiB。超了直接断连，不做截断。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -36,6 +37,10 @@ pub struct Delivery {
     pub records: Vec<Record>,
     /// 为什么开这一轮。
     pub reason: TurnReason,
+    /// wake 策略给出的命中原因（如「@ 了我」「攒够 5 条未读」）。
+    /// 只给 agent 看，不参与调度；时钟轮次通常为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_reason: Option<String>,
     /// 这个会话引用的记忆：每份的 id + worktree 路径。harness 据此让 agent 操作记忆
     /// （文件 + git），`memory_*` 工具用记忆 id 指认要碰哪一份。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -347,6 +352,7 @@ mod tests {
                 note: None,
             }],
             reason: TurnReason::Wake,
+            wake_reason: Some("@ 了我".into()),
             memories: Vec::new(),
             session_info: Some(SessionInfo {
                 id: "main".into(),

@@ -13,7 +13,8 @@ use acb_kernel::{
     Capability, ExtensionPoint, Health, LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin,
     PluginError, PluginLoader, PluginManager, PluginMetadata, PluginSource, ProviderDescriptor,
     ProviderId, ProviderInstance,
-    ProviderOptions, WakeContext, WakeDecision, WakePolicy, WakeProvider, PLUGIN_API_VERSION,
+    ProviderOptions, WakeContext, WakeDecision, WakePolicy, WakeProvider, WakeVerdict,
+    PLUGIN_API_VERSION,
 };
 
 /// 这个 manager 的 namespace。`acb` 是内置保留名，树外不能用。
@@ -32,9 +33,19 @@ pub struct AccumulateOnlyWake;
 
 impl WakeProvider for AccumulateOnlyWake {
     fn decide(&self, options: &WakePolicy, context: &WakeContext<'_>) -> WakeDecision {
+        self.decide_with_reason(options, context).decision
+    }
+
+    fn decide_with_reason(
+        &self,
+        options: &WakePolicy,
+        context: &WakeContext<'_>,
+    ) -> WakeVerdict {
         match options.accumulate {
-            Some(threshold) if threshold > 0 && context.unread >= threshold => WakeDecision::Wake,
-            _ => WakeDecision::Stay,
+            Some(threshold) if threshold > 0 && context.unread >= threshold => {
+                WakeVerdict::wake(format!("trusted：攒够 {threshold} 条未读"))
+            }
+            _ => WakeVerdict::stay(),
         }
     }
 }

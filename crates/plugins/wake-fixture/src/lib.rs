@@ -111,7 +111,7 @@ unsafe extern "C" fn wake_invoke(handle: *mut c_void, request_json: *const c_cha
                     id,
                     result: WireResult::Decision {
                         decision: if wake { "wake" } else { "stay" }.into(),
-                        reason: None,
+                        reason: wake.then(|| "fixture：@ 或关键词命中".to_owned()),
                     },
                 }
             }

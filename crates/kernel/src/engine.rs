@@ -109,6 +109,7 @@ struct Pending {
     session: String,
     room: RoomId,
     reason: TurnReason,
+    wake_reason: Option<String>,
 }
 
 /// 正在跑的一轮。挂在会话上：一个会话同一时刻只有这一轮。
@@ -571,9 +572,15 @@ impl<S: Store> Bridge<S> {
                 unread: pending,
                 now: now_millis(),
             };
-            if provider.decide(&subscriber.wake, &context) == WakeDecision::Wake {
+            let verdict = provider.decide_with_reason(&subscriber.wake, &context);
+            if verdict.decision == WakeDecision::Wake {
                 woke.push(subscriber.session.clone());
-                self.enqueue(subscriber.session, room.clone(), TurnReason::Wake);
+                self.enqueue(
+                    subscriber.session,
+                    room.clone(),
+                    TurnReason::Wake,
+                    verdict.reason,
+                );
             }
         }
 
@@ -1468,7 +1475,7 @@ impl<S: Store> Bridge<S> {
                     last_record_at,
                 };
                 if provider.is_due(&policy, &context) {
-                    self.enqueue(session.clone(), room.clone(), TurnReason::Clock);
+                    self.enqueue(session.clone(), room.clone(), TurnReason::Clock, None);
                     self.clock_last.insert(key, now);
                     queued += 1;
                 }
@@ -1492,7 +1499,13 @@ impl<S: Store> Bridge<S> {
         Ok(Some(record.at))
     }
 
-    fn enqueue(&mut self, session: String, room: RoomId, reason: TurnReason) {
+    fn enqueue(
+        &mut self,
+        session: String,
+        room: RoomId,
+        reason: TurnReason,
+        wake_reason: Option<String>,
+    ) {
         let already = self
             .pending
             .iter()
@@ -1504,6 +1517,7 @@ impl<S: Store> Bridge<S> {
             session,
             room,
             reason,
+            wake_reason,
         });
     }
 
@@ -1637,6 +1651,7 @@ impl<S: Store> Bridge<S> {
             room: pending.room,
             records,
             reason: pending.reason,
+            wake_reason: pending.wake_reason,
             memories,
             session_info,
             persona,

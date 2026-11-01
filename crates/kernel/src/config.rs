@@ -498,6 +498,29 @@ pub enum WakeDecision {
     Stay,
 }
 
+/// 判定结果 + 原因。原因给 agent 看「这次为什么醒」，不参与调度。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeVerdict {
+    pub decision: WakeDecision,
+    pub reason: Option<String>,
+}
+
+impl WakeVerdict {
+    pub fn wake(reason: impl Into<String>) -> Self {
+        Self {
+            decision: WakeDecision::Wake,
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn stay() -> Self {
+        Self {
+            decision: WakeDecision::Stay,
+            reason: None,
+        }
+    }
+}
+
 /// 唤醒策略。
 ///
 /// 默认五件套：@ 我就醒、引用我的话也醒、叫昵称就醒、攒够 N 条就醒、被拍就醒
@@ -549,43 +572,48 @@ impl WakePolicy {
     ///
     /// 顺序有讲究：免打扰名单最先——被忽略的人怎么叫都不醒，但记录照旧。
     pub fn decide(&self, input: &WakeInput<'_>) -> WakeDecision {
+        self.decide_with_reason(input).decision
+    }
+
+    /// 同 [`decide`](Self::decide)，但带上命中原因，给 agent 看「这次为什么醒」。
+    pub fn decide_with_reason(&self, input: &WakeInput<'_>) -> WakeVerdict {
         if self
             .ignore_speakers
             .iter()
             .any(|speaker| speaker == input.sender_id)
         {
-            return WakeDecision::Stay;
+            return WakeVerdict::stay();
         }
 
         if let Some(event) = input.event {
             if event == "poke" && self.poke && input.at_self {
-                return WakeDecision::Wake;
+                return WakeVerdict::wake("被拍了一下");
             }
             if self.events.iter().any(|wanted| wanted == event) {
-                return WakeDecision::Wake;
+                return WakeVerdict::wake(format!("事件 {event}"));
             }
-            return WakeDecision::Stay;
+            return WakeVerdict::stay();
         }
 
         if self.at_mention && input.at_self {
-            return WakeDecision::Wake;
+            return WakeVerdict::wake("@ 了我");
         }
         // 引用我的话等同于对我说：QQ 里「回复」是最自然的追问方式，很多人不会再加 @。
         if self.reply && input.reply_to_self {
-            return WakeDecision::Wake;
+            return WakeVerdict::wake("引用了我说的话");
         }
         if self.name_mention && matches_any(&self.names, input.text) {
-            return WakeDecision::Wake;
+            return WakeVerdict::wake("叫了我的名字");
         }
         if matches_any(&self.keywords, input.text) {
-            return WakeDecision::Wake;
+            return WakeVerdict::wake("命中关键词");
         }
         if let Some(threshold) = self.accumulate {
             if threshold > 0 && input.unread >= threshold {
-                return WakeDecision::Wake;
+                return WakeVerdict::wake(format!("攒够 {threshold} 条未读"));
             }
         }
-        WakeDecision::Stay
+        WakeVerdict::stay()
     }
 }
 

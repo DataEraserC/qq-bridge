@@ -36,8 +36,8 @@ use acb_kernel::{
     LoaderManifest, ManagerManifest, ManagerPlugin, MethodSpec, Outbound, OutboundError,
     OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager, PluginMetadata,
     PluginSource, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, RoomId,
-    Sent, WakeContext, WakeDecision, WakePolicy, WakeProvider, PLUGIN_API_VERSION,
-    validate_manifest,
+    Sent, WakeContext, WakeDecision, WakePolicy, WakeProvider, WakeVerdict,
+    PLUGIN_API_VERSION, validate_manifest,
 };
 use libloading::Library;
 use serde_json::{Value, json};
@@ -152,6 +152,20 @@ impl LoadedPlugin {
                 }
                 let metadata = PluginMetadata::try_from(wire.metadata)
                     .map_err(|detail| format!("metadata 不合法：{detail}"))?;
+                if metadata
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err("wake 插件必须声明 metadata.summary".into());
+                }
+                if metadata.effects.is_empty() {
+                    return Err(
+                        "wake 插件必须声明 effects（至少 may_wake / may_stay_silent）".into(),
+                    );
+                }
                 Ok(Self::Wake(DylibWakeManager::new(
                     Arc::new(library),
                     table,
@@ -471,6 +485,14 @@ impl DylibWakeProvider {
 
 impl WakeProvider for DylibWakeProvider {
     fn decide(&self, options: &WakePolicy, context: &WakeContext<'_>) -> WakeDecision {
+        self.decide_with_reason(options, context).decision
+    }
+
+    fn decide_with_reason(
+        &self,
+        options: &WakePolicy,
+        context: &WakeContext<'_>,
+    ) -> WakeVerdict {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let request = WireWakeRequest {
             session: context.session.to_owned(),
@@ -496,23 +518,26 @@ impl WakeProvider for DylibWakeProvider {
 
         match invoke(&self.table, &self.handle, &message) {
             Ok(AdapterMessage::Reply {
-                result: WireResult::Decision { decision, .. },
+                result: WireResult::Decision { decision, reason },
                 ..
             }) => match decision.as_str() {
-                "wake" => WakeDecision::Wake,
-                "stay" => WakeDecision::Stay,
+                "wake" => WakeVerdict {
+                    decision: WakeDecision::Wake,
+                    reason,
+                },
+                "stay" => WakeVerdict::stay(),
                 other => {
                     self.note_failure(&format!("不认识的 wake 判定：{other}"));
-                    WakeDecision::Stay
+                    WakeVerdict::stay()
                 }
             },
             Ok(other) => {
                 self.note_failure(&format!("回执不是 wake 判定：{other:?}"));
-                WakeDecision::Stay
+                WakeVerdict::stay()
             }
             Err(detail) => {
                 self.note_failure(&detail);
-                WakeDecision::Stay
+                WakeVerdict::stay()
             }
         }
     }

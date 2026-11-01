@@ -10,6 +10,7 @@ import assert from "node:assert/strict"
 import {
   BridgeError,
   BridgeLink,
+  PROTOCOL_VERSION,
   normalizeToolArgs,
   parseEndpoint,
   personaSignature,
@@ -56,7 +57,12 @@ test("握手带上协议版本和令牌，拿到会话组", async (t) => {
   const { bridge, link } = await setup(t)
 
   assert.deepEqual(link.sessions, ["main"])
-  assert.deepEqual(bridge.hello, { frame: "hello", version: 4, harness: "opencode", token: "t-main" })
+  assert.deepEqual(bridge.hello, {
+    frame: "hello",
+    version: PROTOCOL_VERSION,
+    harness: "opencode",
+    token: "t-main",
+  })
 })
 
 test("桥断了会自己重连，重连成功后重新绑上设备", async (t) => {
@@ -194,6 +200,15 @@ test("一轮摊成给模型看的文本", () => {
   assert.match(text, /事件 poke/)
   assert.match(text, /第 2 次投递/)
   assert.match(text, /ack_messages/)
+})
+
+test("wake_reason 写进开轮原因", () => {
+  const text = renderTurn({
+    ...delivery(),
+    records: [],
+    wake_reason: "@ 了我",
+  })
+  assert.match(text, /有新消息（@ 了我）/)
 })
 
 test("空记录的一轮也要说清楚是例行检查", () => {

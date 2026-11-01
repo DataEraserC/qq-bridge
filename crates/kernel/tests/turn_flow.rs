@@ -430,6 +430,7 @@ fn mention_wakes_then_reply_and_ack_advance_the_watermark() {
     assert_eq!(delivery.session, "main");
     assert_eq!(delivery.room, room("qq:group/123"));
     assert_eq!(delivery.reason, TurnReason::Wake);
+    assert_eq!(delivery.wake_reason.as_deref(), Some("@ 了我"));
     assert_eq!(delivery.records.len(), 1);
     assert_eq!(delivery.records[0].id, 1);
     assert_eq!(delivery.records[0].redelivery, None, "第一次投递不带标注");

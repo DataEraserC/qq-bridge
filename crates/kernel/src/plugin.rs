@@ -23,7 +23,7 @@ use crate::adapter::{
 };
 use crate::config::{
     AccessPolicy, ClockPolicy, Config, Connection, DeliveryPolicy, ReceivePolicy,
-    TurnErrorAction, TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy,
+    TurnErrorAction, TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy, WakeVerdict,
 };
 use crate::event_queue::EventQueue;
 use crate::outbound::Sent;
@@ -435,6 +435,19 @@ pub struct WakeContext<'a> {
 /// 把 `WakeContext` 收成原有的 `WakeInput`，保证行为不变。
 pub trait WakeProvider: Send + Sync {
     fn decide(&self, options: &WakePolicy, context: &WakeContext<'_>) -> WakeDecision;
+
+    /// 带原因的判定。默认调用 [`decide`](Self::decide)，reason 为空；
+    /// 有能力的 provider 覆盖它，让 agent 知道「这次为什么醒」。
+    fn decide_with_reason(
+        &self,
+        options: &WakePolicy,
+        context: &WakeContext<'_>,
+    ) -> WakeVerdict {
+        WakeVerdict {
+            decision: self.decide(options, context),
+            reason: None,
+        }
+    }
 }
 
 /// 内置唤醒策略：等价于原来的 `WakePolicy::decide`。
@@ -443,6 +456,14 @@ pub struct DefaultWakeProvider;
 
 impl WakeProvider for DefaultWakeProvider {
     fn decide(&self, options: &WakePolicy, context: &WakeContext<'_>) -> WakeDecision {
+        self.decide_with_reason(options, context).decision
+    }
+
+    fn decide_with_reason(
+        &self,
+        options: &WakePolicy,
+        context: &WakeContext<'_>,
+    ) -> WakeVerdict {
         let input = WakeInput {
             sender_id: context.sender_id,
             text: context.text,
@@ -451,7 +472,7 @@ impl WakeProvider for DefaultWakeProvider {
             event: context.event,
             unread: context.unread,
         };
-        options.decide(&input)
+        options.decide_with_reason(&input)
     }
 }
 
@@ -1217,6 +1238,17 @@ impl PluginManager {
         let manifest = factory.manifest();
         validate_manifest(&manifest)?;
         let kind = manifest.kind.as_ref().to_owned();
+        if source != PluginSource::Builtin
+            && manifest
+                .metadata
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err(AdapterError::MissingDocs(kind));
+        }
         if self.adapters.contains_key(&kind) || self.adapter_providers.contains_key(&kind) {
             return Err(AdapterError::DuplicateKind(kind));
         }
@@ -1547,6 +1579,23 @@ impl PluginManager {
             descriptor.metadata.merge_missing(&manifest.metadata);
         }
         for descriptor in &descriptors {
+            if descriptor.source != PluginSource::Builtin
+                && descriptor
+                    .metadata
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                return Err(PluginError::Manager {
+                    namespace: namespace.clone(),
+                    detail: format!(
+                        "provider {} 没有声明 summary（agent 需要知道它是干什么的）",
+                        descriptor.id
+                    ),
+                });
+            }
             if descriptor.id.namespace() != namespace {
                 return Err(PluginError::Manager {
                     namespace: namespace.clone(),

@@ -34,7 +34,7 @@ pub use config::{
     EndpointConfig, Harness,
     KNOWN_MEMORY_KINDS, Memory, OutboundPolicy, Persona, ReceivePolicy,
     RetentionConfig, Session, StorageConfig, Subscription, Transport, TurnErrorAction,
-    TurnErrorActions, TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy,
+    TurnErrorActions, TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy, WakeVerdict,
 };
 pub use endpoint::{Conn, ControlRegistry, EndpointError, handshake, run_connection, serve};
 pub use relay::{FileRelay, RelayError};

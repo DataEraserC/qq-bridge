@@ -8,7 +8,7 @@
 import net from "node:net"
 
 /// 协议版本。和 `acb_proto::frame::PROTOCOL_VERSION` 必须一致。
-export const PROTOCOL_VERSION = 4
+export const PROTOCOL_VERSION = 5
 
 const MAX_FRAME_BYTES = 1024 * 1024
 const HANDSHAKE_TIMEOUT_MS = 10_000
@@ -356,8 +356,10 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
   const lines = []
   const room = roomText(delivery.room)
   const count = delivery.records.length
-  const reason =
-    delivery.reason === "clock" ? "定时例行检查" : "有新消息"
+  const why = delivery.reason === "clock" ? "定时例行检查" : "有新消息"
+  const reason = delivery.wake_reason
+    ? `${why}（${delivery.wake_reason}）`
+    : why
 
   if (count === 0) {
     lines.push(`[${room}] ${reason}，这一轮没有新记录。`)
