@@ -15,13 +15,25 @@ use std::sync::Arc;
 use acb_proto::RoomId;
 use thiserror::Error;
 
-use crate::config::{Config, WakeDecision, WakeInput, WakePolicy};
+use crate::config::{AccessPolicy, Config, WakeDecision, WakeInput, WakePolicy};
 
 /// 插件 API 版本。provider / manager / loader 的 manifest 都要对得上。
 pub const PLUGIN_API_VERSION: u32 = 1;
 
 /// 内置 wake provider 的 id。默认订阅没有显式写 provider 时用它。
 pub const DEFAULT_WAKE_PROVIDER: &str = "acb.wake.default";
+
+/// 内置 access provider 的 id。会话没有显式写 provider 时用它。
+pub const DEFAULT_ACCESS_PROVIDER: &str = "acb.access.subscribed";
+
+/// 任何房间都允许访问（整个会话豁免订阅边界）。
+pub const ALL_ROOMS_ACCESS_PROVIDER: &str = "acb.access.all_rooms";
+
+/// 订阅的房间照常；另外列在 `access.rooms` 里的房间也算可访问。
+///
+/// 给「一个聊天完全豁免」用：不用为它加订阅（也就不会被它叫醒），
+/// 但可以照常读、发、调平台方法。
+pub const ELEVATED_ACCESS_PROVIDER: &str = "acb.access.elevated_in_rooms";
 
 /// 内置 provider 的保留 namespace；树外 manager 不能占用。
 pub const BUILTIN_NAMESPACE: &str = "acb";
@@ -66,6 +78,21 @@ impl ProviderId {
         Self::parse(DEFAULT_WAKE_PROVIDER).expect("内置 provider id 必须合法")
     }
 
+    /// 内置 access provider（默认按订阅）。
+    pub fn builtin_access() -> Self {
+        Self::parse(DEFAULT_ACCESS_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
+    /// 内置 access provider：所有房间。
+    pub fn builtin_all_rooms_access() -> Self {
+        Self::parse(ALL_ROOMS_ACCESS_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
+    /// 内置 access provider：指定房间提权。
+    pub fn builtin_elevated_access() -> Self {
+        Self::parse(ELEVATED_ACCESS_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
@@ -93,6 +120,7 @@ impl FromStr for ProviderId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExtensionPoint {
     Wake,
+    Access,
     Receive,
     Send,
     Clock,
@@ -107,6 +135,7 @@ impl ExtensionPoint {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Wake => "wake",
+            Self::Access => "access",
             Self::Receive => "receive",
             Self::Send => "send",
             Self::Clock => "clock",
@@ -123,6 +152,7 @@ impl ExtensionPoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     WakeDecision,
+    AccessDecision,
     Log,
     ReadTranscript,
     EmitSend,
@@ -134,6 +164,7 @@ impl Capability {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WakeDecision => "wake_decision",
+            Self::AccessDecision => "access_decision",
             Self::Log => "log",
             Self::ReadTranscript => "read_transcript",
             Self::EmitSend => "emit_send",
@@ -181,6 +212,12 @@ pub enum PluginError {
     UnsupportedExtensionPoint {
         id: String,
         point: ExtensionPoint,
+    },
+    #[error("provider {id} 返回的实例是 {found:?}，但这里要 {expected:?}")]
+    WrongProviderKind {
+        id: String,
+        expected: ExtensionPoint,
+        found: ExtensionPoint,
     },
     #[error("provider {id} 的 API 版本 {found} 不兼容（需要 {required}）")]
     ApiVersion {
@@ -247,15 +284,158 @@ impl WakeProvider for DefaultWakeProvider {
     }
 }
 
-/// manager 实例化 provider 时能拿到的 options。Phase 1 只有 wake。
+/// 一次访问请求要做什么。
+///
+/// 粗粒度就够：策略只决定「能不能碰这个房间/这条连接」，具体动作（读、写、
+/// 破坏性）仍由 core 和连接配置各自把关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessAction {
+    /// 读房间：历史、事件、笔记、只读平台方法。
+    Read,
+    /// 往房间写：发消息、写类平台方法。
+    Send,
+    /// 使用一条连接（账号级平台方法、平台目录）。
+    Connection,
+}
+
+impl AccessAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Send => "send",
+            Self::Connection => "connection",
+        }
+    }
+}
+
+/// 访问判定的输入。`room` 为 `None` 表示连接级请求。
+#[derive(Debug, Clone, Copy)]
+pub struct AccessRequest<'a> {
+    pub session: &'a str,
+    pub connection: &'a str,
+    pub room: Option<&'a RoomId>,
+    pub action: AccessAction,
+    /// 这个会话自己订阅的房间。provider 只读，不写。
+    pub subscriptions: &'a [RoomId],
+}
+
+/// 访问判定的结果。provider 只回答这个；拒绝时的错误文案由 core 组织。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessDecision {
+    Allow,
+    Deny,
+}
+
+/// 访问策略 provider。
+pub trait AccessProvider: Send + Sync {
+    fn check(&self, options: &AccessPolicy, request: &AccessRequest<'_>) -> AccessDecision;
+}
+
+/// 内置 access provider：只看会话订阅（原来写死的行为）。
+#[derive(Debug, Default)]
+pub struct SubscribedAccessProvider;
+
+impl AccessProvider for SubscribedAccessProvider {
+    fn check(&self, _options: &AccessPolicy, request: &AccessRequest<'_>) -> AccessDecision {
+        match request.action {
+            AccessAction::Connection => {
+                if request
+                    .subscriptions
+                    .iter()
+                    .any(|room| room.connection == request.connection)
+                {
+                    AccessDecision::Allow
+                } else {
+                    AccessDecision::Deny
+                }
+            }
+            AccessAction::Read | AccessAction::Send => {
+                if request
+                    .room
+                    .is_some_and(|room| request.subscriptions.iter().any(|sub| sub == room))
+                {
+                    AccessDecision::Allow
+                } else {
+                    AccessDecision::Deny
+                }
+            }
+        }
+    }
+}
+
+/// 整个会话豁免：任何房间、任何连接都允许。
+#[derive(Debug, Default)]
+pub struct AllRoomsAccessProvider;
+
+impl AccessProvider for AllRoomsAccessProvider {
+    fn check(&self, _options: &AccessPolicy, _request: &AccessRequest<'_>) -> AccessDecision {
+        AccessDecision::Allow
+    }
+}
+
+/// 订阅的房间照常；`access.rooms` 里列出的房间同样允许。
+///
+/// 用「房间列表」而不是「全部」，是因为豁免要精确到那一个聊天：
+/// 不用为它加订阅（也就不会被它叫醒），但仍然能读、能发、能调平台方法。
+#[derive(Debug, Default)]
+pub struct ElevatedInRoomsAccessProvider;
+
+impl AccessProvider for ElevatedInRoomsAccessProvider {
+    fn check(&self, options: &AccessPolicy, request: &AccessRequest<'_>) -> AccessDecision {
+        match request.action {
+            AccessAction::Connection => {
+                let subscribed = request
+                    .subscriptions
+                    .iter()
+                    .any(|room| room.connection == request.connection);
+                let elevated = options
+                    .rooms
+                    .iter()
+                    .any(|room| room.connection == request.connection);
+                if subscribed || elevated {
+                    AccessDecision::Allow
+                } else {
+                    AccessDecision::Deny
+                }
+            }
+            AccessAction::Read | AccessAction::Send => {
+                let by_room = request
+                    .room
+                    .is_some_and(|room| request.subscriptions.iter().any(|sub| sub == room));
+                let elevated = request
+                    .room
+                    .is_some_and(|room| options.rooms.iter().any(|listed| listed == room));
+                if by_room || elevated {
+                    AccessDecision::Allow
+                } else {
+                    AccessDecision::Deny
+                }
+            }
+        }
+    }
+}
+
+/// manager 实例化 provider 时能拿到的 options。
 #[derive(Debug, Clone, Copy)]
 pub enum ProviderOptions<'a> {
     Wake(&'a WakePolicy),
+    Access(&'a AccessPolicy),
 }
 
-/// manager 返回的 provider 实例。Phase 1 只有 wake 变体。
+/// manager 返回的 provider 实例。
 pub enum ProviderInstance {
     Wake(Arc<dyn WakeProvider>),
+    Access(Arc<dyn AccessProvider>),
+}
+
+impl ProviderInstance {
+    /// 这个实例对应哪个扩展点。Root 用它拒绝“manager 返回错类型”。
+    pub fn extension_point(&self) -> ExtensionPoint {
+        match self {
+            Self::Wake(_) => ExtensionPoint::Wake,
+            Self::Access(_) => ExtensionPoint::Access,
+        }
+    }
 }
 
 /// 一棵子树的管理者。Root 只和这个接口说话；子树内部怎么注册由它自己决定。
@@ -305,14 +485,42 @@ impl PluginLoader for NativeLoader {
                 vec![Capability::WakeDecision],
             ),
             Arc::new(DefaultWakeProvider),
+        )?;
+        manager.register_access(
+            ProviderDescriptor::new(
+                ProviderId::builtin_access(),
+                ExtensionPoint::Access,
+                PLUGIN_API_VERSION,
+                vec![Capability::AccessDecision],
+            ),
+            Arc::new(SubscribedAccessProvider),
+        )?;
+        manager.register_access(
+            ProviderDescriptor::new(
+                ProviderId::builtin_all_rooms_access(),
+                ExtensionPoint::Access,
+                PLUGIN_API_VERSION,
+                vec![Capability::AccessDecision],
+            ),
+            Arc::new(AllRoomsAccessProvider),
+        )?;
+        manager.register_access(
+            ProviderDescriptor::new(
+                ProviderId::builtin_elevated_access(),
+                ExtensionPoint::Access,
+                PLUGIN_API_VERSION,
+                vec![Capability::AccessDecision],
+            ),
+            Arc::new(ElevatedInRoomsAccessProvider),
         )
     }
 }
 
-/// RootManager：固定门面。Phase 1 只做 wake 的注册/解析/校验。
+/// RootManager：固定门面。负责所有扩展点的注册/解析/校验。
 #[derive(Default)]
 pub struct PluginManager {
     wake: HashMap<ProviderId, Arc<dyn WakeProvider>>,
+    access: HashMap<ProviderId, Arc<dyn AccessProvider>>,
     managers: HashMap<String, Arc<dyn ManagerPlugin>>,
     descriptors: HashMap<ProviderId, ProviderDescriptor>,
 }
@@ -348,6 +556,26 @@ impl PluginManager {
         Ok(())
     }
 
+    /// 注册 access provider。校验规则同 wake。
+    pub fn register_access(
+        &mut self,
+        descriptor: ProviderDescriptor,
+        provider: Arc<dyn AccessProvider>,
+    ) -> Result<(), PluginError> {
+        self.check_descriptor(
+            &descriptor,
+            ExtensionPoint::Access,
+            Capability::AccessDecision,
+        )?;
+        if self.descriptors.contains_key(&descriptor.id) {
+            return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
+        }
+        self.descriptors
+            .insert(descriptor.id.clone(), descriptor.clone());
+        self.access.insert(descriptor.id, provider);
+        Ok(())
+    }
+
     /// 安装一个树外 manager。它拥有自己的 namespace 和子树注册表；Root 只做
     /// namespace/id 审计，之后把它子树里的 id 委托给它。
     pub fn install_manager(
@@ -379,7 +607,17 @@ impl PluginManager {
                     ),
                 });
             }
-            self.check_descriptor(descriptor, ExtensionPoint::Wake, Capability::WakeDecision)?;
+            let required = match descriptor.extension_point {
+                ExtensionPoint::Wake => Capability::WakeDecision,
+                ExtensionPoint::Access => Capability::AccessDecision,
+                point => {
+                    return Err(PluginError::UnsupportedExtensionPoint {
+                        id: descriptor.id.to_string(),
+                        point,
+                    });
+                }
+            };
+            self.check_descriptor(descriptor, descriptor.extension_point, required)?;
             if self.descriptors.contains_key(&descriptor.id) {
                 return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
             }
@@ -419,12 +657,49 @@ impl PluginManager {
         };
         match manager.instantiate(id, ProviderOptions::Wake(options))? {
             ProviderInstance::Wake(provider) => Ok(provider),
+            other => Err(PluginError::WrongProviderKind {
+                id: id.to_string(),
+                expected: ExtensionPoint::Wake,
+                found: other.extension_point(),
+            }),
+        }
+    }
+
+    /// 解析 access provider。先查 Root 直接注册的，再按 namespace 委托 manager。
+    pub fn resolve_access(
+        &self,
+        id: &ProviderId,
+        options: &AccessPolicy,
+    ) -> Result<Arc<dyn AccessProvider>, PluginError> {
+        if let Some(provider) = self.access.get(id) {
+            return Ok(provider.clone());
+        }
+        let Some(descriptor) = self.descriptors.get(id) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        if descriptor.extension_point != ExtensionPoint::Access {
+            return Err(PluginError::UnsupportedExtensionPoint {
+                id: id.to_string(),
+                point: descriptor.extension_point,
+            });
+        }
+        let Some(manager) = self.managers.get(id.namespace()) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        match manager.instantiate(id, ProviderOptions::Access(options))? {
+            ProviderInstance::Access(provider) => Ok(provider),
+            other => Err(PluginError::WrongProviderKind {
+                id: id.to_string(),
+                expected: ExtensionPoint::Access,
+                found: other.extension_point(),
+            }),
         }
     }
 
     /// 启动时校验整份配置引用的 provider 都存在。`main` 在起线程前调用。
     pub fn validate_config(&self, config: &Config) -> Result<(), PluginError> {
         for session in &config.sessions {
+            self.resolve_access(&session.access.provider, &session.access)?;
             for subscription in &session.subscriptions {
                 self.resolve_wake(&subscription.wake.provider, &subscription.wake)?;
             }
@@ -469,7 +744,7 @@ impl PluginManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, WakePolicy};
+    use crate::config::{AccessPolicy, Config, WakePolicy};
 
     fn test_room() -> RoomId {
         RoomId::new("qq", "group/1").expect("合法")
@@ -521,6 +796,128 @@ mod tests {
             descriptor.id == ProviderId::builtin_wake()
                 && descriptor.extension_point == ExtensionPoint::Wake
         }));
+    }
+
+    #[test]
+    fn native_loader_registers_the_access_providers() {
+        let manager = PluginManager::with_native_builtins();
+        for id in [
+            ProviderId::builtin_access(),
+            ProviderId::builtin_all_rooms_access(),
+            ProviderId::builtin_elevated_access(),
+        ] {
+            manager
+                .resolve_access(&id, &AccessPolicy::default())
+                .expect("内置 access provider 应当可解析");
+        }
+        assert_eq!(
+            manager
+                .descriptors()
+                .iter()
+                .filter(|descriptor| descriptor.extension_point == ExtensionPoint::Access)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn access_providers_follow_the_configured_boundary() {
+        let subscribed = test_room();
+        let inside = RoomId::new("qq", "group/999").expect("合法");
+        let other = RoomId::new("qq", "group/888").expect("合法");
+        let subscriptions = vec![subscribed.clone()];
+        fn request<'a>(
+            room: &'a RoomId,
+            action: AccessAction,
+            subscriptions: &'a [RoomId],
+        ) -> AccessRequest<'a> {
+            AccessRequest {
+                session: "main",
+                connection: "qq",
+                room: Some(room),
+                action,
+                subscriptions,
+            }
+        }
+        let default = AccessPolicy::default();
+
+        // 默认：只认订阅。
+        assert_eq!(
+            SubscribedAccessProvider.check(
+                &default,
+                &request(&subscribed, AccessAction::Send, &subscriptions)
+            ),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            SubscribedAccessProvider.check(
+                &default,
+                &request(&inside, AccessAction::Read, &subscriptions)
+            ),
+            AccessDecision::Deny
+        );
+
+        // 全豁免：任何房间都行。
+        assert_eq!(
+            AllRoomsAccessProvider.check(
+                &default,
+                &request(&inside, AccessAction::Send, &subscriptions)
+            ),
+            AccessDecision::Allow
+        );
+
+        // 指定房间：列表里的行，列表外不行。
+        let elevated_policy = AccessPolicy {
+            provider: ProviderId::builtin_elevated_access(),
+            rooms: vec![inside.clone()],
+        };
+        assert_eq!(
+            ElevatedInRoomsAccessProvider.check(
+                &elevated_policy,
+                &request(&inside, AccessAction::Read, &subscriptions)
+            ),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            ElevatedInRoomsAccessProvider.check(
+                &elevated_policy,
+                &request(&other, AccessAction::Send, &subscriptions)
+            ),
+            AccessDecision::Deny
+        );
+    }
+
+    #[test]
+    fn connection_access_follows_the_same_policy() {
+        let subscribed = test_room();
+        let subscriptions = vec![subscribed];
+        let request = AccessRequest {
+            session: "main",
+            connection: "dc",
+            room: None,
+            action: AccessAction::Connection,
+            subscriptions: &subscriptions,
+        };
+        let default = AccessPolicy::default();
+        assert_eq!(
+            SubscribedAccessProvider.check(&default, &request),
+            AccessDecision::Deny,
+            "订阅里没有 dc 这条连接"
+        );
+        assert_eq!(
+            AllRoomsAccessProvider.check(&default, &request),
+            AccessDecision::Allow
+        );
+
+        let elevated_policy = AccessPolicy {
+            provider: ProviderId::builtin_elevated_access(),
+            rooms: vec![RoomId::new("dc", "channel/9").expect("合法")],
+        };
+        assert_eq!(
+            ElevatedInRoomsAccessProvider.check(&elevated_policy, &request),
+            AccessDecision::Allow,
+            "豁免房间在 dc 上，连接级也该放行"
+        );
     }
 
     #[test]
@@ -599,6 +996,92 @@ mod tests {
         ));
     }
 
+    struct AccessManager;
+
+    impl ManagerPlugin for AccessManager {
+        fn namespace(&self) -> &str {
+            "vendor"
+        }
+
+        fn descriptors(&self) -> Vec<ProviderDescriptor> {
+            vec![ProviderDescriptor::new(
+                ProviderId::parse("vendor.all_rooms").expect("合法"),
+                ExtensionPoint::Access,
+                PLUGIN_API_VERSION,
+                vec![Capability::AccessDecision],
+            )]
+        }
+
+        fn instantiate(
+            &self,
+            id: &ProviderId,
+            _options: ProviderOptions<'_>,
+        ) -> Result<ProviderInstance, PluginError> {
+            if id.name() == "all_rooms" {
+                Ok(ProviderInstance::Access(Arc::new(
+                    AllRoomsAccessProvider,
+                )))
+            } else {
+                Err(PluginError::UnknownProvider(id.to_string()))
+            }
+        }
+    }
+
+    #[test]
+    fn manager_can_supply_access_providers() {
+        let mut manager = PluginManager::with_native_builtins();
+        manager
+            .install_manager(Arc::new(AccessManager))
+            .expect("树外 manager 应当能装 access provider");
+
+        let id = ProviderId::parse("vendor.all_rooms").expect("合法");
+        manager
+            .resolve_access(&id, &AccessPolicy::default())
+            .expect("子树里的 access provider 应当可解析");
+    }
+
+    struct WrongKindManager;
+
+    impl ManagerPlugin for WrongKindManager {
+        fn namespace(&self) -> &str {
+            "wrong"
+        }
+
+        fn descriptors(&self) -> Vec<ProviderDescriptor> {
+            vec![ProviderDescriptor::new(
+                ProviderId::parse("wrong.access").expect("合法"),
+                ExtensionPoint::Access,
+                PLUGIN_API_VERSION,
+                vec![Capability::AccessDecision],
+            )]
+        }
+
+        fn instantiate(
+            &self,
+            _id: &ProviderId,
+            _options: ProviderOptions<'_>,
+        ) -> Result<ProviderInstance, PluginError> {
+            Ok(ProviderInstance::Wake(Arc::new(DefaultWakeProvider)))
+        }
+    }
+
+    #[test]
+    fn manager_returning_the_wrong_provider_kind_is_rejected() {
+        let mut manager = PluginManager::with_native_builtins();
+        manager
+            .install_manager(Arc::new(WrongKindManager))
+            .expect("descriptor 本身合法");
+        let id = ProviderId::parse("wrong.access").expect("合法");
+        assert!(matches!(
+            manager.resolve_access(&id, &AccessPolicy::default()),
+            Err(PluginError::WrongProviderKind {
+                expected: ExtensionPoint::Access,
+                found: ExtensionPoint::Wake,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn tree_out_manager_cannot_take_the_builtin_namespace() {
         struct AcbManager;
@@ -671,6 +1154,46 @@ mod tests {
 
             [sessions.subscriptions.wake]
             provider = "vendor.missing"
+        "#;
+        let config = Config::parse(text).expect("语法合法");
+        let manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.validate_config(&config),
+            Err(PluginError::UnknownProvider(_))
+        ));
+    }
+
+    #[test]
+    fn validate_config_rejects_an_unknown_access_provider_before_start() {
+        let text = r#"
+            [[connections]]
+            id = "qq"
+            platform = "qq"
+            kind = "onebot11"
+            url = "ws://127.0.0.1:3001"
+            account = "10001"
+
+            [[personas]]
+            id = "p"
+            name = "P"
+            text = "你是桥。"
+
+            [[harnesses]]
+            id = "dsh"
+            name = "DSH"
+
+            [[sessions]]
+            id = "main"
+            harness = "dsh"
+            persona = "p"
+            token = "t-main"
+
+            [sessions.access]
+            provider = "vendor.missing"
+
+            [[sessions.subscriptions]]
+            connection = "qq"
+            room = "group/1"
         "#;
         let config = Config::parse(text).expect("语法合法");
         let manager = PluginManager::with_native_builtins();

@@ -64,6 +64,22 @@ ignore_speakers = []   # 这些人的发言不叫醒（但照样记账）
 - `accumulate` 调小反应快但费 token，调大省钱但「攒话」；
 - 两个会话订同一个群完全合法（比如一个主会话 + 一个备用），各自的水位互不干扰。
 
+### 访问策略：能不能去订阅外的房间
+
+默认只能读写自己订阅的房间。要放宽，给会话加一段（ADR-0026）：
+
+```toml
+[sessions.access]
+provider = "acb.access.subscribed"   # 默认：只认订阅
+# provider = "acb.access.all_rooms"        # 整个会话豁免：任何已配连接的房间都能碰
+# provider = "acb.access.elevated_in_rooms" # 指定房间豁免（用下面的 rooms）
+# rooms = ["qq:group/123"]                  # 只有 elevated 用；这些房间不用订阅也能读写
+```
+
+- 豁免只改变**工具能碰到哪里**，不改变唤醒：没订阅的房间不会因为它来消息就开轮。
+- 破坏性操作仍由连接的 `allow_destructive` 单独把关，访问策略不能顶替它。
+- `all_rooms` 也只能落在**配置里存在的连接**上——连接本身没配登录账号，发不出去。
+
 ## 人格与记忆
 
 ```toml

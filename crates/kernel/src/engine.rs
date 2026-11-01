@@ -25,16 +25,18 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::config::{Config, Session, TurnErrorAction, WakeDecision, WakePolicy};
+use crate::config::{Config, TurnErrorAction, WakeDecision, WakePolicy};
 use crate::memory::{
     MemoryRepo, git_add, git_blame, git_branch, git_commit, git_diff, git_log, git_push,
     git_status, list_dir, read_file, search, write_file,
 };
 use crate::outbound::{
-    CallError, CallOutcome, MethodSpec, Outbound, OutboundError, OutboundHandle, Outbounds,
+    CallError, CallOutcome, Effect, MethodSpec, Outbound, OutboundError, OutboundHandle, Outbounds,
     OutgoingKind, OutgoingRecord, RecordMode, Risk, Scope, Sent, TargetRole, expand_query,
 };
-use crate::plugin::{PluginError, PluginManager, WakeContext};
+use crate::plugin::{
+    AccessAction, AccessDecision, AccessRequest, PluginError, PluginManager, WakeContext,
+};
 use crate::render;
 use crate::storage::{
     Cursor, MIN_KEPT, Note, NoteKey, NoteKind, PrunePlan, RecordDraft, StorageError, Store,
@@ -665,11 +667,11 @@ impl<S: Store> Bridge<S> {
                 let args: SendArgs = parse(args)?;
                 self.deliver_out(turn_config.clone(), &turn_session, &room, args.elements.0)
             }
-            // 给了目标：只能落在当前会话订阅的房间范围内（跨会话发送已砍）。
+            // 给了目标：跨会话发送已砍；目标房间由本会话的访问策略把关。
             "send_message_to" => {
                 let args: SendToArgs = parse(args)?;
                 let target = resolve_room(&args.to)?;
-                Self::ensure_session_subscribes(&turn_config, &turn_session, &target)?;
+                self.ensure_can_send(&turn_config, &turn_session, &target)?;
                 self.deliver_out(
                     turn_config.clone(),
                     &turn_session,
@@ -814,7 +816,7 @@ impl<S: Store> Bridge<S> {
                 let args: SendToArgs = parse(args)?;
                 let target = resolve_room(&args.to)?;
                 let ctx = self.turn_ctx(ticket, tool)?;
-                Self::ensure_session_subscribes(&ctx.config, &ctx.session, &target)?;
+                self.ensure_can_send(&ctx.config, &ctx.session, &target)?;
                 let prepared = self.prepare_send(
                     ctx.config.clone(),
                     &ctx.session,
@@ -867,9 +869,17 @@ impl<S: Store> Bridge<S> {
         };
 
         match spec.scope {
-            Scope::Room => Self::ensure_readable(&ctx.config, sessions, &room)?,
+            Scope::Room => {
+                // 只读方法和写方法分开判：策略可以只放开读（或只放开写）。
+                let action = if spec.effect == Effect::Read {
+                    AccessAction::Read
+                } else {
+                    AccessAction::Send
+                };
+                self.ensure_room_access(&ctx.config, sessions, action, &room)?;
+            }
             Scope::Connection => {
-                Self::ensure_connection_readable(&ctx.config, sessions, &room.connection)?
+                self.ensure_connection_readable(&ctx.config, sessions, &room.connection)?
             }
         }
 
@@ -1093,88 +1103,124 @@ impl<S: Store> Bridge<S> {
             .collect()
     }
 
-    /// 这一组里，谁订了这个房间。
-    fn sessions_subscribing<'a>(
-        config: &'a Config,
+    /// 用会话自己的访问策略判定一次访问。
+    ///
+    /// provider 只回答允许/拒绝；拒绝的形状（错误码、文案）由 core 统一组织。
+    /// `sessions` 取并集：任何一个会话被允许就算通过（工具面目前只传当前会话一个）。
+    fn check_access(
+        &self,
+        config: &Config,
         sessions: &[String],
-        room: &RoomId,
-    ) -> Vec<&'a Session> {
-        config
-            .sessions
-            .iter()
-            .filter(|session| sessions.iter().any(|id| id == &session.id))
-            .filter(|session| {
-                session
-                    .subscriptions
-                    .iter()
-                    .any(|subscription| &subscription.room == room)
-            })
-            .collect()
+        action: AccessAction,
+        room: Option<&RoomId>,
+        connection: &str,
+    ) -> Result<(), ToolError> {
+        let mut denied = Vec::new();
+        for id in sessions {
+            let Some(session) = config.session(id) else {
+                continue;
+            };
+            let provider = self
+                .plugins
+                .resolve_access(&session.access.provider, &session.access)
+                .map_err(|error| {
+                    ToolError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "[internal] 会话 {id} 的访问策略 {} 不可用：{error}",
+                            session.access.provider
+                        ),
+                    )
+                })?;
+            let subscriptions: Vec<RoomId> = session
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.room.clone())
+                .collect();
+            let request = AccessRequest {
+                session: id,
+                connection,
+                room,
+                action,
+                subscriptions: &subscriptions,
+            };
+            if provider.check(&session.access, &request) == AccessDecision::Allow {
+                return Ok(());
+            }
+            denied.push(format!("{}（{}）", id, session.access.provider));
+        }
+
+        let detail = match action {
+            AccessAction::Connection => format!(
+                "会话 {} 在连接 {connection} 上没有可访问的房间",
+                sessions.join(", ")
+            ),
+            AccessAction::Read | AccessAction::Send => format!(
+                "会话 {} 没有访问 {} 的权限",
+                sessions.join(", "),
+                room.map(ToString::to_string).unwrap_or_default()
+            ),
+        };
+        let policy = if denied.is_empty() {
+            String::new()
+        } else {
+            format!("（访问策略 {}）", denied.join("；"))
+        };
+        Err(ToolError::new(
+            ErrorCode::RoomNotSubscribed,
+            format!("{detail}{policy}"),
+        ))
     }
 
-    /// 当前会话是否订阅了这个房间。没订阅就拒——这是 `send_message_to` 的边界。
-    fn ensure_session_subscribes(
+    /// 能不能对 `room` 做 `action`。
+    fn ensure_room_access(
+        &self,
+        config: &Config,
+        sessions: &[String],
+        action: AccessAction,
+        room: &RoomId,
+    ) -> Result<(), ToolError> {
+        self.check_access(
+            config,
+            sessions,
+            action,
+            Some(room),
+            &room.connection,
+        )
+    }
+
+    /// 读的工具默认要求「能读这个房间」。具体边界由会话的访问策略决定。
+    fn ensure_readable(
+        &self,
+        config: &Config,
+        sessions: &[String],
+        room: &RoomId,
+    ) -> Result<(), ToolError> {
+        self.ensure_room_access(config, sessions, AccessAction::Read, room)
+    }
+
+    /// 当前会话能不能往这个房间发。`send_message_to` 的边界。
+    fn ensure_can_send(
+        &self,
         config: &Config,
         session: &str,
         room: &RoomId,
     ) -> Result<(), ToolError> {
-        let subscribed = config.session(session).is_some_and(|session| {
-            session
-                .subscriptions
-                .iter()
-                .any(|subscription| &subscription.room == room)
-        });
-        if subscribed {
-            Ok(())
-        } else {
-            Err(ToolError::new(
-                ErrorCode::RoomNotSubscribed,
-                format!("会话 {session} 没有订阅 {room}；只能发到本会话订阅的房间"),
-            ))
-        }
+        let sessions = [session.to_owned()];
+        self.ensure_room_access(config, &sessions, AccessAction::Send, room)
     }
 
-    /// 读的工具只要求「本组有人订了这个房间」。
-    fn ensure_readable(
-        config: &Config,
-        sessions: &[String],
-        room: &RoomId,
-    ) -> Result<(), ToolError> {
-        if Self::sessions_subscribing(config, sessions, room).is_empty() {
-            return Err(ToolError::new(
-                ErrorCode::RoomNotSubscribed,
-                format!("你这组会话都没订阅 {room}"),
-            ));
-        }
-        Ok(())
-    }
-
-    /// 连接级权限：这组会话里有任何一个在订阅这条连接上的房间，就算有权限。
+    /// 连接级权限：访问策略决定这条连接上有没有可用的房间。
     ///
     /// 好友列表、账号资料这类方法跟房间无关，所以不要求模型报出一个具体房间；
-    /// 但也不能凭空调一个自己完全没订阅的号。
+    /// 但也不能凭空调一个自己完全够不着的号。
     fn ensure_connection_readable(
+        &self,
         config: &Config,
         sessions: &[String],
         connection: &str,
     ) -> Result<(), ToolError> {
-        let ok = config
-            .sessions
-            .iter()
-            .filter(|session| sessions.iter().any(|id| id == &session.id))
-            .any(|session| {
-                session
-                    .subscriptions
-                    .iter()
-                    .any(|subscription| subscription.room.connection == connection)
-            });
-        if !ok {
-            return Err(ToolError::new(
-                ErrorCode::RoomNotSubscribed,
-                format!("你这组会话在连接 {connection} 上没有任何订阅"),
-            ));
-        }
-        Ok(())
+        self.check_access(config, sessions, AccessAction::Connection, None, connection)
     }
 
     /// 解析一次平台调用落在哪个房间上，并按方法声明的 [`Scope`] 做权限校验。
@@ -1190,9 +1236,9 @@ impl<S: Store> Bridge<S> {
     ) -> Result<RoomId, ToolError> {
         let room = self.resolve(given, turn_room)?;
         match scope {
-            Scope::Room => Self::ensure_readable(config, sessions, &room)?,
+            Scope::Room => self.ensure_readable(config, sessions, &room)?,
             Scope::Connection => {
-                Self::ensure_connection_readable(config, sessions, &room.connection)?
+                self.ensure_connection_readable(config, sessions, &room.connection)?
             }
         }
         Ok(room)
@@ -1746,7 +1792,7 @@ impl<S: Store> Bridge<S> {
         args: HistoryArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        Self::ensure_readable(config, sessions, &room)?;
+        self.ensure_readable(config, sessions, &room)?;
 
         let columns = column_set(args.columns.as_deref())?;
 
@@ -1797,7 +1843,7 @@ impl<S: Store> Bridge<S> {
         args: FetchRecordsArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        Self::ensure_readable(config, sessions, &room)?;
+        self.ensure_readable(config, sessions, &room)?;
 
         if args.ids.is_empty() {
             return Err(ToolError::new(
@@ -1874,7 +1920,7 @@ impl<S: Store> Bridge<S> {
         args: NotesArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        Self::ensure_readable(config, sessions, &room)?;
+        self.ensure_readable(config, sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => Some(parse_note_kind(text)?),
@@ -1903,7 +1949,7 @@ impl<S: Store> Bridge<S> {
         args: SetNoteArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        Self::ensure_readable(config, sessions, &room)?;
+        self.ensure_readable(config, sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => parse_note_kind(text)?,
@@ -1949,7 +1995,7 @@ impl<S: Store> Bridge<S> {
         args: DelNoteArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        Self::ensure_readable(config, sessions, &room)?;
+        self.ensure_readable(config, sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => parse_note_kind(text)?,
@@ -1968,7 +2014,7 @@ impl<S: Store> Bridge<S> {
         args: EventsArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        Self::ensure_readable(config, sessions, &room)?;
+        self.ensure_readable(config, sessions, &room)?;
 
         let limit = args.limit.unwrap_or(DEFAULT_HISTORY).min(MAX_PAGE_LIMIT);
         let offset = args.offset.unwrap_or(0);

@@ -59,7 +59,7 @@ LoaderPlugin:
 
 - `ProviderDescriptor` 至少包含：`id`、`extension_point`、`api_version`、`capabilities`。
 - 每种扩展点有自己的 Provider trait 和 conformance suite；没有测试的扩展点不开放给第三方。
-- 当前已落地的第一个扩展点是 wake；其余按 phase 逐步加。
+- 当前已落地的扩展点是 wake 与 access；其余按 phase 逐步加。
 
 ### Root 保留的硬约束
 
@@ -89,6 +89,16 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
 2. Phase 2：PlatformAdapter 注册表 + 事件/动作队列（见 ADR-0027）。
 3. Phase 3：ManagerPlugin / LoaderPlugin 契约落地，先做一个受信任的树外 manager，再做 LuaManager + LuaLoader。
 4. Phase 4：DeliveryComposer + pre/post hooks；最后才是“换投递引擎”这类顶层插件。
+
+## 实现记录
+
+- **Phase 1**：RootManager + NativeLoader + 内置 wake provider；`wake.provider` 可替换，默认行为不变。
+- **Phase 2d（2026-11-01）**：AccessPolicy 扩展点落地。
+  - 会话配置新增 `[sessions.access]`：`provider` + `rooms`；不写就是 `acb.access.subscribed`，行为与原来写死的「只能碰自己订阅的房间」完全一致。
+  - 内置三个 provider：`acb.access.subscribed`（默认）、`acb.access.all_rooms`（整个会话豁免）、`acb.access.elevated_in_rooms`（`rooms` 里列出的房间不用订阅也能读写）。
+  - **策略只回答 allow/deny**；参数、目标、破坏性、记账仍由 core 统一执行。破坏性操作继续由连接的 `allow_destructive` 单独把关，两个维度不互相顶替。
+  - 读取/发送/平台调用都走同一个 `AccessRequest`（会话、连接、房间、动作、会话自己的订阅）；连接级请求 `room = None`。
+  - 未知 access provider 在启动时拒绝；树外 ManagerPlugin 可以注册 access provider，返回错类型会被 Root 拒绝。
 
 ## 参考
 

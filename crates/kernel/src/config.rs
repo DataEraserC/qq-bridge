@@ -327,6 +327,8 @@ pub struct Session {
     pub token: String,
     /// 订阅列表。
     pub subscriptions: Vec<Subscription>,
+    /// 访问策略（ADR-0026 Phase 2d）。默认按订阅；可换 provider。
+    pub access: AccessPolicy,
     /// 这个会话一轮失败时按顺序执行的「通知动作」列表。空 = 只记日志。
     /// 见 [`TurnErrorAction`]。
     pub on_turn_error: TurnErrorActions,
@@ -338,6 +340,30 @@ pub struct Subscription {
     /// 房间（连接名 + 路径）。
     pub room: RoomId,
     pub wake: WakePolicy,
+}
+
+/// 一个会话的访问策略。
+///
+/// **只决定「能不能碰这个房间/这条连接」**；破坏性操作仍由连接配置的
+/// `allow_destructive` 单独把关（两个维度，不能互相顶替）。
+///
+/// `rooms` 只有 `acb.access.elevated_in_rooms` 用：列在里面的房间不用订阅
+/// 也能读、能发、能调平台方法。空表 = 没有额外豁免。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessPolicy {
+    /// 访问策略的 provider id（ADR-0026）。
+    pub provider: ProviderId,
+    /// 额外豁免的房间。
+    pub rooms: Vec<RoomId>,
+}
+
+impl Default for AccessPolicy {
+    fn default() -> Self {
+        Self {
+            provider: ProviderId::builtin_access(),
+            rooms: Vec::new(),
+        }
+    }
 }
 
 /// 唤醒策略的判定输入。只带判定需要的东西，不把整条记录塞进来。
@@ -495,6 +521,26 @@ pub enum ConfigError {
         room: String,
         provider: String,
         detail: String,
+    },
+    #[error("会话 {session} 的访问策略 provider 不合法：{provider}（{detail}）")]
+    BadAccessProvider {
+        session: String,
+        provider: String,
+        detail: String,
+    },
+    #[error("会话 {session} 的访问策略房间不合法：{room}（{detail}）")]
+    BadAccessRoom {
+        session: String,
+        room: String,
+        detail: String,
+    },
+    #[error("会话 {session} 的访问策略重复列了房间 {room}")]
+    DuplicateAccessRoom { session: String, room: String },
+    #[error("会话 {session} 的访问策略房间 {room} 引用了不存在的连接 {connection}")]
+    UnknownAccessConnection {
+        session: String,
+        room: String,
+        connection: String,
     },
     #[error("会话 {session} 的接入令牌不能为空")]
     EmptyToken { session: String },
@@ -888,6 +934,7 @@ impl Config {
                 .flatten();
 
             let on_turn_error = parse_turn_error_actions(&raw_session.on_turn_error)?;
+            let access = build_access(&id, raw_session.access, &connections)?;
 
             sessions.push(Session {
                 id,
@@ -898,6 +945,7 @@ impl Config {
                 memories: raw_session.memories,
                 token: raw_session.token.trim().to_owned(),
                 subscriptions,
+                access,
                 on_turn_error,
             });
         }
@@ -1107,6 +1155,55 @@ fn build_subscription(session: &str, raw: RawSubscription) -> Result<Subscriptio
     Ok(Subscription { room, wake })
 }
 
+fn build_access(
+    session: &str,
+    raw: RawAccess,
+    connections: &[Connection],
+) -> Result<AccessPolicy, ConfigError> {
+    let provider = match raw
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => ProviderId::parse(text).map_err(|error| ConfigError::BadAccessProvider {
+            session: session.to_owned(),
+            provider: text.to_owned(),
+            detail: error.to_string(),
+        })?,
+        None => ProviderId::builtin_access(),
+    };
+
+    let mut rooms = Vec::new();
+    for text in raw.rooms {
+        let text = text.trim();
+        let room = RoomId::parse(text).map_err(|error| ConfigError::BadAccessRoom {
+            session: session.to_owned(),
+            room: text.to_owned(),
+            detail: error.to_string(),
+        })?;
+        if !connections
+            .iter()
+            .any(|connection| connection.id == room.connection)
+        {
+            return Err(ConfigError::UnknownAccessConnection {
+                session: session.to_owned(),
+                room: room.to_string(),
+                connection: room.connection.clone(),
+            });
+        }
+        if rooms.iter().any(|listed| listed == &room) {
+            return Err(ConfigError::DuplicateAccessRoom {
+                session: session.to_owned(),
+                room: room.to_string(),
+            });
+        }
+        rooms.push(room);
+    }
+
+    Ok(AccessPolicy { provider, rooms })
+}
+
 fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, ConfigError> {
     let default = WakePolicy::default();
 
@@ -1262,9 +1359,21 @@ struct RawSession {
     token: String,
     #[serde(default)]
     subscriptions: Vec<RawSubscription>,
+    /// 访问策略（默认按订阅）。
+    #[serde(default)]
+    access: RawAccess,
     /// 一轮失败时的通知动作列表（默认空 = 只记日志）。
     #[serde(default)]
     on_turn_error: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAccess {
+    /// 访问策略 provider id。不写就用内置「按订阅」。
+    provider: Option<String>,
+    /// 额外豁免的房间（完整写法 `连接:路径`，如 `qq:group/123`）。
+    #[serde(default)]
+    rooms: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1431,6 +1540,68 @@ mod tests {
         // 超时默认 5 分钟（dsh 驱动原来的写死值），协议帧里带毫秒。
         assert_eq!(config.turn_timeout_secs, DEFAULT_TURN_TIMEOUT_SECS);
         assert_eq!(config.turn_timeout_ms(), 300_000);
+    }
+
+    #[test]
+    fn access_defaults_to_the_builtin_subscribed_provider() {
+        let config = Config::parse(&config_with(ONE_CONNECTION, ONE_SESSION)).expect("能解析");
+        let access = &config.sessions[0].access;
+        assert_eq!(access.provider, ProviderId::builtin_access());
+        assert!(access.rooms.is_empty());
+    }
+
+    /// `[sessions.access]` 写在 `[[sessions]]` 里、订阅表之前。
+    fn session_with_access(access: &str) -> String {
+        ONE_SESSION.replacen(
+            "        [[sessions.subscriptions]]",
+            &format!(
+                "        [sessions.access]\n{access}\n\n        [[sessions.subscriptions]]"
+            ),
+            1,
+        )
+    }
+
+    #[test]
+    fn access_policy_parses_provider_and_rooms() {
+        let sessions = session_with_access(
+            "        provider = \"acb.access.elevated_in_rooms\"\n        rooms = [\"qq:group/999\"]",
+        );
+        let config = Config::parse(&config_with(ONE_CONNECTION, &sessions)).expect("能解析");
+        let access = &config.sessions[0].access;
+        assert_eq!(access.provider, ProviderId::builtin_elevated_access());
+        assert_eq!(
+            access.rooms,
+            vec![RoomId::new("qq", "group/999").expect("合法")]
+        );
+    }
+
+    #[test]
+    fn access_policy_rejects_bad_provider_and_rooms() {
+        let bad_provider = session_with_access("        provider = \"subscribed\"");
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &bad_provider)),
+            Err(ConfigError::BadAccessProvider { .. })
+        ));
+
+        let bad_room = session_with_access("        rooms = [\"qq:\"]");
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &bad_room)),
+            Err(ConfigError::BadAccessRoom { .. })
+        ));
+
+        let unknown_connection = session_with_access("        rooms = [\"tg:group/999\"]");
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &unknown_connection)),
+            Err(ConfigError::UnknownAccessConnection { .. })
+        ));
+
+        let duplicate = session_with_access(
+            "        rooms = [\"qq:group/999\", \"qq:group/999\"]",
+        );
+        assert!(matches!(
+            Config::parse(&config_with(ONE_CONNECTION, &duplicate)),
+            Err(ConfigError::DuplicateAccessRoom { .. })
+        ));
     }
 
     #[test]

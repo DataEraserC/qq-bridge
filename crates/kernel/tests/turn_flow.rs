@@ -96,6 +96,32 @@ fn bridge() -> (Bridge<MemoryStore>, Sends) {
     (bridge, sends)
 }
 
+/// 带访问策略的桥。`rooms` 只有 `elevated_in_rooms` 用得到。
+fn bridge_with_access(provider: &str, rooms: &[&str]) -> (Bridge<MemoryStore>, Sends) {
+    let rooms = rooms
+        .iter()
+        .map(|room| format!("\"{room}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let access = format!(
+        "        [sessions.access]\n        provider = \"{provider}\"\n        rooms = [{rooms}]"
+    );
+    let text = config().replacen(
+        "        [[sessions.subscriptions]]",
+        &format!("{access}\n\n        [[sessions.subscriptions]]"),
+        1,
+    );
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let bridge = Bridge::new(
+        acb_kernel::Config::parse(&text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder {
+            sends: sends.clone(),
+        }),
+    );
+    (bridge, sends)
+}
+
 fn room(text: &str) -> RoomId {
     RoomId::parse(text).expect("房间合法")
 }
@@ -471,6 +497,77 @@ fn send_message_to_is_fenced_by_subscriptions() {
             }),
         )
         .expect_err("订阅外必须拒");
+    assert_eq!(error.code, ErrorCode::RoomNotSubscribed);
+}
+
+/// `all_rooms`：整个会话豁免订阅边界，可以发到任意房间。
+#[test]
+fn all_rooms_access_policy_reaches_unsubscribed_rooms() {
+    let (mut bridge, sends) = bridge_with_access("acb.access.all_rooms", &[]);
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let result = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message_to",
+            json!({
+                "to": "qq:group/999",
+                "elements": [{"type": "text", "text": "发得出去"}]
+            }),
+        )
+        .expect("全豁免策略下，没订阅的房间也能发");
+    assert_eq!(result["room"], "qq:group/999");
+    assert_eq!(sends.lock().expect("没被毒死")[0].0, room("qq:group/999"));
+}
+
+/// `elevated_in_rooms`：只开列表里的那个聊天（读和写都开），其他照旧。
+#[test]
+fn elevated_access_opens_only_the_listed_rooms() {
+    let (mut bridge, sends) = bridge_with_access("acb.access.elevated_in_rooms", &["qq:group/999"]);
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message_to",
+            json!({
+                "to": "qq:group/999",
+                "elements": [{"type": "text", "text": "去豁免的群说一句"}]
+            }),
+        )
+        .expect("列表里的房间能发");
+    assert_eq!(sends.lock().expect("没被毒死")[0].0, room("qq:group/999"));
+
+    // 读也开：不用订阅就能看那个房间的流水。
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "get_history",
+            json!({"room": "qq:group/999"}),
+        )
+        .expect("列表里的房间能读");
+
+    // 列表外的房间仍然拒。
+    let error = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message_to",
+            json!({
+                "to": "qq:group/888",
+                "elements": [{"type": "text", "text": "发不出去"}]
+            }),
+        )
+        .expect_err("没列出来的房间照旧拒");
     assert_eq!(error.code, ErrorCode::RoomNotSubscribed);
 }
 

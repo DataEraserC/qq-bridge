@@ -24,7 +24,7 @@ pub use adapter::{
 };
 pub use event_queue::{drain_events, EventQueue, EventReceiver};
 pub use config::{
-    Config, Connection, ConsoleConfig, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM,
+    AccessPolicy, Config, Connection, ConsoleConfig, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM,
     DEFAULT_STORAGE_PATH, DEFAULT_WORKTREES_ROOT, EndpointConfig, Harness, KNOWN_ADAPTERS,
     KNOWN_MEMORY_KINDS, Memory, Persona, RetentionConfig, Session, StorageConfig, Subscription,
     Transport, WakeDecision, WakeInput, WakePolicy,
@@ -38,8 +38,11 @@ pub use outbound::{
     TargetSpec,
 };
 pub use plugin::{
-    Capability, DefaultWakeProvider, ExtensionPoint, ManagerPlugin, NativeLoader, PluginError,
-    PluginLoader, PluginManager, ProviderDescriptor, ProviderId, PLUGIN_API_VERSION,
+    AccessAction, AccessDecision, AccessProvider, AccessRequest, AllRoomsAccessProvider, Capability,
+    DefaultWakeProvider, ElevatedInRoomsAccessProvider, ExtensionPoint, ManagerPlugin, NativeLoader,
+    PluginError, PluginLoader, PluginManager, ProviderDescriptor, ProviderId, ProviderInstance,
+    ProviderOptions, SubscribedAccessProvider, WakeProvider, ALL_ROOMS_ACCESS_PROVIDER,
+    DEFAULT_ACCESS_PROVIDER, ELEVATED_ACCESS_PROVIDER, PLUGIN_API_VERSION,
 };
 pub use storage::{
     Counts, Cursor, Deliveries, FEEDBACK_CAP, Feedback, FeedbackDraft, Feedbacks, MIN_KEPT,

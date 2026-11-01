@@ -91,7 +91,7 @@ InboundEvent:
 - **Phase 2c-2 已落地**：`Outbounds` 提供可克隆的 `OutboundHandle`；endpoint 把 `send_message` / `send_message_to` / `platform_call` 拆成“锁内 prepare / 锁外 execute / 锁内 finish”。入站事件走 `EventQueue`，适配器只提交 `RecordDraft`，core 的 `drain_events` 线程统一 `ingest`；适配器侧不再 `try_lock`。
 - **Phase 2c-3 已落地**：`MethodSpec` 增加 `effect`（read/write/send/delete）与 `record`（none/message/event）；OneBot 的 effect/record 由风险、标签和方法名推导，不维护第二份手写表。
 - **`Outbound::call` 返回 `CallOutcome`**：适配器把发送类方法（发消息、合并转发、群公告）**实际发出去的内容**翻译成 `OutgoingRecord`，core 不认识平台消息段。`finish_platform_call` 成功后写流水并对**所有订阅者** ack，修掉「用 `platform_call` 发的消息在自己水位上留洞、导致积压反复重投」的问题。
-- **尚未做**：动态适配器（外置进程 / 动态加载）；AccessPolicy provider（Phase 2d，`acb.access.*`）。
+- **尚未做**：动态适配器（外置进程 / 动态加载）。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
 
 ## 参考
 
