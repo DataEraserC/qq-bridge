@@ -67,6 +67,19 @@ fn main() -> std::io::Result<()> {
                     },
                 )?;
             }
+            CoreMessage::Decide { id, .. } => {
+                write_message(
+                    &mut stdout,
+                    &AdapterMessage::Reply {
+                        id,
+                        result: WireResult::Error {
+                            error: WireError::Unsupported {
+                                detail: "这个 fixture 不是策略 provider".into(),
+                            },
+                        },
+                    },
+                )?;
+            }
             CoreMessage::Send { id, .. } => {
                 write_message(
                     &mut stdout,

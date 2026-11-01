@@ -74,17 +74,24 @@ pub mod abi {
     }
 }
 
-/// 适配器 manifest 的 wire 形状。
+/// 插件 manifest 的 wire 形状。
+///
+/// `extension` 决定这是平台适配器还是别的扩展点（当前 P4 支持 `wake`）。
+/// 平台适配器用 `kind` / `transports`；策略 provider 用 `id` 作为 provider id。
 #[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
 pub struct WireManifest {
     pub id: String,
     pub platform: String,
+    #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub transports: Vec<String>,
     pub api_version: u32,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// `platform_adapter`（默认）或 `wake`。
+    #[serde(default = "default_extension")]
+    pub extension: String,
 }
 
 /// 一条连接的 wire 形状（动态库接管适配器实例化时用）。
@@ -103,6 +110,46 @@ pub struct WireConnection {
     pub admin_qqs: Vec<String>,
     #[serde(default)]
     pub options: Value,
+}
+
+/// 动态库 `create` 收到的实例配置。
+///
+/// 适配器和策略 provider 共用同一个入口，用 `kind` 区分：
+/// - `adapter`：一条平台连接；
+/// - `provider`：一个策略实例（如 wake），`options` 是对应策略的配置。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireInstanceConfig {
+    Adapter { connection: WireConnection },
+    Provider {
+        provider: String,
+        extension: String,
+        #[serde(default)]
+        options: Value,
+    },
+}
+
+/// wake 判定的 wire 形状；插件只读，不写。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireWakeRequest {
+    pub session: String,
+    pub room: String,
+    pub connection: String,
+    pub platform: String,
+    pub sender_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub at_self: bool,
+    #[serde(default)]
+    pub reply_to_self: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub unread: u32,
+    #[serde(default)]
+    pub now: i64,
 }
 
 /// 一条入站记录。字段与 kernel 的 `RecordDraft` 对齐，由 core 负责转换。
@@ -214,6 +261,15 @@ pub enum CoreMessage {
     Describe {
         id: u64,
     },
+    /// 问一个策略 provider（`point` = `wake` / `access` …）。
+    Decide {
+        id: u64,
+        point: String,
+        #[serde(default)]
+        options: Value,
+        #[serde(default)]
+        request: Value,
+    },
     Send {
         id: u64,
         room: RoomId,
@@ -237,6 +293,12 @@ pub enum WireResult {
     Catalog {
         #[serde(default)]
         catalog: Vec<WireMethodSpec>,
+    },
+    /// `decision` 是策略自己的词：wake 用 `wake` / `stay`，access 用 `allow` / `deny`。
+    Decision {
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Sent {
         platform_id: String,
@@ -286,6 +348,10 @@ pub fn encode_line<T: Serialize>(value: &T) -> Result<String, serde_json::Error>
 /// 从一行 JSON 里解码。
 pub fn decode_line<T: DeserializeOwned>(line: &str) -> Result<T, serde_json::Error> {
     serde_json::from_str(line)
+}
+
+fn default_extension() -> String {
+    "platform_adapter".to_owned()
 }
 
 fn default_param_type() -> String {

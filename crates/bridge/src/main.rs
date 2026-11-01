@@ -84,9 +84,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(lua) = LuaLoader::from_env() {
         plugins.install_loader(&lua)?;
     }
-    // 动态库适配器：配了 [[adapters]] 才装载；插件自己报 manifest。
-    if !config.adapters.is_empty() {
-        plugins.install_loader(&DynamicLoader::new(&config.adapters))?;
+    // 动态库插件：配了 [[plugins]] 才装载；插件自己报 manifest（适配器或策略 provider）。
+    if !config.plugins.is_empty() {
+        plugins.install_loader(&DynamicLoader::new(&config.plugins))?;
     }
     // 平台适配器也登记在 Root 里：内置 OneBot、外置进程、动态库走同一张表。
     plugins.register_adapter(Arc::new(OneBotAdapterFactory))?;

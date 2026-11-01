@@ -26,26 +26,30 @@ use std::time::Duration;
 
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, ENTRY_SYMBOL, EntryFn, HostV1};
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireConnection, WireManifest, WireResult, decode_line,
-    encode_line,
+    AdapterMessage, CoreMessage, WireConnection, WireInstanceConfig, WireManifest, WireResult,
+    WireWakeRequest, decode_line, encode_line,
 };
 use acb_kernel::wire::{call_error, convert_catalog, send_error};
 use acb_kernel::{
-    AdapterError, AdapterFactory, AdapterHost, AdapterInstance, AdapterManifest,
-    AdapterPluginConfig, CallError, CallOutcome, Connection, Element, EventQueue, ExtensionPoint,
-    LoaderKind, LoaderManifest, MethodSpec, Outbound, OutboundError, OutgoingRecord, PluginError,
-    PluginLoader, PluginManager, RoomId, Sent, PLUGIN_API_VERSION, validate_manifest,
+    AdapterError, AdapterFactory, AdapterHost, AdapterInstance, AdapterManifest, CallError,
+    CallOutcome, Capability, Connection, Element, EventQueue, ExtensionPoint, Health, LoaderKind,
+    LoaderManifest, ManagerManifest, ManagerPlugin, MethodSpec, Outbound, OutboundError,
+    OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager, ProviderDescriptor,
+    ProviderId, ProviderInstance, ProviderOptions, RoomId, Sent, WakeContext, WakeDecision,
+    WakePolicy, WakeProvider, PLUGIN_API_VERSION, validate_manifest,
 };
 use libloading::Library;
+use serde_json::{Value, json};
+use std::sync::atomic::AtomicU64;
 
 /// 动态库 loader：把配置里声明的 `.so` 装进 Root。
 #[derive(Debug, Default)]
 pub struct DynamicLoader {
-    plugins: Vec<AdapterPluginConfig>,
+    plugins: Vec<PluginConfig>,
 }
 
 impl DynamicLoader {
-    pub fn new(plugins: &[AdapterPluginConfig]) -> Self {
+    pub fn new(plugins: &[PluginConfig]) -> Self {
         Self {
             plugins: plugins.to_vec(),
         }
@@ -57,32 +61,35 @@ impl PluginLoader for DynamicLoader {
         LoaderManifest::new(
             LoaderKind::Dynamic,
             PLUGIN_API_VERSION,
-            vec![ExtensionPoint::PlatformAdapter],
+            vec![ExtensionPoint::PlatformAdapter, ExtensionPoint::Wake],
         )
     }
 
     fn install(&self, manager: &mut PluginManager) -> Result<(), PluginError> {
         for plugin in &self.plugins {
-            let factory = DylibAdapterFactory::load(&plugin.path, plugin.kind.as_deref())
+            let loaded = LoadedPlugin::load(&plugin.path, plugin.kind.as_deref())
                 .map_err(|detail| {
                     PluginError::Loader(format!("加载 {} 失败：{detail}", plugin.path))
                 })?;
-            manager
-                .register_adapter(Arc::new(factory))
-                .map_err(|error| PluginError::Loader(error.to_string()))?;
+            match loaded {
+                LoadedPlugin::Adapter(factory) => manager
+                    .register_adapter(Arc::new(factory))
+                    .map_err(|error| PluginError::Loader(error.to_string()))?,
+                LoadedPlugin::Wake(wake) => manager
+                    .install_manager(Arc::new(wake))
+                    .map_err(|error| PluginError::Loader(error.to_string()))?,
+            }
         }
         Ok(())
     }
 }
 
-struct DylibAdapterFactory {
-    /// 库必须活到进程退出：函数指针都指向它。
-    _library: Arc<Library>,
-    table: AdapterV1,
-    manifest: AdapterManifest,
+enum LoadedPlugin {
+    Adapter(DylibAdapterFactory),
+    Wake(DylibWakeManager),
 }
 
-impl DylibAdapterFactory {
+impl LoadedPlugin {
     fn load(path: &str, expected_kind: Option<&str>) -> Result<Self, String> {
         let library = unsafe { Library::new(path) }
             .map_err(|error| format!("打不开动态库：{error}"))?;
@@ -110,32 +117,63 @@ impl DylibAdapterFactory {
             return Err("插件函数表不完整（manifest/create/invoke/destroy/free_string 都要有）".into());
         }
 
-        let manifest = read_manifest(&table)?;
-        validate_manifest(&manifest).map_err(|error| error.to_string())?;
-        if let Some(expected) = expected_kind {
-            if manifest.kind.as_ref() != expected {
-                return Err(format!(
-                    "manifest 的 kind 是 {}，配置里写的是 {expected}",
-                    manifest.kind
-                ));
+        let wire = read_manifest(&table)?;
+        match wire.extension.as_str() {
+            "platform_adapter" => {
+                let manifest = AdapterManifest::try_from(wire)
+                    .map_err(|detail| format!("manifest 不合法：{detail}"))?;
+                validate_manifest(&manifest).map_err(|error| error.to_string())?;
+                if let Some(expected) = expected_kind {
+                    if manifest.kind.as_ref() != expected {
+                        return Err(format!(
+                            "manifest 的 kind 是 {}，配置里写的是 {expected}",
+                            manifest.kind
+                        ));
+                    }
+                }
+                Ok(Self::Adapter(DylibAdapterFactory {
+                    _library: Arc::new(library),
+                    table,
+                    manifest,
+                }))
             }
+            "wake" => {
+                let provider = ProviderId::parse(&wire.id)
+                    .map_err(|error| format!("wake provider id 不合法：{error}"))?;
+                if provider.namespace() == "acb" {
+                    return Err("树外插件不能用 acb namespace".into());
+                }
+                if wire.api_version != PLUGIN_API_VERSION {
+                    return Err(format!(
+                        "插件 API 版本 {} 不兼容（需要 {PLUGIN_API_VERSION}）",
+                        wire.api_version
+                    ));
+                }
+                Ok(Self::Wake(DylibWakeManager::new(
+                    Arc::new(library),
+                    table,
+                    provider,
+                    wire.platform,
+                    wire.id,
+                )))
+            }
+            other => Err(format!("不认识的插件扩展点：{other}")),
         }
-
-        Ok(Self {
-            _library: Arc::new(library),
-            table,
-            manifest,
-        })
     }
 }
 
-fn read_manifest(table: &AdapterV1) -> Result<AdapterManifest, String> {
+struct DylibAdapterFactory {
+    /// 库必须活到进程退出：函数指针都指向它。
+    _library: Arc<Library>,
+    table: AdapterV1,
+    manifest: AdapterManifest,
+}
+
+fn read_manifest(table: &AdapterV1) -> Result<WireManifest, String> {
     let manifest_fn = table.manifest.ok_or("没有 manifest 函数")?;
     let pointer = unsafe { manifest_fn() };
     let json = take_owned_string(pointer, table)?;
-    let wire: WireManifest =
-        serde_json::from_str(&json).map_err(|error| format!("manifest 不是合法 JSON：{error}"))?;
-    AdapterManifest::try_from(wire).map_err(|detail| format!("manifest 不合法：{detail}"))
+    serde_json::from_str(&json).map_err(|error| format!("manifest 不是合法 JSON：{error}"))
 }
 
 impl AdapterFactory for DylibAdapterFactory {
@@ -172,7 +210,9 @@ impl DylibAdapterFactory {
             log: Some(log),
         };
 
-        let config = WireConnection::from(connection);
+        let config = WireInstanceConfig::Adapter {
+            connection: WireConnection::from(connection),
+        };
         let config_json = CString::new(
             encode_line(&config).map_err(|error| format!("连接配置序列化失败：{error}"))?,
         )
@@ -240,6 +280,247 @@ fn describe(
         } => Err(format!("插件拒绝 describe：{error:?}")),
         other => Err(format!("describe 回执不对：{other:?}")),
     }
+}
+
+/// 动态库 wake provider 的 manager。一个插件一个子树，namespace 来自 provider id。
+struct DylibWakeManager {
+    library: Arc<Library>,
+    table: AdapterV1,
+    provider: ProviderId,
+    platform: String,
+    plugin_id: String,
+    cached: Mutex<Option<Arc<DylibWakeProvider>>>,
+}
+
+impl DylibWakeManager {
+    fn new(
+        library: Arc<Library>,
+        table: AdapterV1,
+        provider: ProviderId,
+        platform: String,
+        plugin_id: String,
+    ) -> Self {
+        Self {
+            library,
+            table,
+            provider,
+            platform,
+            plugin_id,
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+impl ManagerPlugin for DylibWakeManager {
+    fn manifest(&self) -> ManagerManifest {
+        ManagerManifest::new(
+            self.provider.namespace(),
+            PLUGIN_API_VERSION,
+            vec![Capability::WakeDecision],
+        )
+    }
+
+    fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        vec![ProviderDescriptor::new(
+            self.provider.clone(),
+            ExtensionPoint::Wake,
+            PLUGIN_API_VERSION,
+            vec![Capability::WakeDecision],
+        )]
+    }
+
+    fn instantiate(
+        &self,
+        id: &ProviderId,
+        options: ProviderOptions<'_>,
+    ) -> Result<ProviderInstance, PluginError> {
+        if id != &self.provider {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        }
+        let ProviderOptions::Wake(policy) = options else {
+            return Err(PluginError::Provider {
+                id: id.to_string(),
+                detail: "wake provider 需要 WakePolicy".into(),
+            });
+        };
+
+        let mut cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(provider) = cached.as_ref() {
+            let provider: Arc<dyn WakeProvider> = provider.clone();
+            return Ok(ProviderInstance::Wake(provider));
+        }
+        let provider = DylibWakeProvider::create(
+            Arc::clone(&self.library),
+            self.table,
+            &self.plugin_id,
+            &self.platform,
+            policy,
+        )
+        .map_err(|detail| PluginError::Provider {
+            id: id.to_string(),
+            detail,
+        })?;
+        let provider = Arc::new(provider);
+        *cached = Some(Arc::clone(&provider));
+        let dynamic: Arc<dyn WakeProvider> = provider;
+        Ok(ProviderInstance::Wake(dynamic))
+    }
+
+    fn shutdown(&self) {
+        let provider = self
+            .cached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(provider) = provider {
+            provider.destroy();
+        }
+    }
+
+    fn health(&self) -> Health {
+        Health::Healthy
+    }
+}
+
+struct DylibWakeProvider {
+    _library: Arc<Library>,
+    _context: Arc<HostContext>,
+    table: AdapterV1,
+    handle: Arc<Mutex<AdapterHandle>>,
+    seq: AtomicU64,
+    failures: AtomicU64,
+}
+
+impl DylibWakeProvider {
+    fn create(
+        library: Arc<Library>,
+        table: AdapterV1,
+        plugin_id: &str,
+        platform: &str,
+        policy: &WakePolicy,
+    ) -> Result<Self, String> {
+        // wake 判定不需要入站事件；给一个空队列，插件误发事件时会被记录为队列关闭。
+        let (events, _receiver) = EventQueue::channel();
+        let context = Arc::new(HostContext {
+            events,
+            stop: Arc::new(AtomicBool::new(false)),
+            connection: plugin_id.to_owned(),
+        });
+        let host = HostV1 {
+            abi_version: ABI_VERSION,
+            ctx: Arc::as_ptr(&context) as *mut c_void,
+            submit_event: Some(submit_event),
+            should_stop: Some(should_stop),
+            log: Some(log),
+        };
+        let config = WireInstanceConfig::Provider {
+            provider: plugin_id.to_owned(),
+            extension: "wake".into(),
+            options: wake_options(policy),
+        };
+        let config_json = CString::new(
+            encode_line(&config).map_err(|error| format!("wake 配置序列化失败：{error}"))?,
+        )
+        .map_err(|_| "wake 配置里含有 NUL".to_owned())?;
+
+        let create = table.create.ok_or("没有 create 函数")?;
+        let handle_ptr = unsafe { create(config_json.as_ptr(), &host) };
+        if handle_ptr.is_null() {
+            return Err(format!(
+                "wake 插件 {plugin_id}（platform {platform}）create 返回空 handle"
+            ));
+        }
+
+        Ok(Self {
+            _library: library,
+            _context: context,
+            table,
+            handle: Arc::new(Mutex::new(AdapterHandle {
+                ptr: handle_ptr,
+                alive: true,
+            })),
+            seq: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+        })
+    }
+
+    fn note_failure(&self, detail: &str) {
+        let count = self.failures.fetch_add(1, Ordering::Relaxed);
+        if count < 5 || count % 100 == 0 {
+            eprintln!("wake 插件失败（第 {} 次）：{detail}", count + 1);
+        }
+    }
+
+    fn destroy(&self) {
+        destroy_handle(&self.table, &self.handle);
+    }
+}
+
+impl WakeProvider for DylibWakeProvider {
+    fn decide(&self, options: &WakePolicy, context: &WakeContext<'_>) -> WakeDecision {
+        let id = self.seq.fetch_add(1, Ordering::Relaxed);
+        let request = WireWakeRequest {
+            session: context.session.to_owned(),
+            room: context.room.to_string(),
+            connection: context.connection.to_owned(),
+            platform: context.platform.to_owned(),
+            sender_id: context.sender_id.to_owned(),
+            text: context.text.to_owned(),
+            at_self: context.at_self,
+            reply_to_self: context.reply_to_self,
+            event: context.event.map(str::to_owned),
+            tags: context.tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            unread: context.unread,
+            now: context.now,
+        };
+        let request = serde_json::to_value(request).unwrap_or(Value::Null);
+        let message = CoreMessage::Decide {
+            id,
+            point: "wake".into(),
+            options: wake_options(options),
+            request,
+        };
+
+        match invoke(&self.table, &self.handle, &message) {
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Decision { decision, .. },
+                ..
+            }) => match decision.as_str() {
+                "wake" => WakeDecision::Wake,
+                "stay" => WakeDecision::Stay,
+                other => {
+                    self.note_failure(&format!("不认识的 wake 判定：{other}"));
+                    WakeDecision::Stay
+                }
+            },
+            Ok(other) => {
+                self.note_failure(&format!("回执不是 wake 判定：{other:?}"));
+                WakeDecision::Stay
+            }
+            Err(detail) => {
+                self.note_failure(&detail);
+                WakeDecision::Stay
+            }
+        }
+    }
+}
+
+fn wake_options(policy: &WakePolicy) -> Value {
+    json!({
+        "provider": policy.provider.to_string(),
+        "at_mention": policy.at_mention,
+        "reply": policy.reply,
+        "name_mention": policy.name_mention,
+        "names": policy.names,
+        "accumulate": policy.accumulate,
+        "poke": policy.poke,
+        "events": policy.events,
+        "keywords": policy.keywords,
+        "ignore_speakers": policy.ignore_speakers,
+    })
 }
 
 struct HostContext {

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use acb_adapter_dynamic::DynamicLoader;
 use acb_kernel::{
-    AdapterHost, AdapterInstance, AdapterPluginConfig, CallError, Connection, Element, EventQueue,
+    AdapterHost, AdapterInstance, CallError, Connection, Element, EventQueue, PluginConfig,
     PluginManager, RoomId, Transport,
 };
 use serde_json::json;
@@ -56,27 +56,26 @@ fn connection() -> Connection {
 
 #[test]
 fn dynamic_adapter_loads_and_speaks_the_wire_protocol() {
+    // `cargo test` 不保证重建同包的 cdylib；每次先补一次，保证测的是当前源码。
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../Cargo.toml");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("-p")
+        .arg("acb-adapter-dynamic-fixture")
+        .status()
+        .expect("能跑 cargo build");
+    assert!(status.success(), "fixture 动态库构建失败");
+
     let path = fixture_path();
-    if !path.exists() {
-        // `cargo test` 不一定先构建同包的 cdylib；缺了就补一次（nix 的 buildPhase 会先建好）。
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let status = std::process::Command::new(cargo)
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(manifest)
-            .arg("-p")
-            .arg("acb-adapter-dynamic-fixture")
-            .status()
-            .expect("能跑 cargo build");
-        assert!(status.success(), "fixture 动态库构建失败");
-    }
     assert!(path.exists(), "缺 fixture 动态库：{}", path.display());
     let path = path.to_string_lossy().into_owned();
 
     let mut plugins = PluginManager::with_native_builtins();
     plugins
-        .install_loader(&DynamicLoader::new(&[AdapterPluginConfig {
+        .install_loader(&DynamicLoader::new(&[PluginConfig {
             path,
             kind: Some("demo".into()),
         }]))

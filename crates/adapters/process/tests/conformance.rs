@@ -11,7 +11,7 @@ use std::time::Duration;
 use acb_adapter_process::ProcessAdapterFactory;
 use acb_kernel::{
     AdapterError, AdapterHost, AdapterInstance, CallError, Connection, Element, EventQueue,
-    Outbound, PluginManager, RoomId, Transport,
+    PluginManager, RoomId, Transport,
 };
 use serde_json::json;
 

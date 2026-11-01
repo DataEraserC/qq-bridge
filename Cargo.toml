@@ -10,6 +10,7 @@ members = [
     "crates/adapters/dynamic-fixture",
     "crates/plugins/trusted",
     "crates/plugins/lua",
+    "crates/plugins/wake-fixture",
     "crates/bridge",
 ]
 

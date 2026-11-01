@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, HostV1};
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireConnection, WireError, WireManifest, WireMethodSpec,
-    WireOutgoingKind, WireOutgoingRecord, WireParamSpec, WireRecord, WireResult, decode_line,
-    encode_line,
+    AdapterMessage, CoreMessage, WireConnection, WireError, WireInstanceConfig, WireManifest,
+    WireMethodSpec, WireOutgoingKind, WireOutgoingRecord, WireParamSpec, WireRecord, WireResult,
+    decode_line, encode_line,
 };
 use acb_proto::{Element, RecordKind, RoomId, Sender};
 use serde_json::{Value, json};
@@ -61,6 +61,7 @@ unsafe extern "C" fn fixture_manifest() -> *mut c_char {
             "send".into(),
             "catalog".into(),
         ],
+        extension: "platform_adapter".into(),
     };
     let json = serde_json::to_string(&manifest).expect("manifest 可序列化");
     CString::new(json)
@@ -75,9 +76,9 @@ unsafe extern "C" fn fixture_create(config_json: *const c_char, host: *const Hos
     let config = unsafe { CStr::from_ptr(config_json) }
         .to_string_lossy()
         .into_owned();
-    let connection: WireConnection = match decode_line(&config) {
-        Ok(connection) => connection,
-        Err(_) => return std::ptr::null_mut(),
+    let connection: WireConnection = match decode_line::<WireInstanceConfig>(&config) {
+        Ok(WireInstanceConfig::Adapter { connection }) => connection,
+        _ => return std::ptr::null_mut(),
     };
     let host = unsafe { *host };
     let stop = Arc::new(AtomicBool::new(false));
@@ -191,6 +192,14 @@ unsafe extern "C" fn fixture_invoke(handle: *mut c_void, request_json: *const c_
             };
             AdapterMessage::Reply { id, result }
         }
+        CoreMessage::Decide { id, .. } => AdapterMessage::Reply {
+            id,
+            result: WireResult::Error {
+                error: WireError::Unsupported {
+                    detail: "这个 fixture 不是策略 provider".into(),
+                },
+            },
+        },
         CoreMessage::Shutdown => {
             fixture.stop.store(true, Ordering::Relaxed);
             if let Some(log) = fixture.host.log {

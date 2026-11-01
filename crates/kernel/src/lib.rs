@@ -26,8 +26,8 @@ pub use adapter::{
 };
 pub use event_queue::{drain_events, EventQueue, EventReceiver};
 pub use config::{
-    AccessPolicy, AdapterPluginConfig, ClockPolicy, Config, Connection, ConsoleConfig,
-    DEFAULT_MAX_AGE_DAYS,
+    AccessPolicy, ClockPolicy, Config, Connection, ConsoleConfig, DEFAULT_MAX_AGE_DAYS,
+    PluginConfig,
     DEFAULT_MAX_RECORDS_PER_ROOM, DEFAULT_STORAGE_PATH, DEFAULT_WORKTREES_ROOT, DeliveryPolicy,
     EndpointConfig, Harness,
     KNOWN_MEMORY_KINDS, Memory, OutboundPolicy, Persona, ReceivePolicy,

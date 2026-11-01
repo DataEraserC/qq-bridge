@@ -1,0 +1,18 @@
+[package]
+name = "acb-adapter-wake-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "动态库 wake provider 的 conformance fixture"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+acb-adapter-api = { path = "../../adapter-api" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+acb-adapter-dynamic = { path = "../../adapters/dynamic" }
+acb-kernel = { path = "../../kernel" }

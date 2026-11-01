@@ -55,6 +55,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "acb-adapter-wake-fixture"
+version = "0.1.0"
+dependencies = [
+ "acb-adapter-api",
+ "acb-adapter-dynamic",
+ "acb-kernel",
+ "serde_json",
+]
+
+[[package]]
 name = "acb-bridge"
 version = "0.1.0"
 dependencies = [

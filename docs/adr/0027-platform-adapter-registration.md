@@ -104,10 +104,16 @@ InboundEvent:
   - conformance 测试真启动一个 fixture 子进程，覆盖 hello、入站事件、发送回执、调用回执、错误分类和缺 `command` 的启动失败。
 - **Phase 3 P3（2026-11-01，动态库）**：适配器实现可以编成 `.so` / `.dylib`，在桥进程内运行。
   - `acb-adapter-api` 增加 C ABI：只导出一个 `acb_adapter_entry_v1`，返回 `AdapterV1` 函数表（manifest / create / invoke / destroy / free_string），core 通过 `HostV1` 回调把事件、日志和退出信号交给插件。跨 ABI 的文本全是 JSON，和外置进程共用同一套 wire。
-  - 新增 `acb-adapter-dynamic`（`DynamicLoader`）：按 `[[adapters]]` 的 `path` / `kind` 用 libloading 装载，插件自己报 manifest，注册进 Root 后与内置/进程适配器完全同构。
+  - 新增 `acb-adapter-dynamic`（`DynamicLoader`）：按 `[[plugins]]` 的 `path` / `kind` 用 libloading 装载，插件自己报 manifest，注册进 Root 后与内置/进程适配器完全同构。
   - 动态库在桥进程内，插件 panic 或挂死会带倒整座桥；需要崩溃隔离时用 `process`。P3 不做调用超时（in-process 无法打断），这是明确取舍。
   - conformance 测试真的用 libloading 打开一个 fixture cdylib，覆盖 manifest、describe 目录、入站事件、发送/调用回执、错误分类和 shutdown。
-- **尚未做**：P4 把 wake/access 等策略扩展点也接到同一套 wire。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
+- **Phase 3 P4（2026-11-01，策略扩展点）**：wake provider 也能走同一套动态库 wire。
+  - `WireManifest` 增加 `extension`（默认 `platform_adapter`，P4 支持 `wake`）；动态库 `create` 的参数改为带标签的 `WireInstanceConfig`（`adapter` / `provider`）。
+  - 新增 `CoreMessage::Decide` / `WireResult::Decision` / `WireWakeRequest`：wake 插件按 `WireWakeRequest` 判定，返回 `wake` / `stay`；解析失败或插件报错一律按 `stay` 兜底。
+  - `DynamicLoader` 按 manifest 的 extension 分流：适配器注册进适配器表，wake 插件注册成 `ManagerPlugin` 子树（provider id 来自 manifest.id），provider 实例缓存在 manager 里。
+  - 配置表 `[[adapters]]` 更名为 `[[plugins]]`，同一份清单可以装适配器和策略插件。wake 只支持动态库载体：策略判定在 core 的 ingest 路径里，外置进程会在 core 锁内做 I/O，违反 ADR-0027 的队列原则。
+  - conformance 测试用 wake fixture cdylib 真加载并验证 `at_self` / 关键词判定。
+- **尚未做**：access 等其它策略扩展点的动态库载体。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
 
 ## 参考
 

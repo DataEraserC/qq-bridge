@@ -42,7 +42,7 @@ impl AdapterFactory for OneBotAdapterFactory {
     fn create(
         &self,
         connection: &Connection,
-        events: EventQueue,
+        _events: EventQueue,
     ) -> Result<AdapterInstance, AdapterError> {
         if connection.url.is_none() {
             return Err(AdapterError::Create(

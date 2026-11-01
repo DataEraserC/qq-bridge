@@ -68,8 +68,9 @@ pub struct Config {
     pub file_relay: Option<FileRelayConfig>,
     /// 平台侧连接。一个账号一条，可以有多条。
     pub connections: Vec<Connection>,
-    /// 动态库适配器声明。启动时加载这些 `.so` / `.dylib`，manifest 由插件自己报。
-    pub adapters: Vec<AdapterPluginConfig>,
+    /// 动态库插件声明。启动时加载这些 `.so` / `.dylib`，manifest 由插件自己报；
+    /// 插件可以是平台适配器，也可以是 wake/access 等策略 provider。
+    pub plugins: Vec<PluginConfig>,
     /// 状态存哪。流水、水位、笔记、投递计数都在这里，重启不改。
     pub storage: StorageConfig,
     /// 流水保留：旧记录什么时候可以删。
@@ -253,12 +254,12 @@ impl DestructivePolicy {
     }
 }
 
-/// 一个动态库适配器声明。
+/// 一个动态库插件声明。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterPluginConfig {
+pub struct PluginConfig {
     /// `.so` / `.dylib` 路径。
     pub path: String,
-    /// 期望的适配器 kind。插件 manifest 的 `kind` 必须等于它；不写就不校验。
+    /// 期望的适配器 kind。只对平台适配器插件生效；不写就不校验。
     pub kind: Option<String>,
 }
 
@@ -721,10 +722,10 @@ pub enum ConfigError {
     BadUrl { connection: String, url: String },
     #[error("连接 {connection} 的登录账号不能为空——桥要靠它分辨「哪句是我说的」")]
     EmptyAccount { connection: String },
-    #[error("动态适配器路径不能为空")]
-    EmptyAdapterPath,
-    #[error("动态适配器路径重复：{path}")]
-    DuplicateAdapterPath { path: String },
+    #[error("动态插件路径不能为空")]
+    EmptyPluginPath,
+    #[error("动态插件路径重复：{path}")]
+    DuplicatePluginPath { path: String },
     #[error("连接 {connection} 的入站策略 provider 不合法：{provider}（{detail}）")]
     BadReceiveProvider {
         connection: String,
@@ -863,20 +864,20 @@ impl Config {
             None => None,
         };
 
-        let mut adapters: Vec<AdapterPluginConfig> = Vec::with_capacity(raw.adapters.len());
-        for raw_adapter in raw.adapters {
-            let path = raw_adapter.path.trim().to_owned();
+        let mut plugins: Vec<PluginConfig> = Vec::with_capacity(raw.plugins.len());
+        for raw_plugin in raw.plugins {
+            let path = raw_plugin.path.trim().to_owned();
             if path.is_empty() {
-                return Err(ConfigError::EmptyAdapterPath);
+                return Err(ConfigError::EmptyPluginPath);
             }
-            if adapters.iter().any(|adapter| adapter.path == path) {
-                return Err(ConfigError::DuplicateAdapterPath { path });
+            if plugins.iter().any(|plugin| plugin.path == path) {
+                return Err(ConfigError::DuplicatePluginPath { path });
             }
-            let kind = raw_adapter
+            let kind = raw_plugin
                 .kind
                 .map(|kind| kind.trim().to_owned())
                 .filter(|kind| !kind.is_empty());
-            adapters.push(AdapterPluginConfig { path, kind });
+            plugins.push(PluginConfig { path, kind });
         }
 
         let mut connections: Vec<Connection> = Vec::with_capacity(raw.connections.len());
@@ -1118,7 +1119,7 @@ impl Config {
             console,
             file_relay,
             connections,
-            adapters,
+            plugins,
             storage,
             retention,
             worktrees_root,
@@ -1590,9 +1591,9 @@ struct RawConfig {
     file_relay: Option<RawFileRelay>,
     #[serde(default)]
     connections: Vec<RawConnection>,
-    /// 动态库适配器声明。
+    /// 动态库插件声明。
     #[serde(default)]
-    adapters: Vec<RawAdapterPlugin>,
+    plugins: Vec<RawPlugin>,
     storage: Option<RawStorage>,
     retention: Option<RawRetention>,
     worktrees_root: Option<String>,
@@ -1699,7 +1700,7 @@ struct RawRetention {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawAdapterPlugin {
+struct RawPlugin {
     path: String,
     #[serde(default)]
     kind: Option<String>,
@@ -2061,25 +2062,25 @@ mod tests {
     #[test]
     fn dynamic_adapter_plugins_are_parsed_and_deduplicated() {
         let text = format!(
-            "{}\n[[adapters]]\npath = \"/tmp/libdemo.so\"\nkind = \"demo\"\n",
+            "{}\n[[plugins]]\npath = \"/tmp/libdemo.so\"\nkind = \"demo\"\n",
             config_with(ONE_CONNECTION, ONE_SESSION)
         );
         let config = Config::parse(&text).expect("能解析");
-        assert_eq!(config.adapters.len(), 1);
-        assert_eq!(config.adapters[0].path, "/tmp/libdemo.so");
-        assert_eq!(config.adapters[0].kind.as_deref(), Some("demo"));
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].path, "/tmp/libdemo.so");
+        assert_eq!(config.plugins[0].kind.as_deref(), Some("demo"));
 
-        let duplicate = format!("{text}\n[[adapters]]\npath = \"/tmp/libdemo.so\"\n");
+        let duplicate = format!("{text}\n[[plugins]]\npath = \"/tmp/libdemo.so\"\n");
         assert!(matches!(
             Config::parse(&duplicate),
-            Err(ConfigError::DuplicateAdapterPath { .. })
+            Err(ConfigError::DuplicatePluginPath { .. })
         ));
 
         let empty = config_with(ONE_CONNECTION, ONE_SESSION)
-            + "\n[[adapters]]\npath = \"  \"\n";
+            + "\n[[plugins]]\npath = \"  \"\n";
         assert!(matches!(
             Config::parse(&empty),
-            Err(ConfigError::EmptyAdapterPath)
+            Err(ConfigError::EmptyPluginPath)
         ));
     }
 

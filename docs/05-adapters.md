@@ -91,14 +91,14 @@ command = ["/path/to/adapter", "--stdio"]
 - 子进程崩溃后，未完成的请求明确报「通道不可用」；桥退出时发 `shutdown`，2 秒内不收尾就 kill。
 - 一个最小的参考实现见 `crates/adapters/process/src/bin/fixture.rs`。
 
-## 动态库适配器（`[[adapters]]`）
+## 动态库插件（`[[plugins]]`）
 
 适配器也可以编成 `.so` / `.dylib`，由桥用 libloading 装载、在桥进程内运行：
 
 ```toml
-[[adapters]]
+[[plugins]]
 path = "/path/to/libdemo_adapter.so"
-kind = "demo"          # 可选：插件 manifest 的 kind 必须等于它
+kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
 ```
 
 动态库只导出 `acb_adapter_entry_v1`，返回一张 C 函数表；manifest、连接配置、
@@ -108,6 +108,24 @@ kind = "demo"          # 可选：插件 manifest 的 kind 必须等于它
 - 动态库和桥同进程：插件 panic、死循环或内存错误会带倒整座桥。需要崩溃隔离就用
   `kind = "process"`。P3 对动态库调用不加超时（in-process 打断不了）。
 - 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`。
+
+### wake 策略插件
+
+同一张 `[[plugins]]` 表也装策略 provider。插件 manifest 写
+`extension = "wake"`、`id = "vendor.wake"`，然后在订阅里引用：
+
+```toml
+[[plugins]]
+path = "/path/to/libwake.so"
+
+[[sessions.subscriptions.wake]]
+provider = "vendor.wake"
+```
+
+插件通过 `CoreMessage::Decide` 收到 `WireWakeRequest`（发送者、正文、@/引用/拍、
+标签、未读数），返回 `WireResult::Decision { decision = "wake" | "stay" }`。
+解析失败或插件报错按 `stay` 兜底，不会误把会话叫醒。wake 判定在 core 的入库路径里，
+所以这一版只开放动态库载体；外置进程会在 core 锁内做 I/O，等以后有异步判定再开。
 
 ## 事件怎么映射
 

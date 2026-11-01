@@ -408,6 +408,7 @@ mod tests {
             transports: vec!["process".into()],
             api_version: 1,
             capabilities: vec!["receive_events".into(), "send".into()],
+            extension: "platform_adapter".into(),
         })
         .expect("能转换");
         assert_eq!(manifest.kind, "demo");
