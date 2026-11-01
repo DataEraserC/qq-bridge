@@ -70,6 +70,11 @@ pub static MANIFEST: AdapterManifest = AdapterManifest {
     transports: Cow::Borrowed(TRANSPORTS),
     api_version: ADAPTER_API_VERSION,
     capabilities: Cow::Borrowed(CAPABILITIES),
+    // 子进程自己决定发什么事件、打什么标签；载体只负责把 at_self / reply_to_self 原样带进来。
+    events: Cow::Borrowed(&[]),
+    event_tags: Cow::Borrowed(&[]),
+    supports_at: true,
+    supports_reply: true,
     metadata: PluginMetadata {
         title: Some(Cow::Borrowed("外置进程适配器")),
         summary: Some(Cow::Borrowed("按连接的 options 启动子进程，stdio JSON 行协议")),

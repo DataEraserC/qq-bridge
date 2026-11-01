@@ -144,7 +144,7 @@ false 是「这次没查」，不是「这条没这个值」，要的话把它�
   {
     name: "list_rooms",
     description:
-      "你当前会话订阅了哪些房间、各自未读多少。想发消息前先看能发到哪。同一实例上别的会话订阅的房间不在这里，也发不过去。",
+      "你当前会话订阅了哪些房间、各自未读多少。每条还带连接（connection）、平台（platform）、适配器 kind 和方法数（method_count），多平台会话能一眼看出哪个房间属于哪个平台。想发消息前先看能发到哪。同一实例上别的会话订阅的房间不在这里，也发不过去。",
     schema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -210,8 +210,11 @@ false 是「这次没查」，不是「这条没这个值」，要的话把它�
     description: `查这个平台还能干哪些消息之外的事（读合并转发的正文、查群成员、发图、审批入群……）。
 桥只提供这一个目录和下面那个通用调用口——平台特有的能力都从这里查，不在工具列表里。
 
-不给条件：列出全部方法（名字 + 一句话 + 标签），不带参数表。
+不给条件：列出当前轮次那条连接的全部方法（名字 + 一句话 + 标签），不带参数表。
 给 group / tag / query：命中的方法带参数表。三者可以叠加。
+给 connection：查指定的另一条连接（比如同时订阅了 QQ 和 Discord，人在 QQ 房间里也能看 Discord 能干什么）。
+all=true：只给每条订阅连接的摘要（平台、kind、方法数、events / event_tags / supports_at / supports_reply），
+想展开某条再带 connection 查。all 不能和 room / connection / 过滤条件一起给。
 
 方法名是「归属.动作」，归属跟平台 API 的命名空间对齐（forward.* / message.* / group.*）。
 tags 是用途，跨归属：想找「图片相关」，用 tag="image"，不必知道平台把它放在哪个归属下。
@@ -225,6 +228,14 @@ query 按词搜名字、说明、标签，中文和英文都认（「图片」�
       type: "object",
       properties: {
         room: ROOM_SCHEMA,
+        connection: {
+          type: "string",
+          description: "连接名（如 qq / dc）；给了就不用给 room，但会话必须能访问这条连接",
+        },
+        all: {
+          type: "boolean",
+          description: "只给每条订阅连接的摘要，不能和 room / connection / 过滤条件同时给",
+        },
         group: { type: "string", description: "只看某个归属，如 forward、message、group" },
         tag: { type: "string", description: "只看带这个用途标签的，如 image、send、member、file" },
         query: { type: "string", description: "按关键词找方法（中英都认）" },
@@ -324,7 +335,9 @@ room 怎么给，看方法的 scope：
 默认 scope="session"：
 - providers：access / delivery / turn_error / receive / send_hooks（本会话生效的实现）
 - subscriptions：每个订阅房间的 wake / clock 策略
-- adapter：当前连接用的适配器 kind、平台、平台方法数、说明
+- adapters：本会话订阅的**所有**连接的适配器（connection / platform / kind / 方法数 /
+  events / event_tags / supports_at / supports_reply / receive）
+- adapter：当前轮次那条连接的适配器（adapters 里的一项，方便直接用）
 scope="global"：列出整个 Root 目录，可用 extension 过滤（wake / access / delivery /
 turn_error / clock / receive / platform_adapter / send）。
 

@@ -7,10 +7,11 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
-    Bridge, CallError, CallOutcome, Cursor, Effect, Element, ErrorCode, Ingest, MemoryStore,
-    MethodSpec, Outbound, OutboundError, OutgoingKind, OutgoingRecord, ParamSpec, ParamType,
-    RecordDraft, RecordMode, Risk, RoomId, Scope, Sender, Sent, TargetSpec, Ticket,
-    Transcript, Watermarks, outbound::tags, unread,
+    AdapterError, AdapterFactory, AdapterInstance, AdapterManifest, Bridge, CallError, CallOutcome,
+    Connection, Cursor, Effect, Element, ErrorCode, EventQueue, Ingest, MemoryStore, MethodSpec,
+    Outbound, OutboundError, OutgoingKind, OutgoingRecord, ParamSpec, ParamType, PluginManager,
+    PluginMetadata, RecordDraft, RecordMode, Risk, RoomId, Scope, Sender, Sent, TargetSpec, Ticket,
+    Transcript, Watermarks, ADAPTER_API_VERSION, outbound::tags, unread,
 };
 use serde_json::{Value, json};
 
@@ -296,14 +297,62 @@ fn setup_with(extra: &str) -> (Bridge<MemoryStore>, Calls) {
         "account = \"bot\"",
         &format!("account = \"bot\"\n        {extra}"),
     );
-    let bridge = Bridge::new(
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins
+        .register_adapter(Arc::new(FakeAdapterFactory))
+        .expect("注册假适配器");
+    let bridge = Bridge::with_plugins(
         acb_kernel::Config::parse(&text).expect("配置合法"),
         MemoryStore::new(),
         Box::new(Platformy {
             calls: calls.clone(),
         }),
+        plugins,
     );
     (bridge, calls)
+}
+
+static ADAPTER_TRANSPORTS: &[Cow<'static, str>] = &[Cow::Borrowed("ws-client")];
+static ADAPTER_CAPABILITIES: &[acb_kernel::AdapterCapability] = &[
+    acb_kernel::AdapterCapability::ReceiveEvents,
+    acb_kernel::AdapterCapability::Send,
+    acb_kernel::AdapterCapability::Catalog,
+];
+static ADAPTER_EVENTS: &[Cow<'static, str>] =
+    &[Cow::Borrowed("poke"), Cow::Borrowed("group_increase")];
+static ADAPTER_EVENT_TAGS: &[Cow<'static, str>] =
+    &[Cow::Borrowed("poke"), Cow::Borrowed("notice")];
+
+/// 假的 OneBot manifest：只用来验证能力声明能被 agent 看到，不提供实例。
+struct FakeAdapterFactory;
+
+impl AdapterFactory for FakeAdapterFactory {
+    fn manifest(&self) -> AdapterManifest {
+        AdapterManifest {
+            id: Cow::Borrowed("acb.adapter.fake-onebot"),
+            platform: Cow::Borrowed("qq"),
+            kind: Cow::Borrowed("onebot11"),
+            transports: Cow::Borrowed(ADAPTER_TRANSPORTS),
+            api_version: ADAPTER_API_VERSION,
+            capabilities: Cow::Borrowed(ADAPTER_CAPABILITIES),
+            events: Cow::Borrowed(ADAPTER_EVENTS),
+            event_tags: Cow::Borrowed(ADAPTER_EVENT_TAGS),
+            supports_at: true,
+            supports_reply: true,
+            metadata: PluginMetadata::EMPTY,
+        }
+    }
+
+    fn create(
+        &self,
+        _connection: &Connection,
+        _events: EventQueue,
+    ) -> Result<AdapterInstance, AdapterError> {
+        Err(AdapterError::Create(
+            "fake-onebot".into(),
+            "测试不需要实例化".into(),
+        ))
+    }
 }
 
 fn sessions() -> Vec<String> {
@@ -369,6 +418,26 @@ fn describe_plugins_shows_effective_session_providers() {
 
     assert_eq!(session["adapter"]["kind"], "onebot11");
     assert_eq!(session["adapter"]["method_count"], 8);
+    assert_eq!(session["adapter"]["platform"], "qq");
+    // 多平台会话：另一个订阅连接也要列出来，不能只给当前轮次那个平台。
+    let adapters = session["adapters"].as_array().expect("有连接列表");
+    assert_eq!(adapters.len(), 2);
+    assert_eq!(adapters[0]["connection"], "qq");
+    assert_eq!(adapters[0]["current"], true);
+    assert_eq!(adapters[1]["connection"], "dc");
+    assert_eq!(adapters[1]["platform"], "discord");
+    assert_eq!(adapters[1]["current"], false);
+    assert_eq!(adapters[1]["receive"]["id"], "acb.receive.all");
+    assert!(
+        adapters[0]["events"]
+            .as_array()
+            .expect("事件能力")
+            .iter()
+            .any(|event| event == "poke"),
+        "OneBot 要声明会写进流水的 poke 事件"
+    );
+    assert_eq!(adapters[0]["supports_at"], true);
+    assert_eq!(adapters[0]["supports_reply"], true);
 
     let global = bridge
         .tool_call(
@@ -396,6 +465,133 @@ fn describe_plugins_shows_effective_session_providers() {
         )
         .expect_err("scope 不合法");
     assert_eq!(bad_scope.code, ErrorCode::BadRequest);
+}
+
+/// 多平台会话：`list_rooms` 每条房间都要能看出属于哪个平台、用哪个适配器、有多少方法。
+#[test]
+fn list_rooms_reports_platform_and_method_count() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let result = bridge
+        .tool_call(&ticket, &sessions(), "list_rooms", json!({}))
+        .expect("能查房间");
+    let rooms = result["rooms"].as_array().expect("有房间");
+    assert_eq!(rooms.len(), 2);
+
+    let qq = rooms
+        .iter()
+        .find(|room| room["connection"] == "qq")
+        .expect("有 qq 房间");
+    assert_eq!(qq["platform"], "qq");
+    assert_eq!(qq["kind"], "onebot11");
+    assert_eq!(qq["method_count"], 8);
+
+    let dc = rooms
+        .iter()
+        .find(|room| room["connection"] == "dc")
+        .expect("有 dc 房间");
+    assert_eq!(dc["platform"], "discord");
+    assert_eq!(dc["kind"], "onebot11");
+    // 这条假连接故意没声明任何平台方法。
+    assert_eq!(dc["method_count"], 0);
+}
+
+/// 目录按连接查：多平台会话不用假装在别的房间里，也能看那条连接能干什么。
+#[test]
+fn platform_methods_can_target_a_connection_and_summarize_all() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    let all = bridge
+        .tool_call(&ticket, &sessions(), "platform_methods", json!({"all": true}))
+        .expect("能查连接摘要");
+    assert_eq!(all["scope"], "connections");
+    assert_eq!(all["total"], 2);
+    let connections = all["connections"].as_array().expect("有连接");
+    let qq = connections
+        .iter()
+        .find(|connection| connection["connection"] == "qq")
+        .expect("有 qq");
+    assert_eq!(qq["method_count"], 8);
+    assert_eq!(qq["supports_at"], true);
+    assert_eq!(qq["supports_reply"], true);
+    assert!(qq["events"]
+        .as_array()
+        .expect("事件能力")
+        .iter()
+        .any(|event| event == "poke"));
+    let dc = connections
+        .iter()
+        .find(|connection| connection["connection"] == "dc")
+        .expect("有 dc");
+    assert_eq!(dc["method_count"], 0);
+    assert_eq!(dc["platform"], "discord");
+
+    // 指定连接：不用给房间；当前轮次在 qq，所以 room 就是本轮房间。
+    let qq_methods = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"connection": "qq"}),
+        )
+        .expect("能查 qq 那条连接");
+    assert_eq!(qq_methods["connection"], "qq");
+    assert_eq!(qq_methods["platform"], "qq");
+    assert_eq!(qq_methods["total"], 8);
+    assert_eq!(qq_methods["room"], "qq:group/123");
+
+    let filtered = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"connection": "qq", "group": "forward"}),
+        )
+        .expect("能按归属过滤");
+    assert_eq!(filtered["methods"][0]["name"], "forward.get_content");
+
+    // dc 没声明目录：明确报「平台不支持」，不是空清单。
+    let unsupported = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"connection": "dc"}),
+        )
+        .expect_err("dc 没有平台目录");
+    assert!(unsupported.message.contains("unsupported_platform"));
+
+    let unknown = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"connection": "nope"}),
+        )
+        .expect_err("不存在的连接要报错");
+    assert_eq!(unknown.code, ErrorCode::BadRequest);
+
+    let conflict = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"all": true, "connection": "qq"}),
+        )
+        .expect_err("all 不能和 connection 一起给");
+    assert_eq!(conflict.code, ErrorCode::BadRequest);
+
+    let wrong_room = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_methods",
+            json!({"connection": "dc", "room": "qq:group/123"}),
+        )
+        .expect_err("room 不在指定连接上");
+    assert_eq!(wrong_room.code, ErrorCode::BadRequest);
 }
 
 /// 什么都不给：逐条清单。够模型决定调哪个，但不带参数表——带表就等于全倒出来了。

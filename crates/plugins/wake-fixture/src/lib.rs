@@ -40,6 +40,10 @@ unsafe extern "C" fn wake_manifest() -> *mut c_char {
         transports: Vec::new(),
         api_version: 1,
         capabilities: vec!["wake_decision".into()],
+        events: Vec::new(),
+        event_tags: Vec::new(),
+        supports_at: false,
+        supports_reply: false,
         extension: "wake".into(),
         metadata: WirePluginMetadata {
             title: Some("wake 夹具".into()),

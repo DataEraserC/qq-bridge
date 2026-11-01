@@ -125,6 +125,14 @@ InboundEvent:
   - `get_platform_events` 的 kind 输出带 `tags` / `payload` / `summary`；OneBot 的
     poke / notice / request 都补齐元数据。core 仍然没有 `poke` / `notice_type` 的 match 分支，
     事件名只是字符串匹配，平台语义由适配器打的标签承载。
+- **Phase 4 P6（2026-11-01，能力声明与多平台发现）**：适配器自己说清能收什么、能叫醒什么。
+  - `AdapterManifest` / `WireManifest` 加 `events` / `event_tags` / `supports_at` / `supports_reply`；
+    OneBot 声明常见事件与标签，`process` 载体声明 hints 透传，动态库插件自己填。
+    字段是声明不是保证，core 不拿它当校验闸门。
+  - `list_rooms` 每条房间带 `connection` / `platform` / `kind` / `method_count`；
+    `platform_methods` 加 `connection`（直接指定另一条连接）与 `all=true`（只给每条订阅连接
+    的平台/方法数/事件能力摘要）；`describe_plugins` 的 session 视图增加 `adapters` 数组，
+    覆盖本会话订阅的所有连接，`adapter` 仍指向当前轮次那条。
 
 ## 参考
 

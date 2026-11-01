@@ -1352,6 +1352,12 @@ impl PluginManager {
         }
     }
 
+    /// 按连接 `kind` 取已注册适配器的 manifest。动态库/外置进程适配器也由 loader
+    /// 直接注册进 Root，因此和内置适配器一样能查。
+    pub fn adapter_manifest(&self, kind: &str) -> Option<AdapterManifest> {
+        self.adapters.get(kind).map(|factory| factory.manifest())
+    }
+
     /// 已直接注册的适配器 manifest（给控制台/诊断用）。
     pub fn adapter_manifests(&self) -> Vec<AdapterManifest> {
         let mut manifests: Vec<AdapterManifest> = self

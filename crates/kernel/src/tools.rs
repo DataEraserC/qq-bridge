@@ -198,6 +198,13 @@ pub const MAX_PAGE_LIMIT: usize = 500;
 pub struct PlatformMethodsArgs {
     #[serde(default)]
     pub room: Option<String>,
+    /// 只看这条连接（如 `qq`），不用给房间。会话必须能访问这条连接。
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// 只给每条可访问连接的摘要（平台、kind、方法数、事件/标签能力），
+    /// 想展开某条再用 `connection` 查。不能和 room / connection / 过滤条件同时给。
+    #[serde(default)]
+    pub all: Option<bool>,
     /// 只看某一归属，如 `forward`、`group`。
     #[serde(default)]
     pub group: Option<String>,

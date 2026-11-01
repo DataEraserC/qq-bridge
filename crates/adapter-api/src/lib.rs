@@ -89,6 +89,18 @@ pub struct WireManifest {
     pub api_version: u32,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// 会写进流水的平台事件名（不带平台前缀），如 `poke`、`reaction_add`。
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// 给事件打的跨平台语义标签，如 `poke`、`reaction`、`notice`。
+    #[serde(default)]
+    pub event_tags: Vec<String>,
+    /// 入站记录里的 `at_self` 是否可信。
+    #[serde(default)]
+    pub supports_at: bool,
+    /// 入站记录里的 `reply_to_self` 是否可信。
+    #[serde(default)]
+    pub supports_reply: bool,
     /// `platform_adapter`（默认）或 `wake`。
     #[serde(default = "default_extension")]
     pub extension: String,

@@ -43,6 +43,16 @@ impl TryFrom<WireManifest> for AdapterManifest {
             .into_iter()
             .map(Cow::Owned)
             .collect::<Vec<_>>();
+        let events = manifest
+            .events
+            .into_iter()
+            .map(Cow::Owned)
+            .collect::<Vec<_>>();
+        let event_tags = manifest
+            .event_tags
+            .into_iter()
+            .map(Cow::Owned)
+            .collect::<Vec<_>>();
         let metadata =
             PluginMetadata::try_from(manifest.metadata).map_err(|detail| format!("metadata：{detail}"))?;
         Ok(AdapterManifest {
@@ -52,6 +62,10 @@ impl TryFrom<WireManifest> for AdapterManifest {
             transports: transports.into(),
             api_version: manifest.api_version,
             capabilities: capabilities.into(),
+            events: events.into(),
+            event_tags: event_tags.into(),
+            supports_at: manifest.supports_at,
+            supports_reply: manifest.supports_reply,
             metadata,
         })
     }
@@ -437,16 +451,26 @@ mod tests {
     #[test]
     fn manifest_capabilities_are_converted() {
         let manifest = AdapterManifest::try_from(WireManifest {
-            id: "acb.adapter.demo".into(),
+            id: "demo.adapter".into(),
             platform: "demo".into(),
             kind: "demo".into(),
             transports: vec!["process".into()],
             api_version: 1,
             capabilities: vec!["receive_events".into(), "send".into()],
+            events: vec!["knock".into()],
+            event_tags: vec!["mention".into()],
+            supports_at: true,
+            supports_reply: true,
             extension: "platform_adapter".into(),
-            metadata: acb_adapter_api::WirePluginMetadata::default(),
+            metadata: WirePluginMetadata::default(),
         })
         .expect("能转换");
+        assert!(manifest.events.iter().any(|event| event.as_ref() == "knock"));
+        assert!(manifest
+            .event_tags
+            .iter()
+            .any(|tag| tag.as_ref() == "mention"));
+        assert!(manifest.supports_at && manifest.supports_reply);
         assert_eq!(manifest.kind, "demo");
         assert!(manifest
             .capabilities

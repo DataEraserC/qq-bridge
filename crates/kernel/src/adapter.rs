@@ -46,6 +46,16 @@ pub struct AdapterManifest {
     pub transports: Cow<'static, [Cow<'static, str>]>,
     pub api_version: u32,
     pub capabilities: Cow<'static, [AdapterCapability]>,
+    /// 适配器会写进流水的平台事件名（不带平台前缀），如 `poke`、`group_increase`。
+    ///
+    /// 这是声明不是保证：没列出的 `notice_type` 也可能原样记进流水。
+    pub events: Cow<'static, [Cow<'static, str>]>,
+    /// 适配器给事件打的跨平台语义标签，如 `poke`、`reaction`、`notice`。
+    pub event_tags: Cow<'static, [Cow<'static, str>]>,
+    /// 入站记录里 `at_self`（@ 到本账号 / 冲我来的事件）是否可信。
+    pub supports_at: bool,
+    /// 入站记录里 `reply_to_self`（引用我发的消息）是否可信。
+    pub supports_reply: bool,
     /// 给 agent / 控制台看的说明。
     pub metadata: PluginMetadata,
 }
@@ -212,6 +222,10 @@ mod tests {
         transports: Cow::Borrowed(FAKE_TRANSPORTS),
         api_version: ADAPTER_API_VERSION,
         capabilities: Cow::Borrowed(FAKE_CAPS),
+        events: Cow::Borrowed(&[]),
+        event_tags: Cow::Borrowed(&[]),
+        supports_at: true,
+        supports_reply: true,
         metadata: PluginMetadata::EMPTY,
     };
 
@@ -296,6 +310,10 @@ mod tests {
                 transports: Cow::Borrowed(FAKE_TRANSPORTS),
                 api_version: ADAPTER_API_VERSION,
                 capabilities: Cow::Borrowed(FAKE_CAPS),
+                events: Cow::Borrowed(&[]),
+                event_tags: Cow::Borrowed(&[]),
+                supports_at: true,
+                supports_reply: true,
                 metadata: PluginMetadata::EMPTY,
             }
         }

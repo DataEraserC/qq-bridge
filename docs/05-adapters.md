@@ -111,6 +111,23 @@ kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
   （至少 `may_wake` / `may_stay_silent`），否则启动时拒绝。
 - 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`。
 
+### 适配器 manifest 声明什么
+
+三种载体（内置、外置进程、动态库）共用同一份 manifest，除 id / platform / kind /
+transport / 平台方法目录外，还声明入站语义能力：
+
+| 字段 | 含义 |
+|------|------|
+| `events` | 会写进流水的平台事件名（不带平台前缀），如 `poke`、`group_increase`；OneBot 的 `notice_type` 是开放的，没列出的也会原样记 |
+| `event_tags` | 给事件打的跨平台语义标签，如 `poke`、`reaction`、`notice`；唤醒策略的 `event_tags` 按它匹配 |
+| `supports_at` | 入站记录里的 `at_self`（@ 到本账号 / 冲我来的事件）是否可信 |
+| `supports_reply` | 入站记录里的 `reply_to_self`（引用我发的消息）是否可信 |
+
+这些字段是**声明不是保证**：agent 通过 `describe_plugins` / `platform_methods(all=true)` /
+`list_rooms` 看得到，用来判断某个平台能配哪些唤醒条件；core 不拿它做强制校验。
+`process` 载体声明 `supports_at` / `supports_reply`（子进程原样带 hints），事件留空由子进程决定；
+动态库插件在自己的 `WireManifest` 里填。
+
 ### wake 策略插件
 
 同一张 `[[plugins]]` 表也装策略 provider。插件 manifest 写

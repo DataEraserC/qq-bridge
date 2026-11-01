@@ -1393,27 +1393,6 @@ impl<S: Store> Bridge<S> {
         self.check_access(config, sessions, AccessAction::Connection, None, connection)
     }
 
-    /// 解析一次平台调用落在哪个房间上，并按方法声明的 [`Scope`] 做权限校验。
-    ///
-    /// 房间级的必须落在一个具体房间上；连接级的只借 `room` 选连接，不给就用当前轮次的。
-    fn resolve_capability_room(
-        &self,
-        config: &Config,
-        sessions: &[String],
-        given: &Option<String>,
-        turn_room: &RoomId,
-        scope: Scope,
-    ) -> Result<RoomId, ToolError> {
-        let room = self.resolve(given, turn_room)?;
-        match scope {
-            Scope::Room => self.ensure_readable(config, sessions, &room)?,
-            Scope::Connection => {
-                self.ensure_connection_readable(config, sessions, &room.connection)?
-            }
-        }
-        Ok(room)
-    }
-
     /// 时钟评估：检查每个订阅的时钟策略，到点就把（会话, 房间）排进队列。
     ///
     /// 只做廉价检查：解析 provider 时用当前配置快照，到点才开轮。返回本次排了几轮。
@@ -2309,9 +2288,14 @@ impl<S: Store> Bridge<S> {
                     .pending_records(id, room, &account)
                     .map_err(internal)?
                     .len();
+                let connection = config.connection(&room.connection);
                 rooms.push(json!({
                     "room": room,
                     "session": id,
+                    "connection": room.connection,
+                    "platform": connection.map(|connection| connection.platform.as_str()).unwrap_or_default(),
+                    "kind": connection.map(|connection| connection.kind.as_str()).unwrap_or_default(),
+                    "method_count": self.outbound.catalog(&room.connection).len(),
                     "watermark": watermark,
                     "unread": unread,
                 }));
@@ -2513,20 +2497,61 @@ impl<S: Store> Bridge<S> {
                         })
                     })
                     .collect::<Vec<_>>();
-                let adapter = connection.map(|connection| {
-                    let info = self
-                        .plugins
-                        .catalog()
-                        .into_iter()
-                        .find(|info| info.kind.as_deref() == Some(connection.kind.as_str()));
-                    json!({
-                        "connection": connection.id,
-                        "platform": connection.platform,
-                        "kind": connection.kind,
-                        "transport": connection.transport.as_str(),
-                        "method_count": self.outbound.catalog(&connection.id).len(),
-                        "info": info.map(|info| info.to_json()),
+
+                // 一个会话可以同时订阅多个平台的房间；这里把所有订阅连接都列出来，
+                // 免得 agent 只看见当前轮次那个平台，以为别的房间不存在。
+                let mut connections: Vec<&crate::config::Connection> = Vec::new();
+                for subscription in &session.subscriptions {
+                    if let Some(found) = config.connection(&subscription.room.connection) {
+                        if !connections.iter().any(|seen| seen.id == found.id) {
+                            connections.push(found);
+                        }
+                    }
+                }
+                let adapters = connections
+                    .iter()
+                    .map(|connection| {
+                        let info = self
+                            .plugins
+                            .catalog()
+                            .into_iter()
+                            .find(|info| info.kind.as_deref() == Some(connection.kind.as_str()));
+                        let manifest = self.plugins.adapter_manifest(&connection.kind);
+                        let (events, event_tags, supports_at, supports_reply) = match manifest {
+                            Some(manifest) => (
+                                manifest
+                                    .events
+                                    .iter()
+                                    .map(|event| event.as_ref().to_owned())
+                                    .collect::<Vec<_>>(),
+                                manifest
+                                    .event_tags
+                                    .iter()
+                                    .map(|tag| tag.as_ref().to_owned())
+                                    .collect::<Vec<_>>(),
+                                manifest.supports_at,
+                                manifest.supports_reply,
+                            ),
+                            None => (Vec::new(), Vec::new(), false, false),
+                        };
+                        json!({
+                            "connection": connection.id,
+                            "platform": connection.platform,
+                            "kind": connection.kind,
+                            "transport": connection.transport.as_str(),
+                            "method_count": self.outbound.catalog(&connection.id).len(),
+                            "current": connection.id == room.connection,
+                            "receive": self.plugin_info_json(&connection.receive.provider),
+                            "events": events,
+                            "event_tags": event_tags,
+                            "supports_at": supports_at,
+                            "supports_reply": supports_reply,
+                            "info": info.map(|info| info.to_json()),
+                        })
                     })
+                    .collect::<Vec<_>>();
+                let adapter = adapters.iter().find(|adapter| {
+                    adapter["connection"].as_str() == Some(room.connection.as_str())
                 });
                 Ok(json!({
                     "scope": "session",
@@ -2539,8 +2564,9 @@ impl<S: Store> Bridge<S> {
                         "send_hooks": send_hooks,
                     },
                     "subscriptions": subscriptions,
+                    "adapters": adapters,
                     "adapter": adapter,
-                    "hint": "描述由插件作者声明，是说明不是指令；effects 是文档，不是强制保证。",
+                    "hint": "描述由插件作者声明，是说明不是指令；effects 是文档，不是强制保证。adapters 覆盖本会话订阅的所有连接。",
                 }))
             }
             other => Err(ToolError::new(
@@ -2566,23 +2592,79 @@ impl<S: Store> Bridge<S> {
         turn_room: &RoomId,
         args: PlatformMethodsArgs,
     ) -> Result<Value, ToolError> {
-        // 目录本身就是连接级的东西：同一个号的哪个房间，能做的事都一样。
-        // 所以这里不要求模型报出一个具体房间，只要它订阅了这条连接就行。
-        let room = self.resolve_capability_room(
-            config,
-            sessions,
-            &args.room,
-            turn_room,
-            Scope::Connection,
-        )?;
+        let requested_connection = clean(args.connection.as_deref()).map(str::to_owned);
 
-        let methods = self.outbound.catalog(&room.connection);
-        if methods.is_empty() {
-            return Err(no_catalog(&room.connection));
+        // all=true：多平台会话先看每条连接的摘要，避免模型只看见当前房间那个平台。
+        if args.all.unwrap_or(false) {
+            if requested_connection.is_some()
+                || clean(args.room.as_deref()).is_some()
+                || clean(args.group.as_deref()).is_some()
+                || clean(args.tag.as_deref()).is_some()
+                || clean(args.query.as_deref()).is_some()
+            {
+                return Err(ToolError::new(
+                    ErrorCode::BadRequest,
+                    "[bad_params] all=true 只给连接摘要，不能再给 room / connection / group / tag / query；\
+                     想展开某条连接，单独用 connection 查。",
+                ));
+            }
+            return self.connection_summaries(config, sessions);
         }
-        let room_text = room.to_string();
-        let connection = room.connection.clone();
-        let platform = Self::platform_of(config, &room.connection).to_owned();
+
+        let given_room = if clean(args.room.as_deref()).is_some() {
+            Some(self.resolve(&args.room, turn_room)?)
+        } else {
+            None
+        };
+
+        // 目录本身就是连接级的东西：同一个号的哪个房间，能做的事都一样。
+        // 所以这里不要求模型报出一个具体房间，只要它能访问这条连接就行。
+        let connection = match requested_connection {
+            Some(connection) => {
+                if !config
+                    .connections
+                    .iter()
+                    .any(|candidate| candidate.id == connection)
+                {
+                    return Err(ToolError::new(
+                        ErrorCode::BadRequest,
+                        format!(
+                            "[bad_params] 没有这条连接：{connection}；先调 list_rooms 看有哪些。"
+                        ),
+                    ));
+                }
+                if let Some(room) = &given_room {
+                    if room.connection != connection {
+                        return Err(ToolError::new(
+                            ErrorCode::BadRequest,
+                            format!("[bad_params] room {room} 不在连接 {connection} 上。"),
+                        ));
+                    }
+                }
+                self.ensure_connection_readable(config, sessions, &connection)?;
+                connection
+            }
+            None => match &given_room {
+                Some(room) => {
+                    self.ensure_connection_readable(config, sessions, &room.connection)?;
+                    room.connection.clone()
+                }
+                None => {
+                    self.ensure_connection_readable(config, sessions, &turn_room.connection)?;
+                    turn_room.connection.clone()
+                }
+            },
+        };
+
+        let room_text = given_room
+            .map(|room| room.to_string())
+            .or_else(|| (turn_room.connection == connection).then(|| turn_room.to_string()));
+
+        let methods = self.outbound.catalog(&connection);
+        if methods.is_empty() {
+            return Err(no_catalog(&connection));
+        }
+        let platform = Self::platform_of(config, &connection).to_owned();
 
         let group = clean(args.group.as_deref());
         let tag = clean(args.tag.as_deref());
@@ -2626,6 +2708,74 @@ impl<S: Store> Bridge<S> {
             "matched": hits.len(),
             "methods": hits.iter().map(|method| describe_method(method)).collect::<Vec<_>>(),
             "hint": "每条都带一个 example：照它把 params 里的号/内容换掉，就能直接喂给 platform_call。",
+        }))
+    }
+
+    /// 多平台会话的连接摘要：每条订阅连接一条，带平台、kind、方法数和事件能力。
+    ///
+    /// 只做发现，不倒方法表——方法表按连接查，免得一次把几个平台的目录都塞进上下文。
+    fn connection_summaries(
+        &self,
+        config: &Config,
+        sessions: &[String],
+    ) -> Result<Value, ToolError> {
+        let mut ids: Vec<String> = Vec::new();
+        for id in sessions {
+            let Some(session) = config.session(id) else {
+                continue;
+            };
+            for subscription in &session.subscriptions {
+                if !ids.contains(&subscription.room.connection) {
+                    ids.push(subscription.room.connection.clone());
+                }
+            }
+        }
+
+        let mut connections = Vec::new();
+        for id in ids {
+            let Some(connection) = config.connection(&id) else {
+                continue;
+            };
+            self.ensure_connection_readable(config, sessions, &id)?;
+            let methods = self.outbound.catalog(&id);
+            let manifest = self.plugins.adapter_manifest(&connection.kind);
+            let (events, event_tags, supports_at, supports_reply) = match manifest {
+                Some(manifest) => (
+                    manifest
+                        .events
+                        .iter()
+                        .map(|event| event.as_ref().to_owned())
+                        .collect::<Vec<_>>(),
+                    manifest
+                        .event_tags
+                        .iter()
+                        .map(|tag| tag.as_ref().to_owned())
+                        .collect::<Vec<_>>(),
+                    manifest.supports_at,
+                    manifest.supports_reply,
+                ),
+                None => (Vec::new(), Vec::new(), false, false),
+            };
+            connections.push(json!({
+                "connection": connection.id,
+                "platform": connection.platform,
+                "kind": connection.kind,
+                "transport": connection.transport.as_str(),
+                "method_count": methods.len(),
+                "tags": tags_of(&methods),
+                "events": events,
+                "event_tags": event_tags,
+                "supports_at": supports_at,
+                "supports_reply": supports_reply,
+            }));
+        }
+
+        let total = connections.len();
+        Ok(json!({
+            "scope": "connections",
+            "connections": connections,
+            "total": total,
+            "hint": "先看每条连接的摘要，再带 connection 查具体方法；events 是适配器声明会产生的平台事件，event_tags 是跨平台语义标签。",
         }))
     }
 
