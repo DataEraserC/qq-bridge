@@ -88,7 +88,8 @@ InboundEvent:
   - `message.send_forward` 现在按房间推导 `group_id`/`user_id`，并拒绝在群里指定 `user_id` 把目标换成私聊。
 - **Phase 2b 已落地（target 部分）**：`MethodSpec` 增加 `targets: &[TargetSpec]`；`TargetSpec` 区分 `Room` / `Member`，并声明房间路径类型。kernel 的 `platform_call` 在 `check_params` 之后调用 `check_target_params`，即使适配器自己没检查，core 也会拒绝在 `params` 里换房间目标。OneBot 的 targets 由 `ROUTES` 推导，避免方法表和路由表各抄一份。
 - **Phase 2c-1 已落地**：`AdapterManifest` + `AdapterFactory` + `AdapterRegistry`；`main.rs` 不再知道 `OneBotOutbound` / `LinkSlot` / `supervise` 怎么拼，只注册 `OneBotAdapterFactory`，按连接 `kind` 取 `AdapterInstance`。连接线程仍由适配器自己的 `launch` 启动，core 不持有 socket。
-- **尚未做**：`effect`/`record` 元数据与 `platform_call` 发送记账、`EventQueue`/`ActionQueue`（把 core 在锁里调适配器这件事彻底拆掉）。这些是 Phase 2c 的下一刀。
+- **Phase 2c-2 已落地**：`Outbounds` 提供可克隆的 `OutboundHandle`；endpoint 把 `send_message` / `send_message_to` / `platform_call` 拆成“锁内 prepare / 锁外 execute / 锁内 finish”。入站事件走 `EventQueue`，适配器只提交 `RecordDraft`，core 的 `drain_events` 线程统一 `ingest`；适配器侧不再 `try_lock`。
+- **尚未做**：`effect`/`record` 元数据与 `platform_call` 发送记账。这是 Phase 2c 的下一刀。
 
 ## 参考
 
