@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use acb_kernel::{Bridge, EventQueue, Outbound, RoomId, Store};
+use acb_kernel::{Connection, EventQueue, Outbound, RoomId};
 use serde_json::{Value, json};
 use tungstenite::error::Error as WsError;
 use tungstenite::{Message, WebSocket};
@@ -355,20 +355,25 @@ fn fail_all(waiting: &mut HashMap<String, Sender<Result<Value, LinkError>>>, rea
 }
 
 /// 守护一条平台连接：连不上就等着重试，断了就重连，直到要退出。
-pub fn supervise<S: Store + Send + 'static>(
+///
+/// 只拿连接配置快照，不拿 `Bridge`：适配器在 core 外，收发的记录走 `events`
+/// 队列，账号核对用配置里的 `account`。
+pub fn supervise(
     slot: LinkSlot,
-    url: String,
-    token: Option<String>,
-    connection: String,
-    admin_qqs: Vec<String>,
-    bridge: Arc<Mutex<Bridge<S>>>,
+    connection: Connection,
     shutdown: Arc<AtomicBool>,
     events: EventQueue,
 ) {
+    let url = connection.url.clone();
+    let token = connection.token.clone();
+    let id = connection.id.clone();
+    let admin_qqs = connection.admin_qqs.clone();
+    let account = connection.account.clone();
+
     while !shutdown.load(Ordering::Relaxed) {
         match connect(&url, token.as_deref(), READ_TICK) {
             Ok(ws) => {
-                eprintln!("适配器 {connection}：已连上 {url}");
+                eprintln!("适配器 {id}：已连上 {url}");
                 let (sender, actions) = mpsc::channel();
                 slot.install(sender.clone());
 
@@ -376,16 +381,16 @@ pub fn supervise<S: Store + Send + 'static>(
                 // 自己说的话就会被当成别人说的，严重时会自己回自己。这种事必须当场喊出来。
                 {
                     let sender = sender.clone();
-                    let bridge = Arc::clone(&bridge);
-                    let connection = connection.clone();
-                    std::thread::spawn(move || probe_login(&sender, &bridge, &connection));
+                    let account = account.clone();
+                    let id = id.clone();
+                    std::thread::spawn(move || probe_login(&sender, &account, &id));
                 }
 
                 let outcome = pump(
                     ws,
                     actions,
                     &events,
-                    &connection,
+                    &id,
                     &admin_qqs,
                     &slot,
                     &shutdown,
@@ -396,15 +401,15 @@ pub fn supervise<S: Store + Send + 'static>(
                 }
                 match outcome {
                     Ok(()) => {
-                        eprintln!("适配器 {connection}：连接关了，{RECONNECT_DELAY:?} 后重连")
+                        eprintln!("适配器 {id}：连接关了，{RECONNECT_DELAY:?} 后重连")
                     }
                     Err(error) => {
-                        eprintln!("适配器 {connection}：{error}，{RECONNECT_DELAY:?} 后重连")
+                        eprintln!("适配器 {id}：{error}，{RECONNECT_DELAY:?} 后重连")
                     }
                 }
             }
             Err(error) => {
-                eprintln!("适配器 {connection}：{error}");
+                eprintln!("适配器 {id}：{error}");
             }
         }
 
@@ -418,7 +423,7 @@ pub fn supervise<S: Store + Send + 'static>(
 }
 
 /// 问一下对面登录的是哪个号，顺手检查订阅里配的发送账号对不对。
-fn probe_login<S: Store>(sender: &Sender<Action>, bridge: &Mutex<Bridge<S>>, connection: &str) {
+fn probe_login(sender: &Sender<Action>, configured: &str, connection: &str) {
     let (reply_tx, reply_rx) = mpsc::channel();
     let request = Action {
         body: serde_json::json!({"action": "get_login_info", "params": {}, "echo": "acb-probe"}),
@@ -443,14 +448,6 @@ fn probe_login<S: Store>(sender: &Sender<Action>, bridge: &Mutex<Bridge<S>>, con
     };
     eprintln!("适配器 {connection}：登录账号 {self_id}");
 
-    let configured = {
-        let guard = bridge.lock().unwrap_or_else(|poison| poison.into_inner());
-        guard
-            .config()
-            .connection(connection)
-            .map(|connection| connection.account.clone())
-            .unwrap_or_default()
-    };
     if !configured.is_empty() && configured != self_id {
         eprintln!(
             "注意：连接 {connection} 登录的是 {self_id}，但配置里写的是 {configured}。\

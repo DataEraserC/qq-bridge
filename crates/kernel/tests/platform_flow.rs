@@ -3,6 +3,7 @@
 //! 这里的 `Platformy` 假装有一条带平台能力的连接。桥不认识任何方法名——它只认
 //! `MethodSpec` 这个形状，所以这些测试同时也在证明「core 不认识 QQ」。
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
@@ -33,99 +34,130 @@ static FILE_PARAMS: &[ParamSpec] = &[ParamSpec::required("file_id", "群文件 i
 /// 测试平台声明：`group_id` 是房间目标，不能由模型在 params 里换掉。
 static GROUP_TARGETS: &[TargetSpec] = &[TargetSpec::room("group_id", "group")];
 
+fn spec(
+    name: &'static str,
+    summary: &'static str,
+    tags: &[&'static str],
+    risk: Risk,
+    scope: Scope,
+    params: &[ParamSpec],
+    targets: &[TargetSpec],
+    effect: Effect,
+    record: RecordMode,
+) -> MethodSpec {
+    MethodSpec {
+        name: name.into(),
+        summary: summary.into(),
+        tags: tags
+            .iter()
+            .map(|tag| Cow::Borrowed(*tag))
+            .collect::<Vec<_>>()
+            .into(),
+        risk,
+        scope,
+        params: params.to_vec().into(),
+        targets: targets.to_vec().into(),
+        effect,
+        record,
+    }
+}
+
 /// 故意让 `image` 这个标签跨在两个归属上：`message.*` 和 `group.*` 各有一个。
 /// 这正是 tag 维度存在的理由——模型问「图片相关」，一次就得把两边都捞出来。
-static METHODS: &[MethodSpec] = &[
-    MethodSpec {
-        name: "forward.get_content",
-        summary: "读一条合并转发的正文",
-        tags: &[tags::FORWARD, tags::MESSAGE],
-        risk: Risk::Read,
-        scope: Scope::Room,
-        params: FORWARD_PARAMS,
-        targets: &[],
-        effect: Effect::Read,
-        record: RecordMode::None,
-    },
-    MethodSpec {
-        name: "group.get_member_info",
-        summary: "查群成员信息",
-        tags: &[tags::MEMBER, tags::GROUP],
-        risk: Risk::Read,
-        scope: Scope::Room,
-        params: MEMBER_PARAMS,
-        targets: GROUP_TARGETS,
-        effect: Effect::Read,
-        record: RecordMode::None,
-    },
-    MethodSpec {
-        name: "message.send_image",
-        summary: "往会话里发一张图",
-        tags: &[tags::SEND, tags::IMAGE, tags::MEDIA],
-        risk: Risk::Write,
-        scope: Scope::Room,
-        params: IMAGE_PARAMS,
-        targets: &[],
-        effect: Effect::Send,
-        record: RecordMode::Message,
-    },
-    MethodSpec {
-        name: "group.get_file_url",
-        summary: "取群文件的下载地址",
-        tags: &[tags::FILE, tags::IMAGE, tags::DOWNLOAD],
-        risk: Risk::Read,
-        scope: Scope::Room,
-        params: FILE_PARAMS,
-        targets: GROUP_TARGETS,
-        effect: Effect::Read,
-        record: RecordMode::None,
-    },
-    MethodSpec {
-        name: "group.kick",
-        summary: "踢人",
-        tags: &[tags::ADMIN, tags::MEMBER],
-        risk: Risk::Destructive,
-        scope: Scope::Room,
-        params: KICK_PARAMS,
-        targets: GROUP_TARGETS,
-        effect: Effect::Write,
-        record: RecordMode::None,
-    },
-    MethodSpec {
-        name: "group.ban",
-        summary: "禁言",
-        tags: &[tags::ADMIN, tags::MUTE],
-        risk: Risk::Destructive,
-        scope: Scope::Room,
-        params: KICK_PARAMS,
-        targets: GROUP_TARGETS,
-        effect: Effect::Write,
-        record: RecordMode::None,
-    },
-    MethodSpec {
-        name: "group.get_member_list",
-        summary: "群成员列表（不带分页，一次给全）",
-        tags: &[tags::MEMBER, tags::GROUP],
-        risk: Risk::Read,
-        scope: Scope::Room,
-        params: &[],
-        targets: GROUP_TARGETS,
-        effect: Effect::Read,
-        record: RecordMode::None,
-    },
-    // 跟房间无关的那一类：查的是这个号本身有什么，不是房间里发生了什么。
-    MethodSpec {
-        name: "friend.list",
-        summary: "好友列表",
-        tags: &[tags::FRIEND],
-        risk: Risk::Read,
-        scope: Scope::Connection,
-        params: &[],
-        targets: &[],
-        effect: Effect::Read,
-        record: RecordMode::None,
-    },
-];
+fn methods() -> Arc<[MethodSpec]> {
+    vec![
+        spec(
+            "forward.get_content",
+            "读一条合并转发的正文",
+            &[tags::FORWARD, tags::MESSAGE],
+            Risk::Read,
+            Scope::Room,
+            FORWARD_PARAMS,
+            &[],
+            Effect::Read,
+            RecordMode::None,
+        ),
+        spec(
+            "group.get_member_info",
+            "查群成员信息",
+            &[tags::MEMBER, tags::GROUP],
+            Risk::Read,
+            Scope::Room,
+            MEMBER_PARAMS,
+            GROUP_TARGETS,
+            Effect::Read,
+            RecordMode::None,
+        ),
+        spec(
+            "message.send_image",
+            "往会话里发一张图",
+            &[tags::SEND, tags::IMAGE, tags::MEDIA],
+            Risk::Write,
+            Scope::Room,
+            IMAGE_PARAMS,
+            &[],
+            Effect::Send,
+            RecordMode::Message,
+        ),
+        spec(
+            "group.get_file_url",
+            "取群文件的下载地址",
+            &[tags::FILE, tags::IMAGE, tags::DOWNLOAD],
+            Risk::Read,
+            Scope::Room,
+            FILE_PARAMS,
+            GROUP_TARGETS,
+            Effect::Read,
+            RecordMode::None,
+        ),
+        spec(
+            "group.kick",
+            "踢人",
+            &[tags::ADMIN, tags::MEMBER],
+            Risk::Destructive,
+            Scope::Room,
+            KICK_PARAMS,
+            GROUP_TARGETS,
+            Effect::Write,
+            RecordMode::None,
+        ),
+        spec(
+            "group.ban",
+            "禁言",
+            &[tags::ADMIN, tags::MUTE],
+            Risk::Destructive,
+            Scope::Room,
+            KICK_PARAMS,
+            GROUP_TARGETS,
+            Effect::Write,
+            RecordMode::None,
+        ),
+        spec(
+            "group.get_member_list",
+            "群成员列表（不带分页，一次给全）",
+            &[tags::MEMBER, tags::GROUP],
+            Risk::Read,
+            Scope::Room,
+            &[],
+            GROUP_TARGETS,
+            Effect::Read,
+            RecordMode::None,
+        ),
+        // 跟房间无关的那一类：查的是这个号本身有什么，不是房间里发生了什么。
+        spec(
+            "friend.list",
+            "好友列表",
+            &[tags::FRIEND],
+            Risk::Read,
+            Scope::Connection,
+            &[],
+            &[],
+            Effect::Read,
+            RecordMode::None,
+        ),
+    ]
+    .into()
+}
 
 type Calls = Arc<Mutex<Vec<(String, Value)>>>;
 
@@ -142,8 +174,12 @@ impl Outbound for Platformy {
     }
 
     /// 只有 `qq` 这条连接有平台能力，`dc` 没有——用来验证「这个连接没声明」那条路。
-    fn catalog(&self, connection: &str) -> &'static [MethodSpec] {
-        if connection == "qq" { METHODS } else { &[] }
+    fn catalog(&self, connection: &str) -> Arc<[MethodSpec]> {
+        if connection == "qq" {
+            methods()
+        } else {
+            Arc::from(Vec::<MethodSpec>::new())
+        }
     }
 
     fn call(

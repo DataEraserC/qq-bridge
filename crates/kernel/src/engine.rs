@@ -164,7 +164,8 @@ pub(crate) struct PreparedPlatformCall {
 
 impl PreparedPlatformCall {
     pub(crate) fn execute(&self) -> Result<CallOutcome, CallError> {
-        self.outbound.call(&self.room, self.spec.name, &self.params)
+        self.outbound
+            .call(&self.room, self.spec.name.as_ref(), &self.params)
     }
 }
 
@@ -980,13 +981,16 @@ impl<S: Store> Bridge<S> {
         if methods.is_empty() {
             return Err(no_catalog(&room.connection));
         }
-        let Some(spec) = methods.iter().find(|method| method.name == args.method) else {
+        let Some(spec) = methods
+            .iter()
+            .find(|method| method.name.as_ref() == args.method.as_str())
+        else {
             let hint = match methods
                 .iter()
                 .find(|method| method.group() == group_of_name(&args.method))
             {
                 Some(near) => format!("你是不是想调 {}？", near.name),
-                None => format!("这个连接支持：{}", method_names(methods)),
+                None => format!("这个连接支持：{}", method_names(&methods)),
             };
             return Err(ToolError::new(
                 ErrorCode::BadRequest,
@@ -1019,7 +1023,7 @@ impl<S: Store> Bridge<S> {
         }
 
         if spec.risk == Risk::Destructive
-            && !Self::allows_destructive(&ctx.config, &room.connection, spec.name)
+            && !Self::allows_destructive(&ctx.config, &room.connection, spec.name.as_ref())
         {
             return Err(ToolError::new(
                 ErrorCode::ToolNotAllowed,
@@ -1047,7 +1051,7 @@ impl<S: Store> Bridge<S> {
 
         Ok(PreparedPlatformCall {
             room,
-            spec: *spec,
+            spec: spec.clone(),
             params,
             args,
             config,
@@ -2467,7 +2471,7 @@ impl<S: Store> Bridge<S> {
                 "total": methods.len(),
                 "returned": list.len(),
                 "methods": list,
-                "tags": tags_of(methods),
+                "tags": tags_of(&methods),
                 "hint": "名字里点号前那段是归属（跟平台 API 命名空间对齐）；tags 是用途，跨归属。\
                          要某个方法的参数表，再调一次并给 group / tag / query，三者可叠加。\
                          scope=connection 的方法跟房间无关（好友列表、账号资料这类），调它不用给 room。",
@@ -2484,7 +2488,7 @@ impl<S: Store> Bridge<S> {
             .collect();
 
         if hits.is_empty() {
-            return Err(no_match(methods, group, tag, query.as_deref()));
+            return Err(no_match(&methods, group, tag, query.as_deref()));
         }
 
         Ok(json!({
@@ -3195,11 +3199,12 @@ fn describe_method(spec: &MethodSpec) -> Value {
 }
 
 /// 这台连接用到的标签，按首次出现的顺序。
-fn tag_names(methods: &[MethodSpec]) -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = Vec::new();
+fn tag_names<'a>(methods: &'a [MethodSpec]) -> Vec<&'a str> {
+    let mut names: Vec<&'a str> = Vec::new();
     for method in methods {
-        for tag in method.tags {
-            if !names.contains(tag) {
+        for tag in method.tags.iter() {
+            let tag = tag.as_ref();
+            if !names.contains(&tag) {
                 names.push(tag);
             }
         }
@@ -3258,17 +3263,18 @@ fn no_match(
 fn method_names(methods: &[MethodSpec]) -> String {
     methods
         .iter()
-        .map(|method| method.name)
+        .map(|method| method.name.as_ref())
         .collect::<Vec<_>>()
         .join(" / ")
 }
 
 /// 有哪些分组，按声明顺序（不是字母序）：适配器写得顺，模型看得也顺。
-fn groups_of(methods: &[MethodSpec]) -> Vec<&'static str> {
-    let mut groups: Vec<&'static str> = Vec::new();
+fn groups_of<'a>(methods: &'a [MethodSpec]) -> Vec<&'a str> {
+    let mut groups: Vec<&'a str> = Vec::new();
     for method in methods {
-        if !groups.contains(&method.group()) {
-            groups.push(method.group());
+        let group = method.group();
+        if !groups.contains(&group) {
+            groups.push(group);
         }
     }
     groups
@@ -3294,8 +3300,8 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
         }
     };
 
-    for param in spec.params {
-        match given.get(param.name) {
+    for param in spec.params.iter() {
+        match given.get(param.name.as_ref()) {
             None | Some(Value::Null) => {
                 if param.required {
                     return Err(ToolError::new(
@@ -3320,17 +3326,24 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
                     ));
                 }
                 if !param.values.is_empty() {
-                    let allowed = value
-                        .as_str()
-                        .is_some_and(|text| param.values.contains(&text));
+                    let allowed = value.as_str().is_some_and(|text| {
+                        param
+                            .values
+                            .iter()
+                            .any(|candidate| candidate.as_ref() == text)
+                    });
                     if !allowed {
+                        let choices = param
+                            .values
+                            .iter()
+                            .map(|candidate| candidate.as_ref())
+                            .collect::<Vec<_>>()
+                            .join(" / ");
                         return Err(ToolError::new(
                             ErrorCode::BadRequest,
                             format!(
-                                "[bad_params] {} 的参数 {} 只能是 {}，给的是 {value}",
-                                spec.name,
-                                param.name,
-                                param.values.join(" / ")
+                                "[bad_params] {} 的参数 {} 只能是 {choices}，给的是 {value}",
+                                spec.name, param.name
                             ),
                         ));
                     }
@@ -3340,7 +3353,11 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
     }
 
     for key in given.keys() {
-        if !spec.params.iter().any(|param| param.name == key) {
+        if !spec
+            .params
+            .iter()
+            .any(|param| param.name.as_ref() == key.as_str())
+        {
             let known = if spec.params.is_empty() {
                 "这个方法不要参数".to_owned()
             } else {
@@ -3348,7 +3365,7 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
                     "能给的参数：{}",
                     spec.params
                         .iter()
-                        .map(|param| param.name)
+                        .map(|param| param.name.as_ref())
                         .collect::<Vec<_>>()
                         .join(" / ")
                 )
@@ -3381,16 +3398,16 @@ fn check_target_params(spec: &MethodSpec, room: &RoomId, params: &Value) -> Resu
     let room_kind = room.path.first().map(String::as_str).unwrap_or("");
     let room_id = room.path.get(1).map(String::as_str).unwrap_or("");
 
-    for target in spec.targets {
+    for target in spec.targets.iter() {
         if target.role != TargetRole::Room {
             continue;
         }
-        let Some(value) = given.get(target.param) else {
+        let Some(value) = given.get(target.param.as_ref()) else {
             continue;
         };
         let given_id = value.as_str().unwrap_or_default();
 
-        if target.room_kind == room_kind {
+        if target.room_kind.as_ref() == room_kind {
             if given_id != room_id {
                 return Err(bad_target(spec, room, target, given_id));
             }
@@ -3401,8 +3418,8 @@ fn check_target_params(spec: &MethodSpec, room: &RoomId, params: &Value) -> Resu
         // 的情况可以放过（poke.send 群里的 user_id）。
         let is_member_here = spec.targets.iter().any(|other| {
             other.role == TargetRole::Member
-                && other.param == target.param
-                && other.room_kind == room_kind
+                && other.param.as_ref() == target.param.as_ref()
+                && other.room_kind.as_ref() == room_kind
         });
         if !is_member_here {
             return Err(bad_target(spec, room, target, given_id));
@@ -3418,7 +3435,12 @@ fn bad_target(
     target: &crate::outbound::TargetSpec,
     given_id: &str,
 ) -> ToolError {
-    let suggestion = format!("{}:{}/{}", room.connection, target.room_kind, given_id);
+    let suggestion = format!(
+        "{}:{}/{}",
+        room.connection,
+        target.room_kind.as_ref(),
+        given_id
+    );
     ToolError::new(
         ErrorCode::BadRequest,
         format!(

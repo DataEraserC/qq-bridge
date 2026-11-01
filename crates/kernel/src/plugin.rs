@@ -17,10 +17,15 @@ use acb_proto::{Element, Omitted, Record, RecordKind, RoomId, Sender};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::config::{
-    AccessPolicy, ClockPolicy, Config, DeliveryPolicy, ReceivePolicy, TurnErrorAction,
-    TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy,
+use crate::adapter::{
+    AdapterError, AdapterFactory, AdapterManifest, AdapterInstance, create_instance,
+    validate_manifest,
 };
+use crate::config::{
+    AccessPolicy, ClockPolicy, Config, Connection, DeliveryPolicy, ReceivePolicy,
+    TurnErrorAction, TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy,
+};
+use crate::event_queue::EventQueue;
 use crate::outbound::Sent;
 
 /// 插件 API 版本。provider / manager / loader 的 manifest 都要对得上。
@@ -241,6 +246,8 @@ pub struct ProviderDescriptor {
     pub extension_point: ExtensionPoint,
     pub api_version: u32,
     pub capabilities: Vec<Capability>,
+    /// 平台适配器的配置 `kind`（如 `onebot11` / `process`）；其他扩展点为 None。
+    pub kind: Option<String>,
 }
 
 impl ProviderDescriptor {
@@ -255,7 +262,14 @@ impl ProviderDescriptor {
             extension_point,
             api_version,
             capabilities,
+            kind: None,
         }
+    }
+
+    /// 平台适配器声明自己对应的连接 `kind`。
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
+        self
     }
 }
 
@@ -821,6 +835,8 @@ pub enum ProviderOptions<'a> {
     TurnError(&'a TurnErrorPolicy),
     Clock(&'a ClockPolicy),
     Receive(&'a ReceivePolicy),
+    /// 平台适配器：按这条连接的配置实例化。
+    PlatformAdapter(&'a Connection),
     /// 不需要 options 的扩展点（发送钩子）。
     None,
 }
@@ -834,6 +850,7 @@ pub enum ProviderInstance {
     TurnError(Arc<dyn TurnErrorProvider>),
     Clock(Arc<dyn ClockProvider>),
     Receive(Arc<dyn ReceiveProvider>),
+    PlatformAdapter(Arc<dyn AdapterFactory>),
 }
 
 impl ProviderInstance {
@@ -847,6 +864,7 @@ impl ProviderInstance {
             Self::TurnError(_) => ExtensionPoint::TurnError,
             Self::Clock(_) => ExtensionPoint::Clock,
             Self::Receive(_) => ExtensionPoint::Receive,
+            Self::PlatformAdapter(_) => ExtensionPoint::PlatformAdapter,
         }
     }
 }
@@ -1034,6 +1052,10 @@ pub struct PluginManager {
     turn_errors: HashMap<ProviderId, Arc<dyn TurnErrorProvider>>,
     clocks: HashMap<ProviderId, Arc<dyn ClockProvider>>,
     receives: HashMap<ProviderId, Arc<dyn ReceiveProvider>>,
+    /// 直接注册的平台适配器工厂，键是连接配置里的 `kind`。
+    adapters: HashMap<String, Arc<dyn AdapterFactory>>,
+    /// manager 子树声明的适配器：`kind` → provider id。
+    adapter_providers: HashMap<String, ProviderId>,
     managers: HashMap<String, Arc<dyn ManagerPlugin>>,
     /// 安装顺序（含嵌套子树）。reload/health 正序，shutdown 逆序。
     manager_order: Vec<String>,
@@ -1085,6 +1107,7 @@ impl PluginManager {
                     | ExtensionPoint::TurnError
                     | ExtensionPoint::Clock
                     | ExtensionPoint::Receive
+                    | ExtensionPoint::PlatformAdapter
             ) {
                 return Err(PluginError::UnsupportedExtensionPoint {
                     id: format!("loader:{}", manifest.kind.as_str()),
@@ -1093,6 +1116,82 @@ impl PluginManager {
             }
         }
         loader.install(self)
+    }
+
+    /// 直接注册一个平台适配器工厂（内置适配器、native loader 用它）。
+    ///
+    /// 适配器也走 Root 的 manifest / 版本 / 能力审计，和 provider 一样。
+    pub fn register_adapter(&mut self, factory: Arc<dyn AdapterFactory>) -> Result<(), AdapterError> {
+        let manifest = factory.manifest();
+        validate_manifest(&manifest)?;
+        let kind = manifest.kind.as_ref().to_owned();
+        if self.adapters.contains_key(&kind) || self.adapter_providers.contains_key(&kind) {
+            return Err(AdapterError::DuplicateKind(kind));
+        }
+
+        let id = ProviderId::parse(manifest.id.as_ref())
+            .map_err(|_| AdapterError::BadId(manifest.id.as_ref().to_owned()))?;
+        if self.descriptors.contains_key(&id) {
+            return Err(AdapterError::DuplicateId(id.to_string()));
+        }
+        self.descriptors.insert(
+            id.clone(),
+            ProviderDescriptor::new(
+                id,
+                ExtensionPoint::PlatformAdapter,
+                PLUGIN_API_VERSION,
+                vec![Capability::PlatformCatalog],
+            )
+            .with_kind(kind.clone()),
+        );
+        self.adapters.insert(kind, factory);
+        Ok(())
+    }
+
+    /// 按连接配置实例化适配器。先查直接注册的工厂，再按 `kind` 委托 manager 子树。
+    pub fn create_adapter(
+        &self,
+        connection: &Connection,
+        events: EventQueue,
+    ) -> Result<AdapterInstance, AdapterError> {
+        if let Some(factory) = self.adapters.get(&connection.kind) {
+            return create_instance(factory.as_ref(), connection, events);
+        }
+
+        let Some(id) = self.adapter_providers.get(&connection.kind).cloned() else {
+            return Err(AdapterError::UnknownKind(connection.kind.clone()));
+        };
+        let Some(manager) = self.managers.get(id.namespace()) else {
+            return Err(AdapterError::Create(
+                connection.id.clone(),
+                format!("manager {} 没装", id.namespace()),
+            ));
+        };
+
+        match manager.instantiate(&id, ProviderOptions::PlatformAdapter(connection)) {
+            Ok(ProviderInstance::PlatformAdapter(factory)) => {
+                create_instance(factory.as_ref(), connection, events)
+            }
+            Ok(other) => Err(AdapterError::Create(
+                connection.id.clone(),
+                format!("{} 返回的是 {:?}，不是平台适配器", id, other.extension_point()),
+            )),
+            Err(error) => Err(AdapterError::Create(
+                connection.id.clone(),
+                error.to_string(),
+            )),
+        }
+    }
+
+    /// 已直接注册的适配器 manifest（给控制台/诊断用）。
+    pub fn adapter_manifests(&self) -> Vec<AdapterManifest> {
+        let mut manifests: Vec<AdapterManifest> = self
+            .adapters
+            .values()
+            .map(|factory| factory.manifest())
+            .collect();
+        manifests.sort_by(|left, right| left.kind.cmp(&right.kind));
+        manifests
     }
 
     /// 注册 wake provider。Root 在这里校验扩展点、API 版本、能力和重复 id。
@@ -1241,6 +1340,11 @@ impl PluginManager {
         self.collect_manager(manager, &mut ancestry, &mut collected)?;
         for entry in collected {
             for descriptor in entry.descriptors {
+                if descriptor.extension_point == ExtensionPoint::PlatformAdapter {
+                    if let Some(kind) = descriptor.kind.clone() {
+                        self.adapter_providers.insert(kind, descriptor.id.clone());
+                    }
+                }
                 self.descriptors
                     .insert(descriptor.id.clone(), descriptor);
             }
@@ -1322,6 +1426,7 @@ impl PluginManager {
                 ExtensionPoint::TurnError => Capability::TurnErrorDecision,
                 ExtensionPoint::Clock => Capability::ClockDecision,
                 ExtensionPoint::Receive => Capability::ReceiveDecision,
+                ExtensionPoint::PlatformAdapter => Capability::PlatformCatalog,
                 point => {
                     return Err(PluginError::UnsupportedExtensionPoint {
                         id: descriptor.id.to_string(),
@@ -1329,6 +1434,31 @@ impl PluginManager {
                     });
                 }
             };
+            if descriptor.extension_point == ExtensionPoint::PlatformAdapter {
+                let kind = descriptor.kind.as_deref().map(str::trim).unwrap_or("");
+                if kind.is_empty() {
+                    return Err(PluginError::Manager {
+                        namespace: namespace.clone(),
+                        detail: format!("适配器 descriptor {} 没声明 kind", descriptor.id),
+                    });
+                }
+                let duplicate = self.adapters.contains_key(kind)
+                    || self.adapter_providers.contains_key(kind)
+                    || collected.iter().any(|entry| {
+                        entry.descriptors.iter().any(|existing| {
+                            existing.extension_point == ExtensionPoint::PlatformAdapter
+                                && existing.kind.as_deref() == Some(kind)
+                        })
+                    });
+                if duplicate {
+                    return Err(PluginError::DuplicateProvider(format!("adapter kind {kind}")));
+                }
+            } else if descriptor.kind.is_some() {
+                return Err(PluginError::Manager {
+                    namespace: namespace.clone(),
+                    detail: format!("只有平台适配器能声明 kind，{} 声明了", descriptor.id),
+                });
+            }
             if !manifest.capabilities.contains(&required) {
                 return Err(PluginError::MissingCapability {
                     id: format!("manager:{namespace}"),
@@ -2391,7 +2521,7 @@ mod tests {
             LoaderManifest::new(
                 LoaderKind::Process,
                 PLUGIN_API_VERSION,
-                vec![ExtensionPoint::PlatformAdapter],
+                vec![ExtensionPoint::Manager],
             )
         }
         fn install(&self, _manager: &mut PluginManager) -> Result<(), PluginError> {
@@ -2420,7 +2550,7 @@ mod tests {
         assert!(matches!(
             manager.install_loader(&UnsupportedExtensionLoader),
             Err(PluginError::UnsupportedExtensionPoint {
-                point: ExtensionPoint::PlatformAdapter,
+                point: ExtensionPoint::Manager,
                 ..
             })
         ));

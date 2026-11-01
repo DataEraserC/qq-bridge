@@ -1,21 +1,21 @@
-//! 平台适配器注册表（ADR-0027，Phase 2c 第一步）。
+//! 平台适配器契约（ADR-0027）。
 //!
-//! 目标是把 `main.rs` 里「知道 onebot11 怎么 new」的知识挪回适配器 crate：
-//! core 只认 `AdapterManifest` + `AdapterFactory`，按连接配置的 `kind` 取实例。
-//! 适配器仍然在 core 外，拥有自己的连接线程；这里只做注册/实例化，不做事件队列
-//! （队列是 Phase 2c 的下一刀）。
+//! 适配器在 core 外：它拥有平台连接、解码、出站和平台方法目录；core 只按连接
+//! 配置的 `kind` 实例化，并通过 [`AdapterHost`] 把入站队列和退出信号交给它。
+//!
+//! 适配器现在登记在 [`crate::plugin::PluginManager`] 里（扩展点
+//! `platform_adapter`），所以内置、动态库和外置进程三种载体走同一套
+//! manifest / 能力 / 版本审计。
 
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::config::{Connection, Transport};
-use crate::engine::Bridge;
+use crate::config::Connection;
 use crate::event_queue::EventQueue;
 use crate::outbound::Outbound;
-use crate::storage::Store;
 
 /// 适配器接口版本。manifest 要对得上。
 pub const ADAPTER_API_VERSION: u32 = 1;
@@ -32,28 +32,46 @@ pub enum AdapterCapability {
 }
 
 /// 一条适配器的静态声明。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 字段是 `Cow`：内置适配器用静态借用，动态库/外置进程可以构造自己的 manifest。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterManifest {
-    pub id: &'static str,
-    pub platform: &'static str,
+    /// 全局唯一的 provider id（`acb.adapter.onebot11`）。
+    pub id: Cow<'static, str>,
+    pub platform: Cow<'static, str>,
     /// 对应配置里的 `kind`（如 `onebot11`）。
-    pub kind: &'static str,
-    /// 支持的 `transport` 值（如 `ws-client`）。
-    pub transports: &'static [&'static str],
+    pub kind: Cow<'static, str>,
+    /// 支持的 `transport` 值（如 `ws-client`、`process`）。
+    pub transports: Cow<'static, [Cow<'static, str>]>,
     pub api_version: u32,
-    pub capabilities: &'static [AdapterCapability],
+    pub capabilities: Cow<'static, [AdapterCapability]>,
+}
+
+/// 适配器启动时能拿到的东西。
+///
+/// 故意不含 `Bridge` / `Store`：适配器只往入站队列里丢事件、只看退出信号，
+/// 入库、唤醒、水位都由 core 的 drain 线程统一处理。
+pub struct AdapterHost {
+    pub events: EventQueue,
+    pub shutdown: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for AdapterHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AdapterHost").finish_non_exhaustive()
+    }
 }
 
 /// 实例化后交给 core 的两样东西：出站通道 + 启动函数。
 ///
-/// `launch` 故意做成 `FnOnce(Arc<Mutex<Bridge<S>>>...)`：适配器自己拥有连接线程，
-/// core 不替它保管 socket，也不需要知道它怎么重连。
-pub struct AdapterInstance<S: Store> {
+/// `launch` 由适配器自己拥有连接线程；core 不替它保管 socket，也不需要知道它
+/// 怎么重连、怎么启动子进程或加载动态库。
+pub struct AdapterInstance {
     pub outbound: Box<dyn Outbound>,
-    pub launch: Box<dyn FnOnce(Arc<Mutex<Bridge<S>>>, Arc<AtomicBool>) + Send>,
+    pub launch: Box<dyn FnOnce(AdapterHost) + Send>,
 }
 
-impl<S: Store> std::fmt::Debug for AdapterInstance<S> {
+impl std::fmt::Debug for AdapterInstance {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AdapterInstance")
@@ -61,10 +79,10 @@ impl<S: Store> std::fmt::Debug for AdapterInstance<S> {
     }
 }
 
-/// 一个适配器工厂。泛型在 `S` 上，这样 `main` 可以用具体的 `SqliteStore` 注册，
-/// 适配器 crate 仍然能拿到完整的 `Bridge<S>`。
-pub trait AdapterFactory<S: Store>: Send + Sync {
-    fn manifest(&self) -> &AdapterManifest;
+/// 一个适配器工厂。core 按 `kind` 取实例，不关心载体是进程内、动态库还是外置进程。
+pub trait AdapterFactory: Send + Sync {
+    /// 这个工厂的静态声明。返回 owned 值，动态适配器才能按连接构造。
+    fn manifest(&self) -> AdapterManifest;
 
     /// 实例化一条连接。`events` 是 core 的入站队列写端；适配器只往里丢，
     /// 不直接调 `Bridge::ingest`。
@@ -72,14 +90,16 @@ pub trait AdapterFactory<S: Store>: Send + Sync {
         &self,
         connection: &Connection,
         events: EventQueue,
-    ) -> Result<AdapterInstance<S>, AdapterError>;
+    ) -> Result<AdapterInstance, AdapterError>;
 }
 
-/// 注册表错误。
+/// 适配器注册/实例化错误。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AdapterError {
     #[error("适配器 kind 重复注册：{0}")]
     DuplicateKind(String),
+    #[error("适配器 id 重复：{0}")]
+    DuplicateId(String),
     #[error("没有这个适配器 kind：{0}")]
     UnknownKind(String),
     #[error("适配器 {adapter} 不支持 transport {transport}")]
@@ -95,98 +115,69 @@ pub enum AdapterError {
     },
     #[error("适配器 {0} 的接口版本 {1} 不兼容（需要 {ADAPTER_API_VERSION}）")]
     ApiVersion(String, u32),
+    #[error("适配器 id 不合法：{0}（要写成 namespace.name）")]
+    BadId(String),
     #[error("适配器 {0} 实例化失败：{1}")]
     Create(String, String),
 }
 
-/// 一套适配器工厂。按连接配置的 `kind` 挑实现。
-pub struct AdapterRegistry<S: Store> {
-    factories: HashMap<String, Arc<dyn AdapterFactory<S>>>,
-}
-
-impl<S: Store> Default for AdapterRegistry<S> {
-    fn default() -> Self {
-        Self {
-            factories: HashMap::new(),
-        }
+/// manifest 本身的校验：版本必须对得上，id 必须是 `namespace.name`。
+pub fn validate_manifest(manifest: &AdapterManifest) -> Result<(), AdapterError> {
+    if manifest.api_version != ADAPTER_API_VERSION {
+        return Err(AdapterError::ApiVersion(
+            manifest.id.as_ref().to_owned(),
+            manifest.api_version,
+        ));
     }
-}
-
-impl<S: Store> AdapterRegistry<S> {
-    pub fn new() -> Self {
-        Self::default()
+    if crate::plugin::ProviderId::parse(manifest.id.as_ref()).is_err() {
+        return Err(AdapterError::BadId(manifest.id.as_ref().to_owned()));
     }
-
-    /// 注册一个适配器。`kind` 来自 manifest，不是连接配置。
-    pub fn register(
-        &mut self,
-        factory: Arc<dyn AdapterFactory<S>>,
-    ) -> Result<(), AdapterError> {
-        let manifest = factory.manifest();
-        if manifest.api_version != ADAPTER_API_VERSION {
-            return Err(AdapterError::ApiVersion(
-                manifest.id.to_owned(),
-                manifest.api_version,
-            ));
-        }
-        if self.factories.contains_key(manifest.kind) {
-            return Err(AdapterError::DuplicateKind(manifest.kind.to_owned()));
-        }
-        self.factories
-            .insert(manifest.kind.to_owned(), factory);
-        Ok(())
-    }
-
-    /// 按连接配置实例化。连接里的 `kind` / `transport` 必须和 manifest 对得上。
-    pub fn create(
-        &self,
-        connection: &Connection,
-        events: EventQueue,
-    ) -> Result<AdapterInstance<S>, AdapterError> {
-        let factory = self
-            .factories
-            .get(&connection.kind)
-            .ok_or_else(|| AdapterError::UnknownKind(connection.kind.clone()))?;
-        let manifest = factory.manifest();
-
-        if manifest.kind != connection.kind {
-            return Err(AdapterError::KindMismatch {
-                connection: connection.id.clone(),
-                manifest: manifest.kind.to_owned(),
-                configured: connection.kind.clone(),
-            });
-        }
-        let transport = connection.transport.as_str();
-        if !manifest.transports.contains(&transport) {
-            return Err(AdapterError::UnsupportedTransport {
-                adapter: manifest.id.to_owned(),
-                transport: transport.to_owned(),
-            });
-        }
-
-        factory.create(connection, events)
-    }
-
-    /// 已注册的 manifest（给控制台/诊断用）。
-    pub fn manifests(&self) -> Vec<&AdapterManifest> {
-        let mut manifests: Vec<&AdapterManifest> =
-            self.factories.values().map(|factory| factory.manifest()).collect();
-        manifests.sort_by_key(|manifest| manifest.kind);
-        manifests
-    }
+    Ok(())
 }
 
 /// 一条连接在配置里的 transport 是否被 manifest 允许。
-pub fn manifest_supports_transport(manifest: &AdapterManifest, transport: Transport) -> bool {
-    manifest.transports.contains(&transport.as_str())
+pub fn manifest_supports_transport(manifest: &AdapterManifest, transport: &str) -> bool {
+    manifest
+        .transports
+        .iter()
+        .any(|supported| supported.as_ref() == transport)
+}
+
+/// 校验 manifest 与连接配置对得上，然后实例化。
+///
+/// 注册时和实例化时各查一遍：连接配置可能在注册之后才出现，错误信息要指向
+/// 具体那条连接，而不是笼统的「适配器坏了」。
+pub fn create_instance(
+    factory: &dyn AdapterFactory,
+    connection: &Connection,
+    events: EventQueue,
+) -> Result<AdapterInstance, AdapterError> {
+    let manifest = factory.manifest();
+    validate_manifest(&manifest)?;
+
+    if manifest.kind.as_ref() != connection.kind.as_str() {
+        return Err(AdapterError::KindMismatch {
+            connection: connection.id.clone(),
+            manifest: manifest.kind.as_ref().to_owned(),
+            configured: connection.kind.clone(),
+        });
+    }
+    if !manifest_supports_transport(&manifest, connection.transport.as_str()) {
+        return Err(AdapterError::UnsupportedTransport {
+            adapter: manifest.id.as_ref().to_owned(),
+            transport: connection.transport.as_str().to_owned(),
+        });
+    }
+
+    factory.create(connection, events)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Connection;
+    use crate::config::Transport;
     use crate::outbound::{OutboundError, Sent};
-    use crate::storage::MemoryStore;
+    use crate::plugin::PluginManager;
     use acb_proto::{Element, RoomId};
     use std::sync::Arc;
 
@@ -205,33 +196,33 @@ mod tests {
         }
     }
 
-    static FAKE_TRANSPORTS: &[&str] = &["ws-client"];
+    static FAKE_TRANSPORTS: &[Cow<'static, str>] = &[Cow::Borrowed("ws-client")];
     static FAKE_CAPS: &[AdapterCapability] =
         &[AdapterCapability::ReceiveEvents, AdapterCapability::Send];
     static FAKE_MANIFEST: AdapterManifest = AdapterManifest {
-        id: "fake",
-        platform: "qq",
-        kind: "fake",
-        transports: FAKE_TRANSPORTS,
+        id: Cow::Borrowed("acb.adapter.fake"),
+        platform: Cow::Borrowed("qq"),
+        kind: Cow::Borrowed("fake"),
+        transports: Cow::Borrowed(FAKE_TRANSPORTS),
         api_version: ADAPTER_API_VERSION,
-        capabilities: FAKE_CAPS,
+        capabilities: Cow::Borrowed(FAKE_CAPS),
     };
 
     struct FakeFactory;
 
-    impl AdapterFactory<MemoryStore> for FakeFactory {
-        fn manifest(&self) -> &AdapterManifest {
-            &FAKE_MANIFEST
+    impl AdapterFactory for FakeFactory {
+        fn manifest(&self) -> AdapterManifest {
+            FAKE_MANIFEST.clone()
         }
 
         fn create(
             &self,
             _connection: &Connection,
             _events: EventQueue,
-        ) -> Result<AdapterInstance<MemoryStore>, AdapterError> {
+        ) -> Result<AdapterInstance, AdapterError> {
             Ok(AdapterInstance {
                 outbound: Box::new(FakeOutbound),
-                launch: Box::new(|_bridge, _shutdown| {}),
+                launch: Box::new(|_host| {}),
             })
         }
     }
@@ -257,45 +248,71 @@ mod tests {
     }
 
     #[test]
-    fn registry_creates_by_kind_and_validates_transport() {
-        let mut registry = AdapterRegistry::<MemoryStore>::new();
-        registry
-            .register(Arc::new(FakeFactory))
+    fn root_creates_by_kind_and_validates_transport() {
+        let mut plugins = PluginManager::with_native_builtins();
+        plugins
+            .register_adapter(Arc::new(FakeFactory))
             .expect("能注册");
-        assert_eq!(registry.manifests()[0].kind, "fake");
+        assert!(plugins
+            .adapter_manifests()
+            .iter()
+            .any(|manifest| manifest.kind.as_ref() == "fake"));
 
-        let instance = registry
-            .create(&connection("fake", Transport::WsClient), events())
+        let instance = plugins
+            .create_adapter(&connection("fake", Transport::WsClient), events())
             .expect("能实例化");
         let _ = instance.outbound;
 
-        let bad_transport = registry
-            .create(&connection("fake", Transport::WsServer), events())
+        let bad_transport = plugins
+            .create_adapter(&connection("fake", Transport::WsServer), events())
             .expect_err("transport 不支持");
         assert!(matches!(
             bad_transport,
             AdapterError::UnsupportedTransport { .. }
         ));
 
-        let unknown = registry
-            .create(&connection("nope", Transport::WsClient), events())
+        let unknown = plugins
+            .create_adapter(&connection("nope", Transport::WsClient), events())
             .expect_err("kind 不存在");
         assert!(matches!(unknown, AdapterError::UnknownKind(_)));
     }
 
     #[test]
     fn duplicate_kind_is_rejected() {
-        let mut registry = AdapterRegistry::<MemoryStore>::new();
-        registry.register(Arc::new(FakeFactory)).expect("第一次能注册");
+        let mut plugins = PluginManager::with_native_builtins();
+        plugins
+            .register_adapter(Arc::new(FakeFactory))
+            .expect("第一次能注册");
         assert!(matches!(
-            registry.register(Arc::new(FakeFactory)),
+            plugins.register_adapter(Arc::new(FakeFactory)),
             Err(AdapterError::DuplicateKind(_))
         ));
     }
 
     #[test]
     fn manifest_transport_helper_matches() {
-        assert!(manifest_supports_transport(&FAKE_MANIFEST, Transport::WsClient));
-        assert!(!manifest_supports_transport(&FAKE_MANIFEST, Transport::WsServer));
+        assert!(manifest_supports_transport(&FAKE_MANIFEST, "ws-client"));
+        assert!(!manifest_supports_transport(&FAKE_MANIFEST, "ws-server"));
+    }
+
+    #[test]
+    fn manifest_rejects_bad_ids_and_versions() {
+        let bad_id = AdapterManifest {
+            id: Cow::Borrowed("fake"),
+            ..FAKE_MANIFEST.clone()
+        };
+        assert!(matches!(
+            validate_manifest(&bad_id),
+            Err(AdapterError::BadId(_))
+        ));
+
+        let bad_version = AdapterManifest {
+            api_version: ADAPTER_API_VERSION + 1,
+            ..FAKE_MANIFEST.clone()
+        };
+        assert!(matches!(
+            validate_manifest(&bad_version),
+            Err(AdapterError::ApiVersion(_, _))
+        ));
     }
 }

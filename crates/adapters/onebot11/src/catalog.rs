@@ -47,21 +47,25 @@ const fn any(name: &'static str, desc: &'static str) -> ParamSpec {
     ParamSpec::any(name, desc)
 }
 
-const fn m(
+fn m(
     name: &'static str,
     summary: &'static str,
-    tags: &'static [&'static str],
+    tags: &[&'static str],
     risk: Risk,
-    params: &'static [ParamSpec],
+    params: &[ParamSpec],
 ) -> MethodSpec {
     MethodSpec {
-        name,
-        summary,
-        tags,
+        name: name.into(),
+        summary: summary.into(),
+        tags: tags
+            .iter()
+            .map(|tag| std::borrow::Cow::Borrowed(*tag))
+            .collect::<Vec<_>>()
+            .into(),
         risk,
         scope: Scope::Room,
-        params,
-        targets: &[],
+        params: params.to_vec().into(),
+        targets: Vec::new().into(),
         // 下面两个字段由 `catalog()` 按方法名/风险推导；这里只是静态表的缺省值。
         effect: Effect::Read,
         record: RecordMode::None,
@@ -72,21 +76,25 @@ const fn m(
 ///
 /// 模型查好友列表时不该被迫先编一个群号出来。这类方法 `room` 可以不提；
 /// 提了也只用来「会话订阅了多个连接时选是哪个号」。
-const fn cm(
+fn cm(
     name: &'static str,
     summary: &'static str,
-    tags: &'static [&'static str],
+    tags: &[&'static str],
     risk: Risk,
-    params: &'static [ParamSpec],
+    params: &[ParamSpec],
 ) -> MethodSpec {
     MethodSpec {
-        name,
-        summary,
-        tags,
+        name: name.into(),
+        summary: summary.into(),
+        tags: tags
+            .iter()
+            .map(|tag| std::borrow::Cow::Borrowed(*tag))
+            .collect::<Vec<_>>()
+            .into(),
         risk,
         scope: Scope::Connection,
-        params,
-        targets: &[],
+        params: params.to_vec().into(),
+        targets: Vec::new().into(),
         // 下面两个字段由 `catalog()` 按方法名/风险推导；这里只是静态表的缺省值。
         effect: Effect::Read,
         record: RecordMode::None,
@@ -99,7 +107,8 @@ const fn cm(
 // 方便模型看到消息里的 `{"type":"forward"}` 就联想到 `message.forward_content`；
 // tags 是跨归属的用途标记，模型按需求找入口时靠它（`tag=image` 一次捞齐发图、取图、改群头像）。
 
-pub static METHODS: &[MethodSpec] = &[
+fn methods() -> Vec<MethodSpec> {
+    vec![
     // ── 账号自己 ──
     cm(
         "account.login_info",
@@ -595,7 +604,8 @@ pub static METHODS: &[MethodSpec] = &[
         Risk::Read,
         &[req("url", "要检查的链接")],
     ),
-];
+    ]
+}
 
 // ── 路由 ──────────────────────────────────────────────────────────────────
 //
@@ -742,29 +752,29 @@ pub static ROUTES: &[Route] = &[
 
 /// 方法表 + 从路由推导出的目标参数声明。
 ///
-/// `METHODS` 本身保持静态；目标声明在第一次访问时合并进来。这样新增方法时
-/// 不用在两张表里各抄一遍 targets，路由表仍然是唯一真相。
-///
-/// `effect` / `record` 同理：能从风险、标签、方法名推导的就不再手写，
-/// 少一处“加方法时忘了填”的机会。
-pub fn catalog() -> &'static [MethodSpec] {
-    static CATALOG: OnceLock<Vec<MethodSpec>> = OnceLock::new();
-    CATALOG.get_or_init(|| {
-        METHODS
-            .iter()
-            .map(|method| MethodSpec {
-                targets: targets_of(method.name),
-                effect: effect_of(method),
-                record: record_of(method.name),
-                ..*method
-            })
-            .collect()
-    })
+/// 方法表在第一次访问时构造并缓存成 owned 的 `Arc<[MethodSpec]>`；目标声明、
+/// effect / record 从路由和风险推导，路由表仍然是唯一真相。
+pub fn catalog() -> std::sync::Arc<[MethodSpec]> {
+    static CATALOG: OnceLock<std::sync::Arc<[MethodSpec]>> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| {
+            methods()
+                .into_iter()
+                .map(|method| MethodSpec {
+                    targets: targets_of(method.name.as_ref()).into(),
+                    effect: effect_of(&method),
+                    record: record_of(method.name.as_ref()),
+                    ..method
+                })
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .clone()
 }
 
 /// 这个方法做什么。发送/撤回/删除按语义认，其余按风险认。
 fn effect_of(method: &MethodSpec) -> Effect {
-    if method.has_tag(tags::RECALL) || DELETE_METHODS.contains(&method.name) {
+    if method.has_tag(tags::RECALL) || DELETE_METHODS.contains(&method.name.as_ref()) {
         Effect::Delete
     } else if method.has_tag(tags::SEND) {
         Effect::Send

@@ -6,6 +6,7 @@
 //! 分发按**连接**，不按平台：同一个平台可以挂多条连接（两个 QQ 号），房间的第一段就是
 //! 连接名，查表不会撞。
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use acb_proto::{Element, RoomId};
@@ -109,59 +110,68 @@ pub enum OutboundError {
 ///
 /// 内部用这个简化形状，**对外渲染成 JSON Schema** 给模型看（见 ADR-0020）：
 /// 适配器作者不用碰 schema 库，模型看到的还是它最熟的形式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 动态适配器也能构造目录，所以这些字段是 owned 的（静态声明用 `Cow::Borrowed`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamSpec {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub ty: ParamType,
     pub required: bool,
-    pub desc: &'static str,
+    pub desc: Cow<'static, str>,
     /// 可选值的枚举。空表示不限。
-    pub values: &'static [&'static str],
+    pub values: Cow<'static, [Cow<'static, str>]>,
 }
+
+const EMPTY_VALUES: &[Cow<'static, str>] = &[];
 
 impl ParamSpec {
     /// 最简单的写法：必填字符串。
     pub const fn required(name: &'static str, desc: &'static str) -> Self {
         Self {
-            name,
+            name: Cow::Borrowed(name),
             ty: ParamType::String,
             required: true,
-            desc,
-            values: &[],
+            desc: Cow::Borrowed(desc),
+            values: Cow::Borrowed(EMPTY_VALUES),
         }
     }
 
     /// 可选参数。
     pub const fn optional(name: &'static str, ty: ParamType, desc: &'static str) -> Self {
         Self {
-            name,
+            name: Cow::Borrowed(name),
             ty,
             required: false,
-            desc,
-            values: &[],
+            desc: Cow::Borrowed(desc),
+            values: Cow::Borrowed(EMPTY_VALUES),
         }
     }
 
     /// 形状不固定的必填参数（OneBot 那种消息段）。
     pub const fn any(name: &'static str, desc: &'static str) -> Self {
         Self {
-            name,
+            name: Cow::Borrowed(name),
             ty: ParamType::Any,
             required: true,
-            desc,
-            values: &[],
+            desc: Cow::Borrowed(desc),
+            values: Cow::Borrowed(EMPTY_VALUES),
         }
     }
 
     /// 形状不固定的可选参数。
     pub const fn maybe_any(name: &'static str, desc: &'static str) -> Self {
         Self {
-            name,
+            name: Cow::Borrowed(name),
             ty: ParamType::Any,
             required: false,
-            desc,
-            values: &[],
+            desc: Cow::Borrowed(desc),
+            values: Cow::Borrowed(EMPTY_VALUES),
         }
+    }
+
+    /// 带枚举值。静态声明用 `Cow::Borrowed`，动态适配器用 `Cow::Owned`。
+    pub fn with_values(mut self, values: impl IntoIterator<Item = Cow<'static, str>>) -> Self {
+        self.values = values.into_iter().collect::<Vec<_>>().into();
+        self
     }
 
     /// 渲染成 JSON Schema 的一个属性。
@@ -171,14 +181,17 @@ impl ParamSpec {
         if self.ty != ParamType::Any {
             schema.insert("type".into(), Value::String(self.ty.json_type().into()));
         }
-        schema.insert("description".into(), Value::String(self.desc.into()));
+        schema.insert(
+            "description".into(),
+            Value::String(self.desc.as_ref().to_owned()),
+        );
         if !self.values.is_empty() {
             schema.insert(
                 "enum".into(),
                 Value::Array(
                     self.values
                         .iter()
-                        .map(|value| Value::String((*value).into()))
+                        .map(|value| Value::String(value.as_ref().to_owned()))
                         .collect(),
                 ),
             );
@@ -191,7 +204,7 @@ impl ParamSpec {
     pub fn sample(&self) -> Value {
         // 有枚举就取第一个：那是这个参数唯一正确的取值范围。
         if let Some(first) = self.values.first() {
-            return Value::String((*first).into());
+            return Value::String(first.as_ref().to_owned());
         }
         match self.ty {
             ParamType::Integer => serde_json::json!(10),
@@ -200,7 +213,7 @@ impl ParamSpec {
             ParamType::Object => serde_json::json!({}),
             // 形状不固定的那些：按名字猜最常见的样子。猜不准也没关系，
             // 它是样例不是约束——参数表里写着真实形状。
-            ParamType::Any => match self.name {
+            ParamType::Any => match self.name.as_ref() {
                 "message" => serde_json::json!([{ "type": "text", "text": "你好" }]),
                 "messages" => serde_json::json!([{
                     "type": "node",
@@ -212,7 +225,7 @@ impl ParamSpec {
                 }]),
                 _ => serde_json::json!({}),
             },
-            ParamType::String => Value::String(sample_string(self.name).to_owned()),
+            ParamType::String => Value::String(sample_string(self.name.as_ref()).to_owned()),
         }
     }
 }
@@ -387,11 +400,11 @@ pub enum TargetRole {
 }
 
 /// 声明一个参数和房间路径的关系。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetSpec {
-    pub param: &'static str,
+    pub param: Cow<'static, str>,
     /// 房间路径的第一段，如 `group` / `private`。由适配器声明，core 只比对。
-    pub room_kind: &'static str,
+    pub room_kind: Cow<'static, str>,
     pub role: TargetRole,
 }
 
@@ -399,8 +412,8 @@ impl TargetSpec {
     /// 这个参数是房间目标：在 `room_kind` 类型的房间里必须等于房间的 id。
     pub const fn room(param: &'static str, room_kind: &'static str) -> Self {
         Self {
-            param,
-            room_kind,
+            param: Cow::Borrowed(param),
+            room_kind: Cow::Borrowed(room_kind),
             role: TargetRole::Room,
         }
     }
@@ -409,29 +422,31 @@ impl TargetSpec {
     /// 不能按房间目标校验。
     pub const fn member(param: &'static str, room_kind: &'static str) -> Self {
         Self {
-            param,
-            room_kind,
+            param: Cow::Borrowed(param),
+            room_kind: Cow::Borrowed(room_kind),
             role: TargetRole::Member,
         }
     }
 }
 
 /// 一个平台方法的声明。适配器自己给，core 只认这个形状。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 字段都是 `Cow`：内置适配器用静态借用，动态/外置适配器可以构造自己的目录。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodSpec {
     /// 全名，强制 `resource.method`（`forward.get_content`）。
-    pub name: &'static str,
-    pub summary: &'static str,
+    pub name: Cow<'static, str>,
+    pub summary: Cow<'static, str>,
     /// 用途标签，跨归属表达「这是干什么的」。从 [`tags`] 里挑。
-    pub tags: &'static [&'static str],
+    pub tags: Cow<'static, [Cow<'static, str>]>,
     pub risk: Risk,
     /// 这个能力是「房间里的事」还是「账号上的事」。
     ///
     /// 好友列表、账号资料这类跟房间无关：模型不该为了查好友列表先编一个群号出来。
     pub scope: Scope,
-    pub params: &'static [ParamSpec],
+    pub params: Cow<'static, [ParamSpec]>,
     /// 哪些参数是房间目标、哪些是成员目标。空 = 这个方法没有房间目标参数。
-    pub targets: &'static [TargetSpec],
+    pub targets: Cow<'static, [TargetSpec]>,
     /// 这个方法做什么（读/写/发送/删除）。
     pub effect: Effect,
     /// 调用成功后要不要写流水，以及写消息还是事件。
@@ -441,21 +456,26 @@ pub struct MethodSpec {
 impl MethodSpec {
     /// 归属：名字里点号前面那段。跟平台 API 的命名空间对齐，模型看到 `{"type":"forward"}`
     /// 就能联想到 `forward.*`。
-    pub fn group(&self) -> &'static str {
-        self.name.split('.').next().unwrap_or(self.name)
+    pub fn group(&self) -> &str {
+        self.name.as_ref().split('.').next().unwrap_or(self.name.as_ref())
     }
 
     /// 带不带这个标签。大小写不敏感——模型未必记得住声明时是大写还是小写。
     pub fn has_tag(&self, tag: &str) -> bool {
-        self.tags.iter().any(|item| item.eq_ignore_ascii_case(tag))
+        self.tags
+            .iter()
+            .any(|item| item.as_ref().eq_ignore_ascii_case(tag))
     }
 
     /// 这个词命中不命中：名字、说明、标签任一含它都算。
     pub fn matches(&self, needle: &str) -> bool {
         let needle = needle.to_lowercase();
-        self.name.to_lowercase().contains(&needle)
-            || self.summary.to_lowercase().contains(&needle)
-            || self.tags.iter().any(|tag| tag.to_lowercase().contains(&needle))
+        self.name.as_ref().to_lowercase().contains(&needle)
+            || self.summary.as_ref().to_lowercase().contains(&needle)
+            || self
+                .tags
+                .iter()
+                .any(|tag| tag.as_ref().to_lowercase().contains(&needle))
     }
 
     /// 参数表渲染成 JSON Schema。
@@ -464,10 +484,10 @@ impl MethodSpec {
     pub fn params_schema(&self) -> Value {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
-        for param in self.params {
-            properties.insert(param.name.to_owned(), param.to_schema());
+        for param in self.params.iter() {
+            properties.insert(param.name.as_ref().to_owned(), param.to_schema());
             if param.required {
-                required.push(Value::String(param.name.to_owned()));
+                required.push(Value::String(param.name.as_ref().to_owned()));
             }
         }
         let mut schema = serde_json::Map::new();
@@ -488,7 +508,7 @@ impl MethodSpec {
     pub fn example_call(&self) -> Value {
         let mut params = serde_json::Map::new();
         for param in self.params.iter().filter(|param| param.required) {
-            params.insert(param.name.to_owned(), param.sample());
+            params.insert(param.name.as_ref().to_owned(), param.sample());
         }
         serde_json::json!({
             "method": self.name,
@@ -571,11 +591,12 @@ pub trait Outbound: Send {
 
     /// 这条连接声明了哪些平台方法。
     ///
+    /// 返回 `Arc` 而不是静态切片：外置/动态适配器的目录是运行时构造的。
     /// 默认空表——只有实现了平台特有能力才需要覆盖。`connection` 由分发层传进来，
     /// 单连接的适配器可以不理；[`Outbounds`] 用它挑对应的那条。
-    fn catalog(&self, connection: &str) -> &'static [MethodSpec] {
+    fn catalog(&self, connection: &str) -> Arc<[MethodSpec]> {
         let _ = connection;
-        &[]
+        Arc::from(Vec::<MethodSpec>::new())
     }
 
     /// 调一个平台方法，返回平台原始结果，以及这次调用顺带产生的流水记录。
@@ -659,11 +680,11 @@ impl Outbound for Outbounds {
         }
     }
 
-    fn catalog(&self, connection: &str) -> &'static [MethodSpec] {
+    fn catalog(&self, connection: &str) -> Arc<[MethodSpec]> {
         match self.handle_for(connection) {
             Some(outbound) => outbound.catalog(connection),
             // 没接这条连接：空表。上层会报「没有这个连接」，不用在这编一套。
-            None => &[],
+            None => Arc::from(Vec::<MethodSpec>::new()),
         }
     }
 
@@ -698,7 +719,7 @@ impl OutboundHandle {
             .send(room, elements)
     }
 
-    pub fn catalog(&self, connection: &str) -> &'static [MethodSpec] {
+    pub fn catalog(&self, connection: &str) -> Arc<[MethodSpec]> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -816,22 +837,19 @@ mod tests {
     #[derive(Default)]
     struct Platformy;
 
-    static FORWARD_PARAMS: &[ParamSpec] = &[ParamSpec {
-        name: "id",
-        ty: ParamType::String,
-        required: true,
-        desc: "转发 id",
-        values: &[],
-    }];
+    static FORWARD_PARAMS: &[ParamSpec] = &[ParamSpec::required("id", "转发 id")];
+
+    static FORWARD_TAGS: &[Cow<'static, str>] =
+        &[Cow::Borrowed(tags::FORWARD), Cow::Borrowed(tags::MESSAGE)];
 
     static METHODS: &[MethodSpec] = &[MethodSpec {
-        name: "forward.get_content",
-        summary: "读合并转发的正文",
-        tags: &[tags::FORWARD, tags::MESSAGE],
+        name: Cow::Borrowed("forward.get_content"),
+        summary: Cow::Borrowed("读合并转发的正文"),
+        tags: Cow::Borrowed(FORWARD_TAGS),
         risk: Risk::Read,
         scope: Scope::Room,
-        params: FORWARD_PARAMS,
-        targets: &[],
+        params: Cow::Borrowed(FORWARD_PARAMS),
+        targets: Cow::Borrowed(&[]),
         effect: Effect::Read,
         record: RecordMode::None,
     }];
@@ -844,8 +862,8 @@ mod tests {
             })
         }
 
-        fn catalog(&self, _connection: &str) -> &'static [MethodSpec] {
-            METHODS
+        fn catalog(&self, _connection: &str) -> Arc<[MethodSpec]> {
+            Arc::from(METHODS.to_vec())
         }
 
         fn call(
@@ -891,13 +909,13 @@ mod tests {
     #[test]
     fn method_group_is_prefix() {
         let spec = MethodSpec {
-            name: "group.get_member_info",
-            summary: "",
-            tags: &[],
+            name: Cow::Borrowed("group.get_member_info"),
+            summary: Cow::Borrowed(""),
+            tags: Cow::Borrowed(&[]),
             risk: Risk::Read,
             scope: Scope::Room,
-            params: &[],
-            targets: &[],
+            params: Cow::Borrowed(&[]),
+            targets: Cow::Borrowed(&[]),
             effect: Effect::Read,
             record: RecordMode::None,
         };
@@ -909,24 +927,24 @@ mod tests {
     fn tag_cuts_across_groups() {
         static MIXED: &[MethodSpec] = &[
             MethodSpec {
-                name: "message.send",
-                summary: "发一条消息",
-                tags: &[tags::SEND, tags::IMAGE],
+                name: Cow::Borrowed("message.send"),
+                summary: Cow::Borrowed("发一条消息"),
+                tags: Cow::Borrowed(&[Cow::Borrowed(tags::SEND), Cow::Borrowed(tags::IMAGE)]),
                 risk: Risk::Write,
                 scope: Scope::Room,
-                params: &[],
-                targets: &[],
+                params: Cow::Borrowed(&[]),
+                targets: Cow::Borrowed(&[]),
                 effect: Effect::Send,
                 record: RecordMode::Message,
             },
             MethodSpec {
-                name: "group.get_member_info",
-                summary: "查群成员",
-                tags: &[tags::MEMBER],
+                name: Cow::Borrowed("group.get_member_info"),
+                summary: Cow::Borrowed("查群成员"),
+                tags: Cow::Borrowed(&[Cow::Borrowed(tags::MEMBER)]),
                 risk: Risk::Read,
                 scope: Scope::Room,
-                params: &[],
-                targets: &[],
+                params: Cow::Borrowed(&[]),
+                targets: Cow::Borrowed(&[]),
                 effect: Effect::Read,
                 record: RecordMode::None,
             },
@@ -935,7 +953,7 @@ mod tests {
         let pictures: Vec<&str> = MIXED
             .iter()
             .filter(|method| method.has_tag("image"))
-            .map(|method| method.name)
+            .map(|method| method.name.as_ref())
             .collect();
         assert_eq!(pictures, vec!["message.send"]);
         assert_eq!(MIXED[0].group(), "message");

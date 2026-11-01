@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use acb_adapter_onebot11::OneBotAdapterFactory;
 use acb_kernel::{
-    AdapterRegistry, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds,
-    PluginManager, SqliteStore, drain_events, serve,
+    AdapterHost, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds, PluginManager,
+    SqliteStore, drain_events, serve,
 };
 use acb_plugin_lua::LuaLoader;
 use acb_plugin_trusted::TrustedLoader;
@@ -74,22 +74,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // 每条连接先占一个发送口，桥建好之后再起守护线程去连。
-    // 适配器由注册表按 kind 实例化；main 不再知道 onebot11 的构造细节。
-    let mut adapters = AdapterRegistry::<SqliteStore>::new();
-    adapters.register(std::sync::Arc::new(OneBotAdapterFactory))?;
-
-    // 入站队列：适配器只往里丢记录，core 的 drain 线程统一 ingest。
-    let (events, event_rx) = EventQueue::channel();
-
-    let mut outbounds = Outbounds::new();
-    let mut launches = Vec::new();
-    for connection in &config.connections {
-        let instance = adapters.create(connection, events.clone())?;
-        outbounds = outbounds.with(connection.id.clone(), instance.outbound);
-        launches.push(instance.launch);
-    }
-
     // 扩展宿主：先装内置 provider，再装树外 manager（ADR-0026 Phase 3）。
     // 树外 manager 只是把 provider 注册进 Root；配置里引用 `trusted.*` 才生效。
     let mut plugins = PluginManager::with_native_builtins();
@@ -97,6 +81,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Lua 脚本插件是可选能力：设了 ACB_LUA_DIR 才装，目录里的 *.lua 变成 lua.* provider。
     if let Some(lua) = LuaLoader::from_env() {
         plugins.install_loader(&lua)?;
+    }
+    // 内置平台适配器也登记在 Root 里；动态/外置适配器以后走同一张表。
+    plugins.register_adapter(Arc::new(OneBotAdapterFactory))?;
+
+    // 入站队列：适配器只往里丢记录，core 的 drain 线程统一 ingest。
+    let (events, event_rx) = EventQueue::channel();
+
+    // 每条连接先占一个发送口，桥建好之后再起守护线程去连。
+    // 适配器由 Root 按 kind 实例化；main 不再知道 onebot11 的构造细节。
+    let mut outbounds = Outbounds::new();
+    let mut launches = Vec::new();
+    for connection in &config.connections {
+        let instance = plugins.create_adapter(connection, events.clone())?;
+        outbounds = outbounds.with(connection.id.clone(), instance.outbound);
+        launches.push(instance.launch);
     }
 
     let bridge = Arc::new(Mutex::new(Bridge::with_plugins(
@@ -122,9 +121,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for launch in launches {
-        let bridge = Arc::clone(&bridge);
-        let shutdown = Arc::clone(&shutdown);
-        std::thread::spawn(move || launch(bridge, shutdown));
+        let host = AdapterHost {
+            events: events.clone(),
+            shutdown: Arc::clone(&shutdown),
+        };
+        std::thread::spawn(move || launch(host));
     }
 
     // 控制指令注册表：控制台靠它把 control 帧推给管理某会话的 harness 连接。

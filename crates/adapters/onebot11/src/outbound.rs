@@ -83,7 +83,7 @@ impl Outbound for OneBotOutbound {
         parse_response(response)
     }
 
-    fn catalog(&self, _connection: &str) -> &'static [MethodSpec] {
+    fn catalog(&self, _connection: &str) -> std::sync::Arc<[MethodSpec]> {
         catalog()
     }
 
@@ -629,7 +629,7 @@ mod tests {
             );
         }
 
-        for method in methods {
+        for method in methods.iter() {
             // 强制 resource.method 写法，目录靠点号前那段分组。
             assert!(
                 method.name.contains('.'),
@@ -646,16 +646,18 @@ mod tests {
     #[test]
     fn declared_methods_and_routes_match() {
         let outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
-        for method in outbound.catalog("qq") {
+        for method in outbound.catalog("qq").iter() {
             assert!(
-                ROUTES.iter().any(|route| route.method == method.name),
+                ROUTES.iter().any(|route| route.method == method.name.as_ref()),
                 "{} 声明了但没有路由",
                 method.name
             );
         }
         for route in ROUTES {
             assert!(
-                catalog().iter().any(|method| method.name == route.method),
+                catalog()
+                    .iter()
+                    .any(|method| method.name.as_ref() == route.method),
                 "{} 有路由但没声明，模型永远查不到它",
                 route.method
             );
@@ -668,29 +670,29 @@ mod tests {
         let methods = catalog();
         let poke = methods
             .iter()
-            .find(|method| method.name == "poke.send")
+            .find(|method| method.name.as_ref() == "poke.send")
             .expect("有 poke");
         assert!(poke
             .targets
             .iter()
-            .any(|target| target.param == "group_id" && target.role == TargetRole::Room));
+            .any(|target| target.param.as_ref() == "group_id" && target.role == TargetRole::Room));
         assert!(poke
             .targets
             .iter()
-            .any(|target| target.param == "user_id" && target.role == TargetRole::Member));
+            .any(|target| target.param.as_ref() == "user_id" && target.role == TargetRole::Member));
 
         let forward = methods
             .iter()
-            .find(|method| method.name == "message.send_forward")
+            .find(|method| method.name.as_ref() == "message.send_forward")
             .expect("有合并转发");
         assert!(forward
             .targets
             .iter()
-            .any(|target| target.param == "group_id" && target.role == TargetRole::Room));
+            .any(|target| target.param.as_ref() == "group_id" && target.role == TargetRole::Room));
         assert!(forward
             .targets
             .iter()
-            .any(|target| target.param == "user_id" && target.role == TargetRole::Room));
+            .any(|target| target.param.as_ref() == "user_id" && target.role == TargetRole::Room));
     }
 
     /// 目录里不许出现重复方法名——否则 platform_call 会静默用第一条。
@@ -698,8 +700,12 @@ mod tests {
     fn method_names_are_unique() {
         let outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
         let mut seen = std::collections::HashSet::new();
-        for method in outbound.catalog("qq") {
-            assert!(seen.insert(method.name), "{} 重复声明了", method.name);
+        for method in outbound.catalog("qq").iter() {
+            assert!(
+                seen.insert(method.name.as_ref()),
+                "{} 重复声明了",
+                method.name
+            );
         }
     }
 
@@ -707,7 +713,8 @@ mod tests {
     #[test]
     fn catalog_covers_what_a_person_can_do_in_a_group() {
         let outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
-        let names: Vec<&str> = outbound.catalog("qq").iter().map(|m| m.name).collect();
+        let methods = outbound.catalog("qq");
+        let names: Vec<&str> = methods.iter().map(|m| m.name.as_ref()).collect();
         for expected in [
             "message.send_group",
             "message.history_group",
@@ -733,9 +740,9 @@ mod tests {
     #[test]
     fn account_level_methods_are_connection_scoped() {
         let outbound = OneBotOutbound::new(LinkSlot::new(), "qq");
-        for method in outbound.catalog("qq") {
+        for method in outbound.catalog("qq").iter() {
             let account_level = matches!(
-                method.name,
+                method.name.as_ref(),
                 "account.login_info"
                     | "account.status"
                     | "account.version"
@@ -972,7 +979,7 @@ mod tests {
         let method = |name: &str| {
             methods
                 .iter()
-                .find(|method| method.name == name)
+                .find(|method| method.name.as_ref() == name)
                 .unwrap_or_else(|| panic!("没有 {name}"))
         };
 

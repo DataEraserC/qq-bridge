@@ -19,8 +19,9 @@ pub mod storage;
 pub mod tools;
 
 pub use adapter::{
-    AdapterCapability, AdapterError, AdapterFactory, AdapterInstance, AdapterManifest,
-    AdapterRegistry, ADAPTER_API_VERSION,
+    AdapterCapability, AdapterError, AdapterFactory, AdapterHost, AdapterInstance,
+    AdapterManifest, ADAPTER_API_VERSION, create_instance, manifest_supports_transport,
+    validate_manifest,
 };
 pub use event_queue::{drain_events, EventQueue, EventReceiver};
 pub use config::{
