@@ -1,20 +1,44 @@
 //! LuaManager / LuaLoader（ADR-0026 Phase 3b）。
 //!
-//! 一个 `.lua` 文件 = 一个 provider，文件所在目录由 `ACB_LUA_DIR` 指定。脚本返回：
+//! 一个 `.lua` 文件 = 一个 provider，文件所在目录由 `ACB_LUA_DIR` 指定。脚本按扩展点
+//! 返回不同形状的 table：
 //!
 //! ```lua
+//! -- wake
 //! return {
-//!   extension = "wake",            -- wake | access
-//!   decide = function(options, context)
-//!     return "wake"                -- wake/stay（也可返回 true/false）
+//!   extension = "wake",
+//!   decide = function(options, context) return "wake" end, -- wake/stay
+//! }
+//!
+//! -- access
+//! return {
+//!   extension = "access",
+//!   decide = function(options, request) return "allow" end, -- allow/deny
+//! }
+//!
+//! -- delivery：返回本轮要投的编号；nil = 用内置默认选批
+//! return {
+//!   extension = "delivery",
+//!   compose = function(options, request)
+//!     return { keep = { request.records[#request.records].id } }
 //!   end,
+//! }
+//!
+//! -- send：before 可改写元素数组，after 只观察回执
+//! return {
+//!   extension = "send",
+//!   before = function(context, elements)
+//!     elements[#elements + 1] = { type = "text", text = " [签名]" }
+//!     return elements
+//!   end,
+//!   after = function(context, sent) end,
 //! }
 //! ```
 //!
-//! 文件名就是 provider 名，最终 id 是 `lua.<文件名>`。`options` / `context` 是只读的
-//! 普通 table；脚本拿不到 Store、Bridge 或配置写入能力。每次调用最多 50ms，死循环会被
-//! 指令钩子打断，按「不唤醒 / 拒绝访问」处理并记一次失败（manager 的 health 会变成
-//! Degraded）。
+//! 文件名就是 provider 名，最终 id 是 `lua.<文件名>`。`options` / `context` / `request`
+//! 是普通 table；脚本拿不到 Store、Bridge 或配置写入能力。每次调用最多 50ms，死循环会被
+//! 指令钩子打断：wake/access 按安全侧兜底，delivery 回退内置 composer，send 的 before
+//! 报错则这次发送失败。失败数累计在 manager health 里。
 //!
 //! LuaManager 本身是 native 实现：先有它（以及 mlua 运行时），LuaLoader 才能加载脚本。
 //! 这是 ADR-0026 的 bootstrap 约束——manager 不能由自己管理的格式来加载。
@@ -27,11 +51,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use acb_kernel::{
-    AccessDecision, AccessPolicy, AccessProvider, AccessRequest, Capability, ExtensionPoint, Health,
-    LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin, PluginError, PluginLoader,
-    PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, ReloadScope,
-    WakeContext, WakeDecision, WakePolicy, WakeProvider, PLUGIN_API_VERSION,
+    AccessDecision, AccessPolicy, AccessProvider, AccessRequest, Capability, DeliveryComposer,
+    DeliveryPlan, DeliveryPolicy, DeliveryRequest, Element, ExtensionPoint, Health, LoaderKind,
+    LoaderManifest, ManagerManifest, ManagerPlugin, Omitted, PluginError, PluginLoader,
+    PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, Record,
+    RecordKind, ReloadScope, SendContext, SendHook, SenderRole, Sent, WakeContext, WakeDecision,
+    WakePolicy, WakeProvider, default_delivery_plan, PLUGIN_API_VERSION,
 };
+use acb_proto::element::flatten_text;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, RegistryKey, StdLib, Table, Value, VmState};
 
 /// Lua manager 的 namespace。脚本不能自己挑 namespace，避免和别的 manager 抢。
@@ -141,6 +168,95 @@ impl AccessProvider for LuaAccessProvider {
     }
 }
 
+struct LuaDeliveryComposer {
+    caller: LuaCaller,
+}
+
+impl DeliveryComposer for LuaDeliveryComposer {
+    fn compose(&self, options: &DeliveryPolicy, request: &DeliveryRequest<'_>) -> DeliveryPlan {
+        let result = self.caller.call(|lua, function| {
+            let options = delivery_options_table(lua, options)?;
+            let request = delivery_request_table(lua, request)?;
+            function.call::<Value>((options, request))
+        });
+        match result {
+            Ok(Value::Nil) => default_delivery_plan(request),
+            Ok(value) => match interpret_delivery_plan(value) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.caller.record_failure(&error);
+                    default_delivery_plan(request)
+                }
+            },
+            Err(error) => {
+                self.caller.record_failure(&error);
+                default_delivery_plan(request)
+            }
+        }
+    }
+}
+
+struct LuaSendHook {
+    before: Option<LuaCaller>,
+    after: Option<LuaCaller>,
+}
+
+impl SendHook for LuaSendHook {
+    fn before_send(
+        &self,
+        context: &SendContext<'_>,
+        elements: &mut Vec<Element>,
+    ) -> Result<(), PluginError> {
+        let Some(caller) = &self.before else {
+            return Ok(());
+        };
+        let result = caller.call(|lua, function| {
+            let context = send_context_table(lua, context)?;
+            let elements = elements_to_table(lua, elements)?;
+            function.call::<Value>((context, elements))
+        });
+        let replacement = match result {
+            Ok(Value::Nil) => return Ok(()),
+            Ok(Value::Table(table)) => elements_from_table(&table),
+            Ok(other) => Err(mlua::Error::runtime(format!(
+                "send.before 要返回元素数组或 nil，收到 {other:?}"
+            ))),
+            Err(error) => Err(error),
+        };
+        match replacement {
+            Ok(new_elements) => {
+                *elements = new_elements;
+                Ok(())
+            }
+            Err(error) => {
+                caller.record_failure(&error);
+                Err(provider_error(caller, &error))
+            }
+        }
+    }
+
+    fn after_send(&self, context: &SendContext<'_>, sent: &Sent) {
+        let Some(caller) = &self.after else {
+            return;
+        };
+        let result = caller.call(|lua, function| {
+            let context = send_context_table(lua, context)?;
+            let sent = sent_table(lua, sent)?;
+            function.call::<Value>((context, sent))
+        });
+        if let Err(error) = result {
+            caller.record_failure(&error);
+        }
+    }
+}
+
+fn provider_error(caller: &LuaCaller, error: &mlua::Error) -> PluginError {
+    PluginError::Provider {
+        id: caller.label.clone(),
+        detail: error.to_string(),
+    }
+}
+
 /// 一个已经加载好的 provider：descriptor 信息和可克隆的实例。
 struct LoadedProvider {
     id: ProviderId,
@@ -151,6 +267,8 @@ struct LoadedProvider {
 enum LoadedInstance {
     Wake(Arc<dyn WakeProvider>),
     Access(Arc<dyn AccessProvider>),
+    Delivery(Arc<dyn DeliveryComposer>),
+    Send(Arc<dyn SendHook>),
 }
 
 impl LoadedProvider {
@@ -158,6 +276,8 @@ impl LoadedProvider {
         match &self.instance {
             LoadedInstance::Wake(provider) => ProviderInstance::Wake(provider.clone()),
             LoadedInstance::Access(provider) => ProviderInstance::Access(provider.clone()),
+            LoadedInstance::Delivery(composer) => ProviderInstance::Delivery(composer.clone()),
+            LoadedInstance::Send(hook) => ProviderInstance::Send(hook.clone()),
         }
     }
 }
@@ -191,7 +311,12 @@ impl ManagerPlugin for LuaManager {
         ManagerManifest::new(
             self.namespace.clone(),
             PLUGIN_API_VERSION,
-            vec![Capability::WakeDecision, Capability::AccessDecision],
+            vec![
+                Capability::WakeDecision,
+                Capability::AccessDecision,
+                Capability::DeliverPlan,
+                Capability::SendHook,
+            ],
         )
     }
 
@@ -270,7 +395,12 @@ impl PluginLoader for LuaLoader {
         LoaderManifest::new(
             LoaderKind::Script,
             PLUGIN_API_VERSION,
-            vec![ExtensionPoint::Wake, ExtensionPoint::Access],
+            vec![
+                ExtensionPoint::Wake,
+                ExtensionPoint::Access,
+                ExtensionPoint::Delivery,
+                ExtensionPoint::Send,
+            ],
         )
     }
 
@@ -320,6 +450,8 @@ fn load_scripts(
         let capability = match loaded.extension {
             ExtensionPoint::Wake => Capability::WakeDecision,
             ExtensionPoint::Access => Capability::AccessDecision,
+            ExtensionPoint::Delivery => Capability::DeliverPlan,
+            ExtensionPoint::Send => Capability::SendHook,
             point => {
                 return Err(PluginError::UnsupportedExtensionPoint {
                     id: loaded.id.to_string(),
@@ -371,43 +503,108 @@ fn load_script(
 
     let extension: String = table.get("extension").map_err(|error| {
         PluginError::Loader(format!(
-            "{}：缺少 extension（要写 \"wake\" 或 \"access\"）：{error}",
+            "{}：缺少 extension（wake / access / delivery / send）：{error}",
             path.display()
         ))
     })?;
     let extension = match extension.as_str() {
         "wake" => ExtensionPoint::Wake,
         "access" => ExtensionPoint::Access,
+        "delivery" => ExtensionPoint::Delivery,
+        "send" => ExtensionPoint::Send,
         other => {
             return Err(PluginError::Loader(format!(
-                "{}：不支持的 extension {other:?}（只支持 \"wake\" / \"access\"）",
+                "{}：不支持的 extension {other:?}（只支持 wake / access / delivery / send）",
                 path.display()
             )));
         }
     };
-    let decide: Function = table.get("decide").map_err(|error| {
-        PluginError::Loader(format!(
-            "{}：缺少 decide 函数：{error}",
-            path.display()
-        ))
-    })?;
-    let function = lua.create_registry_value(decide).map_err(|error| {
-        PluginError::Loader(format!("{}：保存 decide 失败：{error}", path.display()))
-    })?;
-
-    let caller = LuaCaller {
-        lua: Arc::new(Mutex::new(lua)),
-        function,
-        timeout: LUA_CALL_TIMEOUT,
-        failures: failures.clone(),
-        label: id.to_string(),
-    };
     let instance = match extension {
         ExtensionPoint::Wake => {
-            LoadedInstance::Wake(Arc::new(LuaWakeProvider { caller }))
+            let function = required_function(&table, "decide", path)?;
+            let key = lua.create_registry_value(function).map_err(|error| {
+                PluginError::Loader(format!("{}：保存 decide 失败：{error}", path.display()))
+            })?;
+            LoadedInstance::Wake(Arc::new(LuaWakeProvider {
+                caller: LuaCaller {
+                    lua: Arc::new(Mutex::new(lua)),
+                    function: key,
+                    timeout: LUA_CALL_TIMEOUT,
+                    failures: failures.clone(),
+                    label: id.to_string(),
+                },
+            }))
         }
         ExtensionPoint::Access => {
-            LoadedInstance::Access(Arc::new(LuaAccessProvider { caller }))
+            let function = required_function(&table, "decide", path)?;
+            let key = lua.create_registry_value(function).map_err(|error| {
+                PluginError::Loader(format!("{}：保存 decide 失败：{error}", path.display()))
+            })?;
+            LoadedInstance::Access(Arc::new(LuaAccessProvider {
+                caller: LuaCaller {
+                    lua: Arc::new(Mutex::new(lua)),
+                    function: key,
+                    timeout: LUA_CALL_TIMEOUT,
+                    failures: failures.clone(),
+                    label: id.to_string(),
+                },
+            }))
+        }
+        ExtensionPoint::Delivery => {
+            let function = required_function(&table, "compose", path)?;
+            let key = lua.create_registry_value(function).map_err(|error| {
+                PluginError::Loader(format!("{}：保存 compose 失败：{error}", path.display()))
+            })?;
+            LoadedInstance::Delivery(Arc::new(LuaDeliveryComposer {
+                caller: LuaCaller {
+                    lua: Arc::new(Mutex::new(lua)),
+                    function: key,
+                    timeout: LUA_CALL_TIMEOUT,
+                    failures: failures.clone(),
+                    label: id.to_string(),
+                },
+            }))
+        }
+        ExtensionPoint::Send => {
+            let before = optional_function(&table, "before", path)?;
+            let after = optional_function(&table, "after", path)?;
+            if before.is_none() && after.is_none() {
+                return Err(PluginError::Loader(format!(
+                    "{}：send 脚本至少要有一个 before 或 after",
+                    path.display()
+                )));
+            }
+            let before_key = before
+                .map(|function| lua.create_registry_value(function))
+                .transpose()
+                .map_err(|error| {
+                    PluginError::Loader(format!(
+                        "{}：保存 before 失败：{error}",
+                        path.display()
+                    ))
+                })?;
+            let after_key = after
+                .map(|function| lua.create_registry_value(function))
+                .transpose()
+                .map_err(|error| {
+                    PluginError::Loader(format!("{}：保存 after 失败：{error}", path.display()))
+                })?;
+            let lua = Arc::new(Mutex::new(lua));
+            let before = before_key.map(|key| LuaCaller {
+                lua: lua.clone(),
+                function: key,
+                timeout: LUA_CALL_TIMEOUT,
+                failures: failures.clone(),
+                label: format!("{id}.before"),
+            });
+            let after = after_key.map(|key| LuaCaller {
+                lua,
+                function: key,
+                timeout: LUA_CALL_TIMEOUT,
+                failures: failures.clone(),
+                label: format!("{id}.after"),
+            });
+            LoadedInstance::Send(Arc::new(LuaSendHook { before, after }))
         }
         _ => unreachable!("extension 已在上面筛过"),
     };
@@ -415,6 +612,28 @@ fn load_script(
         id,
         extension,
         instance,
+    })
+}
+
+fn required_function(table: &Table, name: &str, path: &Path) -> Result<Function, PluginError> {
+    table.get::<Function>(name).map_err(|error| {
+        PluginError::Loader(format!(
+            "{}：缺少 {name} 函数：{error}",
+            path.display()
+        ))
+    })
+}
+
+fn optional_function(
+    table: &Table,
+    name: &str,
+    path: &Path,
+) -> Result<Option<Function>, PluginError> {
+    table.get::<Option<Function>>(name).map_err(|error| {
+        PluginError::Loader(format!(
+            "{}：{name} 不是函数：{error}",
+            path.display()
+        ))
     })
 }
 
@@ -481,6 +700,235 @@ fn string_list(lua: &Lua, items: &[impl AsRef<str>]) -> mlua::Result<Table> {
         table.set(index + 1, item.as_ref())?;
     }
     Ok(table)
+}
+
+fn delivery_options_table(lua: &Lua, options: &DeliveryPolicy) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("provider", options.provider.to_string())?;
+    Ok(table)
+}
+
+fn delivery_request_table(lua: &Lua, request: &DeliveryRequest<'_>) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("session", request.session)?;
+    table.set("room", request.room.to_string())?;
+    table.set("limit", request.limit)?;
+    let records = lua.create_table()?;
+    for (index, record) in request.records.iter().enumerate() {
+        records.set(index + 1, record_table(lua, record)?)?;
+    }
+    table.set("records", records)?;
+    Ok(table)
+}
+
+fn record_table(lua: &Lua, record: &Record) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("id", record.id)?;
+    table.set("room", record.room.to_string())?;
+    table.set("at", record.at)?;
+    table.set("at_self", record.at_self)?;
+    table.set("reply_to_self", record.reply_to_self)?;
+    table.set("redelivery", record.redelivery)?;
+    table.set("note", record.note.clone())?;
+    table.set("platform_id", record.platform_id.clone())?;
+    table.set("text", flatten_text(&record.elements))?;
+
+    let sender = lua.create_table()?;
+    sender.set("id", record.sender.id.clone())?;
+    sender.set("name", record.sender.name.clone())?;
+    sender.set("role", record.sender.role.as_ref().map(role_name))?;
+    table.set("sender", sender)?;
+
+    match &record.kind {
+        RecordKind::Message => {
+            table.set("kind", "message")?;
+            table.set("event", Option::<String>::None)?;
+        }
+        RecordKind::Event { event } => {
+            table.set("kind", "event")?;
+            table.set("event", event.clone())?;
+        }
+    }
+
+    table.set("elements", elements_to_table(lua, &record.elements)?)?;
+    match &record.quote_ref {
+        Some(quote) => {
+            let quote_table = lua.create_table()?;
+            quote_table.set("platform_id", quote.platform_id.clone())?;
+            quote_table.set("id", quote.id)?;
+            table.set("quote_ref", quote_table)?;
+        }
+        None => table.set("quote_ref", Value::Nil)?,
+    }
+    Ok(table)
+}
+
+fn role_name(role: &SenderRole) -> &'static str {
+    match role {
+        SenderRole::SystemAdmin => "system_admin",
+        SenderRole::Owner => "owner",
+        SenderRole::Admin => "admin",
+    }
+}
+
+fn elements_to_table(lua: &Lua, elements: &[Element]) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    for (index, element) in elements.iter().enumerate() {
+        table.set(index + 1, element_to_table(lua, element)?)?;
+    }
+    Ok(table)
+}
+
+fn element_to_table(lua: &Lua, element: &Element) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    match element {
+        Element::Text { text } => {
+            table.set("type", "text")?;
+            table.set("text", text.clone())?;
+        }
+        Element::At { target, all } => {
+            table.set("type", "at")?;
+            table.set("target", target.clone())?;
+            table.set("all", *all)?;
+        }
+        Element::Quote { message_id } => {
+            table.set("type", "quote")?;
+            table.set("message_id", message_id.clone())?;
+        }
+        Element::Image { url, alt } => {
+            table.set("type", "image")?;
+            table.set("url", url.clone())?;
+            table.set("alt", alt.clone())?;
+        }
+        Element::Audio { url } => {
+            table.set("type", "audio")?;
+            table.set("url", url.clone())?;
+        }
+        Element::Video { url } => {
+            table.set("type", "video")?;
+            table.set("url", url.clone())?;
+        }
+        Element::File { url, name } => {
+            table.set("type", "file")?;
+            table.set("url", url.clone())?;
+            table.set("name", name.clone())?;
+        }
+        Element::Face { platform, id } => {
+            table.set("type", "face")?;
+            table.set("platform", platform.clone())?;
+            table.set("id", id.clone())?;
+        }
+        Element::Opaque { platform, payload } => {
+            table.set("type", "opaque")?;
+            table.set("platform", platform.clone())?;
+            table.set(
+                "payload_json",
+                serde_json::to_string(payload).map_err(|error| {
+                    mlua::Error::runtime(format!("opaque 载荷序列化失败：{error}"))
+                })?,
+            )?;
+        }
+    }
+    Ok(table)
+}
+
+fn elements_from_table(table: &Table) -> mlua::Result<Vec<Element>> {
+    let mut elements = Vec::new();
+    for value in table.sequence_values::<Table>() {
+        elements.push(element_from_table(&value?)?);
+    }
+    Ok(elements)
+}
+
+fn element_from_table(table: &Table) -> mlua::Result<Element> {
+    let kind: String = table.get("type")?;
+    Ok(match kind.as_str() {
+        "text" => Element::Text {
+            text: table.get::<String>("text")?,
+        },
+        "at" => Element::At {
+            target: table.get::<Option<String>>("target")?.unwrap_or_default(),
+            all: table.get::<Option<bool>>("all")?.unwrap_or(false),
+        },
+        "quote" => Element::Quote {
+            message_id: table.get::<String>("message_id")?,
+        },
+        "image" => Element::Image {
+            url: table.get::<String>("url")?,
+            alt: table.get::<Option<String>>("alt")?,
+        },
+        "audio" => Element::Audio {
+            url: table.get::<String>("url")?,
+        },
+        "video" => Element::Video {
+            url: table.get::<String>("url")?,
+        },
+        "file" => Element::File {
+            url: table.get::<String>("url")?,
+            name: table.get::<String>("name")?,
+        },
+        "face" => Element::Face {
+            platform: table.get::<String>("platform")?,
+            id: table.get::<String>("id")?,
+        },
+        "opaque" => {
+            let payload_json: String = table.get("payload_json")?;
+            let payload = serde_json::from_str(&payload_json).map_err(|error| {
+                mlua::Error::runtime(format!("opaque 载荷不是合法 JSON：{error}"))
+            })?;
+            Element::Opaque {
+                platform: table.get::<String>("platform")?,
+                payload,
+            }
+        }
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "不认识的元素类型 {other:?}；合法值：text/at/quote/image/audio/video/file/face/opaque"
+            )));
+        }
+    })
+}
+
+fn send_context_table(lua: &Lua, context: &SendContext<'_>) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("session", context.session)?;
+    table.set("room", context.room.to_string())?;
+    table.set("origin", context.origin.as_str())?;
+    Ok(table)
+}
+
+fn sent_table(lua: &Lua, sent: &Sent) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("platform_id", sent.platform_id.clone())?;
+    table.set("at", sent.at)?;
+    Ok(table)
+}
+
+fn interpret_delivery_plan(value: Value) -> mlua::Result<DeliveryPlan> {
+    let Value::Table(table) = value else {
+        return Err(mlua::Error::runtime(format!(
+            "delivery composer 要返回 table 或 nil，收到 {value:?}"
+        )));
+    };
+    let keep = match table.get::<Option<Table>>("keep")? {
+        Some(keep) => {
+            let mut ids = Vec::new();
+            for value in keep.sequence_values::<u64>() {
+                ids.push(value?);
+            }
+            ids
+        }
+        None => Vec::new(),
+    };
+    let omitted = match table.get::<Option<Table>>("omitted")? {
+        Some(omitted) => Some(Omitted {
+            from: omitted.get("from")?,
+            to: omitted.get("to")?,
+            count: omitted.get("count")?,
+        }),
+        None => None,
+    };
+    Ok(DeliveryPlan { keep, omitted })
 }
 
 fn interpret_wake(value: Value) -> mlua::Result<WakeDecision> {

@@ -17,7 +17,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::config::{
-    AccessPolicy, Config, DeliveryPolicy, OutboundPolicy, WakeDecision, WakeInput, WakePolicy,
+    AccessPolicy, Config, DeliveryPolicy, WakeDecision, WakeInput, WakePolicy,
 };
 use crate::outbound::Sent;
 
@@ -325,6 +325,8 @@ pub enum PluginError {
     ReservedNamespace(String),
     #[error("子树管理器 {namespace} 出错：{detail}")]
     Manager { namespace: String, detail: String },
+    #[error("provider {id} 出错：{detail}")]
+    Provider { id: String, detail: String },
     #[error("manager 子树太深：{namespace}（上限 {max} 层）")]
     ManagerDepth { namespace: String, max: usize },
     #[error("manager 环路：{0}")]
@@ -617,6 +619,15 @@ pub enum SendOrigin {
     Message,
     /// 一轮失败后的通知。
     TurnFailure,
+}
+
+impl SendOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::TurnFailure => "turn_failure",
+        }
+    }
 }
 
 /// 发送钩子的上下文。hook 只能看到这些，拿不到 Store / ticket / 水位。

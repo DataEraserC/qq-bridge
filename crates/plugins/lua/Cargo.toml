@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "LuaManager / LuaLoader：用 Lua 脚本注册扩展点（ADR-0026 Phase 3b）"
+description = "LuaManager / LuaLoader：用 Lua 脚本注册扩展点（ADR-0026 Phase 3b/4b）"
 
 [dependencies]
 acb-kernel = { path = "../../kernel" }
+acb-proto = { path = "../../proto" }
+serde_json = { workspace = true }
 # Lua 5.4 编进二进制，不依赖系统里的 Lua；send 让 Lua 状态可以跨线程共享。
 mlua = { version = "0.11", features = ["lua54", "vendored", "send"] }

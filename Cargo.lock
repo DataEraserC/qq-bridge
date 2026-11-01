@@ -44,7 +44,9 @@ name = "acb-plugin-lua"
 version = "0.1.0"
 dependencies = [
  "acb-kernel",
+ "acb-proto",
  "mlua",
+ "serde_json",
 ]
 
 [[package]]

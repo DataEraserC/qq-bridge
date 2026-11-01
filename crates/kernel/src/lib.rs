@@ -45,7 +45,7 @@ pub use plugin::{
     PluginLoader, PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions,
     ReloadScope, SendContext, SendHook, SendOrigin, SubscribedAccessProvider, WakeContext,
     WakeProvider, ALL_ROOMS_ACCESS_PROVIDER, DEFAULT_ACCESS_PROVIDER, DEFAULT_DELIVERY_PROVIDER,
-    ELEVATED_ACCESS_PROVIDER, PLUGIN_API_VERSION,
+    ELEVATED_ACCESS_PROVIDER, PLUGIN_API_VERSION, default_delivery_plan,
 };
 pub use storage::{
     Counts, Cursor, Deliveries, FEEDBACK_CAP, Feedback, FeedbackDraft, Feedbacks, MIN_KEPT,

@@ -117,7 +117,10 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - NativeLoader 注册内置 `acb.delivery.default`；Root 支持 Delivery / Send 两个扩展点，未知 provider 启动时拒绝。
   - 失败通知也走发送钩子（origin = turn_failure）；`platform_call` 的发送类方法不经过 send hooks——那类消息由适配器直接产出 `OutgoingRecord`，core 不认识平台消息段。
   - native composer / hook 是受信任的同步调用，本轮不加超时；树外或动态载体接入这些扩展点时再补超时与隔离。
-  - 尚未做：把 composer / send hooks 开放给 LuaManager（Lua 脚本目前仍只支持 wake / access）。
+- **Phase 4b（2026-11-01）**：LuaManager 支持 delivery / send 扩展点。
+  - `extension = "delivery"`：`compose(options, request)`，`request.records` 是普通 table（含 id / at / sender / kind / text / elements 等），返回 `{ keep = {编号...}, omitted = {from,to,count} }`；返回 nil 或报错时回退内置 composer。
+  - `extension = "send"`：`before(context, elements)` 可改写元素数组并返回，`after(context, sent)` 只观察回执。元素九种类型完整往返，opaque 载荷用 `payload_json` 字符串。
+  - 继承 Lua 的 50ms 超时；send.before 报错则这次发送失败，send.after 报错只累计 health（Degraded）。
 
 ## 参考
 

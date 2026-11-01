@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use acb_kernel::{
-    AccessAction, AccessRequest, Config, PluginManager, ProviderId, ReloadScope, RoomId,
+    AccessAction, AccessRequest, Config, DeliveryPolicy, DeliveryRequest, Element, PluginManager,
+    ProviderId, Record, RecordKind, ReloadScope, RoomId, SendContext, SendOrigin, Sender, Sent,
     WakeContext, WakeDecision, WakePolicy,
 };
 
@@ -74,6 +75,27 @@ fn access_request<'a>(room: &'a RoomId, action: AccessAction) -> AccessRequest<'
         room: Some(room),
         action,
         subscriptions: &[],
+    }
+}
+
+fn record(id: u64, text: &str) -> Record {
+    Record {
+        id,
+        room: RoomId::new("qq", "group/1").expect("合法"),
+        kind: RecordKind::Message,
+        sender: Sender {
+            id: "10001".to_owned(),
+            name: "老王".to_owned(),
+            role: None,
+        },
+        at: 0,
+        elements: vec![Element::text(text)],
+        at_self: false,
+        reply_to_self: false,
+        platform_id: None,
+        quote_ref: None,
+        redelivery: None,
+        note: None,
     }
 }
 
@@ -304,4 +326,225 @@ return {
     "#;
     let config = Config::parse(text).expect("配置合法");
     plugins.validate_config(&config).expect("lua provider 应当能解析");
+}
+
+#[test]
+fn delivery_composer_runs_from_a_lua_script() {
+    let dir = TempDir::new("delivery");
+    dir.write(
+        "newest.lua",
+        r#"
+return {
+  extension = "delivery",
+  compose = function(options, request)
+    local keep = {}
+    if #request.records > 0 then
+      keep[1] = request.records[#request.records].id
+    end
+    return { keep = keep }
+  end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.newest").expect("合法");
+    let composer = plugins
+        .resolve_delivery(&id, &DeliveryPolicy::default())
+        .expect("Lua composer 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let records = vec![record(1, "第一"), record(2, "第二")];
+    let plan = composer.compose(
+        &DeliveryPolicy::default(),
+        &DeliveryRequest {
+            session: "main",
+            room: &room,
+            records: &records,
+            limit: 10,
+        },
+    );
+    assert_eq!(plan.keep, vec![2], "脚本只留最新一条");
+    assert_eq!(plan.omitted, None);
+}
+
+#[test]
+fn delivery_error_falls_back_to_the_default_plan() {
+    let dir = TempDir::new("delivery-bad");
+    dir.write(
+        "bad.lua",
+        r#"
+return {
+  extension = "delivery",
+  compose = function() return "nope" end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.bad").expect("合法");
+    let composer = plugins
+        .resolve_delivery(&id, &DeliveryPolicy::default())
+        .expect("Lua composer 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let records = vec![record(1, "第一"), record(2, "第二")];
+    let plan = composer.compose(
+        &DeliveryPolicy::default(),
+        &DeliveryRequest {
+            session: "main",
+            room: &room,
+            records: &records,
+            limit: 10,
+        },
+    );
+    assert_eq!(plan.keep, vec![1, 2], "返回错类型时回退默认选批");
+    let health = plugins
+        .manager_health()
+        .into_iter()
+        .find(|entry| entry.namespace == LUA_NAMESPACE)
+        .expect("lua manager 应当在");
+    assert!(matches!(health.health, Health::Degraded(_)));
+}
+
+#[test]
+fn send_hook_rewrites_elements_from_a_lua_script() {
+    let dir = TempDir::new("send");
+    dir.write(
+        "sign.lua",
+        r#"
+return {
+  extension = "send",
+  before = function(context, elements)
+    elements[#elements + 1] = { type = "text", text = " [Lua " .. context.origin .. "]" }
+    return elements
+  end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.sign").expect("合法");
+    let hook = plugins.resolve_send_hook(&id).expect("Lua send hook 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let context = SendContext {
+        session: "main",
+        room: &room,
+        origin: SendOrigin::Message,
+    };
+    let mut elements = vec![
+        Element::text("你好"),
+        Element::Image {
+            url: "https://example.com/a.png".to_owned(),
+            alt: None,
+        },
+    ];
+    hook.before_send(&context, &mut elements).expect("能改写");
+    assert_eq!(elements.len(), 3);
+    match &elements[2] {
+        Element::Text { text } => assert_eq!(text, " [Lua message]"),
+        other => panic!("最后一段应当是文本，收到 {other:?}"),
+    }
+    assert!(
+        matches!(&elements[1], Element::Image { url, .. } if url == "https://example.com/a.png"),
+        "图片段必须原样保留"
+    );
+}
+
+#[test]
+fn send_after_error_is_recorded_in_health() {
+    let dir = TempDir::new("send-after");
+    dir.write(
+        "after_fail.lua",
+        r#"
+return {
+  extension = "send",
+  after = function() error("boom") end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.after_fail").expect("合法");
+    let hook = plugins.resolve_send_hook(&id).expect("Lua send hook 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let context = SendContext {
+        session: "main",
+        room: &room,
+        origin: SendOrigin::Message,
+    };
+    hook.after_send(
+        &context,
+        &Sent {
+            platform_id: "p-1".to_owned(),
+            at: 0,
+        },
+    );
+    let health = plugins
+        .manager_health()
+        .into_iter()
+        .find(|entry| entry.namespace == LUA_NAMESPACE)
+        .expect("lua manager 应当在");
+    assert!(matches!(health.health, Health::Degraded(_)));
+}
+
+#[test]
+fn config_can_reference_lua_delivery_and_send_hooks() {
+    let dir = TempDir::new("config-4b");
+    dir.write(
+        "newest.lua",
+        r#"
+return {
+  extension = "delivery",
+  compose = function(options, request)
+    return { keep = {} }
+  end,
+}
+"#,
+    );
+    dir.write(
+        "sign.lua",
+        r#"
+return {
+  extension = "send",
+  before = function(context, elements) return elements end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let text = r#"
+        [[connections]]
+        id = "qq"
+        platform = "qq"
+        kind = "onebot11"
+        url = "ws://127.0.0.1:3001"
+        account = "10001"
+
+        [[personas]]
+        id = "p"
+        name = "P"
+        text = "你是桥。"
+
+        [[harnesses]]
+        id = "dsh"
+        name = "DSH"
+
+        [[sessions]]
+        id = "main"
+        harness = "dsh"
+        persona = "p"
+        token = "t-main"
+
+        [sessions.delivery]
+        provider = "lua.newest"
+
+        [sessions.outbound]
+        before = ["lua.sign"]
+
+        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/1"
+    "#;
+    let config = Config::parse(text).expect("配置合法");
+    plugins
+        .validate_config(&config)
+        .expect("lua delivery / send hook 应当能解析");
 }
