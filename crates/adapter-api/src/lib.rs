@@ -188,6 +188,45 @@ pub struct WireWakeRequest {
     pub now: i64,
 }
 
+/// access 策略判定的 wire 形状。`room = null` 表示连接级请求。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireAccessRequest {
+    pub session: String,
+    pub connection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
+    pub action: String,
+    #[serde(default)]
+    pub subscriptions: Vec<String>,
+}
+
+/// receive 策略判定的 wire 形状。字段与 kernel 的 `ReceiveRequest` 对齐。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireReceiveRequest {
+    pub connection: String,
+    pub platform: String,
+    pub room: String,
+    pub sender: Sender,
+    pub kind: RecordKind,
+    #[serde(default)]
+    pub elements: Vec<Element>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub at_self: bool,
+}
+
+/// clock 策略判定的 wire 形状。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireClockRequest {
+    pub session: String,
+    pub room: String,
+    pub now: i64,
+    pub last_clock_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_record_at: Option<i64>,
+}
+
 /// 一条入站记录。字段与 kernel 的 `RecordDraft` 对齐，由 core 负责转换。
 #[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
 pub struct WireRecord {

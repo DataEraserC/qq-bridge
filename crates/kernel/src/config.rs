@@ -598,10 +598,10 @@ impl WakePolicy {
         }
 
         // 语义标签优先：适配器把“拍一拍 / reaction / 入群”翻译成跨平台标签。
-        if let Some(tag) = self
+        if self
             .ignore_event_tags
             .iter()
-            .find(|tag| input.tags.iter().any(|candidate| candidate == tag))
+            .any(|tag| input.tags.iter().any(|candidate| candidate == tag))
         {
             return WakeVerdict::stay();
         }

@@ -133,6 +133,14 @@ InboundEvent:
     `platform_methods` 加 `connection`（直接指定另一条连接）与 `all=true`（只给每条订阅连接
     的平台/方法数/事件能力摘要）；`describe_plugins` 的 session 视图增加 `adapters` 数组，
     覆盖本会话订阅的所有连接，`adapter` 仍指向当前轮次那条。
+- **Phase 4 P7（2026-11-01，策略动态库载体扩展）**：wake 之外的决策型策略也能用动态库。
+  - `extension = "access" | "receive" | "clock"`：插件收到 `CoreMessage::Decide`，`point` 标明
+    扩展点，`request` 是 `WireAccessRequest` / `WireReceiveRequest` / `WireClockRequest`，
+    返回 `WireResult::Decision`（`allow`/`deny`、`record`/`drop`、`due`/`skip`）。
+  - 报错按安全侧兜底：access 拒绝、receive 接收、clock 不触发；失败计数只进日志，不刷屏。
+  - `DynamicLoader` 的 loader manifest 列出这五个扩展点；第三方策略插件仍要求
+    `metadata.summary`，wake 额外要求 `effects`。conformance 测试用同一个 cdylib
+    按环境变量切扩展点，真加载并验证三种判定。
 
 ## 参考
 

@@ -26,18 +26,21 @@ use std::time::Duration;
 
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, ENTRY_SYMBOL, EntryFn, HostV1};
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireConnection, WireInstanceConfig, WireManifest, WireResult,
-    WireWakeRequest, decode_line, encode_line,
+    AdapterMessage, CoreMessage, WireAccessRequest, WireClockRequest, WireConnection,
+    WireInstanceConfig, WireManifest, WireReceiveRequest, WireResult, WireWakeRequest, decode_line,
+    encode_line,
 };
 use acb_kernel::wire::{call_error, convert_catalog, send_error};
 use acb_kernel::{
-    AdapterError, AdapterFactory, AdapterHost, AdapterInstance, AdapterManifest, CallError,
-    CallOutcome, Capability, Connection, Element, EventQueue, ExtensionPoint, Health, LoaderKind,
-    LoaderManifest, ManagerManifest, ManagerPlugin, MethodSpec, Outbound, OutboundError,
-    OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager, PluginMetadata,
-    PluginSource, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, RoomId,
-    Sent, WakeContext, WakeDecision, WakePolicy, WakeProvider, WakeVerdict,
-    PLUGIN_API_VERSION, validate_manifest,
+    AccessDecision, AccessPolicy, AccessProvider, AccessRequest, AdapterError, AdapterFactory,
+    AdapterHost, AdapterInstance, AdapterManifest, CallError, CallOutcome, Capability,
+    ClockContext, ClockPolicy, ClockProvider, Connection, Element, EventQueue, ExtensionPoint,
+    Health, LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin, MethodSpec, Outbound,
+    OutboundError, OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager,
+    PluginMetadata, PluginSource, ProviderDescriptor, ProviderId, ProviderInstance,
+    ProviderOptions, ReceiveDecision, ReceivePolicy, ReceiveProvider, ReceiveRequest, RoomId,
+    Sent, WakeContext, WakeDecision, WakePolicy, WakeProvider, WakeVerdict, PLUGIN_API_VERSION,
+    validate_manifest,
 };
 use libloading::Library;
 use serde_json::{Value, json};
@@ -62,7 +65,13 @@ impl PluginLoader for DynamicLoader {
         LoaderManifest::new(
             LoaderKind::Dynamic,
             PLUGIN_API_VERSION,
-            vec![ExtensionPoint::PlatformAdapter, ExtensionPoint::Wake],
+            vec![
+                ExtensionPoint::PlatformAdapter,
+                ExtensionPoint::Wake,
+                ExtensionPoint::Access,
+                ExtensionPoint::Receive,
+                ExtensionPoint::Clock,
+            ],
         )
     }
 
@@ -79,6 +88,9 @@ impl PluginLoader for DynamicLoader {
                 LoadedPlugin::Wake(wake) => manager
                     .install_manager(Arc::new(wake))
                     .map_err(|error| PluginError::Loader(error.to_string()))?,
+                LoadedPlugin::Decision(decision) => manager
+                    .install_manager(Arc::new(decision))
+                    .map_err(|error| PluginError::Loader(error.to_string()))?,
             }
         }
         Ok(())
@@ -88,6 +100,7 @@ impl PluginLoader for DynamicLoader {
 enum LoadedPlugin {
     Adapter(DylibAdapterFactory),
     Wake(DylibWakeManager),
+    Decision(DylibDecisionManager),
 }
 
 impl LoadedPlugin {
@@ -171,6 +184,44 @@ impl LoadedPlugin {
                     table,
                     provider,
                     wire.platform,
+                    wire.id,
+                    metadata,
+                )))
+            }
+            "access" | "receive" | "clock" => {
+                let provider = ProviderId::parse(&wire.id)
+                    .map_err(|error| format!("{} provider id 不合法：{error}", wire.extension))?;
+                if provider.namespace() == "acb" {
+                    return Err("树外插件不能用 acb namespace".into());
+                }
+                if wire.api_version != PLUGIN_API_VERSION {
+                    return Err(format!(
+                        "插件 API 版本 {} 不兼容（需要 {PLUGIN_API_VERSION}）",
+                        wire.api_version
+                    ));
+                }
+                let metadata = PluginMetadata::try_from(wire.metadata)
+                    .map_err(|detail| format!("metadata 不合法：{detail}"))?;
+                if metadata
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(format!("{} 插件必须声明 metadata.summary", wire.extension));
+                }
+                let point = match wire.extension.as_str() {
+                    "access" => ExtensionPoint::Access,
+                    "receive" => ExtensionPoint::Receive,
+                    "clock" => ExtensionPoint::Clock,
+                    _ => unreachable!("已经按扩展点分流"),
+                };
+                Ok(Self::Decision(DylibDecisionManager::new(
+                    Arc::new(library),
+                    table,
+                    provider,
+                    point,
                     wire.id,
                     metadata,
                 )))
@@ -555,6 +606,400 @@ fn wake_options(policy: &WakePolicy) -> Value {
         "events": policy.events,
         "keywords": policy.keywords,
         "ignore_speakers": policy.ignore_speakers,
+    })
+}
+
+/// 动态库决策型策略 provider 的 manager（access / receive / clock）。
+///
+/// 和 wake 一样：一个插件一个子树，namespace 来自 provider id；判定在 core 的同步路径里，
+/// 所以只开放动态库载体（外置进程会在 core 锁内做 I/O）。
+struct DylibDecisionManager {
+    library: Arc<Library>,
+    table: AdapterV1,
+    provider: ProviderId,
+    point: ExtensionPoint,
+    plugin_id: String,
+    metadata: PluginMetadata,
+    cached: Mutex<Option<CachedDecision>>,
+}
+
+enum CachedDecision {
+    Access(Arc<DylibAccessProvider>),
+    Receive(Arc<DylibReceiveProvider>),
+    Clock(Arc<DylibClockProvider>),
+}
+
+impl CachedDecision {
+    fn instance(&self) -> ProviderInstance {
+        match self {
+            Self::Access(provider) => ProviderInstance::Access(provider.clone()),
+            Self::Receive(provider) => ProviderInstance::Receive(provider.clone()),
+            Self::Clock(provider) => ProviderInstance::Clock(provider.clone()),
+        }
+    }
+
+    fn destroy(&self) {
+        match self {
+            Self::Access(provider) => provider.channel.destroy(),
+            Self::Receive(provider) => provider.channel.destroy(),
+            Self::Clock(provider) => provider.channel.destroy(),
+        }
+    }
+}
+
+impl DylibDecisionManager {
+    fn new(
+        library: Arc<Library>,
+        table: AdapterV1,
+        provider: ProviderId,
+        point: ExtensionPoint,
+        plugin_id: String,
+        metadata: PluginMetadata,
+    ) -> Self {
+        Self {
+            library,
+            table,
+            provider,
+            point,
+            plugin_id,
+            metadata,
+            cached: Mutex::new(None),
+        }
+    }
+
+    fn capability(&self) -> Capability {
+        match self.point {
+            ExtensionPoint::Access => Capability::AccessDecision,
+            ExtensionPoint::Receive => Capability::ReceiveDecision,
+            ExtensionPoint::Clock => Capability::ClockDecision,
+            _ => Capability::AccessDecision,
+        }
+    }
+}
+
+impl ManagerPlugin for DylibDecisionManager {
+    fn manifest(&self) -> ManagerManifest {
+        ManagerManifest::new(
+            self.provider.namespace(),
+            PLUGIN_API_VERSION,
+            vec![self.capability()],
+        )
+        .with_metadata(self.metadata.clone())
+    }
+
+    fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        vec![ProviderDescriptor::new(
+            self.provider.clone(),
+            self.point,
+            PLUGIN_API_VERSION,
+            vec![self.capability()],
+        )
+        .with_metadata(self.metadata.clone())
+        .with_source(PluginSource::Dynamic)]
+    }
+
+    fn instantiate(
+        &self,
+        id: &ProviderId,
+        options: ProviderOptions<'_>,
+    ) -> Result<ProviderInstance, PluginError> {
+        if id != &self.provider {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        }
+        let (extension, options_json) = match (self.point, options) {
+            (ExtensionPoint::Access, ProviderOptions::Access(policy)) => {
+                ("access", access_options(policy))
+            }
+            (ExtensionPoint::Receive, ProviderOptions::Receive(policy)) => {
+                ("receive", receive_options(policy))
+            }
+            (ExtensionPoint::Clock, ProviderOptions::Clock(policy)) => {
+                ("clock", clock_options(policy))
+            }
+            (point, _) => {
+                return Err(PluginError::Provider {
+                    id: id.to_string(),
+                    detail: format!("{point:?} provider 收到的 options 类型不对"),
+                });
+            }
+        };
+
+        let mut cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(provider) = cached.as_ref() {
+            return Ok(provider.instance());
+        }
+
+        let channel = Arc::new(
+            DecisionChannel::create(
+                Arc::clone(&self.library),
+                self.table,
+                &self.plugin_id,
+                extension,
+                options_json,
+            )
+            .map_err(|detail| PluginError::Provider {
+                id: id.to_string(),
+                detail,
+            })?,
+        );
+        let provider = match extension {
+            "access" => CachedDecision::Access(Arc::new(DylibAccessProvider { channel })),
+            "receive" => CachedDecision::Receive(Arc::new(DylibReceiveProvider { channel })),
+            "clock" => CachedDecision::Clock(Arc::new(DylibClockProvider { channel })),
+            other => {
+                return Err(PluginError::Provider {
+                    id: id.to_string(),
+                    detail: format!("不认识的决策扩展点：{other}"),
+                });
+            }
+        };
+        let instance = provider.instance();
+        *cached = Some(provider);
+        Ok(instance)
+    }
+
+    fn shutdown(&self) {
+        let provider = self
+            .cached
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(provider) = provider {
+            provider.destroy();
+        }
+    }
+
+    fn health(&self) -> Health {
+        Health::Healthy
+    }
+}
+
+/// 决策型 provider 的共用通道：一个 handle + 一串请求号。
+struct DecisionChannel {
+    _library: Arc<Library>,
+    _context: Arc<HostContext>,
+    table: AdapterV1,
+    handle: Arc<Mutex<AdapterHandle>>,
+    seq: AtomicU64,
+    failures: AtomicU64,
+    label: String,
+}
+
+impl DecisionChannel {
+    fn create(
+        library: Arc<Library>,
+        table: AdapterV1,
+        plugin_id: &str,
+        extension: &str,
+        options: Value,
+    ) -> Result<Self, String> {
+        let (events, _receiver) = EventQueue::channel();
+        let context = Arc::new(HostContext {
+            events,
+            stop: Arc::new(AtomicBool::new(false)),
+            connection: plugin_id.to_owned(),
+        });
+        let host = HostV1 {
+            abi_version: ABI_VERSION,
+            ctx: Arc::as_ptr(&context) as *mut c_void,
+            submit_event: Some(submit_event),
+            should_stop: Some(should_stop),
+            log: Some(log),
+        };
+        let config = WireInstanceConfig::Provider {
+            provider: plugin_id.to_owned(),
+            extension: extension.to_owned(),
+            options,
+        };
+        let config_json = CString::new(encode_line(&config).map_err(|error| {
+            format!("{extension} 配置序列化失败：{error}")
+        })?)
+        .map_err(|_| format!("{extension} 配置里含有 NUL"))?;
+
+        let create = table.create.ok_or("没有 create 函数")?;
+        let handle_ptr = unsafe { create(config_json.as_ptr(), &host) };
+        if handle_ptr.is_null() {
+            return Err(format!(
+                "{extension} 插件 {plugin_id} create 返回空 handle"
+            ));
+        }
+
+        Ok(Self {
+            _library: library,
+            _context: context,
+            table,
+            handle: Arc::new(Mutex::new(AdapterHandle {
+                ptr: handle_ptr,
+                alive: true,
+            })),
+            seq: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            label: extension.to_owned(),
+        })
+    }
+
+    fn next(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn call(&self, message: &CoreMessage) -> Result<AdapterMessage, String> {
+        invoke(&self.table, &self.handle, message)
+    }
+
+    fn note_failure(&self, detail: &str) {
+        let count = self.failures.fetch_add(1, Ordering::Relaxed);
+        if count < 5 || count % 100 == 0 {
+            eprintln!("{} 插件失败（第 {} 次）：{detail}", self.label, count + 1);
+        }
+    }
+
+    fn destroy(&self) {
+        destroy_handle(&self.table, &self.handle);
+    }
+}
+
+/// 发一次 Decide，取回 `decision` 字符串。回执形状不对或插件报错返回 `None`。
+fn plugin_decision(channel: &DecisionChannel, message: CoreMessage) -> Option<String> {
+    match channel.call(&message) {
+        Ok(AdapterMessage::Reply {
+            result: WireResult::Decision { decision, .. },
+            ..
+        }) => Some(decision),
+        Ok(other) => {
+            channel.note_failure(&format!("回执不是决策：{other:?}"));
+            None
+        }
+        Err(detail) => {
+            channel.note_failure(&detail);
+            None
+        }
+    }
+}
+
+struct DylibAccessProvider {
+    channel: Arc<DecisionChannel>,
+}
+
+impl AccessProvider for DylibAccessProvider {
+    fn check(&self, options: &AccessPolicy, request: &AccessRequest<'_>) -> AccessDecision {
+        let wire = WireAccessRequest {
+            session: request.session.to_owned(),
+            connection: request.connection.to_owned(),
+            room: request.room.map(|room| room.to_string()),
+            action: request.action.as_str().to_owned(),
+            subscriptions: request
+                .subscriptions
+                .iter()
+                .map(|room| room.to_string())
+                .collect(),
+        };
+        let message = CoreMessage::Decide {
+            id: self.channel.next(),
+            point: "access".into(),
+            options: access_options(options),
+            request: serde_json::to_value(wire).unwrap_or(Value::Null),
+        };
+        match plugin_decision(&self.channel, message).as_deref() {
+            Some("allow") => AccessDecision::Allow,
+            Some("deny") => AccessDecision::Deny,
+            Some(other) => {
+                self.channel
+                    .note_failure(&format!("不认识的 access 判定：{other}"));
+                AccessDecision::Deny
+            }
+            None => AccessDecision::Deny,
+        }
+    }
+}
+
+struct DylibReceiveProvider {
+    channel: Arc<DecisionChannel>,
+}
+
+impl ReceiveProvider for DylibReceiveProvider {
+    fn decide(&self, options: &ReceivePolicy, request: &ReceiveRequest<'_>) -> ReceiveDecision {
+        let wire = WireReceiveRequest {
+            connection: request.connection.to_owned(),
+            platform: request.platform.to_owned(),
+            room: request.room.to_string(),
+            sender: request.sender.clone(),
+            kind: request.kind.clone(),
+            elements: request.elements.to_vec(),
+            text: request.text.to_owned(),
+            at_self: request.at_self,
+        };
+        let message = CoreMessage::Decide {
+            id: self.channel.next(),
+            point: "receive".into(),
+            options: receive_options(options),
+            request: serde_json::to_value(wire).unwrap_or(Value::Null),
+        };
+        match plugin_decision(&self.channel, message).as_deref() {
+            Some("record") => ReceiveDecision::Record,
+            Some("drop") => ReceiveDecision::Drop,
+            Some(other) => {
+                self.channel
+                    .note_failure(&format!("不认识的 receive 判定：{other}"));
+                ReceiveDecision::Record
+            }
+            // 出错按「接收」兜底：宁可多记一条，也不误丢消息。
+            None => ReceiveDecision::Record,
+        }
+    }
+}
+
+struct DylibClockProvider {
+    channel: Arc<DecisionChannel>,
+}
+
+impl ClockProvider for DylibClockProvider {
+    fn is_due(&self, options: &ClockPolicy, context: &ClockContext<'_>) -> bool {
+        let wire = WireClockRequest {
+            session: context.session.to_owned(),
+            room: context.room.to_string(),
+            now: context.now,
+            last_clock_at: context.last_clock_at,
+            last_record_at: context.last_record_at,
+        };
+        let message = CoreMessage::Decide {
+            id: self.channel.next(),
+            point: "clock".into(),
+            options: clock_options(options),
+            request: serde_json::to_value(wire).unwrap_or(Value::Null),
+        };
+        match plugin_decision(&self.channel, message).as_deref() {
+            Some("due") => true,
+            Some("skip") => false,
+            Some(other) => {
+                self.channel
+                    .note_failure(&format!("不认识的 clock 判定：{other}"));
+                false
+            }
+            // 出错按「不触发」兜底：时钟只是例行检查，不该因为插件坏了刷屏。
+            None => false,
+        }
+    }
+}
+
+fn access_options(policy: &AccessPolicy) -> Value {
+    json!({
+        "provider": policy.provider.to_string(),
+        "rooms": policy.rooms.iter().map(|room| room.to_string()).collect::<Vec<_>>(),
+    })
+}
+
+fn receive_options(policy: &ReceivePolicy) -> Value {
+    json!({ "provider": policy.provider.to_string() })
+}
+
+fn clock_options(policy: &ClockPolicy) -> Value {
+    json!({
+        "provider": policy.provider.to_string(),
+        "interval_secs": policy.interval_secs,
+        "idle_secs": policy.idle_secs,
     })
 }
 

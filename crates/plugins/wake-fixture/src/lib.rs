@@ -10,12 +10,28 @@ use std::sync::Arc;
 
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, HostV1};
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireError, WireInstanceConfig, WireManifest, WirePluginMetadata,
-    WireResult, WireWakeRequest, decode_line, encode_line,
+    AdapterMessage, CoreMessage, WireAccessRequest, WireClockRequest, WireError,
+    WireInstanceConfig, WireManifest, WirePluginMetadata, WireReceiveRequest, WireResult,
+    WireWakeRequest, decode_line, encode_line,
 };
 
 struct Fixture {
     stop: Arc<AtomicBool>,
+}
+
+/// 同一个 cdylib 也可以当 access / receive / clock 夹具用：manifest 的扩展点由环境变量选，
+/// 没设就是 wake。集成测试各用一个独立进程，所以不会互相踩环境变量。
+fn fixture_extension() -> String {
+    std::env::var("ACB_FIXTURE_EXTENSION").unwrap_or_else(|_| "wake".to_owned())
+}
+
+fn fixture_capability(extension: &str) -> &'static str {
+    match extension {
+        "access" => "access_decision",
+        "receive" => "receive_decision",
+        "clock" => "clock_decision",
+        _ => "wake_decision",
+    }
 }
 
 static TABLE: AdapterV1 = AdapterV1 {
@@ -33,30 +49,37 @@ pub extern "C" fn acb_adapter_entry_v1() -> *const AdapterV1 {
 }
 
 unsafe extern "C" fn wake_manifest() -> *mut c_char {
+    let extension = fixture_extension();
     let manifest = WireManifest {
-        id: "fixture.wake".into(),
+        id: format!("fixture.{extension}"),
         platform: "fixture".into(),
         kind: String::new(),
         transports: Vec::new(),
         api_version: 1,
-        capabilities: vec!["wake_decision".into()],
+        capabilities: vec![fixture_capability(&extension).to_owned()],
         events: Vec::new(),
         event_tags: Vec::new(),
         supports_at: false,
         supports_reply: false,
-        extension: "wake".into(),
+        extension: extension.clone(),
         metadata: WirePluginMetadata {
-            title: Some("wake 夹具".into()),
-            summary: Some("被 @ 或正文含 fixture 时唤醒".into()),
+            title: Some(format!("{extension} 夹具")),
+            summary: Some(format!("测试用 {extension} 策略夹具")),
             description: None,
-            tags: vec!["fixture".into(), "wake".into()],
-            effects: vec!["may_wake".into(), "may_stay_silent".into()],
+            tags: vec!["fixture".into(), extension.clone()],
+            effects: if extension == "wake" {
+                vec!["may_wake".into(), "may_stay_silent".into()]
+            } else {
+                Vec::new()
+            },
             docs_url: None,
             options_schema: None,
         },
     };
     let json = serde_json::to_string(&manifest).expect("manifest 可序列化");
-    CString::new(json).expect("manifest 没有 NUL").into_raw()
+    CString::new(json)
+        .expect("manifest 没有 NUL")
+        .into_raw()
 }
 
 unsafe extern "C" fn wake_create(config_json: *const c_char, _host: *const HostV1) -> *mut c_void {
@@ -95,30 +118,62 @@ unsafe extern "C" fn wake_invoke(handle: *mut c_void, request_json: *const c_cha
             request,
             ..
         } => {
-            if point != "wake" {
-                AdapterMessage::Reply {
-                    id,
-                    result: WireResult::Error {
-                        error: WireError::Unsupported {
-                            detail: format!("不支持的策略：{point}"),
-                        },
-                    },
-                }
-            } else {
-                let request: WireWakeRequest = match serde_json::from_value(request) {
-                    Ok(request) => request,
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                // 简单规则：冲我来，或者话里带 fixture，就醒。
-                let wake = request.at_self || request.text.contains("fixture");
-                AdapterMessage::Reply {
-                    id,
-                    result: WireResult::Decision {
+            let reply = match point.as_str() {
+                "wake" => {
+                    let request: WireWakeRequest = match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(_) => return std::ptr::null_mut(),
+                    };
+                    // 简单规则：冲我来，或者话里带 fixture，就醒。
+                    let wake = request.at_self || request.text.contains("fixture");
+                    WireResult::Decision {
                         decision: if wake { "wake" } else { "stay" }.into(),
                         reason: wake.then(|| "fixture：@ 或关键词命中".to_owned()),
-                    },
+                    }
                 }
-            }
+                "access" => {
+                    let request: WireAccessRequest = match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(_) => return std::ptr::null_mut(),
+                    };
+                    // 简单规则：读放行，写/连接级拒绝；测试两种结果都覆盖。
+                    let allow = request.action == "read";
+                    WireResult::Decision {
+                        decision: if allow { "allow" } else { "deny" }.into(),
+                        reason: None,
+                    }
+                }
+                "receive" => {
+                    let request: WireReceiveRequest = match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(_) => return std::ptr::null_mut(),
+                    };
+                    // 简单规则：正文含 drop 就丢，其余照收。
+                    let drop = request.text.contains("drop");
+                    WireResult::Decision {
+                        decision: if drop { "drop" } else { "record" }.into(),
+                        reason: None,
+                    }
+                }
+                "clock" => {
+                    let request: WireClockRequest = match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(_) => return std::ptr::null_mut(),
+                    };
+                    // 简单规则：距上次开轮满 60 秒就检查。
+                    let due = request.now.saturating_sub(request.last_clock_at) >= 60_000;
+                    WireResult::Decision {
+                        decision: if due { "due" } else { "skip" }.into(),
+                        reason: None,
+                    }
+                }
+                other => WireResult::Error {
+                    error: WireError::Unsupported {
+                        detail: format!("不支持的策略：{other}"),
+                    },
+                },
+            };
+            AdapterMessage::Reply { id, result: reply }
         }
         CoreMessage::Describe { id }
         | CoreMessage::Send { id, .. }

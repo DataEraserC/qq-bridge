@@ -109,6 +109,11 @@ kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
   `kind = "process"`。P3 对动态库调用不加超时（in-process 打断不了）。
 - 第三方插件必须声明 `metadata.summary`；wake 插件还必须声明 `effects`
   （至少 `may_wake` / `may_stay_silent`），否则启动时拒绝。
+- 同一个载体也能装决策型策略：manifest 写 `extension = "access"` / `"receive"` / `"clock"`，
+  provider id 用 `namespace.name`。插件收到 `CoreMessage::Decide`（`point` 是扩展点，
+  `request` 是 access / receive / clock 的 wire 形状），返回 `WireResult::Decision`：
+  access 用 `allow` / `deny`，receive 用 `record` / `drop`，clock 用 `due` / `skip`。
+  报错按安全侧兜底（access 拒绝、receive 接收、clock 不触发）。
 - 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`。
 
 ### 适配器 manifest 声明什么
