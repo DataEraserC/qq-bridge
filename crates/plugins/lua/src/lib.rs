@@ -33,12 +33,20 @@
 //!   end,
 //!   after = function(context, sent) end,
 //! }
+//!
+//! -- turn_error：返回要执行的动作列表
+//! return {
+//!   extension = "turn_error",
+//!   decide = function(request)
+//!     return { { kind = "log" }, { kind = "send", room = "qq:group/ops" } }
+//!   end,
+//! }
 //! ```
 //!
 //! 文件名就是 provider 名，最终 id 是 `lua.<文件名>`。`options` / `context` / `request`
 //! 是普通 table；脚本拿不到 Store、Bridge 或配置写入能力。每次调用最多 50ms，死循环会被
-//! 指令钩子打断：wake/access 按安全侧兜底，delivery 回退内置 composer，send 的 before
-//! 报错则这次发送失败。失败数累计在 manager health 里。
+//! 指令钩子打断：wake/access 按安全侧兜底，delivery/turn_error 回退内置实现，send 的
+//! before 报错则这次发送失败。失败数累计在 manager health 里。
 //!
 //! LuaManager 本身是 native 实现：先有它（以及 mlua 运行时），LuaLoader 才能加载脚本。
 //! 这是 ADR-0026 的 bootstrap 约束——manager 不能由自己管理的格式来加载。
@@ -51,12 +59,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use acb_kernel::{
-    AccessDecision, AccessPolicy, AccessProvider, AccessRequest, Capability, DeliveryComposer,
-    DeliveryPlan, DeliveryPolicy, DeliveryRequest, Element, ExtensionPoint, Health, LoaderKind,
-    LoaderManifest, ManagerManifest, ManagerPlugin, Omitted, PluginError, PluginLoader,
-    PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, Record,
-    RecordKind, ReloadScope, SendContext, SendHook, SenderRole, Sent, WakeContext, WakeDecision,
-    WakePolicy, WakeProvider, default_delivery_plan, PLUGIN_API_VERSION,
+    AccessDecision, AccessPolicy, AccessProvider, AccessRequest, Capability,
+    DefaultTurnErrorProvider, DeliveryComposer, DeliveryPlan, DeliveryPolicy, DeliveryRequest,
+    Element, ExtensionPoint, Health, LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin,
+    Omitted, PluginError, PluginLoader, PluginManager, ProviderDescriptor, ProviderId,
+    ProviderInstance, ProviderOptions, Record, RecordKind, ReloadScope, RoomId, SendContext,
+    SendHook, SenderRole, Sent, TurnErrorAction, TurnErrorProvider, TurnErrorRequest, WakeContext,
+    WakeDecision, WakePolicy, WakeProvider, default_delivery_plan, PLUGIN_API_VERSION,
 };
 use acb_proto::element::flatten_text;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, RegistryKey, StdLib, Table, Value, VmState};
@@ -250,6 +259,32 @@ impl SendHook for LuaSendHook {
     }
 }
 
+struct LuaTurnErrorProvider {
+    caller: LuaCaller,
+}
+
+impl TurnErrorProvider for LuaTurnErrorProvider {
+    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+        let result = self.caller.call(|lua, function| {
+            let request = turn_error_request_table(lua, request)?;
+            function.call::<Value>(request)
+        });
+        match result {
+            Ok(value) => match interpret_turn_error_actions(value) {
+                Ok(actions) => actions,
+                Err(error) => {
+                    self.caller.record_failure(&error);
+                    DefaultTurnErrorProvider.decide(request)
+                }
+            },
+            Err(error) => {
+                self.caller.record_failure(&error);
+                DefaultTurnErrorProvider.decide(request)
+            }
+        }
+    }
+}
+
 fn provider_error(caller: &LuaCaller, error: &mlua::Error) -> PluginError {
     PluginError::Provider {
         id: caller.label.clone(),
@@ -269,6 +304,7 @@ enum LoadedInstance {
     Access(Arc<dyn AccessProvider>),
     Delivery(Arc<dyn DeliveryComposer>),
     Send(Arc<dyn SendHook>),
+    TurnError(Arc<dyn TurnErrorProvider>),
 }
 
 impl LoadedProvider {
@@ -278,6 +314,7 @@ impl LoadedProvider {
             LoadedInstance::Access(provider) => ProviderInstance::Access(provider.clone()),
             LoadedInstance::Delivery(composer) => ProviderInstance::Delivery(composer.clone()),
             LoadedInstance::Send(hook) => ProviderInstance::Send(hook.clone()),
+            LoadedInstance::TurnError(provider) => ProviderInstance::TurnError(provider.clone()),
         }
     }
 }
@@ -316,6 +353,7 @@ impl ManagerPlugin for LuaManager {
                 Capability::AccessDecision,
                 Capability::DeliverPlan,
                 Capability::SendHook,
+                Capability::TurnErrorDecision,
             ],
         )
     }
@@ -400,6 +438,7 @@ impl PluginLoader for LuaLoader {
                 ExtensionPoint::Access,
                 ExtensionPoint::Delivery,
                 ExtensionPoint::Send,
+                ExtensionPoint::TurnError,
             ],
         )
     }
@@ -452,6 +491,7 @@ fn load_scripts(
             ExtensionPoint::Access => Capability::AccessDecision,
             ExtensionPoint::Delivery => Capability::DeliverPlan,
             ExtensionPoint::Send => Capability::SendHook,
+            ExtensionPoint::TurnError => Capability::TurnErrorDecision,
             point => {
                 return Err(PluginError::UnsupportedExtensionPoint {
                     id: loaded.id.to_string(),
@@ -512,9 +552,10 @@ fn load_script(
         "access" => ExtensionPoint::Access,
         "delivery" => ExtensionPoint::Delivery,
         "send" => ExtensionPoint::Send,
+        "turn_error" => ExtensionPoint::TurnError,
         other => {
             return Err(PluginError::Loader(format!(
-                "{}：不支持的 extension {other:?}（只支持 wake / access / delivery / send）",
+                "{}：不支持的 extension {other:?}（只支持 wake / access / delivery / send / turn_error）",
                 path.display()
             )));
         }
@@ -605,6 +646,21 @@ fn load_script(
                 label: format!("{id}.after"),
             });
             LoadedInstance::Send(Arc::new(LuaSendHook { before, after }))
+        }
+        ExtensionPoint::TurnError => {
+            let function = required_function(&table, "decide", path)?;
+            let key = lua.create_registry_value(function).map_err(|error| {
+                PluginError::Loader(format!("{}：保存 decide 失败：{error}", path.display()))
+            })?;
+            LoadedInstance::TurnError(Arc::new(LuaTurnErrorProvider {
+                caller: LuaCaller {
+                    lua: Arc::new(Mutex::new(lua)),
+                    function: key,
+                    timeout: LUA_CALL_TIMEOUT,
+                    failures: failures.clone(),
+                    label: id.to_string(),
+                },
+            }))
         }
         _ => unreachable!("extension 已在上面筛过"),
     };
@@ -929,6 +985,76 @@ fn interpret_delivery_plan(value: Value) -> mlua::Result<DeliveryPlan> {
         None => None,
     };
     Ok(DeliveryPlan { keep, omitted })
+}
+
+fn turn_error_request_table(
+    lua: &Lua,
+    request: &TurnErrorRequest<'_>,
+) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("session", request.session)?;
+    table.set("room", request.room.to_string())?;
+    table.set("error", request.error)?;
+    table.set("actions", turn_error_actions_table(lua, request.actions)?)?;
+    table.set(
+        "default_actions",
+        turn_error_actions_table(lua, request.default_actions)?,
+    )?;
+    Ok(table)
+}
+
+fn turn_error_actions_table(
+    lua: &Lua,
+    actions: &[TurnErrorAction],
+) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    for (index, action) in actions.iter().enumerate() {
+        table.set(index + 1, turn_error_action_table(lua, action)?)?;
+    }
+    Ok(table)
+}
+
+fn turn_error_action_table(lua: &Lua, action: &TurnErrorAction) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    match action {
+        TurnErrorAction::Log => {
+            table.set("kind", "log")?;
+        }
+        TurnErrorAction::Send { room } => {
+            table.set("kind", "send")?;
+            table.set("room", room.to_string())?;
+        }
+    }
+    Ok(table)
+}
+
+fn interpret_turn_error_actions(value: Value) -> mlua::Result<Vec<TurnErrorAction>> {
+    let Value::Table(table) = value else {
+        return Err(mlua::Error::runtime(format!(
+            "turn_error provider 要返回动作数组，收到 {value:?}"
+        )));
+    };
+    let mut actions = Vec::new();
+    for value in table.sequence_values::<Table>() {
+        let action = value?;
+        let kind: String = action.get("kind")?;
+        match kind.as_str() {
+            "log" => actions.push(TurnErrorAction::Log),
+            "send" => {
+                let room: String = action.get("room")?;
+                let room = RoomId::parse(&room).map_err(|error| {
+                    mlua::Error::runtime(format!("失败通知房间不合法：{room}（{error}）"))
+                })?;
+                actions.push(TurnErrorAction::Send { room });
+            }
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "不认识的失败通知动作 {other:?}（只支持 log / send）"
+                )));
+            }
+        }
+    }
+    Ok(actions)
 }
 
 fn interpret_wake(value: Value) -> mlua::Result<WakeDecision> {

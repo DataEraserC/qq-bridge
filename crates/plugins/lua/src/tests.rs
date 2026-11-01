@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use acb_kernel::{
     AccessAction, AccessRequest, Config, DeliveryPolicy, DeliveryRequest, Element, PluginManager,
     ProviderId, Record, RecordKind, ReloadScope, RoomId, SendContext, SendOrigin, Sender, Sent,
-    WakeContext, WakeDecision, WakePolicy,
+    TurnErrorAction, TurnErrorPolicy, TurnErrorRequest, WakeContext, WakeDecision, WakePolicy,
 };
 
 use super::*;
@@ -509,6 +509,15 @@ return {
 }
 "#,
     );
+    dir.write(
+        "notify.lua",
+        r#"
+return {
+  extension = "turn_error",
+  decide = function() return { { kind = "log" } } end,
+}
+"#,
+    );
     let plugins = loaded(&dir);
     let text = r#"
         [[connections]]
@@ -539,6 +548,9 @@ return {
         [sessions.outbound]
         before = ["lua.sign"]
 
+        [sessions.turn_error]
+        provider = "lua.notify"
+
         [[sessions.subscriptions]]
         connection = "qq"
         room = "group/1"
@@ -547,4 +559,88 @@ return {
     plugins
         .validate_config(&config)
         .expect("lua delivery / send hook 应当能解析");
+}
+
+#[test]
+fn turn_error_provider_runs_from_a_lua_script() {
+    let dir = TempDir::new("turn-error");
+    dir.write(
+        "notify.lua",
+        r#"
+return {
+  extension = "turn_error",
+  decide = function(request)
+    local actions = { { kind = "log" } }
+    if request.error ~= "" then
+      actions[#actions + 1] = { kind = "send", room = "qq:group/ops" }
+    end
+    return actions
+  end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.notify").expect("合法");
+    let provider = plugins
+        .resolve_turn_error(&id, &TurnErrorPolicy::default())
+        .expect("Lua turn_error provider 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let request = TurnErrorRequest {
+        session: "main",
+        room: &room,
+        error: "boom",
+        actions: &[],
+        default_actions: &[],
+    };
+    let actions = provider.decide(&request);
+    assert_eq!(
+        actions,
+        vec![
+            TurnErrorAction::Log,
+            TurnErrorAction::Send {
+                room: RoomId::new("qq", "group/ops").expect("合法")
+            }
+        ]
+    );
+}
+
+#[test]
+fn turn_error_error_falls_back_to_default_actions() {
+    let dir = TempDir::new("turn-error-bad");
+    dir.write(
+        "bad.lua",
+        r#"
+return {
+  extension = "turn_error",
+  decide = function() return { { kind = "nope" } } end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.bad").expect("合法");
+    let provider = plugins
+        .resolve_turn_error(&id, &TurnErrorPolicy::default())
+        .expect("Lua turn_error provider 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let session_actions = vec![TurnErrorAction::Log];
+    let request = TurnErrorRequest {
+        session: "main",
+        room: &room,
+        error: "boom",
+        actions: &session_actions,
+        default_actions: &[],
+    };
+    assert_eq!(
+        provider.decide(&request),
+        session_actions,
+        "脚本返回坏动作时回退默认选择"
+    );
+    let health = plugins
+        .manager_health()
+        .into_iter()
+        .find(|entry| entry.namespace == LUA_NAMESPACE)
+        .expect("lua manager 应当在");
+    assert!(matches!(health.health, Health::Degraded(_)));
 }

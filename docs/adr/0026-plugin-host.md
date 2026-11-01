@@ -121,6 +121,10 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - `extension = "delivery"`：`compose(options, request)`，`request.records` 是普通 table（含 id / at / sender / kind / text / elements 等），返回 `{ keep = {编号...}, omitted = {from,to,count} }`；返回 nil 或报错时回退内置 composer。
   - `extension = "send"`：`before(context, elements)` 可改写元素数组并返回，`after(context, sent)` 只观察回执。元素九种类型完整往返，opaque 载荷用 `payload_json` 字符串。
   - 继承 Lua 的 50ms 超时；send.before 报错则这次发送失败，send.after 报错只累计 health（Degraded）。
+- **Phase 5a（2026-11-01）**：turn-error provider 化。
+  - 会话新增 `[sessions.turn_error] provider = ...`，默认 `acb.turn_error.default`；默认实现保持原行为：会话 `on_turn_error` 非空就用它，否则回退全局 `default_on_turn_error`。
+  - provider 只返回动作列表（log / send:房间）；文本组装、发送和锁外执行仍归 core。未知 provider 启动时拒绝。
+  - Lua 增加 `extension = "turn_error"`：`decide(request)` 返回 `{ {kind="log"}, {kind="send", room="qq:group/ops"} }`；报错回退默认选择，并累计 health。
 
 ## 参考
 

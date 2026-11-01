@@ -333,6 +333,8 @@ pub struct Session {
     pub delivery: DeliveryPolicy,
     /// 发送前/后钩子（ADR-0026 Phase 4）。按列表顺序执行。
     pub outbound: OutboundPolicy,
+    /// 失败通知策略（ADR-0026）：默认按 `on_turn_error` / 全局默认选动作。
+    pub turn_error: TurnErrorPolicy,
     /// 这个会话一轮失败时按顺序执行的「通知动作」列表。空 = 只记日志。
     /// 见 [`TurnErrorAction`]。
     pub on_turn_error: TurnErrorActions,
@@ -391,6 +393,21 @@ impl Default for DeliveryPolicy {
 pub struct OutboundPolicy {
     pub before: Vec<ProviderId>,
     pub after: Vec<ProviderId>,
+}
+
+/// 一轮失败时怎么通知（ADR-0026）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnErrorPolicy {
+    /// 失败通知的 provider id。不写就用内置「会话动作优先、否则全局默认」。
+    pub provider: ProviderId,
+}
+
+impl Default for TurnErrorPolicy {
+    fn default() -> Self {
+        Self {
+            provider: ProviderId::builtin_turn_error(),
+        }
+    }
 }
 
 /// 唤醒策略的判定输入。只带判定需要的东西，不把整条记录塞进来。
@@ -577,6 +594,12 @@ pub enum ConfigError {
     },
     #[error("会话 {session} 的发送钩子 provider 不合法：{provider}（{detail}）")]
     BadSendHookProvider {
+        session: String,
+        provider: String,
+        detail: String,
+    },
+    #[error("会话 {session} 的失败通知 provider 不合法：{provider}（{detail}）")]
+    BadTurnErrorProvider {
         session: String,
         provider: String,
         detail: String,
@@ -976,6 +999,7 @@ impl Config {
             let access = build_access(&id, raw_session.access, &connections)?;
             let delivery = build_delivery(&id, raw_session.delivery)?;
             let outbound = build_outbound(&id, raw_session.outbound)?;
+            let turn_error = build_turn_error(&id, raw_session.turn_error)?;
 
             sessions.push(Session {
                 id,
@@ -989,6 +1013,7 @@ impl Config {
                 access,
                 delivery,
                 outbound,
+                turn_error,
                 on_turn_error,
             });
         }
@@ -1285,6 +1310,25 @@ fn build_outbound(session: &str, raw: RawOutbound) -> Result<OutboundPolicy, Con
     })
 }
 
+fn build_turn_error(session: &str, raw: RawTurnError) -> Result<TurnErrorPolicy, ConfigError> {
+    let provider = match raw
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => ProviderId::parse(text).map_err(|error| {
+            ConfigError::BadTurnErrorProvider {
+                session: session.to_owned(),
+                provider: text.to_owned(),
+                detail: error.to_string(),
+            }
+        })?,
+        None => ProviderId::builtin_turn_error(),
+    };
+    Ok(TurnErrorPolicy { provider })
+}
+
 fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, ConfigError> {
     let default = WakePolicy::default();
 
@@ -1449,6 +1493,9 @@ struct RawSession {
     /// 发送前/后钩子（默认空）。
     #[serde(default)]
     outbound: RawOutbound,
+    /// 失败通知策略（默认内置）。
+    #[serde(default)]
+    turn_error: RawTurnError,
     /// 一轮失败时的通知动作列表（默认空 = 只记日志）。
     #[serde(default)]
     on_turn_error: Vec<String>,
@@ -1465,6 +1512,11 @@ struct RawOutbound {
     before: Vec<String>,
     #[serde(default)]
     after: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTurnError {
+    provider: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

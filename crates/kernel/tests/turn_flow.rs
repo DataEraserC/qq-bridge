@@ -10,8 +10,8 @@ use acb_kernel::{
     Element, ErrorCode, ExtensionPoint, Feedbacks, Ingest, ManagerManifest, ManagerPlugin,
     MemoryStore, NoteKey, NoteKind, Notes, Omitted, Outbound, OutboundError, PluginError,
     PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, RecordDraft,
-    RoomId, SendContext, SendHook, Sender, Sent, Transcript, TurnReason, Watermarks, unread,
-    PLUGIN_API_VERSION,
+    RoomId, SendContext, SendHook, Sender, Sent, Transcript, TurnErrorAction, TurnErrorProvider,
+    TurnErrorRequest, TurnReason, Watermarks, unread, PLUGIN_API_VERSION,
 };
 use serde_json::{Value, json};
 
@@ -244,6 +244,50 @@ impl ManagerPlugin for SignHookManager {
     ) -> Result<ProviderInstance, PluginError> {
         if id.name() == "sign" {
             Ok(ProviderInstance::Send(self.hook.clone()))
+        } else {
+            Err(PluginError::UnknownProvider(id.to_string()))
+        }
+    }
+}
+
+/// 无论配置怎么写，都只发到 `qq:group/ops` 的失败通知 provider。
+struct RedirectTurnError;
+
+impl TurnErrorProvider for RedirectTurnError {
+    fn decide(&self, _request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+        vec![TurnErrorAction::Send {
+            room: room("qq:group/ops"),
+        }]
+    }
+}
+
+struct RedirectTurnErrorManager;
+
+impl ManagerPlugin for RedirectTurnErrorManager {
+    fn manifest(&self) -> ManagerManifest {
+        ManagerManifest::new(
+            "test",
+            PLUGIN_API_VERSION,
+            vec![Capability::TurnErrorDecision],
+        )
+    }
+
+    fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        vec![ProviderDescriptor::new(
+            ProviderId::parse("test.failure").expect("合法"),
+            ExtensionPoint::TurnError,
+            PLUGIN_API_VERSION,
+            vec![Capability::TurnErrorDecision],
+        )]
+    }
+
+    fn instantiate(
+        &self,
+        id: &ProviderId,
+        _options: ProviderOptions<'_>,
+    ) -> Result<ProviderInstance, PluginError> {
+        if id.name() == "failure" {
+            Ok(ProviderInstance::TurnError(Arc::new(RedirectTurnError)))
         } else {
             Err(PluginError::UnknownProvider(id.to_string()))
         }
@@ -2579,4 +2623,35 @@ fn send_hooks_can_rewrite_and_observe() {
         ["main:p-1"],
         "发送后钩子应当拿到回执"
     );
+}
+
+#[test]
+fn custom_turn_error_provider_decides_notifications() {
+    let text = config_with(
+        "        [sessions.turn_error]\n        provider = \"test.failure\"",
+    );
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins
+        .install_manager(Arc::new(RedirectTurnErrorManager))
+        .expect("能安装失败通知 provider");
+
+    let (mut bridge, sends) = bridge_with_plugins(&text, plugins);
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    bridge
+        .end_turn(&delivery.ticket, Some("boom"))
+        .expect("能收工");
+    bridge.flush_notices();
+
+    let sends = sends.lock().expect("没被毒死");
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].0, room("qq:group/ops"), "provider 指定的房间");
+    let text = match &sends[0].1[0] {
+        Element::Text { text } => text,
+        other => panic!("失败通知应是文本，收到 {other:?}"),
+    };
+    assert!(text.contains("[一轮失败]"));
+    assert!(text.contains("boom"));
 }

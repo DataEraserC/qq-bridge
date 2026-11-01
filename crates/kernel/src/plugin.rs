@@ -4,8 +4,9 @@
 //! 目的是先把“provider id 解析、能力校验、native loader、manager 子树委托”跑通，
 //! 行为与原来写死的 `WakePolicy::decide` 完全一致。
 //!
-//! 其余扩展点（receive / send / clock / delivery / turn-error / platform adapter）按
-//! ADR-0026 的 phase 逐个加，不在这里提前造空壳。
+//! 目前已落地的扩展点：wake、access、delivery composer、send hooks、turn-error。
+//! 其余（receive / clock / 换投递引擎 / 动态 platform adapter）按 ADR-0026 的 phase
+//! 逐个加，不在这里提前造空壳。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -17,7 +18,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::config::{
-    AccessPolicy, Config, DeliveryPolicy, WakeDecision, WakeInput, WakePolicy,
+    AccessPolicy, Config, DeliveryPolicy, TurnErrorAction, TurnErrorPolicy, WakeDecision, WakeInput,
+    WakePolicy,
 };
 use crate::outbound::Sent;
 
@@ -32,6 +34,9 @@ pub const DEFAULT_ACCESS_PROVIDER: &str = "acb.access.subscribed";
 
 /// 内置投递 composer 的 id。会话没有显式写 delivery provider 时用它。
 pub const DEFAULT_DELIVERY_PROVIDER: &str = "acb.delivery.default";
+
+/// 内置失败通知 provider 的 id。会话没有显式写 turn_error provider 时用它。
+pub const DEFAULT_TURN_ERROR_PROVIDER: &str = "acb.turn_error.default";
 
 /// 每轮从最旧端至少带几条（默认 composer 用）。
 const DELIVERY_OLDEST: usize = 5;
@@ -111,6 +116,11 @@ impl ProviderId {
         Self::parse(DEFAULT_DELIVERY_PROVIDER).expect("内置 provider id 必须合法")
     }
 
+    /// 内置失败通知 provider。
+    pub fn builtin_turn_error() -> Self {
+        Self::parse(DEFAULT_TURN_ERROR_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
@@ -177,6 +187,7 @@ pub enum Capability {
     PlatformCatalog,
     DeliverPlan,
     SendHook,
+    TurnErrorDecision,
 }
 
 impl Capability {
@@ -190,6 +201,7 @@ impl Capability {
             Self::PlatformCatalog => "platform_catalog",
             Self::DeliverPlan => "deliver_plan",
             Self::SendHook => "send_hook",
+            Self::TurnErrorDecision => "turn_error_decision",
         }
     }
 }
@@ -653,12 +665,43 @@ pub trait SendHook: Send + Sync {
     fn after_send(&self, _context: &SendContext<'_>, _sent: &Sent) {}
 }
 
+/// 一次失败通知的输入。动作列表原样给 provider，它只负责选出要执行哪些。
+#[derive(Debug, Clone, Copy)]
+pub struct TurnErrorRequest<'a> {
+    pub session: &'a str,
+    pub room: &'a RoomId,
+    pub error: &'a str,
+    /// 会话自己配的动作（可能空）。
+    pub actions: &'a [TurnErrorAction],
+    /// 全局默认动作。
+    pub default_actions: &'a [TurnErrorAction],
+}
+
+/// 失败通知 provider。默认实现保持原来的选择：会话动作非空就用它，否则用全局默认。
+pub trait TurnErrorProvider: Send + Sync {
+    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction>;
+}
+
+#[derive(Debug, Default)]
+pub struct DefaultTurnErrorProvider;
+
+impl TurnErrorProvider for DefaultTurnErrorProvider {
+    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+        if request.actions.is_empty() {
+            request.default_actions.to_vec()
+        } else {
+            request.actions.to_vec()
+        }
+    }
+}
+
 /// manager 实例化 provider 时能拿到的 options。
 #[derive(Debug, Clone, Copy)]
 pub enum ProviderOptions<'a> {
     Wake(&'a WakePolicy),
     Access(&'a AccessPolicy),
     Delivery(&'a DeliveryPolicy),
+    TurnError(&'a TurnErrorPolicy),
     /// 不需要 options 的扩展点（发送钩子）。
     None,
 }
@@ -669,6 +712,7 @@ pub enum ProviderInstance {
     Access(Arc<dyn AccessProvider>),
     Delivery(Arc<dyn DeliveryComposer>),
     Send(Arc<dyn SendHook>),
+    TurnError(Arc<dyn TurnErrorProvider>),
 }
 
 impl ProviderInstance {
@@ -679,6 +723,7 @@ impl ProviderInstance {
             Self::Access(_) => ExtensionPoint::Access,
             Self::Delivery(_) => ExtensionPoint::Delivery,
             Self::Send(_) => ExtensionPoint::Send,
+            Self::TurnError(_) => ExtensionPoint::TurnError,
         }
     }
 }
@@ -764,6 +809,7 @@ impl PluginLoader for NativeLoader {
                 ExtensionPoint::Wake,
                 ExtensionPoint::Access,
                 ExtensionPoint::Delivery,
+                ExtensionPoint::TurnError,
             ],
         )
     }
@@ -813,6 +859,15 @@ impl PluginLoader for NativeLoader {
                 vec![Capability::DeliverPlan],
             ),
             Arc::new(DefaultDeliveryComposer),
+        )?;
+        manager.register_turn_error(
+            ProviderDescriptor::new(
+                ProviderId::builtin_turn_error(),
+                ExtensionPoint::TurnError,
+                PLUGIN_API_VERSION,
+                vec![Capability::TurnErrorDecision],
+            ),
+            Arc::new(DefaultTurnErrorProvider),
         )
     }
 }
@@ -824,6 +879,7 @@ pub struct PluginManager {
     access: HashMap<ProviderId, Arc<dyn AccessProvider>>,
     delivery: HashMap<ProviderId, Arc<dyn DeliveryComposer>>,
     send_hooks: HashMap<ProviderId, Arc<dyn SendHook>>,
+    turn_errors: HashMap<ProviderId, Arc<dyn TurnErrorProvider>>,
     managers: HashMap<String, Arc<dyn ManagerPlugin>>,
     /// 安装顺序（含嵌套子树）。reload/health 正序，shutdown 逆序。
     manager_order: Vec<String>,
@@ -872,6 +928,7 @@ impl PluginManager {
                     | ExtensionPoint::Access
                     | ExtensionPoint::Delivery
                     | ExtensionPoint::Send
+                    | ExtensionPoint::TurnError
             ) {
                 return Err(PluginError::UnsupportedExtensionPoint {
                     id: format!("loader:{}", manifest.kind.as_str()),
@@ -951,6 +1008,26 @@ impl PluginManager {
         self.descriptors
             .insert(descriptor.id.clone(), descriptor.clone());
         self.send_hooks.insert(descriptor.id, hook);
+        Ok(())
+    }
+
+    /// 注册失败通知 provider。校验规则同 wake。
+    pub fn register_turn_error(
+        &mut self,
+        descriptor: ProviderDescriptor,
+        provider: Arc<dyn TurnErrorProvider>,
+    ) -> Result<(), PluginError> {
+        self.check_descriptor(
+            &descriptor,
+            ExtensionPoint::TurnError,
+            Capability::TurnErrorDecision,
+        )?;
+        if self.descriptors.contains_key(&descriptor.id) {
+            return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
+        }
+        self.descriptors
+            .insert(descriptor.id.clone(), descriptor.clone());
+        self.turn_errors.insert(descriptor.id, provider);
         Ok(())
     }
 
@@ -1046,6 +1123,7 @@ impl PluginManager {
                 ExtensionPoint::Access => Capability::AccessDecision,
                 ExtensionPoint::Delivery => Capability::DeliverPlan,
                 ExtensionPoint::Send => Capability::SendHook,
+                ExtensionPoint::TurnError => Capability::TurnErrorDecision,
                 point => {
                     return Err(PluginError::UnsupportedExtensionPoint {
                         id: descriptor.id.to_string(),
@@ -1264,6 +1342,37 @@ impl PluginManager {
         ids.iter().map(|id| self.resolve_send_hook(id)).collect()
     }
 
+    /// 解析失败通知 provider。先查 Root 直接注册的，再按 namespace 委托 manager。
+    pub fn resolve_turn_error(
+        &self,
+        id: &ProviderId,
+        options: &TurnErrorPolicy,
+    ) -> Result<Arc<dyn TurnErrorProvider>, PluginError> {
+        if let Some(provider) = self.turn_errors.get(id) {
+            return Ok(provider.clone());
+        }
+        let Some(descriptor) = self.descriptors.get(id) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        if descriptor.extension_point != ExtensionPoint::TurnError {
+            return Err(PluginError::UnsupportedExtensionPoint {
+                id: id.to_string(),
+                point: descriptor.extension_point,
+            });
+        }
+        let Some(manager) = self.managers.get(id.namespace()) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        match manager.instantiate(id, ProviderOptions::TurnError(options))? {
+            ProviderInstance::TurnError(provider) => Ok(provider),
+            other => Err(PluginError::WrongProviderKind {
+                id: id.to_string(),
+                expected: ExtensionPoint::TurnError,
+                found: other.extension_point(),
+            }),
+        }
+    }
+
     /// 启动时校验整份配置引用的 provider 都存在。`main` 在起线程前调用。
     pub fn validate_config(&self, config: &Config) -> Result<(), PluginError> {
         for session in &config.sessions {
@@ -1271,6 +1380,7 @@ impl PluginManager {
             self.resolve_delivery(&session.delivery.provider, &session.delivery)?;
             self.resolve_send_hooks(&session.outbound.before)?;
             self.resolve_send_hooks(&session.outbound.after)?;
+            self.resolve_turn_error(&session.turn_error.provider, &session.turn_error)?;
             for subscription in &session.subscriptions {
                 self.resolve_wake(&subscription.wake.provider, &subscription.wake)?;
             }
@@ -2060,7 +2170,8 @@ mod tests {
             vec![
                 ExtensionPoint::Wake,
                 ExtensionPoint::Access,
-                ExtensionPoint::Delivery
+                ExtensionPoint::Delivery,
+                ExtensionPoint::TurnError
             ]
         );
     }
@@ -2193,6 +2304,102 @@ mod tests {
     fn validate_config_rejects_an_unknown_delivery_provider_before_start() {
         let config = config_with_extra(
             "[sessions.delivery]\nprovider = \"vendor.missing\"",
+        );
+        let manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.validate_config(&config),
+            Err(PluginError::UnknownProvider(_))
+        ));
+    }
+
+    #[test]
+    fn default_turn_error_provider_keeps_the_config_behavior() {
+        let room = test_room();
+        let session_actions = vec![TurnErrorAction::Send { room: room.clone() }];
+        let default_actions = vec![TurnErrorAction::Log];
+        let request = TurnErrorRequest {
+            session: "main",
+            room: &room,
+            error: "boom",
+            actions: &session_actions,
+            default_actions: &default_actions,
+        };
+        assert_eq!(DefaultTurnErrorProvider.decide(&request), session_actions);
+
+        let empty: Vec<TurnErrorAction> = Vec::new();
+        let request = TurnErrorRequest {
+            actions: &empty,
+            ..request
+        };
+        assert_eq!(DefaultTurnErrorProvider.decide(&request), default_actions);
+    }
+
+    struct NoopTurnErrorProvider;
+
+    impl TurnErrorProvider for NoopTurnErrorProvider {
+        fn decide(&self, _request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+            Vec::new()
+        }
+    }
+
+    struct TurnErrorManager;
+
+    impl ManagerPlugin for TurnErrorManager {
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new(
+                "vendor",
+                PLUGIN_API_VERSION,
+                vec![Capability::TurnErrorDecision],
+            )
+        }
+
+        fn descriptors(&self) -> Vec<ProviderDescriptor> {
+            vec![ProviderDescriptor::new(
+                ProviderId::parse("vendor.silent").expect("合法"),
+                ExtensionPoint::TurnError,
+                PLUGIN_API_VERSION,
+                vec![Capability::TurnErrorDecision],
+            )]
+        }
+
+        fn instantiate(
+            &self,
+            id: &ProviderId,
+            _options: ProviderOptions<'_>,
+        ) -> Result<ProviderInstance, PluginError> {
+            if id.name() == "silent" {
+                Ok(ProviderInstance::TurnError(Arc::new(NoopTurnErrorProvider)))
+            } else {
+                Err(PluginError::UnknownProvider(id.to_string()))
+            }
+        }
+    }
+
+    #[test]
+    fn manager_can_supply_turn_error_providers() {
+        let mut manager = PluginManager::with_native_builtins();
+        manager
+            .install_manager(Arc::new(TurnErrorManager))
+            .expect("应当能安装");
+        let id = ProviderId::parse("vendor.silent").expect("合法");
+        let provider = manager
+            .resolve_turn_error(&id, &TurnErrorPolicy::default())
+            .expect("失败通知 provider 应当可解析");
+        let room = test_room();
+        let request = TurnErrorRequest {
+            session: "main",
+            room: &room,
+            error: "boom",
+            actions: &[],
+            default_actions: &[],
+        };
+        assert!(provider.decide(&request).is_empty());
+    }
+
+    #[test]
+    fn validate_config_rejects_an_unknown_turn_error_provider_before_start() {
+        let config = config_with_extra(
+            "[sessions.turn_error]\nprovider = \"vendor.missing\"",
         );
         let manager = PluginManager::with_native_builtins();
         assert!(matches!(

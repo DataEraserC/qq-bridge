@@ -36,8 +36,9 @@ use crate::outbound::{
     OutgoingKind, OutgoingRecord, RecordMode, Risk, Scope, Sent, TargetRole, expand_query,
 };
 use crate::plugin::{
-    AccessAction, AccessDecision, AccessRequest, DefaultDeliveryComposer, DeliveryRequest,
-    PluginError, PluginManager, SendContext, SendHook, SendOrigin, WakeContext,
+    AccessAction, AccessDecision, AccessRequest, DefaultDeliveryComposer, DefaultTurnErrorProvider,
+    DeliveryRequest, PluginError, PluginManager, SendContext, SendHook, SendOrigin,
+    TurnErrorRequest, WakeContext,
 };
 use crate::render;
 use crate::storage::{
@@ -658,8 +659,9 @@ impl<S: Store> Bridge<S> {
         }
     }
 
-    /// 按「会话自己的」`on_turn_error` 顺序执行失败通知；会话没配就回退到全局默认
-    /// `default_on_turn_error`。一个动作失败不打断后面的。
+    /// 交给会话的失败通知 provider 选动作，再按顺序执行。默认 provider 保持原行为：
+    /// 会话动作非空就用它，否则回退全局 `default_on_turn_error`。
+    /// 一个动作失败不打断后面的。
     fn notify_turn_error(
         &mut self,
         config: &Arc<Config>,
@@ -667,14 +669,33 @@ impl<S: Store> Bridge<S> {
         room: &RoomId,
         error: &str,
     ) {
-        // 会话自己配了动作就用它的；没配（空）或找不到会话，回退到全局默认。
-        // 注意：会话存在但 on_turn_error 是空列表，也算「没配」——否则全局默认
-        // 永远不生效（会话总有这条记录）。这是之前失败通知发不出去的根因。
-        let actions = config
+        let policy = config
             .session(session)
-            .filter(|s| !s.on_turn_error.is_empty())
-            .map(|s| s.on_turn_error.clone())
-            .unwrap_or_else(|| config.default_on_turn_error.clone());
+            .map(|session| session.turn_error.clone())
+            .unwrap_or_default();
+        let provider = match self
+            .plugins
+            .resolve_turn_error(&policy.provider, &policy)
+        {
+            Ok(provider) => provider,
+            Err(resolve_error) => {
+                eprintln!(
+                    "失败通知策略 {} 解析失败，回退内置：{resolve_error}",
+                    policy.provider
+                );
+                Arc::new(DefaultTurnErrorProvider)
+            }
+        };
+        let actions = provider.decide(&TurnErrorRequest {
+            session,
+            room,
+            error,
+            actions: config
+                .session(session)
+                .map(|session| session.on_turn_error.as_slice())
+                .unwrap_or(&[]),
+            default_actions: &config.default_on_turn_error,
+        });
         for action in actions {
             match action {
                 // `log` 由 endpoint 的 Log 帧负责（见 turn_end 处理），这里无需重复。
