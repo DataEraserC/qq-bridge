@@ -136,6 +136,38 @@ return {
 }
 
 #[test]
+fn lua_wake_can_return_a_reason() {
+    let dir = TempDir::new("wake-reason");
+    dir.write(
+        "reason.lua",
+        r#"
+return {
+  extension = "wake",
+  decide = function(options, context)
+    if context.at_self then
+      return { decision = "wake", reason = "脚本：被 @ 了" }
+    end
+    return { decision = "stay" }
+  end,
+}
+"#,
+    );
+    let plugins = loaded(&dir);
+    let id = ProviderId::parse("lua.reason").expect("合法");
+    let provider = plugins
+        .resolve_wake(&id, &WakePolicy::default())
+        .expect("脚本 provider 应当可解析");
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+    let verdict = provider.decide_with_reason(
+        &WakePolicy::default(),
+        &wake_context(&room, true, "在吗"),
+    );
+    assert_eq!(verdict.decision, WakeDecision::Wake);
+    assert_eq!(verdict.reason.as_deref(), Some("脚本：被 @ 了"));
+}
+
+#[test]
 fn access_provider_runs_from_a_lua_script() {
     let dir = TempDir::new("access");
     dir.write(

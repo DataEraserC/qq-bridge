@@ -85,7 +85,7 @@ use acb_kernel::{
     ReceivePolicy, ReceiveProvider, ReceiveRequest, Record, RecordKind, ReloadScope, RoomId,
     SendContext, SendHook, SenderRole, Sent, TurnErrorAction, TurnErrorProvider, TurnErrorRequest,
     WakeContext,
-    WakeDecision, WakePolicy, WakeProvider, default_delivery_plan, PLUGIN_API_VERSION,
+    WakeDecision, WakePolicy, WakeProvider, WakeVerdict, default_delivery_plan, PLUGIN_API_VERSION,
 };
 use acb_proto::element::flatten_text;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, RegistryKey, StdLib, Table, Value, VmState};
@@ -149,6 +149,14 @@ struct LuaWakeProvider {
 
 impl WakeProvider for LuaWakeProvider {
     fn decide(&self, options: &WakePolicy, context: &WakeContext<'_>) -> WakeDecision {
+        self.decide_with_reason(options, context).decision
+    }
+
+    fn decide_with_reason(
+        &self,
+        options: &WakePolicy,
+        context: &WakeContext<'_>,
+    ) -> WakeVerdict {
         let result = self.caller.call(|lua, function| {
             let options = wake_options_table(lua, options)?;
             let context = wake_context_table(lua, context)?;
@@ -156,15 +164,15 @@ impl WakeProvider for LuaWakeProvider {
         });
         match result {
             Ok(value) => match interpret_wake(value) {
-                Ok(decision) => decision,
+                Ok(verdict) => verdict,
                 Err(error) => {
                     self.caller.record_failure(&error);
-                    WakeDecision::Stay
+                    WakeVerdict::stay()
                 }
             },
             Err(error) => {
                 self.caller.record_failure(&error);
-                WakeDecision::Stay
+                WakeVerdict::stay()
             }
         }
     }
@@ -1254,19 +1262,39 @@ fn receive_request_table(lua: &Lua, request: &ReceiveRequest<'_>) -> mlua::Resul
     Ok(table)
 }
 
-fn interpret_wake(value: Value) -> mlua::Result<WakeDecision> {
+fn interpret_wake(value: Value) -> mlua::Result<WakeVerdict> {
     match value {
-        Value::Boolean(true) => Ok(WakeDecision::Wake),
-        Value::Boolean(false) => Ok(WakeDecision::Stay),
+        Value::Boolean(true) => Ok(WakeVerdict {
+            decision: WakeDecision::Wake,
+            reason: None,
+        }),
+        Value::Boolean(false) => Ok(WakeVerdict::stay()),
         Value::String(text) => match text.to_string_lossy().as_str() {
-            "wake" => Ok(WakeDecision::Wake),
-            "stay" => Ok(WakeDecision::Stay),
+            "wake" => Ok(WakeVerdict {
+                decision: WakeDecision::Wake,
+                reason: None,
+            }),
+            "stay" => Ok(WakeVerdict::stay()),
             other => Err(mlua::Error::runtime(format!(
                 "wake provider 要返回 \"wake\"/\"stay\"，收到 {other:?}"
             ))),
         },
+        Value::Table(table) => {
+            let decision: String = table.get("decision")?;
+            let reason: Option<String> = table.get("reason")?;
+            match decision.as_str() {
+                "wake" => Ok(WakeVerdict {
+                    decision: WakeDecision::Wake,
+                    reason,
+                }),
+                "stay" => Ok(WakeVerdict::stay()),
+                other => Err(mlua::Error::runtime(format!(
+                    "wake provider 的 decision 要是 \"wake\"/\"stay\"，收到 {other:?}"
+                ))),
+            }
+        }
         other => Err(mlua::Error::runtime(format!(
-            "wake provider 要返回 \"wake\"/\"stay\" 或布尔值，收到 {other:?}"
+            "wake provider 要返回 \"wake\"/\"stay\"、布尔值或 {{decision, reason}} 表，收到 {other:?}"
         ))),
     }
 }
