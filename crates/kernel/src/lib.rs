@@ -25,9 +25,9 @@ pub use adapter::{
 pub use event_queue::{drain_events, EventQueue, EventReceiver};
 pub use config::{
     AccessPolicy, Config, Connection, ConsoleConfig, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM,
-    DEFAULT_STORAGE_PATH, DEFAULT_WORKTREES_ROOT, EndpointConfig, Harness, KNOWN_ADAPTERS,
-    KNOWN_MEMORY_KINDS, Memory, Persona, RetentionConfig, Session, StorageConfig, Subscription,
-    Transport, WakeDecision, WakeInput, WakePolicy,
+    DEFAULT_STORAGE_PATH, DEFAULT_WORKTREES_ROOT, DeliveryPolicy, EndpointConfig, Harness,
+    KNOWN_ADAPTERS, KNOWN_MEMORY_KINDS, Memory, OutboundPolicy, Persona, RetentionConfig, Session,
+    StorageConfig, Subscription, Transport, WakeDecision, WakeInput, WakePolicy,
 };
 pub use endpoint::{Conn, ControlRegistry, EndpointError, handshake, run_connection, serve};
 pub use relay::{FileRelay, RelayError};
@@ -39,12 +39,13 @@ pub use outbound::{
 };
 pub use plugin::{
     AccessAction, AccessDecision, AccessProvider, AccessRequest, AllRoomsAccessProvider, Capability,
-    DefaultWakeProvider, ElevatedInRoomsAccessProvider, ExtensionPoint, Health, LoaderKind,
-    LoaderManifest, MAX_MANAGER_DEPTH, ManagerHealth, ManagerManifest, ManagerPlugin, NativeLoader,
-    PluginError, PluginLoader, PluginManager, ProviderDescriptor, ProviderId, ProviderInstance,
-    ProviderOptions, ReloadScope, SubscribedAccessProvider, WakeContext, WakeProvider,
-    ALL_ROOMS_ACCESS_PROVIDER, DEFAULT_ACCESS_PROVIDER, ELEVATED_ACCESS_PROVIDER,
-    PLUGIN_API_VERSION,
+    DefaultDeliveryComposer, DefaultWakeProvider, DeliveryComposer, DeliveryPlan, DeliveryRequest,
+    ElevatedInRoomsAccessProvider, ExtensionPoint, Health, LoaderKind, LoaderManifest,
+    MAX_MANAGER_DEPTH, ManagerHealth, ManagerManifest, ManagerPlugin, NativeLoader, PluginError,
+    PluginLoader, PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions,
+    ReloadScope, SendContext, SendHook, SendOrigin, SubscribedAccessProvider, WakeContext,
+    WakeProvider, ALL_ROOMS_ACCESS_PROVIDER, DEFAULT_ACCESS_PROVIDER, DEFAULT_DELIVERY_PROVIDER,
+    ELEVATED_ACCESS_PROVIDER, PLUGIN_API_VERSION,
 };
 pub use storage::{
     Counts, Cursor, Deliveries, FEEDBACK_CAP, Feedback, FeedbackDraft, Feedbacks, MIN_KEPT,

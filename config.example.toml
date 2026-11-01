@@ -154,6 +154,16 @@ model = "deepseek-chat"
 # 接入令牌：harness 连进来时报出 harness id + 这个令牌，桥据此绑定会话。
 token = "换成你自己的一长串随机字符"
 
+# 投递批次选择（ADR-0026 Phase 4）。不写就是内置「最旧一小段 + 最新一批」。
+# [sessions.delivery]
+# provider = "acb.delivery.default"
+
+# 发送前/后钩子（ADR-0026 Phase 4）。before 可以改写正文，after 只观察回执。
+# 列表里写 provider id，由已安装的 manager 提供；不写 = 不挂钩子。
+# [sessions.outbound]
+# before = []
+# after = []
+
 # QQ 群：@ 我、引用我的话、叫我名字、攒够 5 条就醒；被拍也醒。
 [[sessions.subscriptions]]
 connection = "qq"

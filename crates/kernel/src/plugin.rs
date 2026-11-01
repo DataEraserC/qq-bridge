@@ -12,11 +12,14 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use acb_proto::RoomId;
+use acb_proto::{Element, Omitted, Record, RoomId};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::config::{AccessPolicy, Config, WakeDecision, WakeInput, WakePolicy};
+use crate::config::{
+    AccessPolicy, Config, DeliveryPolicy, OutboundPolicy, WakeDecision, WakeInput, WakePolicy,
+};
+use crate::outbound::Sent;
 
 /// 插件 API 版本。provider / manager / loader 的 manifest 都要对得上。
 pub const PLUGIN_API_VERSION: u32 = 1;
@@ -26,6 +29,15 @@ pub const DEFAULT_WAKE_PROVIDER: &str = "acb.wake.default";
 
 /// 内置 access provider 的 id。会话没有显式写 provider 时用它。
 pub const DEFAULT_ACCESS_PROVIDER: &str = "acb.access.subscribed";
+
+/// 内置投递 composer 的 id。会话没有显式写 delivery provider 时用它。
+pub const DEFAULT_DELIVERY_PROVIDER: &str = "acb.delivery.default";
+
+/// 每轮从最旧端至少带几条（默认 composer 用）。
+const DELIVERY_OLDEST: usize = 5;
+
+/// 一轮投递的字节上限：整帧不能超过 1 MiB（协议上限），这里留一半余量给信封和记忆信息。
+const MAX_DELIVERY_BYTES: usize = 512 * 1024;
 
 /// 任何房间都允许访问（整个会话豁免订阅边界）。
 pub const ALL_ROOMS_ACCESS_PROVIDER: &str = "acb.access.all_rooms";
@@ -94,6 +106,11 @@ impl ProviderId {
         Self::parse(ELEVATED_ACCESS_PROVIDER).expect("内置 provider id 必须合法")
     }
 
+    /// 内置投递 composer。
+    pub fn builtin_delivery() -> Self {
+        Self::parse(DEFAULT_DELIVERY_PROVIDER).expect("内置 provider id 必须合法")
+    }
+
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
@@ -159,6 +176,7 @@ pub enum Capability {
     EmitSend,
     PlatformCatalog,
     DeliverPlan,
+    SendHook,
 }
 
 impl Capability {
@@ -171,6 +189,7 @@ impl Capability {
             Self::EmitSend => "emit_send",
             Self::PlatformCatalog => "platform_catalog",
             Self::DeliverPlan => "deliver_plan",
+            Self::SendHook => "send_hook",
         }
     }
 }
@@ -489,17 +508,156 @@ impl AccessProvider for ElevatedInRoomsAccessProvider {
     }
 }
 
+/// 一次开轮的候选记录。`records` 按编号从旧到新。
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryRequest<'a> {
+    pub session: &'a str,
+    pub room: &'a RoomId,
+    pub records: &'a [Record],
+    /// 条数上限；字节预算由 composer 自己管（默认实现有 512 KiB 上限）。
+    pub limit: usize,
+}
+
+/// composer 决定本轮投哪些编号，以及中间跳过哪一段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryPlan {
+    /// 要投的编号，顺序就是投递顺序。未知编号会被 core 忽略。
+    pub keep: Vec<u64>,
+    /// 被跳过的中段。`None` = 没跳。
+    pub omitted: Option<Omitted>,
+}
+
+/// 投递批次选择 provider。它只决定「投什么」，不碰水位、票和 ack——
+/// 那些仍是 Root 的职责（ADR-0026 硬约束）。
+pub trait DeliveryComposer: Send + Sync {
+    fn compose(&self, options: &DeliveryPolicy, request: &DeliveryRequest<'_>) -> DeliveryPlan;
+}
+
+/// 内置 composer：最旧一小段 + 最新一批，中间跳过。
+#[derive(Debug, Default)]
+pub struct DefaultDeliveryComposer;
+
+impl DeliveryComposer for DefaultDeliveryComposer {
+    fn compose(&self, _options: &DeliveryPolicy, request: &DeliveryRequest<'_>) -> DeliveryPlan {
+        default_delivery_plan(request)
+    }
+}
+
+/// 默认选批算法。composer 出错时 core 也用它兜底，保证一轮不会空手开。
+pub fn default_delivery_plan(request: &DeliveryRequest<'_>) -> DeliveryPlan {
+    let records = request.records;
+    let len = records.len();
+    if len == 0 {
+        return DeliveryPlan {
+            keep: Vec::new(),
+            omitted: None,
+        };
+    }
+    let limit = request.limit.max(1);
+
+    // 条数切法：至少给最新留 1 条；`limit` 大时最旧端最多 5 条。
+    let head_target = DELIVERY_OLDEST.min(limit.saturating_sub(1)).min(len);
+    let tail_target = (limit - head_target).min(len - head_target);
+
+    let sizes: Vec<usize> = records
+        .iter()
+        .map(|record| serde_json::to_vec(record).map(|bytes| bytes.len()).unwrap_or(0))
+        .collect();
+
+    let mut budget = MAX_DELIVERY_BYTES;
+    // 最旧端：从旧往新装；第一条就算超预算也要留着（等同于「至少保一条」）。
+    let mut head_keep = 0usize;
+    while head_keep < head_target {
+        let size = sizes[head_keep];
+        if head_keep > 0 && size > budget {
+            break;
+        }
+        budget = budget.saturating_sub(size);
+        head_keep += 1;
+    }
+
+    // 最新端：从新往旧装，花剩下的预算。
+    let mut tail_keep = 0usize;
+    while tail_keep < tail_target {
+        let index = len - 1 - tail_keep;
+        if sizes[index] > budget {
+            break;
+        }
+        budget -= sizes[index];
+        tail_keep += 1;
+    }
+    // 一条都没留下：至少给最新 1 条，不能空手开轮。
+    if head_keep + tail_keep == 0 {
+        tail_keep = 1;
+    }
+
+    let mut keep = Vec::with_capacity(head_keep + tail_keep);
+    keep.extend(records[..head_keep].iter().map(|record| record.id));
+    keep.extend(
+        records[len - tail_keep..]
+            .iter()
+            .map(|record| record.id),
+    );
+    let middle = &records[head_keep..len - tail_keep];
+    let omitted = middle
+        .first()
+        .zip(middle.last())
+        .map(|(first, last)| Omitted {
+            from: first.id,
+            to: last.id,
+            count: middle.len(),
+        });
+    DeliveryPlan { keep, omitted }
+}
+
+/// 这次发送从哪儿来。hook 可以按来源区分行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOrigin {
+    /// `send_message` / `send_message_to` 的正文。
+    Message,
+    /// 一轮失败后的通知。
+    TurnFailure,
+}
+
+/// 发送钩子的上下文。hook 只能看到这些，拿不到 Store / ticket / 水位。
+#[derive(Debug, Clone, Copy)]
+pub struct SendContext<'a> {
+    pub session: &'a str,
+    pub room: &'a RoomId,
+    pub origin: SendOrigin,
+}
+
+/// 发送前/后钩子。`before_send` 可以改写正文；`after_send` 只观察回执。
+///
+/// `before_send` 出错时整次发送失败（不静默跳过 hook）；`after_send` 不影响已经发出去的消息。
+pub trait SendHook: Send + Sync {
+    fn before_send(
+        &self,
+        _context: &SendContext<'_>,
+        _elements: &mut Vec<Element>,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn after_send(&self, _context: &SendContext<'_>, _sent: &Sent) {}
+}
+
 /// manager 实例化 provider 时能拿到的 options。
 #[derive(Debug, Clone, Copy)]
 pub enum ProviderOptions<'a> {
     Wake(&'a WakePolicy),
     Access(&'a AccessPolicy),
+    Delivery(&'a DeliveryPolicy),
+    /// 不需要 options 的扩展点（发送钩子）。
+    None,
 }
 
 /// manager 返回的 provider 实例。
 pub enum ProviderInstance {
     Wake(Arc<dyn WakeProvider>),
     Access(Arc<dyn AccessProvider>),
+    Delivery(Arc<dyn DeliveryComposer>),
+    Send(Arc<dyn SendHook>),
 }
 
 impl ProviderInstance {
@@ -508,6 +666,8 @@ impl ProviderInstance {
         match self {
             Self::Wake(_) => ExtensionPoint::Wake,
             Self::Access(_) => ExtensionPoint::Access,
+            Self::Delivery(_) => ExtensionPoint::Delivery,
+            Self::Send(_) => ExtensionPoint::Send,
         }
     }
 }
@@ -589,7 +749,11 @@ impl PluginLoader for NativeLoader {
         LoaderManifest::new(
             LoaderKind::Native,
             PLUGIN_API_VERSION,
-            vec![ExtensionPoint::Wake, ExtensionPoint::Access],
+            vec![
+                ExtensionPoint::Wake,
+                ExtensionPoint::Access,
+                ExtensionPoint::Delivery,
+            ],
         )
     }
 
@@ -629,6 +793,15 @@ impl PluginLoader for NativeLoader {
                 vec![Capability::AccessDecision],
             ),
             Arc::new(ElevatedInRoomsAccessProvider),
+        )?;
+        manager.register_delivery(
+            ProviderDescriptor::new(
+                ProviderId::builtin_delivery(),
+                ExtensionPoint::Delivery,
+                PLUGIN_API_VERSION,
+                vec![Capability::DeliverPlan],
+            ),
+            Arc::new(DefaultDeliveryComposer),
         )
     }
 }
@@ -638,6 +811,8 @@ impl PluginLoader for NativeLoader {
 pub struct PluginManager {
     wake: HashMap<ProviderId, Arc<dyn WakeProvider>>,
     access: HashMap<ProviderId, Arc<dyn AccessProvider>>,
+    delivery: HashMap<ProviderId, Arc<dyn DeliveryComposer>>,
+    send_hooks: HashMap<ProviderId, Arc<dyn SendHook>>,
     managers: HashMap<String, Arc<dyn ManagerPlugin>>,
     /// 安装顺序（含嵌套子树）。reload/health 正序，shutdown 逆序。
     manager_order: Vec<String>,
@@ -680,7 +855,13 @@ impl PluginManager {
             )));
         }
         for point in &manifest.extensions {
-            if !matches!(point, ExtensionPoint::Wake | ExtensionPoint::Access) {
+            if !matches!(
+                point,
+                ExtensionPoint::Wake
+                    | ExtensionPoint::Access
+                    | ExtensionPoint::Delivery
+                    | ExtensionPoint::Send
+            ) {
                 return Err(PluginError::UnsupportedExtensionPoint {
                     id: format!("loader:{}", manifest.kind.as_str()),
                     point: *point,
@@ -723,6 +904,42 @@ impl PluginManager {
         self.descriptors
             .insert(descriptor.id.clone(), descriptor.clone());
         self.access.insert(descriptor.id, provider);
+        Ok(())
+    }
+
+    /// 注册投递 composer。校验规则同 wake。
+    pub fn register_delivery(
+        &mut self,
+        descriptor: ProviderDescriptor,
+        provider: Arc<dyn DeliveryComposer>,
+    ) -> Result<(), PluginError> {
+        self.check_descriptor(
+            &descriptor,
+            ExtensionPoint::Delivery,
+            Capability::DeliverPlan,
+        )?;
+        if self.descriptors.contains_key(&descriptor.id) {
+            return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
+        }
+        self.descriptors
+            .insert(descriptor.id.clone(), descriptor.clone());
+        self.delivery.insert(descriptor.id, provider);
+        Ok(())
+    }
+
+    /// 注册发送钩子。校验规则同 wake。
+    pub fn register_send_hook(
+        &mut self,
+        descriptor: ProviderDescriptor,
+        hook: Arc<dyn SendHook>,
+    ) -> Result<(), PluginError> {
+        self.check_descriptor(&descriptor, ExtensionPoint::Send, Capability::SendHook)?;
+        if self.descriptors.contains_key(&descriptor.id) {
+            return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
+        }
+        self.descriptors
+            .insert(descriptor.id.clone(), descriptor.clone());
+        self.send_hooks.insert(descriptor.id, hook);
         Ok(())
     }
 
@@ -816,6 +1033,8 @@ impl PluginManager {
             let required = match descriptor.extension_point {
                 ExtensionPoint::Wake => Capability::WakeDecision,
                 ExtensionPoint::Access => Capability::AccessDecision,
+                ExtensionPoint::Delivery => Capability::DeliverPlan,
+                ExtensionPoint::Send => Capability::SendHook,
                 point => {
                     return Err(PluginError::UnsupportedExtensionPoint {
                         id: descriptor.id.to_string(),
@@ -968,10 +1187,79 @@ impl PluginManager {
         }
     }
 
+    /// 解析投递 composer。先查 Root 直接注册的，再按 namespace 委托 manager。
+    pub fn resolve_delivery(
+        &self,
+        id: &ProviderId,
+        options: &DeliveryPolicy,
+    ) -> Result<Arc<dyn DeliveryComposer>, PluginError> {
+        if let Some(provider) = self.delivery.get(id) {
+            return Ok(provider.clone());
+        }
+        let Some(descriptor) = self.descriptors.get(id) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        if descriptor.extension_point != ExtensionPoint::Delivery {
+            return Err(PluginError::UnsupportedExtensionPoint {
+                id: id.to_string(),
+                point: descriptor.extension_point,
+            });
+        }
+        let Some(manager) = self.managers.get(id.namespace()) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        match manager.instantiate(id, ProviderOptions::Delivery(options))? {
+            ProviderInstance::Delivery(provider) => Ok(provider),
+            other => Err(PluginError::WrongProviderKind {
+                id: id.to_string(),
+                expected: ExtensionPoint::Delivery,
+                found: other.extension_point(),
+            }),
+        }
+    }
+
+    /// 解析一个发送钩子。
+    pub fn resolve_send_hook(&self, id: &ProviderId) -> Result<Arc<dyn SendHook>, PluginError> {
+        if let Some(hook) = self.send_hooks.get(id) {
+            return Ok(hook.clone());
+        }
+        let Some(descriptor) = self.descriptors.get(id) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        if descriptor.extension_point != ExtensionPoint::Send {
+            return Err(PluginError::UnsupportedExtensionPoint {
+                id: id.to_string(),
+                point: descriptor.extension_point,
+            });
+        }
+        let Some(manager) = self.managers.get(id.namespace()) else {
+            return Err(PluginError::UnknownProvider(id.to_string()));
+        };
+        match manager.instantiate(id, ProviderOptions::None)? {
+            ProviderInstance::Send(hook) => Ok(hook),
+            other => Err(PluginError::WrongProviderKind {
+                id: id.to_string(),
+                expected: ExtensionPoint::Send,
+                found: other.extension_point(),
+            }),
+        }
+    }
+
+    /// 按配置顺序解析一组发送钩子。
+    pub fn resolve_send_hooks(
+        &self,
+        ids: &[ProviderId],
+    ) -> Result<Vec<Arc<dyn SendHook>>, PluginError> {
+        ids.iter().map(|id| self.resolve_send_hook(id)).collect()
+    }
+
     /// 启动时校验整份配置引用的 provider 都存在。`main` 在起线程前调用。
     pub fn validate_config(&self, config: &Config) -> Result<(), PluginError> {
         for session in &config.sessions {
             self.resolve_access(&session.access.provider, &session.access)?;
+            self.resolve_delivery(&session.delivery.provider, &session.delivery)?;
+            self.resolve_send_hooks(&session.outbound.before)?;
+            self.resolve_send_hooks(&session.outbound.after)?;
             for subscription in &session.subscriptions {
                 self.resolve_wake(&subscription.wake.provider, &subscription.wake)?;
             }
@@ -1718,7 +2006,7 @@ mod tests {
             LoaderManifest::new(
                 LoaderKind::Process,
                 PLUGIN_API_VERSION,
-                vec![ExtensionPoint::Delivery],
+                vec![ExtensionPoint::Clock],
             )
         }
         fn install(&self, _manager: &mut PluginManager) -> Result<(), PluginError> {
@@ -1747,7 +2035,7 @@ mod tests {
         assert!(matches!(
             manager.install_loader(&UnsupportedExtensionLoader),
             Err(PluginError::UnsupportedExtensionPoint {
-                point: ExtensionPoint::Delivery,
+                point: ExtensionPoint::Clock,
                 ..
             })
         ));
@@ -1758,7 +2046,11 @@ mod tests {
 
         assert_eq!(
             NativeLoader.manifest().extensions,
-            vec![ExtensionPoint::Wake, ExtensionPoint::Access]
+            vec![
+                ExtensionPoint::Wake,
+                ExtensionPoint::Access,
+                ExtensionPoint::Delivery
+            ]
         );
     }
 
@@ -1844,6 +2136,65 @@ mod tests {
             room = "group/1"
         "#;
         let config = Config::parse(text).expect("语法合法");
+        let manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.validate_config(&config),
+            Err(PluginError::UnknownProvider(_))
+        ));
+    }
+
+    fn config_with_extra(extra: &str) -> Config {
+        let text = format!(
+            r#"
+            [[connections]]
+            id = "qq"
+            platform = "qq"
+            kind = "onebot11"
+            url = "ws://127.0.0.1:3001"
+            account = "10001"
+
+            [[personas]]
+            id = "p"
+            name = "P"
+            text = "你是桥。"
+
+            [[harnesses]]
+            id = "dsh"
+            name = "DSH"
+
+            [[sessions]]
+            id = "main"
+            harness = "dsh"
+            persona = "p"
+            token = "t-main"
+
+            {extra}
+
+            [[sessions.subscriptions]]
+            connection = "qq"
+            room = "group/1"
+            "#
+        );
+        Config::parse(&text).expect("语法合法")
+    }
+
+    #[test]
+    fn validate_config_rejects_an_unknown_delivery_provider_before_start() {
+        let config = config_with_extra(
+            "[sessions.delivery]\nprovider = \"vendor.missing\"",
+        );
+        let manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.validate_config(&config),
+            Err(PluginError::UnknownProvider(_))
+        ));
+    }
+
+    #[test]
+    fn validate_config_rejects_an_unknown_send_hook_before_start() {
+        let config = config_with_extra(
+            "[sessions.outbound]\nbefore = [\"vendor.missing\"]",
+        );
         let manager = PluginManager::with_native_builtins();
         assert!(matches!(
             manager.validate_config(&config),

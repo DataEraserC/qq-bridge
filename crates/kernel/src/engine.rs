@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
 use acb_proto::{
-    Delivery, Element, ErrorCode, MemoryInfo, Omitted, PersonaInfo, QuoteRef, Record, RecordKind,
+    Delivery, Element, ErrorCode, MemoryInfo, PersonaInfo, QuoteRef, Record, RecordKind,
     RoomId, Sender, SessionInfo, Ticket, ToolError, TurnReason,
 };
 use serde::Deserialize;
@@ -36,7 +36,8 @@ use crate::outbound::{
     OutgoingKind, OutgoingRecord, RecordMode, Risk, Scope, Sent, TargetRole, expand_query,
 };
 use crate::plugin::{
-    AccessAction, AccessDecision, AccessRequest, PluginError, PluginManager, WakeContext,
+    AccessAction, AccessDecision, AccessRequest, DefaultDeliveryComposer, DeliveryRequest,
+    PluginError, PluginManager, SendContext, SendHook, SendOrigin, WakeContext,
 };
 use crate::render;
 use crate::storage::{
@@ -53,12 +54,6 @@ use crate::tools::{
 
 /// 一轮最多投多少条。剩下的下一轮再投，免得一次塞爆上下文。
 pub const MAX_DELIVERY: usize = 200;
-
-/// 一轮投递的字节上限：整帧不能超过 1 MiB（协议上限），这里留一半余量给信封和记忆信息。
-///
-/// 为什么按字节再设一道：200 条长消息也能撑到一兆。以前只按条数截，真碰上大段文字
-/// 会把 `turn_start` 撑爆，harness 那边帧解不开、直接断连——看起来像「桥挂了」。
-const MAX_DELIVERY_BYTES: usize = 512 * 1024;
 
 /// 查历史时的默认条数与上限。
 const DEFAULT_HISTORY: usize = 20;
@@ -178,6 +173,12 @@ pub(crate) struct PreparedSend {
     outbound: OutboundHandle,
     trimmed: bool,
     relayed: Vec<(String, String)>,
+    /// 这次发送替哪个会话说话（决定用哪个会话的发送钩子）。
+    session: String,
+    /// 工具正文还是失败通知。
+    origin: SendOrigin,
+    /// 发送成功后要跑的观察钩子。
+    after_hooks: Vec<Arc<dyn SendHook>>,
 }
 
 impl PreparedSend {
@@ -687,6 +688,7 @@ impl<S: Store> Bridge<S> {
                         config.clone(),
                         session,
                         target,
+                        SendOrigin::TurnFailure,
                         vec![Element::text(text)],
                     ) {
                         Ok(prepared) => self.pending_notices.push(prepared),
@@ -731,7 +733,13 @@ impl<S: Store> Bridge<S> {
             // 不给目标：接着说当前这一轮的房间，用本轮的身份。
             "send_message" => {
                 let args: SendArgs = parse(args)?;
-                self.deliver_out(turn_config.clone(), &turn_session, &room, args.elements.0)
+                self.deliver_out(
+                    turn_config.clone(),
+                    &turn_session,
+                    &room,
+                    SendOrigin::Message,
+                    args.elements.0,
+                )
             }
             // 给了目标：跨会话发送已砍；目标房间由本会话的访问策略把关。
             "send_message_to" => {
@@ -742,6 +750,7 @@ impl<S: Store> Bridge<S> {
                     turn_config.clone(),
                     &turn_session,
                     &target,
+                    SendOrigin::Message,
                     args.elements.0,
                 )
             }
@@ -874,6 +883,7 @@ impl<S: Store> Bridge<S> {
                     ctx.config.clone(),
                     &ctx.session,
                     ctx.room.clone(),
+                    SendOrigin::Message,
                     args.elements.0,
                 )?;
                 Ok(ToolCallStart::Send(prepared))
@@ -887,6 +897,7 @@ impl<S: Store> Bridge<S> {
                     ctx.config.clone(),
                     &ctx.session,
                     target,
+                    SendOrigin::Message,
                     args.elements.0,
                 )?;
                 Ok(ToolCallStart::Send(prepared))
@@ -1364,8 +1375,44 @@ impl<S: Store> Bridge<S> {
         } else {
             turn_config.delivery_limit.min(MAX_DELIVERY)
         };
-        let omitted = select_delivery(&mut records, limit);
+        // composer 只决定「投哪些编号」；它看不到 store、票和水位，选出来的编号
+        // 还要在这里过一遍真实记录集合——未知编号、重复编号都不会凭空进 delivered。
+        let delivery_policy = turn_config
+            .session(&pending.session)
+            .map(|session| session.delivery.clone())
+            .unwrap_or_default();
+        let composer = match self
+            .plugins
+            .resolve_delivery(&delivery_policy.provider, &delivery_policy)
+        {
+            Ok(composer) => composer,
+            Err(error) => {
+                eprintln!(
+                    "投递策略 {} 解析失败，回退内置 composer：{error}",
+                    delivery_policy.provider
+                );
+                Arc::new(DefaultDeliveryComposer)
+            }
+        };
+        let plan = composer.compose(
+            &delivery_policy,
+            &DeliveryRequest {
+                session: &pending.session,
+                room: &pending.room,
+                records: &records,
+                limit,
+            },
+        );
+        let omitted = plan.omitted;
         let more = omitted.map(|omitted| omitted.count);
+        let mut by_id: HashMap<u64, Record> = records.into_iter().map(|r| (r.id, r)).collect();
+        let mut selected = Vec::with_capacity(plan.keep.len());
+        for id in &plan.keep {
+            if let Some(record) = by_id.remove(id) {
+                selected.push(record);
+            }
+        }
+        records = selected;
 
         let mut delivered = BTreeSet::new();
         let cursor = Cursor::new(pending.session.clone(), pending.room.clone());
@@ -1431,10 +1478,7 @@ impl<S: Store> Bridge<S> {
                 text: persona.text.clone(),
             });
 
-        // 消息过多时不全投：给最旧一小段（让水位能继续前进）+ 最新一批（让模型
-        // 看得到眼前的话），中间那段跳过并明确告诉模型编号区间。只取最新会让
-        // 旧积压永远排不上、水位卡死；只取最旧又会让新消息被积压挡住。
-        // （批次已经在上面的 `select_delivery` 里选好，这里直接用它。）
+        // 批次已经由 composer 选好（默认是最旧一小段 + 最新一批），这里直接用它。
         Ok(Delivery {
             ticket,
             session: pending.session,
@@ -1510,20 +1554,22 @@ impl<S: Store> Bridge<S> {
         config: Arc<Config>,
         session: &str,
         room: &RoomId,
+        origin: SendOrigin,
         elements: Vec<Element>,
     ) -> Result<Value, ToolError> {
-        let prepared = self.prepare_send(config, session, room.clone(), elements)?;
+        let prepared = self.prepare_send(config, session, room.clone(), origin, elements)?;
         let sent = prepared.execute();
         self.finish_send(prepared, sent)
     }
 
-    /// 校验、切调用标记、中继本机文件、查账号、取出发通道——但**不发送**。
+    /// 校验、切调用标记、跑发送前钩子、中继本机文件、查账号、取出发通道——但**不发送**。
     /// endpoint 可以拿着这个结果放下全局锁，真正等平台。
     fn prepare_send(
         &mut self,
         config: Arc<Config>,
-        _session: &str,
+        session: &str,
         room: RoomId,
+        origin: SendOrigin,
         mut elements: Vec<Element>,
     ) -> Result<PreparedSend, ToolError> {
         // 先把混进正文的「调用标记」切掉。这不是洁癖：群里真的出现过带
@@ -1544,6 +1590,51 @@ impl<S: Store> Bridge<S> {
                 } else {
                     "没有内容可发"
                 },
+            ));
+        }
+
+        // 发送前钩子：按会话配置的顺序跑，可改写正文（例如加签名、脱敏）。
+        // 钩子失败就让这次发送失败，绝不静默跳过——否则「以为挂了钩子」只是错觉。
+        let outbound_policy = config
+            .session(session)
+            .map(|session| session.outbound.clone())
+            .unwrap_or_default();
+        let before_hooks = self
+            .plugins
+            .resolve_send_hooks(&outbound_policy.before)
+            .map_err(|error| {
+                ToolError::new(
+                    ErrorCode::Internal,
+                    format!("发送前钩子解析失败：{error}"),
+                )
+            })?;
+        let after_hooks = self
+            .plugins
+            .resolve_send_hooks(&outbound_policy.after)
+            .map_err(|error| {
+                ToolError::new(
+                    ErrorCode::Internal,
+                    format!("发送后钩子解析失败：{error}"),
+                )
+            })?;
+        let hook_context = SendContext {
+            session,
+            room: &room,
+            origin,
+        };
+        for hook in &before_hooks {
+            hook.before_send(&hook_context, &mut elements)
+                .map_err(|error| {
+                    ToolError::new(
+                        ErrorCode::Internal,
+                        format!("发送前钩子失败：{error}"),
+                    )
+                })?;
+        }
+        if elements.is_empty() {
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                "发送前钩子把正文清空了；检查会话的 [sessions.outbound].before 配置",
             ));
         }
 
@@ -1573,6 +1664,9 @@ impl<S: Store> Bridge<S> {
             outbound,
             trimmed,
             relayed,
+            session: session.to_owned(),
+            origin,
+            after_hooks,
         })
     }
 
@@ -1588,6 +1682,9 @@ impl<S: Store> Bridge<S> {
             config,
             trimmed,
             relayed,
+            session,
+            origin,
+            after_hooks,
             ..
         } = prepared;
 
@@ -1610,6 +1707,16 @@ impl<S: Store> Bridge<S> {
                 return Err(tool_error);
             }
         };
+
+        // 发送成功后跑观察钩子。它们只拿到回执，不能改已经发出去的内容。
+        let hook_context = SendContext {
+            session: &session,
+            room: &room,
+            origin,
+        };
+        for hook in &after_hooks {
+            hook.after_send(&hook_context, &sent);
+        }
 
         let account = config.account_of_room(&room);
         let (record, watermark) = self
@@ -2664,72 +2771,6 @@ impl<S: Store> Bridge<S> {
         let branches = git_branch(&worktree)?;
         Ok(json!({ "branches": branches }))
     }
-}
-
-/// 每轮从**最旧端**至少带几条。让水位有东西可推，同时不至于把新消息全挤掉。
-const DELIVERY_OLDEST: usize = 5;
-
-/// 从完整未读里选本轮投递的批次：最旧一小段 + 最新一批，中间跳过。
-///
-/// 返回被跳过的中段（编号区间 + 条数）；没有跳过就给 `None`。
-/// 条数和字节两个预算同时管：字节不够时继续从中间砍，但最旧端至少留 1 条。
-fn select_delivery(records: &mut Vec<Record>, limit: usize) -> Option<Omitted> {
-    let len = records.len();
-    if len == 0 {
-        return None;
-    }
-    let limit = limit.max(1);
-
-    // 条数切法：至少给最新留 1 条；`limit` 大时最旧端最多 5 条。
-    let head_target = DELIVERY_OLDEST.min(limit.saturating_sub(1)).min(len);
-    let tail_target = (limit - head_target).min(len - head_target);
-
-    let sizes: Vec<usize> = records
-        .iter()
-        .map(|record| serde_json::to_vec(record).map(|bytes| bytes.len()).unwrap_or(0))
-        .collect();
-
-    let mut budget = MAX_DELIVERY_BYTES;
-    // 最旧端：从旧往新装；第一条就算超预算也要留着（等同于原来的「至少保一条」）。
-    let mut head_keep = 0usize;
-    while head_keep < head_target {
-        let size = sizes[head_keep];
-        if head_keep > 0 && size > budget {
-            break;
-        }
-        budget = budget.saturating_sub(size);
-        head_keep += 1;
-    }
-
-    // 最新端：从新往旧装，花剩下的预算。
-    let mut tail_keep = 0usize;
-    while tail_keep < tail_target {
-        let index = len - 1 - tail_keep;
-        let size = sizes[index];
-        if size > budget {
-            break;
-        }
-        budget -= size;
-        tail_keep += 1;
-    }
-    // 一条都没留下：至少给最新 1 条，不能空手开轮。
-    if head_keep + tail_keep == 0 {
-        tail_keep = 1;
-    }
-
-    let mut all = std::mem::take(records);
-    let tail = all.split_off(len - tail_keep);
-    let omitted = all.split_off(head_keep);
-    all.extend(tail);
-    *records = all;
-
-    let first = omitted.first()?.id;
-    let last = omitted.last()?.id;
-    Some(Omitted {
-        from: first,
-        to: last,
-        count: omitted.len(),
-    })
 }
 
 /// 「本轮投给你的是哪一段」——错误信息里要能直接照抄的答案。

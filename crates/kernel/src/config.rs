@@ -329,6 +329,10 @@ pub struct Session {
     pub subscriptions: Vec<Subscription>,
     /// 访问策略（ADR-0026 Phase 2d）。默认按订阅；可换 provider。
     pub access: AccessPolicy,
+    /// 投递批次选择策略（ADR-0026 Phase 4）。默认「最旧一小段 + 最新一批」。
+    pub delivery: DeliveryPolicy,
+    /// 发送前/后钩子（ADR-0026 Phase 4）。按列表顺序执行。
+    pub outbound: OutboundPolicy,
     /// 这个会话一轮失败时按顺序执行的「通知动作」列表。空 = 只记日志。
     /// 见 [`TurnErrorAction`]。
     pub on_turn_error: TurnErrorActions,
@@ -364,6 +368,29 @@ impl Default for AccessPolicy {
             rooms: Vec::new(),
         }
     }
+}
+
+/// 一个会话的投递批次选择策略（ADR-0026 Phase 4）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeliveryPolicy {
+    /// composer 的 provider id。不写就用内置「最旧一小段 + 最新一批」。
+    pub provider: ProviderId,
+}
+
+impl Default for DeliveryPolicy {
+    fn default() -> Self {
+        Self {
+            provider: ProviderId::builtin_delivery(),
+        }
+    }
+}
+
+/// 一个会话的发送钩子。按列表顺序执行：`before` 可以改写正文，
+/// `after` 只观察回执。空列表 = 不挂任何钩子。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OutboundPolicy {
+    pub before: Vec<ProviderId>,
+    pub after: Vec<ProviderId>,
 }
 
 /// 唤醒策略的判定输入。只带判定需要的东西，不把整条记录塞进来。
@@ -541,6 +568,18 @@ pub enum ConfigError {
         session: String,
         room: String,
         connection: String,
+    },
+    #[error("会话 {session} 的投递策略 provider 不合法：{provider}（{detail}）")]
+    BadDeliveryProvider {
+        session: String,
+        provider: String,
+        detail: String,
+    },
+    #[error("会话 {session} 的发送钩子 provider 不合法：{provider}（{detail}）")]
+    BadSendHookProvider {
+        session: String,
+        provider: String,
+        detail: String,
     },
     #[error("会话 {session} 的接入令牌不能为空")]
     EmptyToken { session: String },
@@ -935,6 +974,8 @@ impl Config {
 
             let on_turn_error = parse_turn_error_actions(&raw_session.on_turn_error)?;
             let access = build_access(&id, raw_session.access, &connections)?;
+            let delivery = build_delivery(&id, raw_session.delivery)?;
+            let outbound = build_outbound(&id, raw_session.outbound)?;
 
             sessions.push(Session {
                 id,
@@ -946,6 +987,8 @@ impl Config {
                 token: raw_session.token.trim().to_owned(),
                 subscriptions,
                 access,
+                delivery,
+                outbound,
                 on_turn_error,
             });
         }
@@ -1204,6 +1247,44 @@ fn build_access(
     Ok(AccessPolicy { provider, rooms })
 }
 
+fn build_delivery(session: &str, raw: RawDelivery) -> Result<DeliveryPolicy, ConfigError> {
+    let provider = match raw
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => {
+            ProviderId::parse(text).map_err(|error| ConfigError::BadDeliveryProvider {
+                session: session.to_owned(),
+                provider: text.to_owned(),
+                detail: error.to_string(),
+            })?
+        }
+        None => ProviderId::builtin_delivery(),
+    };
+    Ok(DeliveryPolicy { provider })
+}
+
+fn build_outbound(session: &str, raw: RawOutbound) -> Result<OutboundPolicy, ConfigError> {
+    let parse_hooks = |ids: Vec<String>| -> Result<Vec<ProviderId>, ConfigError> {
+        ids.into_iter()
+            .map(|text| {
+                let text = text.trim().to_owned();
+                ProviderId::parse(&text).map_err(|error| ConfigError::BadSendHookProvider {
+                    session: session.to_owned(),
+                    provider: text,
+                    detail: error.to_string(),
+                })
+            })
+            .collect()
+    };
+    Ok(OutboundPolicy {
+        before: parse_hooks(raw.before)?,
+        after: parse_hooks(raw.after)?,
+    })
+}
+
 fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, ConfigError> {
     let default = WakePolicy::default();
 
@@ -1362,9 +1443,28 @@ struct RawSession {
     /// 访问策略（默认按订阅）。
     #[serde(default)]
     access: RawAccess,
+    /// 投递批次选择（默认内置 composer）。
+    #[serde(default)]
+    delivery: RawDelivery,
+    /// 发送前/后钩子（默认空）。
+    #[serde(default)]
+    outbound: RawOutbound,
     /// 一轮失败时的通知动作列表（默认空 = 只记日志）。
     #[serde(default)]
     on_turn_error: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDelivery {
+    provider: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawOutbound {
+    #[serde(default)]
+    before: Vec<String>,
+    #[serde(default)]
+    after: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -6,9 +6,12 @@
 use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
-    Bridge, Cursor, Element, ErrorCode, Feedbacks, Ingest, MemoryStore, NoteKey, NoteKind, Notes,
-    Omitted, Outbound, OutboundError, RecordDraft, RoomId, Sender, Sent, Transcript, TurnReason,
-    Watermarks, unread,
+    Bridge, Capability, Cursor, DeliveryComposer, DeliveryPlan, DeliveryPolicy, DeliveryRequest,
+    Element, ErrorCode, ExtensionPoint, Feedbacks, Ingest, ManagerManifest, ManagerPlugin,
+    MemoryStore, NoteKey, NoteKind, Notes, Omitted, Outbound, OutboundError, PluginError,
+    PluginManager, ProviderDescriptor, ProviderId, ProviderInstance, ProviderOptions, RecordDraft,
+    RoomId, SendContext, SendHook, Sender, Sent, Transcript, TurnReason, Watermarks, unread,
+    PLUGIN_API_VERSION,
 };
 use serde_json::{Value, json};
 
@@ -120,6 +123,131 @@ fn bridge_with_access(provider: &str, rooms: &[&str]) -> (Bridge<MemoryStore>, S
         }),
     );
     (bridge, sends)
+}
+
+/// 在会话订阅之前插一段配置（例如 `[sessions.delivery]` / `[sessions.outbound]`）。
+fn config_with(insert: &str) -> String {
+    config().replacen(
+        "        [[sessions.subscriptions]]",
+        &format!("{insert}\n\n        [[sessions.subscriptions]]"),
+        1,
+    )
+}
+
+/// 带自定义扩展宿主的桥。
+fn bridge_with_plugins(text: &str, plugins: PluginManager) -> (Bridge<MemoryStore>, Sends) {
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let bridge = Bridge::with_plugins(
+        acb_kernel::Config::parse(text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder {
+            sends: sends.clone(),
+        }),
+        plugins,
+    );
+    (bridge, sends)
+}
+
+/// 只投最新一条的 composer。
+struct LatestOnly;
+
+impl DeliveryComposer for LatestOnly {
+    fn compose(&self, _options: &DeliveryPolicy, request: &DeliveryRequest<'_>) -> DeliveryPlan {
+        let mut keep = Vec::new();
+        if let Some(last) = request.records.last() {
+            keep.push(last.id);
+        }
+        // 故意塞一个不存在的编号：core 必须忽略它，不能让水位出错。
+        keep.push(9999);
+        DeliveryPlan {
+            keep,
+            omitted: None,
+        }
+    }
+}
+
+struct LatestOnlyManager;
+
+impl ManagerPlugin for LatestOnlyManager {
+    fn manifest(&self) -> ManagerManifest {
+        ManagerManifest::new("test", PLUGIN_API_VERSION, vec![Capability::DeliverPlan])
+    }
+
+    fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        vec![ProviderDescriptor::new(
+            ProviderId::parse("test.latest").expect("合法"),
+            ExtensionPoint::Delivery,
+            PLUGIN_API_VERSION,
+            vec![Capability::DeliverPlan],
+        )]
+    }
+
+    fn instantiate(
+        &self,
+        id: &ProviderId,
+        _options: ProviderOptions<'_>,
+    ) -> Result<ProviderInstance, PluginError> {
+        if id.name() == "latest" {
+            Ok(ProviderInstance::Delivery(Arc::new(LatestOnly)))
+        } else {
+            Err(PluginError::UnknownProvider(id.to_string()))
+        }
+    }
+}
+
+/// 发送前加签名、发送后记账的钩子。
+#[derive(Default)]
+struct SignHook {
+    after: Arc<Mutex<Vec<String>>>,
+}
+
+impl SendHook for SignHook {
+    fn before_send(
+        &self,
+        _context: &SendContext<'_>,
+        elements: &mut Vec<Element>,
+    ) -> Result<(), PluginError> {
+        elements.push(Element::text(" [签名]"));
+        Ok(())
+    }
+
+    fn after_send(&self, context: &SendContext<'_>, sent: &Sent) {
+        self.after
+            .lock()
+            .expect("没被毒死")
+            .push(format!("{}:{}", context.session, sent.platform_id));
+    }
+}
+
+struct SignHookManager {
+    hook: Arc<SignHook>,
+}
+
+impl ManagerPlugin for SignHookManager {
+    fn manifest(&self) -> ManagerManifest {
+        ManagerManifest::new("hook", PLUGIN_API_VERSION, vec![Capability::SendHook])
+    }
+
+    fn descriptors(&self) -> Vec<ProviderDescriptor> {
+        vec![ProviderDescriptor::new(
+            ProviderId::parse("hook.sign").expect("合法"),
+            ExtensionPoint::Send,
+            PLUGIN_API_VERSION,
+            vec![Capability::SendHook],
+        )]
+    }
+
+    fn instantiate(
+        &self,
+        id: &ProviderId,
+        _options: ProviderOptions<'_>,
+    ) -> Result<ProviderInstance, PluginError> {
+        if id.name() == "sign" {
+            Ok(ProviderInstance::Send(self.hook.clone()))
+        } else {
+            Err(PluginError::UnknownProvider(id.to_string()))
+        }
+    }
 }
 
 /// 单轮投递条数上限改小的桥。
@@ -2382,5 +2510,73 @@ fn delivery_truncation_keeps_newest_and_a_small_oldest_slice() {
             count: 3
         }),
         "跳过的编号区间要明确给出"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4：投递 composer + 发送前后钩子
+// ---------------------------------------------------------------------------
+
+#[test]
+fn custom_delivery_composer_decides_the_batch() {
+    let text = config_with("        [sessions.delivery]\n        provider = \"test.latest\"");
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins
+        .install_manager(Arc::new(LatestOnlyManager))
+        .expect("能安装 composer");
+
+    let (mut bridge, _sends) = bridge_with_plugins(&text, plugins);
+    for i in 1..=3 {
+        bridge
+            .ingest(message("qq:group/123", "10001", &format!("第{i}句"), true))
+            .expect("能记下来");
+    }
+
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    let ids: Vec<u64> = delivery.records.iter().map(|record| record.id).collect();
+    assert_eq!(ids, vec![3], "composer 只留最新一条，未知编号被忽略");
+    assert_eq!(delivery.omitted, None, "composer 说没跳过中段");
+}
+
+#[test]
+fn send_hooks_can_rewrite_and_observe() {
+    let text = config_with(
+        "        [sessions.outbound]\n        before = [\"hook.sign\"]\n        after = [\"hook.sign\"]",
+    );
+    let hook = Arc::new(SignHook::default());
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins
+        .install_manager(Arc::new(SignHookManager { hook: hook.clone() }))
+        .expect("能安装发送钩子");
+
+    let (mut bridge, sends) = bridge_with_plugins(&text, plugins);
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message",
+            json!({"elements": [{"type": "text", "text": "你好"}]}),
+        )
+        .expect("能发送");
+
+    let sends = sends.lock().expect("没被毒死");
+    let (_, elements) = &sends[0];
+    assert_eq!(elements.len(), 2, "钩子应当追加了一段");
+    match &elements[1] {
+        Element::Text { text } => assert_eq!(text, " [签名]"),
+        other => panic!("第二段应当是文本，收到 {other:?}"),
+    }
+    drop(sends);
+
+    let after = hook.after.lock().expect("没被毒死");
+    assert_eq!(
+        after.as_slice(),
+        ["main:p-1"],
+        "发送后钩子应当拿到回执"
     );
 }

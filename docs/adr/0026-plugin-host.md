@@ -111,6 +111,13 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - 每次调用有 50ms 超时（指令钩子打断）；超时或报错按安全侧兜底（wake 不醒、access 拒绝），并累计失败数让 manager health 变 Degraded。
   - `reload` 只换实现，不允许脚本增删 provider（descriptor 集合变化要求重启）。目录来自环境变量 `ACB_LUA_DIR`，没设就不装 LuaLoader。
   - 这满足 bootstrap 约束：LuaManager 是 native 实现，不是它自己加载的 `.lua` 文件。
+- **Phase 4（2026-11-01）**：投递 composer + 发送前后钩子。
+  - 会话新增 `[sessions.delivery] provider = ...`，默认 `acb.delivery.default`（原来的「最旧一小段 + 最新一批」逻辑搬进 provider）。composer 只返回编号集合和 `omitted`；未知编号被 core 忽略，票/水位/ack 仍由 Root 算；解析失败回退内置 composer，保证一轮不会空手开。
+  - 会话新增 `[sessions.outbound] before = [...] / after = [...]`：`before` 按顺序改写正文（可加签名、脱敏），`after` 只观察回执。`before` 失败则本次发送失败；`after` 不影响已发出去的消息。钩子只拿到 session / room / origin，不拿 Store、票或水位。
+  - NativeLoader 注册内置 `acb.delivery.default`；Root 支持 Delivery / Send 两个扩展点，未知 provider 启动时拒绝。
+  - 失败通知也走发送钩子（origin = turn_failure）；`platform_call` 的发送类方法不经过 send hooks——那类消息由适配器直接产出 `OutgoingRecord`，core 不认识平台消息段。
+  - native composer / hook 是受信任的同步调用，本轮不加超时；树外或动态载体接入这些扩展点时再补超时与隔离。
+  - 尚未做：把 composer / send hooks 开放给 LuaManager（Lua 脚本目前仍只支持 wake / access）。
 
 ## 参考
 
