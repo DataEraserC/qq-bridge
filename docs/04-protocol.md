@@ -65,6 +65,7 @@ sequenceDiagram
 | `session` | 这一轮替哪个会话干活 |
 | `memories` | 会话引用的记忆列表（id + worktree 路径，惰性 checkout，ADR-0017）。记忆独立成仓库，一个会话可引用多份 |
 | `session_info` | 会话身份：id / name / harness / model（model 为空 = harness 侧自己决定） |
+| `persona` | 人格卡 `{id, name, text}`。桥只给语义，怎么塞进模型上下文由 harness 适配器决定 |
 | `room` | 本轮只涉及这一个房间 |
 | `records` | 投递的记录，可能为空 |
 | `more` | 非 0 表示投递超限、有 N 条未读没投进来。数值等于 `omitted.count` |

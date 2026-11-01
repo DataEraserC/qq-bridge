@@ -12,7 +12,9 @@ import {
   BridgeLink,
   normalizeToolArgs,
   parseEndpoint,
+  personaSignature,
   renderElements,
+  renderPersona,
   renderTurn,
 } from "../plugin/acb-wire.mjs"
 import {
@@ -198,6 +200,27 @@ test("空记录的一轮也要说清楚是例行检查", () => {
   const text = renderTurn({ ...delivery(), records: [], reason: "clock" })
   assert.match(text, /定时例行检查/)
   assert.match(text, /没有新记录/)
+})
+
+test("人格卡渲染成一段可注入的 context 文本", () => {
+  const text = renderPersona({
+    id: "p",
+    name: "默认人格",
+    text: "你是桥。",
+  })
+  assert.match(text, /人格：默认人格/)
+  assert.match(text, /你是桥。/)
+  assert.match(text, /按它说话/)
+
+  assert.equal(renderPersona(null), "")
+  assert.equal(renderPersona({ id: "p", name: "", text: "   " }), "")
+
+  // 签名按 id + 正文算：改一个字也要重新注入。
+  assert.equal(personaSignature(null), "")
+  assert.notEqual(
+    personaSignature({ id: "p", text: "甲" }),
+    personaSignature({ id: "p", text: "乙" }),
+  )
 })
 
 test("引用我的话单独标出来，和 @ 分开说", () => {

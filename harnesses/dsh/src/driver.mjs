@@ -30,7 +30,14 @@
 //   ACB_CWD       会话工作目录：先按它 workspace/create 拿 id，再把会话挂进去（Workspaces 分组）
 //   ACB_WORKSPACE_TITLE  新建 workspace 时给它起的显示标题（默认「ACB」）
 
-import { BridgeLink, BridgeError, normalizeToolArgs, renderTurn } from "../../opencode/plugin/acb-wire.mjs"
+import {
+  BridgeLink,
+  BridgeError,
+  normalizeToolArgs,
+  personaSignature,
+  renderPersona,
+  renderTurn,
+} from "../../opencode/plugin/acb-wire.mjs"
 import { TOOLS } from "../../shared/tools.mjs"
 import { McpServer } from "./mcp-server.mjs"
 import { McpHttpServer } from "./mcp-http-server.mjs"
@@ -177,6 +184,9 @@ class TurnDriver {
     // uuid，是为了持久化：进程重启后 createSession 传同一个 sessionId + cwd，
     // dsh 的 claim 逻辑会直接复用旧会话，不丢上下文。
     this.sessions = new Map()
+    // acb session id -> 已经注入过的人格签名。人格只在首轮/变更时注入，
+    // 不能每轮都重发一遍（重复文本会白烧 token）。
+    this.personas = new Map()
     // 重置代次：reset 过的会话换新 id（-r<代次>），避开同 id + 不同 cwd 的冲突。
     this.generations = new Map()
     this.chain = Promise.resolve()
@@ -197,6 +207,8 @@ class TurnDriver {
    */
   resetSession(acbSession) {
     this.sessions.delete(acbSession)
+    // 新 dsh 会话的上下文是空的，人格要重新注入。
+    this.personas.delete(acbSession)
     this.generations.set(acbSession, Date.now().toString(36))
     this.log("info", `已重置会话 ${acbSession}，下次开轮用新 id 新建`)
   }
@@ -256,7 +268,17 @@ class TurnDriver {
     try {
       const sessionId = await this.#session(delivery.session, link)
       await this.#pinModel(sessionId)
-      const text = renderTurn(delivery)
+      let text = renderTurn(delivery)
+      // 人格只在首轮或变更时注入：桥只给语义，dsh 这边把它当成一条 context 消息
+      // 放在本轮最前面。重复注入会白烧 token，所以按签名去重。
+      const personaText = renderPersona(delivery.persona)
+      const signature = personaSignature(delivery.persona)
+      if (personaText && this.personas.get(delivery.session) !== signature) {
+        const updated = this.personas.has(delivery.session) ? "[人格已更新]\n" : ""
+        text = `${updated}${personaText}\n\n${text}`
+        this.personas.set(delivery.session, signature)
+        this.log("info", `会话 ${delivery.session} 注入人格 ${delivery.persona?.id ?? ""}`)
+      }
       const info = delivery.session_info ?? {}
       const model = info.model ?? "(dsh 默认)"
       this.log(

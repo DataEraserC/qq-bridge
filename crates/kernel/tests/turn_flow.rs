@@ -2303,6 +2303,24 @@ fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
 }
 
 // ---------------------------------------------------------------------------
+// 人格下发
+// ---------------------------------------------------------------------------
+
+/// 桥只给语义：人格卡正文随 Delivery 下去，怎么写进模型上下文由 harness 决定。
+#[test]
+fn delivery_carries_the_session_persona() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    let persona = delivery.persona.expect("人格要随轮次下发");
+    assert_eq!(persona.id, "p");
+    assert_eq!(persona.name, "人格");
+    assert_eq!(persona.text, "你是桥。");
+}
+
+// ---------------------------------------------------------------------------
 // 投递截断：最旧一小段 + 最新一批，中间明确告知（2026-11-01 用户裁定）
 // ---------------------------------------------------------------------------
 

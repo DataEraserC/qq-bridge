@@ -15,8 +15,8 @@ pub mod ticket;
 pub use element::{Element, parse_elements};
 pub use error::{DecodeError, ProtoError};
 pub use frame::{
-    Delivery, ErrorCode, Frame, LogLevel, MemoryInfo, Omitted, SessionInfo, SessionMapRef,
-    ToolError, TurnReason,
+    Delivery, ErrorCode, Frame, LogLevel, MemoryInfo, Omitted, PersonaInfo, SessionInfo,
+    SessionMapRef, ToolError, TurnReason,
 };
 pub use record::{QuoteRef, Record, RecordKind, Sender, SenderRole};
 pub use room::RoomId;

@@ -329,6 +329,29 @@ export function roomText(room) {
   return `${room.connection}:${room.path.join("/")}`
 }
 
+/**
+ * 人格卡的签名：id + 正文。harness 用它判断「要不要再注入一次」。
+ */
+export function personaSignature(persona) {
+  if (!persona) return ""
+  return `${persona.id}\u0000${persona.text}`
+}
+
+/**
+ * 把桥下发的人格卡渲染成一段 context 文本。返回空串 = 没有可注入的。
+ *
+ * 桥只给语义，具体怎么塞进模型上下文由各 harness 决定：这里只负责一段
+ * 可读的文本，dsh/opencode 把它放在本轮最前面；有原生 system prompt API 的
+ * harness 也可以改成塞那里。
+ */
+export function renderPersona(persona) {
+  if (!persona || typeof persona.text !== "string") return ""
+  const text = persona.text.trim()
+  if (!text) return ""
+  const label = String(persona.name ?? "").trim() || persona.id || "默认人格"
+  return `[人格：${label}]\n${text}\n[以上是这个会话的人格设定，按它说话。]`
+}
+
 export function renderTurn(delivery, { now = Date.now() } = {}) {
   const lines = []
   const room = roomText(delivery.room)

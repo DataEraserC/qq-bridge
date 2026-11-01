@@ -18,6 +18,8 @@ import {
   BridgeError,
   BridgeLink,
   normalizeToolArgs,
+  personaSignature,
+  renderPersona,
   renderTurn,
 } from "./acb-wire.mjs"
 import { TOOLS } from "../../shared/tools.mjs"
@@ -119,6 +121,8 @@ class TurnDriver {
     this.sessions = new Map()
     /** 已向桥 report_map 过的会话 → opencode 会话 id，防重复回报。 */
     this.reported = new Map()
+    /** 会话 id → 已注入过的人格签名；人格只在首轮/变更时注入一次。 */
+    this.personas = new Map()
     /** 串行链：同一会话本来就串行，这里再兜一层，免得两轮叠在一起。 */
     this.chain = Promise.resolve()
   }
@@ -203,7 +207,17 @@ class TurnDriver {
       const sessionID = await this.#session(delivery.session)
       // 映射（新建或接上的）报给桥，控制台才看得到 harness 侧映射。
       this.#reportMap(delivery.session, sessionID, link)
-      const text = renderTurn(delivery) + CODE_MODE_HINT
+      let text = renderTurn(delivery) + CODE_MODE_HINT
+      // 人格只在首轮或变更时注入：桥只给语义，opencode 这边把它放在本轮最前面。
+      // 重复注入会白烧 token，所以按签名去重。
+      const personaText = renderPersona(delivery.persona)
+      const signature = personaSignature(delivery.persona)
+      if (personaText && this.personas.get(delivery.session) !== signature) {
+        const updated = this.personas.has(delivery.session) ? "[人格已更新]\n" : ""
+        text = `${updated}${personaText}\n\n${text}`
+        this.personas.set(delivery.session, signature)
+        this.log("info", `会话 ${delivery.session} 注入人格 ${delivery.persona?.id ?? ""}`)
+      }
       const info = delivery.session_info ?? {}
       const model = info.model ?? "(opencode 默认)"
       this.log(
@@ -271,6 +285,8 @@ class TurnDriver {
   #forget(session) {
     this.sessions.delete(session)
     this.reported.delete(session)
+    // 新 opencode 会话的上下文是空的，人格要重新注入。
+    this.personas.delete(session)
     void this.#storageSet(`session:${session}`, null)
   }
 

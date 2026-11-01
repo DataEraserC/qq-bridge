@@ -44,6 +44,10 @@ pub struct Delivery {
     /// 「该以什么身份说话、用哪个模型」。可空是为了兼容旧协议帧。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_info: Option<SessionInfo>,
+    /// 这个会话的人格卡正文。桥只给语义，怎么塞进模型上下文由 harness 适配器决定
+    /// （system prompt、首轮 context 消息、或每轮开头的一段说明都可以）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<PersonaInfo>,
     /// 还有多少条没投进来（桥按 `delivery_limit` 截断了）。`None` = 全投了，没有截断。
     /// harness 渲染时据此提示模型「用 fetch_records 抓剩下的」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +73,15 @@ pub struct Omitted {
     pub to: u64,
     /// 区间里实际有多少条未读（编号可能有空洞，所以不能用 `to - from + 1`）。
     pub count: usize,
+}
+
+/// 一个会话在本轮投递里的人格卡。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersonaInfo {
+    pub id: String,
+    pub name: String,
+    /// 人格正文：桥原样转交，不认识里面的内容。
+    pub text: String,
 }
 
 /// 一个会话在本轮投递里的身份信息。
@@ -341,6 +354,7 @@ mod tests {
                 harness: "dsh".into(),
                 model: None,
             }),
+            persona: None,
             more: None,
             omitted: None,
             turn_timeout_ms: None,

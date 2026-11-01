@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
 use acb_proto::{
-    Delivery, Element, ErrorCode, MemoryInfo, Omitted, QuoteRef, Record, RecordKind, RoomId,
-    Sender, SessionInfo, Ticket, ToolError, TurnReason,
+    Delivery, Element, ErrorCode, MemoryInfo, Omitted, PersonaInfo, QuoteRef, Record, RecordKind,
+    RoomId, Sender, SessionInfo, Ticket, ToolError, TurnReason,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1359,6 +1359,15 @@ impl<S: Store> Bridge<S> {
                 harness: session.harness.clone(),
                 model: session.model.clone(),
             });
+        // 人格卡：桥原样下发，怎么塞进模型上下文由 harness 适配器决定。
+        let persona = turn_config
+            .session(&pending.session)
+            .and_then(|session| turn_config.persona(&session.persona))
+            .map(|persona| PersonaInfo {
+                id: persona.id.clone(),
+                name: persona.name.clone(),
+                text: persona.text.clone(),
+            });
 
         // 消息过多时不全投：给最旧一小段（让水位能继续前进）+ 最新一批（让模型
         // 看得到眼前的话），中间那段跳过并明确告诉模型编号区间。只取最新会让
@@ -1372,6 +1381,7 @@ impl<S: Store> Bridge<S> {
             reason: pending.reason,
             memories,
             session_info,
+            persona,
             more,
             omitted,
             // 0 = 配置里关了超时，harness 收到就别自己掐。

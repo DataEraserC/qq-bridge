@@ -25,6 +25,8 @@ flowchart LR
 只有工具面、没有轮次驱动的，叫**半接**：能发不能收，桥推过来的活没人干。这种事要在
 文档里写清楚，不能让人以为接完了。
 
+轮次驱动还负责把桥下发的**语义数据**翻译成 harness 自己的上下文：`records` 是这一轮要处理的消息，`memories` 是记忆 worktree，`session_info` 是身份和模型，`persona` 是人格卡正文。桥只给语义，不规定格式——适配器决定 persona 是塞 system prompt、首轮 context 消息，还是每轮开头的一段说明。模型变更、tool update 这类 **harness 内部**上下文由 harness 自己生成，桥不掺和。
+
 ## 两半各有各的手段
 
 | 能力 | 手段 | 需要 harness 有 | 代价 |
