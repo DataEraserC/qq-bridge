@@ -13,6 +13,7 @@
 //! 当前会话订阅的所有房间；**跨会话发送被砍掉**——一个会话不能替别的人格发言。
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
@@ -30,7 +31,8 @@ use crate::memory::{
     git_status, list_dir, read_file, search, write_file,
 };
 use crate::outbound::{
-    CallError, MethodSpec, Outbound, OutboundError, Risk, Scope, TargetRole, expand_query,
+    CallError, MethodSpec, Outbound, OutboundError, OutboundHandle, Outbounds, Risk, Scope, Sent,
+    TargetRole, expand_query,
 };
 use crate::plugin::{PluginError, PluginManager, WakeContext};
 use crate::render;
@@ -114,6 +116,9 @@ struct ActiveTurn {
     room: RoomId,
     /// 本轮投出去的编号。只有这些能被 `ack_messages` 确认。
     delivered: BTreeSet<u64>,
+    /// 开轮时冻结的配置。轮次中途热重载只影响下一轮；这一轮所有工具查询
+    /// 都用这份快照，否则「轮次边界生效」只是投递批次的边界，不是真的边界。
+    config: Arc<Config>,
 }
 
 /// 刚刚收工的一轮。票不再有效，但留一小会儿：补确认、写反馈都要用到它。
@@ -122,6 +127,7 @@ struct EndedTurn {
     session: String,
     room: RoomId,
     delivered: BTreeSet<u64>,
+    config: Arc<Config>,
     at: Instant,
 }
 
@@ -130,8 +136,53 @@ struct TurnCtx {
     session: String,
     room: RoomId,
     delivered: BTreeSet<u64>,
+    /// 这一轮开轮时冻结的配置快照。工具期间不读 `self.config`。
+    config: Arc<Config>,
     /// 这一轮还在跑吗。写反馈时记进现场，方便区分「干到一半卡住」和「收工后才想起说」。
     live: bool,
+}
+
+/// 已经做完所有校验、只差平台 I/O 的一次 `platform_call`。
+///
+/// `execute` 故意只拿句柄，不拿 `&mut Bridge`：endpoint 可以先把 core 的全局锁放下，
+/// 真正等平台时只锁这条连接自己的出站口。
+pub(crate) struct PreparedPlatformCall {
+    room: RoomId,
+    spec: MethodSpec,
+    params: Value,
+    args: PlatformCallArgs,
+    outbound: OutboundHandle,
+}
+
+impl PreparedPlatformCall {
+    pub(crate) fn execute(&self) -> Result<Value, CallError> {
+        self.outbound
+            .call(&self.room, self.spec.name, &self.params)
+    }
+}
+
+/// 已经做完校验、只差出站 I/O 的一次发送。
+pub(crate) struct PreparedSend {
+    room: RoomId,
+    elements: Vec<Element>,
+    config: Arc<Config>,
+    outbound: OutboundHandle,
+    trimmed: bool,
+    relayed: Vec<(String, String)>,
+}
+
+impl PreparedSend {
+    pub(crate) fn execute(&self) -> Result<Sent, OutboundError> {
+        self.outbound.send(&self.room, &self.elements)
+    }
+}
+
+/// `begin_tool_call` 的两种结果：不需要平台 I/O 的已经做完了；需要平台的交给 endpoint
+/// 在锁外执行，再回来 `finish`。
+pub(crate) enum ToolCallStart {
+    Done(Value),
+    Platform(PreparedPlatformCall),
+    Send(PreparedSend),
 }
 
 /// 某个房间的一个订阅者，判定唤醒时要的东西。
@@ -147,7 +198,7 @@ struct Subscriber {
 pub struct Bridge<S: Store> {
     config: Config,
     store: S,
-    outbound: Box<dyn Outbound>,
+    outbound: Outbounds,
     /// 扩展宿主（ADR-0026）。Phase 1 只承载 wake provider。
     plugins: PluginManager,
     pending: VecDeque<Pending>,
@@ -172,6 +223,9 @@ pub struct Bridge<S: Store> {
 
 impl<S: Store> Bridge<S> {
     pub fn new(config: Config, store: S, outbound: Box<dyn Outbound>) -> Self {
+        // 单实现调用点（测试/单适配器）走兜底；生产 main 传进来的本身就是 Outbounds，
+        // 再包一层兜底只是多一次转发，不改变按连接分发。
+        let outbound = Outbounds::fallback(outbound);
         let memory = MemoryRepo::new(config.worktrees_root.clone());
         let relay = config
             .file_relay
@@ -368,7 +422,7 @@ impl<S: Store> Bridge<S> {
         // 保证投递批次组装时用的配置和开轮后工具查询看到的一致。
         self.apply_staged_config();
         let room = draft.room.clone();
-        let subscribers = self.subscribers_of(&room);
+        let subscribers = Self::subscribers_of(&self.config, &room);
 
         if subscribers.is_empty() {
             return Ok(Ingest::NotSubscribed { room });
@@ -502,16 +556,18 @@ impl<S: Store> Bridge<S> {
     /// 列表顺序执行（记日志 / 发到指定房间），让失败信息能被看见，而不是只吞进日志。
     pub fn end_turn(&mut self, ticket: &Ticket, error: Option<&str>) -> Result<(), BridgeError> {
         // 先把这一轮的信息取出来（room + session），remove 之前要用它做失败通知。
-        let turn = self.active.get(self.by_ticket.get(ticket).ok_or_else(|| {
-            BridgeError::UnknownTicket(ticket.to_string())
-        })?);
+        let turn = self.active.get(
+            self.by_ticket
+                .get(ticket)
+                .ok_or_else(|| BridgeError::UnknownTicket(ticket.to_string()))?,
+        );
         let turn = turn.cloned();
         let Some(turn) = turn else {
             return Err(BridgeError::UnknownTicket(ticket.to_string()));
         };
 
         if let Some(error) = error {
-            self.notify_turn_error(&turn.session, &turn.room, error);
+            self.notify_turn_error(&turn.config, &turn.session, &turn.room, error);
         }
 
         let Some(session) = self.by_ticket.remove(ticket) else {
@@ -525,6 +581,7 @@ impl<S: Store> Bridge<S> {
                 session: turn.session.clone(),
                 room: turn.room.clone(),
                 delivered: turn.delivered.clone(),
+                config: turn.config.clone(),
                 at: Instant::now(),
             },
         );
@@ -536,16 +593,21 @@ impl<S: Store> Bridge<S> {
 
     /// 按「会话自己的」`on_turn_error` 顺序执行失败通知；会话没配就回退到全局默认
     /// `default_on_turn_error`。一个动作失败不打断后面的。
-    fn notify_turn_error(&mut self, session: &str, room: &RoomId, error: &str) {
+    fn notify_turn_error(
+        &mut self,
+        config: &Arc<Config>,
+        session: &str,
+        room: &RoomId,
+        error: &str,
+    ) {
         // 会话自己配了动作就用它的；没配（空）或找不到会话，回退到全局默认。
         // 注意：会话存在但 on_turn_error 是空列表，也算「没配」——否则全局默认
         // 永远不生效（会话总有这条记录）。这是之前失败通知发不出去的根因。
-        let actions = self
-            .config
+        let actions = config
             .session(session)
             .filter(|s| !s.on_turn_error.is_empty())
             .map(|s| s.on_turn_error.clone())
-            .unwrap_or_else(|| self.config.default_on_turn_error.clone());
+            .unwrap_or_else(|| config.default_on_turn_error.clone());
         for action in actions {
             match action {
                 // `log` 由 endpoint 的 Log 帧负责（见 turn_end 处理），这里无需重复。
@@ -554,7 +616,12 @@ impl<S: Store> Bridge<S> {
                     let text = format!("[一轮失败] 会话 {session}（{room}）：{error}");
                     // 失败通知本身发不出去也不该影响主流程，但要把原因记进日志，
                     // 别静默吞掉——否则「为什么没人收到失败提示」会变成查不出的黑洞。
-                    if let Err(err) = self.deliver_out(session, &target, vec![Element::text(text)]) {
+                    if let Err(err) = self.deliver_out(
+                        config.clone(),
+                        session,
+                        &target,
+                        vec![Element::text(text)],
+                    ) {
                         eprintln!("失败通知发到 {target} 没成：{err:?}");
                     }
                 }
@@ -584,6 +651,7 @@ impl<S: Store> Bridge<S> {
 
         let ctx = self.turn_ctx(ticket, tool)?;
         let turn_session = ctx.session.clone();
+        let turn_config = ctx.config.clone();
         // 下面的分支全用 `sessions` 当可见域——按会话圈，不是连接圈。
         let sessions: &[String] = std::slice::from_ref(&turn_session);
         let room = ctx.room.clone();
@@ -594,14 +662,19 @@ impl<S: Store> Bridge<S> {
             // 不给目标：接着说当前这一轮的房间，用本轮的身份。
             "send_message" => {
                 let args: SendArgs = parse(args)?;
-                self.deliver_out(&turn_session, &room, args.elements.0)
+                self.deliver_out(turn_config.clone(), &turn_session, &room, args.elements.0)
             }
             // 给了目标：只能落在当前会话订阅的房间范围内（跨会话发送已砍）。
             "send_message_to" => {
                 let args: SendToArgs = parse(args)?;
                 let target = resolve_room(&args.to)?;
-                self.ensure_session_subscribes(&turn_session, &target)?;
-                self.deliver_out(&turn_session, &target, args.elements.0)
+                Self::ensure_session_subscribes(&turn_config, &turn_session, &target)?;
+                self.deliver_out(
+                    turn_config.clone(),
+                    &turn_session,
+                    &target,
+                    args.elements.0,
+                )
             }
             "ack_messages" => {
                 let args: AckArgs = parse(args)?;
@@ -609,37 +682,37 @@ impl<S: Store> Bridge<S> {
             }
             "get_history" => {
                 let args: HistoryArgs = parse(args)?;
-                self.history(sessions, &room, args)
+                self.history(&turn_config, sessions, &room, args)
             }
             "fetch_records" => {
                 let args: FetchRecordsArgs = parse(args)?;
-                self.fetch_records(sessions, &room, args)
+                self.fetch_records(&turn_config, sessions, &room, args)
             }
-            "list_rooms" => self.list_rooms(sessions),
+            "list_rooms" => self.list_rooms(&turn_config, sessions),
             "get_notes" => {
                 let args: NotesArgs = parse(args)?;
-                self.read_notes(sessions, &room, args)
+                self.read_notes(&turn_config, sessions, &room, args)
             }
             "set_note" => {
                 let args: SetNoteArgs = parse(args)?;
-                self.write_note(sessions, &room, args)
+                self.write_note(&turn_config, sessions, &room, args)
             }
             "del_note" => {
                 let args: DelNoteArgs = parse(args)?;
-                self.delete_note(sessions, &room, args)
+                self.delete_note(&turn_config, sessions, &room, args)
             }
             "get_platform_events" => {
                 let args: EventsArgs = parse(args)?;
-                self.events(sessions, &room, args)
+                self.events(&turn_config, sessions, &room, args)
             }
             // 平台能力：core 不认识任何一个方法名，只做校验和转交（ADR-0020）。
             "platform_methods" => {
                 let args: PlatformMethodsArgs = parse(args)?;
-                self.platform_methods(sessions, &room, args)
+                self.platform_methods(&turn_config, sessions, &room, args)
             }
             "platform_call" => {
                 let args: PlatformCallArgs = parse(args)?;
-                self.platform_call(sessions, &room, args)
+                self.platform_call(ticket, args)
             }
             // 反馈：诚实报告「这里卡住了」。这是出口，不是抱怨箱（ADR-0021）。
             "report_feedback" => {
@@ -649,52 +722,52 @@ impl<S: Store> Bridge<S> {
             // 记忆：文件层。
             "memory_read" => {
                 let args: MemoryArgs = parse(args)?;
-                self.memory_read(&turn_session, args)
+                self.memory_read(&turn_config, &turn_session, args)
             }
             "memory_write" => {
                 let args: MemoryWriteArgs = parse(args)?;
-                self.memory_write(&turn_session, args)
+                self.memory_write(&turn_config, &turn_session, args)
             }
             "memory_list" => {
                 let args: MemoryListArgs = parse(args)?;
-                self.memory_list(&turn_session, args)
+                self.memory_list(&turn_config, &turn_session, args)
             }
             "memory_search" => {
                 let args: MemorySearchArgs = parse(args)?;
-                self.memory_search(&turn_session, args)
+                self.memory_search(&turn_config, &turn_session, args)
             }
             // 记忆：git 层。
             "memory_git_status" => {
                 let args: MemoryArgs = parse(args)?;
-                self.memory_git_status(&turn_session, args)
+                self.memory_git_status(&turn_config, &turn_session, args)
             }
             "memory_git_log" => {
                 let args: MemoryLogArgs = parse(args)?;
-                self.memory_git_log(&turn_session, args)
+                self.memory_git_log(&turn_config, &turn_session, args)
             }
             "memory_git_diff" => {
                 let args: MemoryArgs = parse(args)?;
-                self.memory_git_diff(&turn_session, args)
+                self.memory_git_diff(&turn_config, &turn_session, args)
             }
             "memory_git_blame" => {
                 let args: MemoryBlameArgs = parse(args)?;
-                self.memory_git_blame(&turn_session, args)
+                self.memory_git_blame(&turn_config, &turn_session, args)
             }
             "memory_git_add" => {
                 let args: MemoryAddArgs = parse(args)?;
-                self.memory_git_add(&turn_session, args)
+                self.memory_git_add(&turn_config, &turn_session, args)
             }
             "memory_git_commit" => {
                 let args: MemoryCommitArgs = parse(args)?;
-                self.memory_git_commit(&turn_session, args)
+                self.memory_git_commit(&turn_config, &turn_session, args)
             }
             "memory_git_push" => {
                 let args: MemoryArgs = parse(args)?;
-                self.memory_git_push(&turn_session, args)
+                self.memory_git_push(&turn_config, &turn_session, args)
             }
             "memory_git_branch" => {
                 let args: MemoryArgs = parse(args)?;
-                self.memory_git_branch(&turn_session, args)
+                self.memory_git_branch(&turn_config, &turn_session, args)
             }
             other => Err(ToolError::new(
                 ErrorCode::ToolNotAllowed,
@@ -705,7 +778,171 @@ impl<S: Store> Bridge<S> {
         // 所有工具结果都从这一个口出去：超预算就分页，再不行就落盘（ADR-0022）。
         // 放在这里而不是各个工具里，是为了「新加的工具天然受保护」——
         // 以前每个接口各自截断，于是截断方式各不相同，最糟的一种是把 JSON 砍成半截字符串。
-        Ok(render::fit(tool, value, &self.spill_dir()))
+        //
+        // `platform_call` 的唯一例外：它可能被 endpoint 拆成「锁内 prepare / 锁外
+        // execute / 锁内 finish」，fit 已经在 finish 里做过一次；这里再 fit 会双重分页。
+        if tool == "platform_call" {
+            Ok(value)
+        } else {
+            Ok(render::fit(tool, value, &self.spill_dir()))
+        }
+    }
+
+    /// endpoint 用的两段式入口：能在锁里做完的直接 `Done`，要等平台的返回
+    /// `Platform`，由调用方放下 core 全局锁后执行，再回来 `finish_platform_call`。
+    pub(crate) fn begin_tool_call(
+        &mut self,
+        ticket: &Ticket,
+        sessions: &[String],
+        tool: &str,
+        args: Value,
+    ) -> Result<ToolCallStart, ToolError> {
+        match tool {
+            "send_message" => {
+                let args: SendArgs = parse(args)?;
+                let ctx = self.turn_ctx(ticket, tool)?;
+                let prepared = self.prepare_send(
+                    ctx.config.clone(),
+                    &ctx.session,
+                    ctx.room.clone(),
+                    args.elements.0,
+                )?;
+                Ok(ToolCallStart::Send(prepared))
+            }
+            "send_message_to" => {
+                let args: SendToArgs = parse(args)?;
+                let target = resolve_room(&args.to)?;
+                let ctx = self.turn_ctx(ticket, tool)?;
+                Self::ensure_session_subscribes(&ctx.config, &ctx.session, &target)?;
+                let prepared = self.prepare_send(
+                    ctx.config.clone(),
+                    &ctx.session,
+                    target,
+                    args.elements.0,
+                )?;
+                Ok(ToolCallStart::Send(prepared))
+            }
+            "platform_call" => {
+                let args: PlatformCallArgs = parse(args)?;
+                Ok(ToolCallStart::Platform(
+                    self.prepare_platform_call(ticket, args)?,
+                ))
+            }
+            // 其余工具不碰外部 I/O（读流水/记忆/笔记都在本地），保持原路径。
+            _ => {
+                let value = self.tool_call(ticket, sessions, tool, args)?;
+                Ok(ToolCallStart::Done(value))
+            }
+        }
+    }
+
+    /// 校验并组装一次 `platform_call`，但**不执行**平台 I/O。
+    fn prepare_platform_call(
+        &mut self,
+        ticket: &Ticket,
+        args: PlatformCallArgs,
+    ) -> Result<PreparedPlatformCall, ToolError> {
+        let ctx = self.turn_ctx(ticket, "platform_call")?;
+        let sessions = std::slice::from_ref(&ctx.session);
+        let room = self.resolve(&args.room, &ctx.room)?;
+
+        let methods = self.outbound.catalog(&room.connection);
+        if methods.is_empty() {
+            return Err(no_catalog(&room.connection));
+        }
+        let Some(spec) = methods.iter().find(|method| method.name == args.method) else {
+            let hint = match methods
+                .iter()
+                .find(|method| method.group() == group_of_name(&args.method))
+            {
+                Some(near) => format!("你是不是想调 {}？", near.name),
+                None => format!("这个连接支持：{}", method_names(methods)),
+            };
+            return Err(ToolError::new(
+                ErrorCode::BadRequest,
+                format!("[unknown_method] 没有这个方法：{}；{hint}", args.method),
+            ));
+        };
+
+        match spec.scope {
+            Scope::Room => Self::ensure_readable(&ctx.config, sessions, &room)?,
+            Scope::Connection => {
+                Self::ensure_connection_readable(&ctx.config, sessions, &room.connection)?
+            }
+        }
+
+        if spec.risk == Risk::Destructive
+            && !Self::allows_destructive(&ctx.config, &room.connection, spec.name)
+        {
+            return Err(ToolError::new(
+                ErrorCode::ToolNotAllowed,
+                format!(
+                    "[forbidden] {} 是破坏性操作，连接 {} 默认不开放。\
+                     要开就在 config.toml 的 [[connections]] 那段加 allow_destructive = true\
+                     （或只列要开的方法，如 allow_destructive = [\"{}\"]）",
+                    spec.name, room.connection, spec.name
+                ),
+            ));
+        }
+
+        check_params(spec, &args.params)?;
+        check_target_params(spec, &room, &args.params)?;
+        // params 里的本机文件路径换成中继 URL（ADR-0025）。这一步只碰本地文件，
+        // 在锁里做没问题；真正的平台调用在锁外。
+        let params = self.relay_params(args.params.clone())?;
+
+        let outbound = self.outbound.handle_for(&room.connection).ok_or_else(|| {
+            call_error(CallError::Unavailable(format!(
+                "没有名为 {} 的连接，调不到 {}",
+                room.connection, room
+            )))
+        })?;
+
+        Ok(PreparedPlatformCall {
+            room,
+            spec: *spec,
+            params,
+            args,
+            outbound,
+        })
+    }
+
+    /// 平台结果回来之后：错误映射、查询/分页、最后 fit。这里只拿 `&self`，
+    /// 因为执行期间可能发生了配置热重载，但这一轮的结算不该再读 `self.config` 之外的
+    /// 可变状态——平台调用本身没有改流水/acK 的需求。
+    pub(crate) fn finish_platform_call(
+        &self,
+        prepared: PreparedPlatformCall,
+        result: Result<Value, CallError>,
+    ) -> Result<Value, ToolError> {
+        let result = result.map_err(call_error)?;
+        let grouped = prepared.args.query.group_by.is_some();
+        let result = crate::query::apply_to_value(result, &prepared.args.query)
+            .map_err(|error| ToolError::new(ErrorCode::BadRequest, error.to_string()))?;
+        let result = if grouped {
+            result
+        } else {
+            let limit = prepared
+                .args
+                .limit
+                .unwrap_or(DEFAULT_PAGE_LIMIT)
+                .clamp(1, MAX_PAGE_LIMIT);
+            let offset = prepared.args.offset.unwrap_or(0);
+            render::slice(result, offset, limit)
+        };
+        Ok(render::fit("platform_call", result, &self.spill_dir()))
+    }
+
+    /// 直连 `tool_call` 的 `platform_call` 路径：校验 + 执行 + 结算，仍在调用方锁里。
+    /// endpoint 走 `begin_tool_call` / `finish_platform_call` 的锁外版本。
+    fn platform_call(
+        &mut self,
+        ticket: &Ticket,
+        args: PlatformCallArgs,
+    ) -> Result<Value, ToolError> {
+        let prepared = self.prepare_platform_call(ticket, args)?;
+        let result = prepared.execute();
+        self.finish_platform_call(prepared, result)
     }
 
     /// 这张票能干什么。
@@ -720,6 +957,7 @@ impl<S: Store> Bridge<S> {
                 session: turn.session.clone(),
                 room: turn.room.clone(),
                 delivered: turn.delivered.clone(),
+                config: turn.config.clone(),
                 live: true,
             });
         }
@@ -751,6 +989,7 @@ impl<S: Store> Bridge<S> {
             session: ended.session,
             room: ended.room,
             delivered: ended.delivered,
+            config: ended.config,
             live: false,
         })
     }
@@ -806,9 +1045,9 @@ impl<S: Store> Bridge<S> {
         }
     }
 
-    fn subscribers_of(&self, room: &RoomId) -> Vec<Subscriber> {
-        let account = self.config.account_of_room(room);
-        self.config
+    fn subscribers_of(config: &Config, room: &RoomId) -> Vec<Subscriber> {
+        let account = config.account_of_room(room);
+        config
             .sessions
             .iter()
             .filter_map(|session| {
@@ -826,8 +1065,12 @@ impl<S: Store> Bridge<S> {
     }
 
     /// 这一组里，谁订了这个房间。
-    fn sessions_subscribing(&self, sessions: &[String], room: &RoomId) -> Vec<&Session> {
-        self.config
+    fn sessions_subscribing<'a>(
+        config: &'a Config,
+        sessions: &[String],
+        room: &RoomId,
+    ) -> Vec<&'a Session> {
+        config
             .sessions
             .iter()
             .filter(|session| sessions.iter().any(|id| id == &session.id))
@@ -841,8 +1084,12 @@ impl<S: Store> Bridge<S> {
     }
 
     /// 当前会话是否订阅了这个房间。没订阅就拒——这是 `send_message_to` 的边界。
-    fn ensure_session_subscribes(&self, session: &str, room: &RoomId) -> Result<(), ToolError> {
-        let subscribed = self.config.session(session).is_some_and(|session| {
+    fn ensure_session_subscribes(
+        config: &Config,
+        session: &str,
+        room: &RoomId,
+    ) -> Result<(), ToolError> {
+        let subscribed = config.session(session).is_some_and(|session| {
             session
                 .subscriptions
                 .iter()
@@ -859,8 +1106,12 @@ impl<S: Store> Bridge<S> {
     }
 
     /// 读的工具只要求「本组有人订了这个房间」。
-    fn ensure_readable(&self, sessions: &[String], room: &RoomId) -> Result<(), ToolError> {
-        if self.sessions_subscribing(sessions, room).is_empty() {
+    fn ensure_readable(
+        config: &Config,
+        sessions: &[String],
+        room: &RoomId,
+    ) -> Result<(), ToolError> {
+        if Self::sessions_subscribing(config, sessions, room).is_empty() {
             return Err(ToolError::new(
                 ErrorCode::RoomNotSubscribed,
                 format!("你这组会话都没订阅 {room}"),
@@ -874,12 +1125,11 @@ impl<S: Store> Bridge<S> {
     /// 好友列表、账号资料这类方法跟房间无关，所以不要求模型报出一个具体房间；
     /// 但也不能凭空调一个自己完全没订阅的号。
     fn ensure_connection_readable(
-        &self,
+        config: &Config,
         sessions: &[String],
         connection: &str,
     ) -> Result<(), ToolError> {
-        let ok = self
-            .config
+        let ok = config
             .sessions
             .iter()
             .filter(|session| sessions.iter().any(|id| id == &session.id))
@@ -903,6 +1153,7 @@ impl<S: Store> Bridge<S> {
     /// 房间级的必须落在一个具体房间上；连接级的只借 `room` 选连接，不给就用当前轮次的。
     fn resolve_capability_room(
         &self,
+        config: &Config,
         sessions: &[String],
         given: &Option<String>,
         turn_room: &RoomId,
@@ -910,8 +1161,10 @@ impl<S: Store> Bridge<S> {
     ) -> Result<RoomId, ToolError> {
         let room = self.resolve(given, turn_room)?;
         match scope {
-            Scope::Room => self.ensure_readable(sessions, &room)?,
-            Scope::Connection => self.ensure_connection_readable(sessions, &room.connection)?,
+            Scope::Room => Self::ensure_readable(config, sessions, &room)?,
+            Scope::Connection => {
+                Self::ensure_connection_readable(config, sessions, &room.connection)?
+            }
         }
         Ok(room)
     }
@@ -932,7 +1185,9 @@ impl<S: Store> Bridge<S> {
     }
 
     fn open_turn(&mut self, pending: Pending) -> Result<Delivery, BridgeError> {
-        let account = self.config.account_of_room(&pending.room);
+        // 开轮时冻结配置：这一轮后续的工具查询都用它，热重载只影响下一轮。
+        let turn_config = Arc::new(self.config.clone());
+        let account = turn_config.account_of_room(&pending.room);
         self.heal_own_holes(&pending.session, &pending.room, &account)?;
         let mut records = self.pending_records(&pending.session, &pending.room, &account)?;
         // 引用里的平台编号翻成本房间编号，跟平台编号并排放（ADR-0024）。
@@ -971,16 +1226,16 @@ impl<S: Store> Bridge<S> {
                 session: pending.session.clone(),
                 room: pending.room.clone(),
                 delivered,
+                config: turn_config.clone(),
             },
         );
 
         // 把这个会话引用的记忆连同 worktree 路径一起带给 harness。惰性初始化：worktree
         // 第一次用到才 checkout，之后复用。
-        let memories = self.session_memories(&pending.session);
+        let memories = self.session_memories(&turn_config, &pending.session);
 
         // 会话的身份信息：harness 据此知道「以什么身份说话、用哪个模型」。
-        let session_info = self
-            .config
+        let session_info = turn_config
             .session(&pending.session)
             .map(|session| SessionInfo {
                 id: session.id.clone(),
@@ -992,7 +1247,7 @@ impl<S: Store> Bridge<S> {
         // 消息过多时不全投。截断只丢**旧**的不丢新的（2026-10-31 用户裁定）——
         // 模型干活要的是最新上下文，把新消息截掉等于把要回的话截掉；更早的部分
         // 让模型用 fetch_records 按编号回看（流水里都还在）。
-        let limit = self.config.delivery_limit;
+        let limit = turn_config.delivery_limit;
         let mut dropped = 0usize;
         if limit > 0 && records.len() > limit {
             dropped = records.len() - limit;
@@ -1017,7 +1272,7 @@ impl<S: Store> Bridge<S> {
             session_info,
             more,
             // 0 = 配置里关了超时，harness 收到就别自己掐。
-            turn_timeout_ms: Some(self.config.turn_timeout_ms()),
+            turn_timeout_ms: Some(turn_config.turn_timeout_ms()),
         })
     }
 
@@ -1027,7 +1282,12 @@ impl<S: Store> Bridge<S> {
     /// 如果停在水位之上，就是前沿迈不过去的洞，洞后面的真消息会被反复重投。
     /// 历史上 deliver_out 只确认发送者自己的会话（2026-10-31 修），留下的旧洞
     /// 也靠这里在下次开轮时自动补上，不用手工修库。
-    fn heal_own_holes(&mut self, session: &str, room: &RoomId, account: &str) -> Result<(), BridgeError> {
+    fn heal_own_holes(
+        &mut self,
+        session: &str,
+        room: &RoomId,
+        account: &str,
+    ) -> Result<(), BridgeError> {
         if account.is_empty() {
             return Ok(());
         }
@@ -1049,15 +1309,15 @@ impl<S: Store> Bridge<S> {
 
     /// 会话引用的记忆列表（id + worktree 路径）。worktree 惰性 checkout，失败这一轮就
     /// 开不成——记忆配错了要早点暴露，别让 harness 拿到一个碰不了的路径。
-    fn session_memories(&self, session: &str) -> Vec<MemoryInfo> {
-        let Some(session_cfg) = self.config.session(session) else {
+    fn session_memories(&self, config: &Config, session: &str) -> Vec<MemoryInfo> {
+        let Some(session_cfg) = config.session(session) else {
             return Vec::new();
         };
         session_cfg
             .memories
             .iter()
             .filter_map(|memory_id| {
-                let memory = self.config.memory(memory_id)?;
+                let memory = config.memory(memory_id)?;
                 let worktree = self
                     .memory
                     .ensure_worktree(&memory.location, memory_id, session)
@@ -1072,16 +1332,33 @@ impl<S: Store> Bridge<S> {
 
     fn deliver_out(
         &mut self,
-        _session: &str,
+        config: Arc<Config>,
+        session: &str,
         room: &RoomId,
-        mut elements: Vec<Element>,
+        elements: Vec<Element>,
     ) -> Result<Value, ToolError> {
+        let prepared = self.prepare_send(config, session, room.clone(), elements)?;
+        let sent = prepared.execute();
+        self.finish_send(prepared, sent)
+    }
+
+    /// 校验、切调用标记、中继本机文件、查账号、取出发通道——但**不发送**。
+    /// endpoint 可以拿着这个结果放下全局锁，真正等平台。
+    fn prepare_send(
+        &mut self,
+        config: Arc<Config>,
+        _session: &str,
+        room: RoomId,
+        mut elements: Vec<Element>,
+    ) -> Result<PreparedSend, ToolError> {
         // 先把混进正文的「调用标记」切掉。这不是洁癖：群里真的出现过带
         // `</mcp__acb__send_message>` 和特殊 token 的回复（见 sanitize 模块）。
         // 切完落空的文本段直接丢，免得往平台上发一个空段。
         let trimmed = crate::sanitize::trim_elements(&mut elements);
         if trimmed {
-            elements.retain(|element| !matches!(element, Element::Text { text } if text.trim().is_empty()));
+            elements.retain(
+                |element| !matches!(element, Element::Text { text } if text.trim().is_empty()),
+            );
         }
         if elements.is_empty() {
             return Err(ToolError::new(
@@ -1099,7 +1376,7 @@ impl<S: Store> Bridge<S> {
         // 没配、或路径不是本机存在的文件，就原样透传——平台侧路径（共享卷等）不受影响。
         let relayed = self.relay_elements(&mut elements)?;
 
-        let account = self.config.account_of_room(room);
+        let account = config.account_of_room(&room);
         if account.is_empty() {
             return Err(ToolError::new(
                 ErrorCode::Internal,
@@ -1107,7 +1384,39 @@ impl<S: Store> Bridge<S> {
             ));
         }
 
-        let sent = match self.outbound.send(room, &elements) {
+        let outbound = self.outbound.handle_for(&room.connection).ok_or_else(|| {
+            ToolError::new(
+                ErrorCode::Internal,
+                format!("没有名为 {} 的连接，发不到 {room}", room.connection),
+            )
+        })?;
+
+        Ok(PreparedSend {
+            room,
+            elements,
+            config,
+            outbound,
+            trimmed,
+            relayed,
+        })
+    }
+
+    /// 出站结果回来之后：写流水、对所有订阅者 ack、拼回执。
+    pub(crate) fn finish_send(
+        &mut self,
+        prepared: PreparedSend,
+        result: Result<Sent, OutboundError>,
+    ) -> Result<Value, ToolError> {
+        let PreparedSend {
+            room,
+            elements,
+            config,
+            trimmed,
+            relayed,
+            ..
+        } = prepared;
+
+        let sent = match result {
             Ok(sent) => sent,
             Err(error) => {
                 // 平台侧拉不到媒体 URL 时的报错只有一句干巴巴的 fetch failed
@@ -1127,6 +1436,7 @@ impl<S: Store> Bridge<S> {
             }
         };
 
+        let account = config.account_of_room(&room);
         let record = self
             .store
             .append(
@@ -1153,7 +1463,7 @@ impl<S: Store> Bridge<S> {
         // A 会话发的消息只在 A 的水位上确认掉，B 的水位上永远留一个洞——而水位
         // 只推连续前沿，洞后面的消息就永远算未读，表现为「同一批积压反复重投」。
         let mut watermark = 0;
-        for subscriber in self.subscribers_of(room) {
+        for subscriber in Self::subscribers_of(&config, &room) {
             let cursor = Cursor::new(subscriber.session, room.clone());
             watermark = self.store.ack(&cursor, &[record.id]).map_err(internal)?;
         }
@@ -1180,12 +1490,19 @@ impl<S: Store> Bridge<S> {
         }
         if !relayed.is_empty() {
             // 也必须说：模型给的是本机路径，实际发出去的是中继 URL。
-            receipt["relayed"] = json!(relayed
-                .iter()
-                .map(|(from, to)| json!({"from": from, "to": to}))
-                .collect::<Vec<_>>());
+            receipt["relayed"] = json!(
+                relayed
+                    .iter()
+                    .map(|(from, to)| json!({"from": from, "to": to}))
+                    .collect::<Vec<_>>()
+            );
         }
         Ok(receipt)
+    }
+
+    /// 两段式发送结算后，endpoint 用同一个口做分页/落盘。
+    pub(crate) fn fit_tool_result(&self, tool: &str, value: Value) -> Value {
+        render::fit(tool, value, &self.spill_dir())
     }
 
     /// 把元素里的本机文件收进中继，换成平台取得到的 URL。返回 (原路径, URL) 列表。
@@ -1250,16 +1567,19 @@ impl<S: Store> Bridge<S> {
                     if !local.is_file() {
                         return Ok(serde_json::Value::String(text));
                     }
-                    relay.publish(&local).map(serde_json::Value::String).map_err(|error| {
-                        ToolError::new(
-                            ErrorCode::BadRequest,
-                            format!(
-                                "[bad_params] params 里的文件 {} 本机存在，\
+                    relay
+                        .publish(&local)
+                        .map(serde_json::Value::String)
+                        .map_err(|error| {
+                            ToolError::new(
+                                ErrorCode::BadRequest,
+                                format!(
+                                    "[bad_params] params 里的文件 {} 本机存在，\
                                  但桥收不下来：{error}。小文件可以改用 base64:// 内联。",
-                                local.display()
-                            ),
-                        )
-                    })
+                                    local.display()
+                                ),
+                            )
+                        })
                 }
                 serde_json::Value::Array(items) => items
                     .into_iter()
@@ -1351,12 +1671,13 @@ impl<S: Store> Bridge<S> {
 
     fn history(
         &self,
+        config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
         args: HistoryArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
+        Self::ensure_readable(config, sessions, &room)?;
 
         let columns = column_set(args.columns.as_deref())?;
 
@@ -1383,7 +1704,10 @@ impl<S: Store> Bridge<S> {
         };
         self.fill_quote_refs(&room, &mut records);
 
-        let rendered: Vec<Value> = records.iter().map(|r| record_columns(r, &columns)).collect();
+        let rendered: Vec<Value> = records
+            .iter()
+            .map(|r| record_columns(r, &columns))
+            .collect();
         Ok(json!({
             "room": room,
             "columns": columns,
@@ -1398,12 +1722,13 @@ impl<S: Store> Bridge<S> {
     /// 按水位编号精确查一批记录，只返回指定列。
     fn fetch_records(
         &self,
+        config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
         args: FetchRecordsArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
+        Self::ensure_readable(config, sessions, &room)?;
 
         if args.ids.is_empty() {
             return Err(ToolError::new(
@@ -1428,7 +1753,10 @@ impl<S: Store> Bridge<S> {
         let found: std::collections::BTreeSet<u64> = records.iter().map(|r| r.id).collect();
         let missing: Vec<u64> = wanted.difference(&found).copied().collect();
 
-        let rendered: Vec<Value> = records.iter().map(|r| record_columns(r, &columns)).collect();
+        let rendered: Vec<Value> = records
+            .iter()
+            .map(|r| record_columns(r, &columns))
+            .collect();
         Ok(json!({
             "room": room,
             "columns": columns,
@@ -1442,15 +1770,15 @@ impl<S: Store> Bridge<S> {
     /// 这组会话订阅的所有房间，按（会话，房间）各列一行。
     ///
     /// 两个会话订同一个房间时会出现两行——这是实话：水位本来就是各记各的。
-    fn list_rooms(&self, sessions: &[String]) -> Result<Value, ToolError> {
+    fn list_rooms(&self, config: &Config, sessions: &[String]) -> Result<Value, ToolError> {
         let mut rooms = Vec::new();
         for id in sessions {
-            let Some(session) = self.config.session(id) else {
+            let Some(session) = config.session(id) else {
                 continue;
             };
             for subscription in &session.subscriptions {
                 let room = &subscription.room;
-                let account = self.config.account_of_room(room);
+                let account = config.account_of_room(room);
                 let cursor = Cursor::new(id.clone(), room.clone());
                 let watermark = self.store.watermark(&cursor).map_err(internal)?;
                 let unread = self
@@ -1471,12 +1799,13 @@ impl<S: Store> Bridge<S> {
 
     fn read_notes(
         &self,
+        config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
         args: NotesArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
+        Self::ensure_readable(config, sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => Some(parse_note_kind(text)?),
@@ -1499,12 +1828,13 @@ impl<S: Store> Bridge<S> {
 
     fn write_note(
         &mut self,
+        config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
         args: SetNoteArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
+        Self::ensure_readable(config, sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => parse_note_kind(text)?,
@@ -1544,12 +1874,13 @@ impl<S: Store> Bridge<S> {
 
     fn delete_note(
         &mut self,
+        config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
         args: DelNoteArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
+        Self::ensure_readable(config, sessions, &room)?;
 
         let kind = match args.kind.as_deref() {
             Some(text) => parse_note_kind(text)?,
@@ -1562,12 +1893,13 @@ impl<S: Store> Bridge<S> {
 
     fn events(
         &self,
+        config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
         args: EventsArgs,
     ) -> Result<Value, ToolError> {
         let room = self.resolve(&args.room, turn_room)?;
-        self.ensure_readable(sessions, &room)?;
+        Self::ensure_readable(config, sessions, &room)?;
 
         let limit = args.limit.unwrap_or(DEFAULT_HISTORY).min(MAX_PAGE_LIMIT);
         let offset = args.offset.unwrap_or(0);
@@ -1605,13 +1937,20 @@ impl<S: Store> Bridge<S> {
     /// 而一张清单在四五十个方法时也就一千来 token，只花在模型主动查的那一轮。
     fn platform_methods(
         &self,
+        config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
         args: PlatformMethodsArgs,
     ) -> Result<Value, ToolError> {
         // 目录本身就是连接级的东西：同一个号的哪个房间，能做的事都一样。
         // 所以这里不要求模型报出一个具体房间，只要它订阅了这条连接就行。
-        let room = self.resolve_capability_room(sessions, &args.room, turn_room, Scope::Connection)?;
+        let room = self.resolve_capability_room(
+            config,
+            sessions,
+            &args.room,
+            turn_room,
+            Scope::Connection,
+        )?;
 
         let methods = self.outbound.catalog(&room.connection);
         if methods.is_empty() {
@@ -1619,7 +1958,7 @@ impl<S: Store> Bridge<S> {
         }
         let room_text = room.to_string();
         let connection = room.connection.clone();
-        let platform = self.platform_of(&room.connection).to_owned();
+        let platform = Self::platform_of(config, &room.connection).to_owned();
 
         let group = clean(args.group.as_deref());
         let tag = clean(args.tag.as_deref());
@@ -1648,9 +1987,7 @@ impl<S: Store> Bridge<S> {
             .iter()
             .filter(|method| group.map_or(true, |group| method.group() == group))
             .filter(|method| tag.map_or(true, |tag| method.has_tag(tag)))
-            .filter(|method| {
-                terms.is_empty() || terms.iter().any(|term| method.matches(term))
-            })
+            .filter(|method| terms.is_empty() || terms.iter().any(|term| method.matches(term)))
             .collect();
 
         if hits.is_empty() {
@@ -1666,89 +2003,6 @@ impl<S: Store> Bridge<S> {
             "methods": hits.iter().map(|method| describe_method(method)).collect::<Vec<_>>(),
             "hint": "每条都带一个 example：照它把 params 里的号/内容换掉，就能直接喂给 platform_call。",
         }))
-    }
-
-    /// 调一个平台方法。core 只做校验和转交，不认识任何方法名。
-    fn platform_call(
-        &mut self,
-        sessions: &[String],
-        turn_room: &RoomId,
-        args: PlatformCallArgs,
-    ) -> Result<Value, ToolError> {
-        // 先定位连接，权限校验要等方法查出来才知道该按房间算还是按连接算
-        // （好友列表这类跟房间无关，用房间级的尺子量它会逼模型瞎编一个群号）。
-        let room = self.resolve(&args.room, turn_room)?;
-
-        let methods = self.outbound.catalog(&room.connection);
-        if methods.is_empty() {
-            return Err(no_catalog(&room.connection));
-        }
-
-        // 白名单：只能调适配器声明过的方法，没有「调任意平台 API」这条路。
-        let Some(spec) = methods.iter().find(|method| method.name == args.method) else {
-            let hint = match methods
-                .iter()
-                .find(|method| method.group() == group_of_name(&args.method))
-            {
-                Some(near) => format!("你是不是想调 {}？", near.name),
-                None => format!("这个连接支持：{}", method_names(methods)),
-            };
-            return Err(ToolError::new(
-                ErrorCode::BadRequest,
-                format!("[unknown_method] 没有这个方法：{}；{hint}", args.method),
-            ));
-        };
-
-        // 权限按方法自己声明的边界来：房间里的事要订阅了这个房间，
-        // 号上的事（好友列表、账号资料）只要订阅了这个连接。
-        match spec.scope {
-            Scope::Room => self.ensure_readable(sessions, &room)?,
-            Scope::Connection => self.ensure_connection_readable(sessions, &room.connection)?,
-        }
-
-        // 破坏性操作默认关。白名单挡不住「模型被群里的话骗着去调一个它本来就有权调的方法」，
-        // 只有默认关才挡得住；要放行得在 config.toml 那条连接上显式写 allow_destructive。
-        if spec.risk == Risk::Destructive && !self.allows_destructive(&room.connection, spec.name) {
-            return Err(ToolError::new(
-                ErrorCode::ToolNotAllowed,
-                format!(
-                    "[forbidden] {} 是破坏性操作，连接 {} 默认不开放。\
-                     要开就在 config.toml 的 [[connections]] 那段加 allow_destructive = true\
-                     （或只列要开的方法，如 allow_destructive = [\"{}\"]）",
-                    spec.name, room.connection, spec.name
-                ),
-            ));
-        }
-
-        check_params(spec, &args.params)?;
-        // 房间目标参数不能在 params 里被换掉；适配器可以再兜一层，但这一层是
-        // core 对所有适配器（包括动态加载的）统一的执行契约（ADR-0027）。
-        check_target_params(spec, &room, &args.params)?;
-
-        // params 里的本机文件路径同样换成中继 URL（ADR-0025）——upload_file 这类
-        // 平台方法拿的是 params 里的路径，跟 send_message 的元素是同一个断层。
-        let params = self.relay_params(args.params)?;
-
-        let result = self
-            .outbound
-            .call(&room, spec.name, &params)
-            .map_err(call_error)?;
-
-        // 查询在**分页之前**做：先过滤/分组，再切页——否则 `_page.total` 给的是过滤前的数，
-        // 模型永远算不出「到底几个」。
-        let grouped = args.query.group_by.is_some();
-        let result = crate::query::apply_to_value(result, &args.query)
-            .map_err(|error| ToolError::new(ErrorCode::BadRequest, error.to_string()))?;
-        if grouped {
-            // 分组结果本来就只有几行（十几个角色、几个人），不切页。
-            return Ok(result);
-        }
-
-        // 分页是**桥这一层**的事：平台照旧一次给全，桥切片后再交出去。
-        // 平台方法签名不用为分页改五十遍，大群的大列表也不会因为「一次给不完」被写死。
-        let limit = args.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
-        let offset = args.offset.unwrap_or(0);
-        Ok(render::slice(result, offset, limit))
     }
 
     /// 记一条反馈（ADR-0021）。
@@ -1831,7 +2085,11 @@ impl<S: Store> Bridge<S> {
         let (title_raw, _) = split_first_line(&body);
         let (title, title_clipped) = clip(title_raw, MAX_FEEDBACK_TITLE);
         let (body, body_clipped) = clip(&body, MAX_FEEDBACK_BODY);
-        let suggestion = args.suggestion.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        let suggestion = args
+            .suggestion
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
         let (suggestion, suggestion_clipped) = match suggestion {
             Some(text) => {
                 let (clipped, cut) = clip(text, MAX_FEEDBACK_SUGGESTION);
@@ -1877,7 +2135,12 @@ impl<S: Store> Bridge<S> {
             severity: severity.to_owned(),
             refs,
             occurrences: count,
-            tool: args.tool.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned),
+            tool: args
+                .tool
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned),
             session: session.to_owned(),
             harness,
             room: Some(room.to_string()),
@@ -1939,8 +2202,8 @@ impl<S: Store> Bridge<S> {
     }
 
     /// 连接名 → 平台名。只给展示用，查不到就说 unknown，不要因此拒绝服务。
-    fn platform_of(&self, connection: &str) -> &str {
-        self.config
+    fn platform_of<'a>(config: &'a Config, connection: &str) -> &'a str {
+        config
             .connections
             .iter()
             .find(|item| item.id == connection)
@@ -1949,8 +2212,8 @@ impl<S: Store> Bridge<S> {
     }
 
     /// 这条连接的配置放不放行这个破坏性方法。查不到连接 = 不放行。
-    fn allows_destructive(&self, connection: &str, method: &str) -> bool {
-        self.config
+    fn allows_destructive(config: &Config, connection: &str, method: &str) -> bool {
+        config
             .connections
             .iter()
             .find(|item| item.id == connection)
@@ -1971,10 +2234,11 @@ impl<S: Store> Bridge<S> {
     /// 并惰性初始化 worktree。
     fn memory_worktree(
         &self,
+        config: &Config,
         session: &str,
         memory: &str,
     ) -> Result<std::path::PathBuf, ToolError> {
-        let Some(session_cfg) = self.config.session(session) else {
+        let Some(session_cfg) = config.session(session) else {
             return Err(ToolError::new(
                 ErrorCode::Internal,
                 format!("会话 {session} 不存在"),
@@ -1982,28 +2246,46 @@ impl<S: Store> Bridge<S> {
         };
         self.memory
             .resolve_for(session, memory, &session_cfg.memories, &|memory_id| {
-                self.config.memory(memory_id).map(|m| m.location.clone())
+                config.memory(memory_id).map(|m| m.location.clone())
             })
     }
 
-    fn memory_read(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_read(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let content = read_file(&worktree, &args.path)?;
         Ok(json!({ "path": args.path, "content": content }))
     }
 
-    fn memory_write(&self, session: &str, args: MemoryWriteArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_write(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryWriteArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         write_file(&worktree, &args.path, &args.content)?;
         Ok(json!({ "path": args.path, "written": true }))
     }
 
-    fn memory_list(&self, session: &str, args: MemoryListArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_list(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryListArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let entries = list_dir(&worktree, &args.path)?;
         let total = entries.len();
         let offset = args.offset.unwrap_or(0);
-        let limit = args.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+        let limit = args
+            .limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGE_LIMIT);
         let page: Vec<String> = entries.into_iter().skip(offset).take(limit).collect();
         let has_more = offset + page.len() < total;
         Ok(json!({
@@ -2017,12 +2299,20 @@ impl<S: Store> Bridge<S> {
         }))
     }
 
-    fn memory_search(&self, session: &str, args: MemorySearchArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_search(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemorySearchArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let hits = search(&worktree, &args.path, &args.needle)?;
         let total = hits.len();
         let offset = args.offset.unwrap_or(0);
-        let limit = args.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+        let limit = args
+            .limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGE_LIMIT);
         let page: Vec<String> = hits.into_iter().skip(offset).take(limit).collect();
         let has_more = offset + page.len() < total;
         Ok(json!({
@@ -2038,50 +2328,90 @@ impl<S: Store> Bridge<S> {
 
     // ---- 记忆工具：git 层 ----
 
-    fn memory_git_status(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_status(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let status = git_status(&worktree)?;
         Ok(json!({ "status": status }))
     }
 
-    fn memory_git_log(&self, session: &str, args: MemoryLogArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_log(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryLogArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let log = git_log(&worktree, args.limit.unwrap_or(10));
         Ok(json!({ "log": log }))
     }
 
-    fn memory_git_diff(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_diff(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let diff = git_diff(&worktree)?;
         Ok(json!({ "diff": diff }))
     }
 
-    fn memory_git_blame(&self, session: &str, args: MemoryBlameArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_blame(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryBlameArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let blame = git_blame(&worktree, &args.path)?;
         Ok(json!({ "path": args.path, "blame": blame }))
     }
 
-    fn memory_git_add(&self, session: &str, args: MemoryAddArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_add(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryAddArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         git_add(&worktree, &args.path)?;
         Ok(json!({ "staged": if args.path.is_empty() { "全部" } else { &args.path } }))
     }
 
-    fn memory_git_commit(&self, session: &str, args: MemoryCommitArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_commit(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryCommitArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let result = git_commit(&worktree, &args.message)?;
         Ok(json!({ "result": result }))
     }
 
-    fn memory_git_push(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_push(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let result = git_push(&worktree)?;
         Ok(json!({ "result": result }))
     }
 
-    fn memory_git_branch(&self, session: &str, args: MemoryArgs) -> Result<Value, ToolError> {
-        let worktree = self.memory_worktree(session, &args.memory)?;
+    fn memory_git_branch(
+        &self,
+        config: &Config,
+        session: &str,
+        args: MemoryArgs,
+    ) -> Result<Value, ToolError> {
+        let worktree = self.memory_worktree(config, session, &args.memory)?;
         let branches = git_branch(&worktree)?;
         Ok(json!({ "branches": branches }))
     }
@@ -2096,7 +2426,9 @@ fn fit_records(records: &[Record], budget: usize) -> usize {
     let mut used = 0usize;
     let mut keep = 0usize;
     for record in records.iter().rev() {
-        let size = serde_json::to_vec(record).map(|bytes| bytes.len()).unwrap_or(0);
+        let size = serde_json::to_vec(record)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
         if keep > 0 && used + size > budget {
             break;
         }
@@ -2443,7 +2775,10 @@ fn no_match(
 
     ToolError::new(
         ErrorCode::BadRequest,
-        format!("[no_match] 没有同时满足 {} 的方法；{hint}", given.join(" + ")),
+        format!(
+            "[no_match] 没有同时满足 {} 的方法；{hint}",
+            given.join(" + ")
+        ),
     )
 }
 
@@ -2512,7 +2847,9 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
                     ));
                 }
                 if !param.values.is_empty() {
-                    let allowed = value.as_str().is_some_and(|text| param.values.contains(&text));
+                    let allowed = value
+                        .as_str()
+                        .is_some_and(|text| param.values.contains(&text));
                     if !allowed {
                         return Err(ToolError::new(
                             ErrorCode::BadRequest,
@@ -2536,8 +2873,7 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
             } else {
                 format!(
                     "能给的参数：{}",
-                    spec
-                        .params
+                    spec.params
                         .iter()
                         .map(|param| param.name)
                         .collect::<Vec<_>>()
@@ -2560,11 +2896,7 @@ fn check_params(spec: &MethodSpec, params: &Value) -> Result<(), ToolError> {
 /// - 当前房间类型匹配的 `Room` 目标：参数给了就必须等于房间 id；
 /// - 其它房间类型的 `Room` 目标：给了就拒绝——除非同一参数在当前房间类型里
 ///   被声明成 `Member`（如 `poke.send` 在群里的 `user_id` 是“拍谁”）。
-fn check_target_params(
-    spec: &MethodSpec,
-    room: &RoomId,
-    params: &Value,
-) -> Result<(), ToolError> {
+fn check_target_params(spec: &MethodSpec, room: &RoomId, params: &Value) -> Result<(), ToolError> {
     let Some(given) = params.as_object() else {
         // check_params 已经处理过非对象；这里只兜底。
         return Ok(());

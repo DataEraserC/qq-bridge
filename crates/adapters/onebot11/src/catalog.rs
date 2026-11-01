@@ -45,11 +45,6 @@ const fn any(name: &'static str, desc: &'static str) -> ParamSpec {
     ParamSpec::any(name, desc)
 }
 
-/// 可选、形状不固定。
-const fn maybe_any(name: &'static str, desc: &'static str) -> ParamSpec {
-    ParamSpec::maybe_any(name, desc)
-}
-
 const fn m(
     name: &'static str,
     summary: &'static str,

@@ -6,6 +6,8 @@
 //! 分发按**连接**，不按平台：同一个平台可以挂多条连接（两个 QQ 号），房间的第一段就是
 //! 连接名，查表不会撞。
 
+use std::sync::{Arc, Mutex};
+
 use acb_proto::{Element, RoomId};
 use serde_json::Value;
 use thiserror::Error;
@@ -521,7 +523,9 @@ pub trait Outbound: Send {
 /// 就交给那个房间第一段指向的连接。没接连接的名字明确报错，不静默丢。
 #[derive(Default)]
 pub struct Outbounds {
-    by_connection: std::collections::HashMap<String, Box<dyn Outbound>>,
+    by_connection: std::collections::HashMap<String, Arc<Mutex<Box<dyn Outbound>>>>,
+    /// 单连接/测试用的兜底通道：没有按连接注册时，所有房间都交给它。
+    fallback: Option<Arc<Mutex<Box<dyn Outbound>>>>,
 }
 
 impl Outbounds {
@@ -529,9 +533,18 @@ impl Outbounds {
         Self::default()
     }
 
+    /// 单连接适配器/测试：不按连接名注册，所有房间都走这一条。
+    pub fn fallback(outbound: Box<dyn Outbound>) -> Self {
+        Self {
+            fallback: Some(Arc::new(Mutex::new(outbound))),
+            ..Self::default()
+        }
+    }
+
     /// 给某条连接接上一个出站通道。同名重复接会覆盖前一个（配置层已经拦了重名）。
     pub fn with(mut self, connection: impl Into<String>, outbound: Box<dyn Outbound>) -> Self {
-        self.by_connection.insert(connection.into(), outbound);
+        self.by_connection
+            .insert(connection.into(), Arc::new(Mutex::new(outbound)));
         self
     }
 
@@ -541,11 +554,21 @@ impl Outbounds {
         names.sort_unstable();
         names
     }
+
+    /// 拿一个可以带出全局锁的出站句柄。句柄内部有自己的锁，真正等平台 I/O 时
+    /// core 的全局锁已经放下了。
+    pub fn handle_for(&self, connection: &str) -> Option<OutboundHandle> {
+        self.by_connection
+            .get(connection)
+            .or(self.fallback.as_ref())
+            .cloned()
+            .map(|inner| OutboundHandle { inner })
+    }
 }
 
 impl Outbound for Outbounds {
     fn send(&mut self, room: &RoomId, elements: &[Element]) -> Result<Sent, OutboundError> {
-        match self.by_connection.get_mut(&room.connection) {
+        match self.handle_for(&room.connection) {
             Some(outbound) => outbound.send(room, elements),
             None => Err(OutboundError::Unavailable(format!(
                 "没有名为 {} 的连接，发不到 {}",
@@ -555,7 +578,7 @@ impl Outbound for Outbounds {
     }
 
     fn catalog(&self, connection: &str) -> &'static [MethodSpec] {
-        match self.by_connection.get(connection) {
+        match self.handle_for(connection) {
             Some(outbound) => outbound.catalog(connection),
             // 没接这条连接：空表。上层会报「没有这个连接」，不用在这编一套。
             None => &[],
@@ -563,13 +586,49 @@ impl Outbound for Outbounds {
     }
 
     fn call(&mut self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
-        match self.by_connection.get_mut(&room.connection) {
+        match self.handle_for(&room.connection) {
             Some(outbound) => outbound.call(room, method, params),
             None => Err(CallError::Unavailable(format!(
                 "没有名为 {} 的连接，调不到 {}",
                 room.connection, room
             ))),
         }
+    }
+}
+
+/// 一条连接的出站句柄。可以克隆、带出 `Mutex<Bridge>`，等平台 I/O 时不再占着
+/// core 的全局锁（ADR-0027 Phase 2c-2）。
+#[derive(Clone)]
+pub struct OutboundHandle {
+    inner: Arc<Mutex<Box<dyn Outbound>>>,
+}
+
+impl OutboundHandle {
+    pub fn send(&self, room: &RoomId, elements: &[Element]) -> Result<Sent, OutboundError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .send(room, elements)
+    }
+
+    pub fn catalog(&self, connection: &str) -> &'static [MethodSpec] {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .catalog(connection)
+    }
+
+    pub fn call(&self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .call(room, method, params)
+    }
+}
+
+impl std::fmt::Debug for OutboundHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("OutboundHandle").finish_non_exhaustive()
     }
 }
 
@@ -614,6 +673,28 @@ mod tests {
 
         // 第二个号在同一个群里：房间不同（连接不同），各发各的，不互相覆盖。
         assert_eq!(outbounds.connections(), vec!["qq", "qq2"]);
+    }
+
+    /// 句柄可以脱离 `Outbounds` 单独使用——endpoint 就是拿它去锁外等平台的。
+    #[test]
+    fn handle_can_send_without_the_outbounds_value() {
+        let outbounds = Outbounds::new().with("qq", Box::new(Recorder::default()));
+        let handle = outbounds.handle_for("qq").expect("这条连接有句柄");
+        let room = RoomId::new("qq", "group/1").expect("合法");
+        handle
+            .send(&room, &[Element::text("x")])
+            .expect("句柄能发");
+    }
+
+    /// 单连接/测试走兜底：没有按连接注册时，所有房间都交给同一个实现。
+    #[test]
+    fn fallback_handles_unknown_connection() {
+        let mut outbounds = Outbounds::fallback(Box::new(Recorder::default()));
+        let room = RoomId::new("kook", "1").expect("合法");
+        assert!(outbounds.handle_for("kook").is_some());
+        outbounds
+            .send(&room, &[Element::text("x")])
+            .expect("兜底能发");
     }
 
     #[test]

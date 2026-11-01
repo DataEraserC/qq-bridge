@@ -22,7 +22,7 @@ use acb_proto::frame::{decode, encode};
 use acb_proto::{Delivery, Frame, LogLevel, Ticket};
 use thiserror::Error;
 
-use crate::engine::{Bridge, BridgeError};
+use crate::engine::{Bridge, BridgeError, ToolCallStart};
 use crate::storage::Store;
 
 /// 空闲时多久回头看一眼有没有活。越小越跟手，越大越省 CPU。
@@ -330,6 +330,25 @@ impl Conn {
     }
 }
 
+/// 工具成功/失败都走 `tool_result`，不关连接。
+fn tool_reply(
+    id: String,
+    result: Result<serde_json::Value, acb_proto::ToolError>,
+) -> Frame {
+    match result {
+        Ok(result) => Frame::ToolResult {
+            id,
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => Frame::ToolResult {
+            id,
+            result: None,
+            error: Some(error),
+        },
+    }
+}
+
 /// 服务一条已经建立的连接，直到对端断开或出错。
 pub fn run_connection<S: Store>(
     bridge: &Mutex<Bridge<S>>,
@@ -435,11 +454,49 @@ pub fn run_connection<S: Store>(
                     Ok(frame) => frame,
                     Err(error) => break 'conn Err(EndpointError::Protocol(error.to_string())),
                 };
-                let replies = {
-                    let mut guard = lock(bridge);
-                    match session.handle(&mut guard, frame) {
-                        Ok(replies) => replies,
-                        Err(error) => break 'conn Err(error),
+                let replies = match frame {
+                    // 工具调用拆两段：锁内校验/组装，锁外等平台，锁内结算。
+                    // 只有 `platform_call` 走锁外；其余工具本地完成，仍走原路径。
+                    Frame::ToolCall {
+                        id,
+                        ticket,
+                        tool,
+                        args,
+                    } => {
+                        let start = {
+                            let mut guard = lock(bridge);
+                            guard.begin_tool_call(&ticket, session.sessions(), &tool, args)
+                        };
+                        match start {
+                            Ok(ToolCallStart::Done(result)) => {
+                                vec![tool_reply(id, Ok(result))]
+                            }
+                            Ok(ToolCallStart::Platform(prepared)) => {
+                                let result = prepared.execute();
+                                let guard = lock(bridge);
+                                let result = guard.finish_platform_call(prepared, result);
+                                vec![tool_reply(id, result)]
+                            }
+                            Ok(ToolCallStart::Send(prepared)) => {
+                                let result = prepared.execute();
+                                let mut guard = lock(bridge);
+                                let result = guard
+                                    .finish_send(prepared, result)
+                                    .map(|value| guard.fit_tool_result(&tool, value));
+                                vec![tool_reply(id, result)]
+                            }
+                            Err(error) => vec![tool_reply(id, Err(error))],
+                        }
+                    }
+                    other => {
+                        let replies = {
+                            let mut guard = lock(bridge);
+                            match session.handle(&mut guard, other) {
+                                Ok(replies) => replies,
+                                Err(error) => break 'conn Err(error),
+                            }
+                        };
+                        replies
                     }
                 };
                 for reply in replies {

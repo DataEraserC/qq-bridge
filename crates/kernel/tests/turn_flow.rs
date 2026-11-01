@@ -6,8 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
-    Bridge, Cursor, Element, ErrorCode, Feedbacks, Ingest, MemoryStore, NoteKey, NoteKind, Notes, Outbound,
-    OutboundError, RecordDraft, RoomId, Sender, Sent, Transcript, TurnReason, Watermarks, unread,
+    Bridge, Cursor, Element, ErrorCode, Feedbacks, Ingest, MemoryStore, NoteKey, NoteKind, Notes,
+    Outbound, OutboundError, RecordDraft, RoomId, Sender, Sent, Transcript, TurnReason, Watermarks,
+    unread,
 };
 use serde_json::json;
 
@@ -105,7 +106,7 @@ fn message(room: &str, sender: &str, text: &str, at_self: bool) -> RecordDraft {
         Sender {
             id: sender.to_owned(),
             name: "老王".to_owned(),
-                role: None,
+            role: None,
         },
         AT,
         vec![Element::text(text)],
@@ -123,7 +124,7 @@ fn poke(room: &str, at_self: bool) -> RecordDraft {
         Sender {
             id: "10001".to_owned(),
             name: "老王".to_owned(),
-                role: None,
+            role: None,
         },
         AT,
         "poke",
@@ -473,6 +474,50 @@ fn send_message_to_is_fenced_by_subscriptions() {
     assert_eq!(error.code, ErrorCode::RoomNotSubscribed);
 }
 
+/// 热重载只影响下一轮：这一轮开轮后把 qq 订阅删掉，本轮已开的票仍按快照放行。
+#[test]
+fn active_turn_keeps_config_snapshot_after_reload() {
+    let (mut bridge, sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    // 新配置里没有 qq:group/123 这条订阅了。
+    let reloaded = config().replace(
+        r#"        [[sessions.subscriptions]]
+        connection = "qq"
+        room = "group/123"
+
+"#,
+        "",
+    );
+    bridge.stage_config(acb_kernel::Config::parse(&reloaded).expect("新配置合法"));
+    // ingest 是配置消费点：喂一条 dc 的已订阅消息，让 staged 配置真正换上。
+    bridge
+        .ingest(message("dc:channel/456", "10001", "刷新配置", true))
+        .expect("能记下来");
+    assert_eq!(bridge.config_version(), 1, "staged 配置已生效");
+
+    // 当前配置已经没订阅 qq 群，但本轮的快照还有；所以这个发送仍应放行。
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "send_message_to",
+            json!({
+                "to": "qq:group/123",
+                "elements": [{"type": "text", "text": "按本轮快照发"}]
+            }),
+        )
+        .expect("本轮快照里仍订阅 qq 群");
+    assert_eq!(
+        sends.lock().expect("没被毒死")[0].0,
+        room("qq:group/123"),
+        "发送目标用的是本轮快照的订阅"
+    );
+}
+
 #[test]
 fn ack_messages_refuses_ids_that_were_not_delivered() {
     let (mut bridge, _sends) = bridge();
@@ -646,7 +691,12 @@ fn tool_scope_is_the_turn_session_not_the_connection() {
 
     // 连接代表两个会话，但工具的可见域只有当前轮次会话的房间。
     let rooms = bridge
-        .tool_call(&ticket, &["main".to_owned(), "sib".to_owned()], "list_rooms", json!({}))
+        .tool_call(
+            &ticket,
+            &["main".to_owned(), "sib".to_owned()],
+            "list_rooms",
+            json!({}),
+        )
         .expect("能查");
     let listed: Vec<_> = rooms["rooms"]
         .as_array()
@@ -663,7 +713,10 @@ fn tool_scope_is_the_turn_session_not_the_connection() {
         })
         .collect();
     assert_eq!(listed.len(), 1, "只列当前会话的房间：{listed:?}");
-    assert!(listed[0].contains("789"), "是 sib 的房间，不是 main 的：{listed:?}");
+    assert!(
+        listed[0].contains("789"),
+        "是 sib 的房间，不是 main 的：{listed:?}"
+    );
 }
 
 /// 记录里的 `columns` 状态表要用布尔，不能是「查了 / 没查」这种描述文字。
@@ -799,7 +852,7 @@ fn quoting_my_message_wakes_without_a_mention() {
         Sender {
             id: "10001".into(),
             name: "老王".into(),
-                role: None,
+            role: None,
         },
         AT + 1000,
         vec![
@@ -852,7 +905,7 @@ fn quoting_someone_elses_message_stays_quiet() {
         Sender {
             id: "10001".into(),
             name: "老王".into(),
-                role: None,
+            role: None,
         },
         AT + 1000,
         vec![
@@ -1268,7 +1321,11 @@ fn tools_after_the_turn_say_the_round_is_over() {
         .tool_call(&ticket, &sessions(), "get_history", json!({}))
         .expect_err("轮次结束就不该再开工具");
     assert_eq!(error.code, ErrorCode::Unauthorized);
-    assert!(error.message.contains("[no_active_round]"), "{}", error.message);
+    assert!(
+        error.message.contains("[no_active_round]"),
+        "{}",
+        error.message
+    );
     assert!(
         error.message.contains("请结束本轮"),
         "要让 agent 收手：{}",
@@ -1345,7 +1402,10 @@ fn feedback_is_recorded_counted_and_deduped() {
 
     let stored = bridge.store().feedback(None, 10).expect("能读");
     assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].title, "群成员列表只回来 16 个，没有 total，我数不出 15 个管理员是不是全部");
+    assert_eq!(
+        stored[0].title,
+        "群成员列表只回来 16 个，没有 total，我数不出 15 个管理员是不是全部"
+    );
     assert_eq!(stored[0].refs, vec!["#620", "group.get_member_list"]);
     assert_eq!(stored[0].kind, "gap");
     assert_eq!(stored[0].severity, "major", "gap 默认 major");
@@ -1390,7 +1450,12 @@ fn feedback_rejects_empty_text_and_unknown_kind() {
     let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
 
     let empty = bridge
-        .tool_call(&ticket, &sessions(), "report_feedback", json!({"text": "   "}))
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "report_feedback",
+            json!({"text": "   "}),
+        )
         .expect_err("空正文要拒");
     assert_eq!(empty.code, ErrorCode::BadRequest);
 
@@ -1458,8 +1523,15 @@ fn all_markup_text_is_refused_instead_of_sent_empty() {
         )
         .expect_err("切完没正文就该拒");
     assert_eq!(rejected.code, ErrorCode::BadRequest);
-    assert!(rejected.message.contains("bad_params"), "{}", rejected.message);
-    assert!(sends.lock().expect("没被毒死").is_empty(), "一个字都不该发出去");
+    assert!(
+        rejected.message.contains("bad_params"),
+        "{}",
+        rejected.message
+    );
+    assert!(
+        sends.lock().expect("没被毒死").is_empty(),
+        "一个字都不该发出去"
+    );
 }
 
 /// 反馈正文同样要切：不然人翻开列表看到的是「正文 + 一串标签」。
@@ -1480,7 +1552,11 @@ fn feedback_body_gets_cut_and_the_receipt_says_so() {
         )
         .expect("能记反馈");
 
-    assert_eq!(recorded["truncated"]["text_markup"], json!(true), "标记要被认出来");
+    assert_eq!(
+        recorded["truncated"]["text_markup"],
+        json!(true),
+        "标记要被认出来"
+    );
     assert!(
         recorded["note"].as_str().expect("有说明").contains("标记"),
         "{}",
@@ -1531,7 +1607,11 @@ fn merging_fills_empty_fields_but_keeps_the_first_classification() {
 
     let stored = bridge.store().feedback(None, 10).expect("能读");
     assert_eq!(stored[0].kind, "friction", "分类保留第一次的（ADR-0021）");
-    assert_eq!(stored[0].refs, vec!["#700", "platform_methods"], "空着的出处补上了");
+    assert_eq!(
+        stored[0].refs,
+        vec!["#700", "platform_methods"],
+        "空着的出处补上了"
+    );
     assert_eq!(
         stored[0].suggestion.as_deref(),
         Some("动作名跟 QQ 的 delete_msg 对齐"),
@@ -1539,7 +1619,6 @@ fn merging_fills_empty_fields_but_keeps_the_first_classification() {
     );
     assert_eq!(stored[0].tool.as_deref(), Some("platform_methods"));
 }
-
 
 /// 查历史要给总数：不然「还有没有更早的」只能靠猜。
 #[test]
@@ -1686,7 +1765,11 @@ fn history_can_return_quote_ref_as_a_column() {
         )
         .expect("能查");
     let records = history["records"].as_array().expect("有记录");
-    assert_eq!(records[0]["quote_ref"], serde_json::Value::Null, "没引用就是空");
+    assert_eq!(
+        records[0]["quote_ref"],
+        serde_json::Value::Null,
+        "没引用就是空"
+    );
     assert_eq!(records[1]["quote_ref"]["platform_id"], "p-100");
     assert_eq!(records[1]["quote_ref"]["id"], 1);
     // 状态表照样如实标：别的列这次没取。
@@ -1705,10 +1788,8 @@ impl TempRelayDir {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("时间正常")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "acb-relay-{}-{name}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("acb-relay-{}-{name}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("能建临时目录");
         Self(dir)
     }
@@ -1884,13 +1965,23 @@ fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
     let first = bridge.poll_turn().expect("能开轮").expect("有活");
     assert_eq!(first.session, "main");
     bridge
-        .tool_call(&first.ticket, &["main".to_owned()], "ack_messages", json!({"ids": [1]}))
+        .tool_call(
+            &first.ticket,
+            &["main".to_owned()],
+            "ack_messages",
+            json!({"ids": [1]}),
+        )
         .expect("能确认");
     bridge.end_turn(&first.ticket, None).expect("能收工");
     let second = bridge.poll_turn().expect("能开轮").expect("有活");
     assert_eq!(second.session, "side");
     bridge
-        .tool_call(&second.ticket, &["side".to_owned()], "ack_messages", json!({"ids": [1]}))
+        .tool_call(
+            &second.ticket,
+            &["side".to_owned()],
+            "ack_messages",
+            json!({"ids": [1]}),
+        )
         .expect("能确认");
     bridge.end_turn(&second.ticket, None).expect("能收工");
 
@@ -1908,14 +1999,22 @@ fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
         .expect("能发");
     // #3 是自己发的，deliver_out 已替所有订阅者确认；模型只需确认收到的 #2。
     let acked = bridge
-        .tool_call(&turn.ticket, &["main".to_owned()], "ack_messages", json!({"ids": [2]}))
+        .tool_call(
+            &turn.ticket,
+            &["main".to_owned()],
+            "ack_messages",
+            json!({"ids": [2]}),
+        )
         .expect("能确认");
     assert_eq!(acked["watermark"], 3);
     bridge.end_turn(&turn.ticket, None).expect("能收工");
 
     // 3. side 开轮：#3 已经在 side 的账上确认过了（只是 #2 还没轮到它开轮）。
     //    所以投递里只有 #2，而且确认 #2 之后水位能直接迈过 #3。
-    let side = bridge.poll_turn().expect("能开轮").expect("side 还挂着一次唤醒");
+    let side = bridge
+        .poll_turn()
+        .expect("能开轮")
+        .expect("side 还挂着一次唤醒");
     assert_eq!(side.session, "side");
     assert_eq!(
         side.records.iter().map(|r| r.id).collect::<Vec<_>>(),
@@ -1923,7 +2022,12 @@ fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
         "side 只欠 #2；自己人的 #3 不该出现"
     );
     let acked = bridge
-        .tool_call(&side.ticket, &["side".to_owned()], "ack_messages", json!({"ids": [2]}))
+        .tool_call(
+            &side.ticket,
+            &["side".to_owned()],
+            "ack_messages",
+            json!({"ids": [2]}),
+        )
         .expect("能确认");
     assert_eq!(
         acked["watermark"], 3,
@@ -1957,7 +2061,12 @@ fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
         "只有新戳的 #5；#4 是自己发的，自愈时已确认"
     );
     let acked = bridge
-        .tool_call(&side.ticket, &["side".to_owned()], "ack_messages", json!({"ids": [5]}))
+        .tool_call(
+            &side.ticket,
+            &["side".to_owned()],
+            "ack_messages",
+            json!({"ids": [5]}),
+        )
         .expect("能确认");
     assert_eq!(acked["watermark"], 5, "自愈把 #4 补确认了，前沿才能到 5");
     bridge.end_turn(&side.ticket, None).expect("能收工");
