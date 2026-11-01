@@ -19,6 +19,7 @@ use acb_kernel::{
     AdapterRegistry, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds,
     PluginManager, SqliteStore, drain_events, serve,
 };
+use acb_plugin_lua::LuaLoader;
 use acb_plugin_trusted::TrustedLoader;
 
 mod config_patch;
@@ -93,6 +94,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 树外 manager 只是把 provider 注册进 Root；配置里引用 `trusted.*` 才生效。
     let mut plugins = PluginManager::with_native_builtins();
     plugins.install_loader(&TrustedLoader)?;
+    // Lua 脚本插件是可选能力：设了 ACB_LUA_DIR 才装，目录里的 *.lua 变成 lua.* provider。
+    if let Some(lua) = LuaLoader::from_env() {
+        plugins.install_loader(&lua)?;
+    }
 
     let bridge = Arc::new(Mutex::new(Bridge::with_plugins(
         config.clone(),

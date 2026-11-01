@@ -5,6 +5,7 @@ members = [
     "crates/kernel",
     "crates/adapters/onebot11",
     "crates/plugins/trusted",
+    "crates/plugins/lua",
     "crates/bridge",
 ]
 

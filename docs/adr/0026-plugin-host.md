@@ -104,7 +104,13 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - manager 增加 `children()` / `reload()` / `shutdown()` / `health()`；Root 递归安装子树，最多 4 层并拒绝环路；生命周期由 Root 驱动（shutdown 按安装逆序，子 manager 先收）。
   - loader 增加 `manifest()`（kind、api_version、extensions）与 `unload()`（默认不支持，动态 loader 再覆盖）；Root 加载前校验版本和扩展点。
   - 新增独立 crate `acb-plugin-trusted`（namespace `trusted`），提供 `trusted.accumulate_only`：只在未读攒够时唤醒，`@`/昵称/拍/引用都不单独叫醒。`TrustedLoader` 把它装进 Root，`main` 启动时安装；配置写 `provider = "trusted.accumulate_only"` 即可启用。
-  - 尚未做：LuaManager / LuaLoader（Phase 3b）。
+- **Phase 3b（2026-11-01）**：LuaManager / LuaLoader 落地。
+  - 新增独立 crate `acb-plugin-lua`，用 `mlua`（Lua 5.4 编进二进制）实现一个 native manager：脚本目录里的 `*.lua` 一一对应 `lua.<文件名>` provider。
+  - 脚本返回 `{ extension = "wake"|"access", decide = function(options, context) ... end }`；wake 返回 `"wake"/"stay"`，access 返回 `"allow"/"deny"`（也接受布尔）。
+  - 脚本只能看到 options/context 的普通 table，拿不到 Store / Bridge / 配置写入；标准库只开 `ALL_SAFE`。
+  - 每次调用有 50ms 超时（指令钩子打断）；超时或报错按安全侧兜底（wake 不醒、access 拒绝），并累计失败数让 manager health 变 Degraded。
+  - `reload` 只换实现，不允许脚本增删 provider（descriptor 集合变化要求重启）。目录来自环境变量 `ACB_LUA_DIR`，没设就不装 LuaLoader。
+  - 这满足 bootstrap 约束：LuaManager 是 native 实现，不是它自己加载的 `.lua` 文件。
 
 ## 参考
 
