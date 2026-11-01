@@ -54,7 +54,26 @@ fn process_adapter_speaks_the_wire_protocol() {
     let AdapterInstance {
         mut outbound,
         launch,
+        manifest,
     } = instance;
+
+    // hello 里声明的入站能力要进 manifest，describe_plugins 才看得见。
+    assert!(
+        manifest.events.iter().any(|event| event.as_ref() == "knock"),
+        "{:?}",
+        manifest.events
+    );
+    assert!(
+        manifest
+            .event_tags
+            .iter()
+            .any(|tag| tag.as_ref() == "notice"),
+        "{:?}",
+        manifest.event_tags
+    );
+    assert!(manifest.supports_at);
+    assert!(manifest.supports_reply);
+    assert_eq!(manifest.platform.as_ref(), "fixture");
 
     let catalog = outbound.catalog("fixture");
     assert!(
@@ -134,6 +153,7 @@ fn process_adapter_restarts_after_child_exits() {
     let AdapterInstance {
         mut outbound,
         launch,
+        manifest: _,
     } = instance;
     let shutdown = Arc::new(AtomicBool::new(false));
     let host = AdapterHost {

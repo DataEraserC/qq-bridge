@@ -96,6 +96,7 @@ fn dynamic_adapter_loads_and_speaks_the_wire_protocol() {
     let AdapterInstance {
         mut outbound,
         launch,
+        manifest: _,
     } = instance;
 
     let catalog = outbound.catalog("demo");

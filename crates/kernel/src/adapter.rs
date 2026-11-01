@@ -82,6 +82,9 @@ impl std::fmt::Debug for AdapterHost {
 pub struct AdapterInstance {
     pub outbound: Box<dyn Outbound>,
     pub launch: Box<dyn FnOnce(AdapterHost) + Send>,
+    /// 适配器运行时上报的 manifest。外置进程在 hello 之后可能与静态声明不同
+    /// （子进程自己声明事件和标签）；静态载体直接给工厂的 manifest。
+    pub manifest: AdapterManifest,
 }
 
 impl std::fmt::Debug for AdapterInstance {
@@ -244,6 +247,7 @@ mod tests {
             Ok(AdapterInstance {
                 outbound: Box::new(FakeOutbound),
                 launch: Box::new(|_host| {}),
+                manifest: FAKE_MANIFEST.clone(),
             })
         }
     }
@@ -326,6 +330,7 @@ mod tests {
             Ok(AdapterInstance {
                 outbound: Box::new(FakeOutbound),
                 launch: Box::new(|_host| {}),
+                manifest: FAKE_MANIFEST.clone(),
             })
         }
     }

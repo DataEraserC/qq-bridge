@@ -390,16 +390,31 @@ pub enum WireResult {
     },
 }
 
+/// 适配器在 hello 里声明的入站能力。外置进程自己决定发什么事件、打什么标签。
+#[derive(Debug, Clone, Default, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireAdapterInfo {
+    #[serde(default)]
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub event_tags: Vec<String>,
+    #[serde(default)]
+    pub supports_at: bool,
+    #[serde(default)]
+    pub supports_reply: bool,
+}
+
 /// 适配器 → core。
 #[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdapterMessage {
-    /// 第一行。声明适配器名字和平台方法目录。
+    /// 第一行。声明适配器名字、平台方法目录和入站能力。
     Hello {
         #[serde(default)]
         name: String,
         #[serde(default)]
         catalog: Vec<WireMethodSpec>,
+        #[serde(default)]
+        info: WireAdapterInfo,
     },
     Event {
         record: WireRecord,
@@ -501,6 +516,12 @@ mod tests {
                 effect: "read".into(),
                 record: "none".into(),
             }],
+            info: WireAdapterInfo {
+                events: vec!["poke".into()],
+                event_tags: vec!["poke".into()],
+                supports_at: true,
+                supports_reply: true,
+            },
         };
         let line = encode_line(&hello).expect("能编码");
         assert!(line.contains("\"type\":\"hello\""));

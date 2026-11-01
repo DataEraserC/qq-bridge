@@ -95,6 +95,10 @@ impl AdapterFactory for OneBotAdapterFactory {
             supervise(slot, connection, host.shutdown, host.events);
         });
 
-        Ok(AdapterInstance { outbound, launch })
+        Ok(AdapterInstance {
+            outbound,
+            launch,
+            manifest: MANIFEST.clone(),
+        })
     }
 }

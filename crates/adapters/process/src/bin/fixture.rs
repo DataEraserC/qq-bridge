@@ -6,7 +6,7 @@
 use std::io::{BufRead, Write};
 
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireError, WireMethodSpec, WireOutgoingKind,
+    AdapterMessage, CoreMessage, WireAdapterInfo, WireError, WireMethodSpec, WireOutgoingKind,
     WireOutgoingRecord, WireParamSpec, WireRecord, WireResult, decode_line, encode_line,
 };
 use acb_proto::{Element, RecordKind, RoomId, Sender};
@@ -21,6 +21,12 @@ fn main() -> std::io::Result<()> {
         &AdapterMessage::Hello {
             name: "fixture".into(),
             catalog: catalog(),
+            info: WireAdapterInfo {
+                events: vec!["knock".into(), "poke".into()],
+                event_tags: vec!["notice".into(), "poke".into()],
+                supports_at: true,
+                supports_reply: true,
+            },
         },
     )?;
     write_message(

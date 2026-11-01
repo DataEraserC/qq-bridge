@@ -18,8 +18,8 @@ use acb_adapter_onebot11::OneBotAdapterFactory;
 use acb_adapter_dynamic::DynamicLoader;
 use acb_adapter_process::ProcessAdapterFactory;
 use acb_kernel::{
-    AdapterHost, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds, PluginManager,
-    SqliteStore, drain_events, serve,
+    AdapterHost, AdapterInstance, Bridge, Config, ControlRegistry, EventQueue, FileRelay,
+    Outbounds, PluginManager, SqliteStore, drain_events, serve,
 };
 use acb_plugin_lua::LuaLoader;
 use acb_plugin_trusted::TrustedLoader;
@@ -101,8 +101,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut launches = Vec::new();
     for connection in &config.connections {
         let instance = plugins.create_adapter(connection, events.clone())?;
-        outbounds = outbounds.with(connection.id.clone(), instance.outbound);
-        launches.push(instance.launch);
+        let AdapterInstance {
+            outbound,
+            launch,
+            manifest,
+        } = instance;
+        outbounds = outbounds
+            .with(connection.id.clone(), outbound)
+            .with_manifest(connection.id.clone(), manifest);
+        launches.push(launch);
     }
 
     let bridge = Arc::new(Mutex::new(Bridge::with_plugins(

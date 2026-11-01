@@ -37,7 +37,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireMethodSpec, WireResult, decode_line, encode_line,
+    AdapterMessage, CoreMessage, WireAdapterInfo, WireMethodSpec, WireResult, decode_line,
+    encode_line,
 };
 use acb_kernel::wire::{call_error, convert_catalog, send_error};
 use acb_kernel::{
@@ -106,9 +107,13 @@ impl AdapterFactory for ProcessAdapterFactory {
         connection: &Connection,
         events: EventQueue,
     ) -> Result<AdapterInstance, AdapterError> {
-        let (outbound, launch) = spawn_process(connection, events)
+        let (outbound, launch, manifest) = spawn_process(connection, events)
             .map_err(|detail| AdapterError::Create(connection.id.clone(), detail))?;
-        Ok(AdapterInstance { outbound, launch })
+        Ok(AdapterInstance {
+            outbound,
+            launch,
+            manifest,
+        })
     }
 }
 
@@ -212,6 +217,7 @@ fn parse_options(connection: &Connection) -> Result<ProcessConfig, String> {
 struct HelloData {
     name: String,
     catalog: Vec<WireMethodSpec>,
+    info: WireAdapterInfo,
 }
 
 /// 一条连接的共享进程状态。重启时换 stdin、清 pending，但 outbound 句柄不变。
@@ -220,12 +226,21 @@ struct SharedProcess {
     pending: Pending,
     alive: Arc<AtomicBool>,
     catalog: Mutex<Arc<[MethodSpec]>>,
+    /// 子进程 hello 里声明的入站能力；重启时跟着新 hello 更新。
+    info: Mutex<WireAdapterInfo>,
 }
 
 fn spawn_process(
     connection: &Connection,
     events: EventQueue,
-) -> Result<(Box<dyn Outbound>, Box<dyn FnOnce(AdapterHost) + Send>), String> {
+) -> Result<
+    (
+        Box<dyn Outbound>,
+        Box<dyn FnOnce(AdapterHost) + Send>,
+        AdapterManifest,
+    ),
+    String,
+> {
     let config = parse_options(connection)?;
     let connection_id = connection.id.clone();
     let restart_events = events.clone();
@@ -235,9 +250,10 @@ fn spawn_process(
         pending: Arc::new(Mutex::new(HashMap::new())),
         alive: Arc::new(AtomicBool::new(false)),
         catalog: Mutex::new(Arc::from(Vec::<MethodSpec>::new())),
+        info: Mutex::new(WireAdapterInfo::default()),
     });
 
-    let (child, stdin, catalog) = start_child(
+    let (child, stdin, catalog, info) = start_child(
         &config,
         &connection_id,
         events,
@@ -252,7 +268,14 @@ fn spawn_process(
         .catalog
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = catalog;
+    *shared
+        .info
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = info;
     shared.alive.store(true, Ordering::Relaxed);
+
+    // 在把 shared 交给 launch 闭包之前算好运行时报文。
+    let manifest = runtime_manifest(&connection.platform, &shared);
 
     let outbound = ProcessOutbound {
         shared: Arc::clone(&shared),
@@ -273,7 +296,27 @@ fn spawn_process(
     });
 
     let outbound: Box<dyn Outbound> = Box::new(outbound);
-    Ok((outbound, launch))
+    Ok((outbound, launch, manifest))
+}
+
+/// 静态 process manifest + 子进程 hello 里声明的入站能力。
+fn runtime_manifest(platform: &str, shared: &SharedProcess) -> AdapterManifest {
+    let info = shared
+        .info
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let events: Vec<Cow<'static, str>> = info.events.into_iter().map(Cow::Owned).collect();
+    let event_tags: Vec<Cow<'static, str>> =
+        info.event_tags.into_iter().map(Cow::Owned).collect();
+    AdapterManifest {
+        platform: Cow::Owned(platform.to_owned()),
+        events: events.into(),
+        event_tags: event_tags.into(),
+        supports_at: info.supports_at,
+        supports_reply: info.supports_reply,
+        ..MANIFEST.clone()
+    }
 }
 
 /// 启动一个子进程并等到 hello。失败时把已经起的进程收掉，不留孤儿。
@@ -283,7 +326,7 @@ fn start_child(
     events: EventQueue,
     pending: Pending,
     alive: Arc<AtomicBool>,
-) -> Result<(Child, ChildStdin, Arc<[MethodSpec]>), String> {
+) -> Result<(Child, ChildStdin, Arc<[MethodSpec]>, WireAdapterInfo), String> {
     let mut command = Command::new(&config.program);
     command
         .args(&config.args)
@@ -358,7 +401,7 @@ fn start_child(
         format!("适配器的平台方法目录不合法：{detail}")
     })?;
 
-    Ok((child, stdin, catalog))
+    Ok((child, stdin, catalog, hello.info))
 }
 
 /// 守着子进程：退出就按退避重启，桥要停才收尾。
@@ -411,7 +454,7 @@ fn supervise(
             Arc::clone(&shared.pending),
             Arc::clone(&shared.alive),
         ) {
-            Ok((new_child, stdin, catalog)) => {
+            Ok((new_child, stdin, catalog, info)) => {
                 *shared
                     .stdin
                     .lock()
@@ -420,6 +463,10 @@ fn supervise(
                     .catalog
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = catalog;
+                *shared
+                    .info
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = info;
                 shared.alive.store(true, Ordering::Relaxed);
                 child = new_child;
                 delay = RESTART_DELAY;
@@ -478,10 +525,18 @@ fn spawn_reader(
 
             if !hello_seen {
                 match message {
-                    AdapterMessage::Hello { name, catalog } => {
+                    AdapterMessage::Hello {
+                        name,
+                        catalog,
+                        info,
+                    } => {
                         hello_seen = true;
                         if let Some(sender) = hello_tx.take() {
-                            let _ = sender.send(Ok(HelloData { name, catalog }));
+                            let _ = sender.send(Ok(HelloData {
+                                name,
+                                catalog,
+                                info,
+                            }));
                         }
                     }
                     _ => {

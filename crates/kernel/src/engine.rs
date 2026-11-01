@@ -2531,7 +2531,12 @@ impl<S: Store> Bridge<S> {
                             .catalog()
                             .into_iter()
                             .find(|info| info.kind.as_deref() == Some(connection.kind.as_str()));
-                        let manifest = self.plugins.adapter_manifest(&connection.kind);
+                        // 先看这条连接运行时上报的能力（外置进程 hello 会带），
+                        // 没有再退回按 kind 的静态声明。
+                        let manifest = self
+                            .outbound
+                            .manifest(&connection.id)
+                            .or_else(|| self.plugins.adapter_manifest(&connection.kind));
                         let (events, event_tags, supports_at, supports_reply) = match manifest {
                             Some(manifest) => (
                                 manifest
@@ -2753,7 +2758,11 @@ impl<S: Store> Bridge<S> {
             };
             self.ensure_connection_readable(config, sessions, &id)?;
             let methods = self.outbound.catalog(&id);
-            let manifest = self.plugins.adapter_manifest(&connection.kind);
+            // 同 describe_plugins：连接运行时 manifest 优先，静态声明兜底。
+            let manifest = self
+                .outbound
+                .manifest(&id)
+                .or_else(|| self.plugins.adapter_manifest(&connection.kind));
             let (events, event_tags, supports_at, supports_reply) = match manifest {
                 Some(manifest) => (
                     manifest

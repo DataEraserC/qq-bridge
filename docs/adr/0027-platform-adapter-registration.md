@@ -149,6 +149,16 @@ InboundEvent:
     超时后 handle 视为不可用。`destroy` 最多等 2 秒，插件卡死时跳过销毁而不是挂住桥。
   - **动态库 unload 不做**：Root 不保留 loader，适配器连接持有库的函数指针；
     安全卸载需要先拆连接/停进程，等有连接生命周期管理再做。
+- **Phase 4 P9（2026-11-01，外置进程能力声明）**：外置适配器的入站能力不再只能靠猜。
+  - `AdapterMessage::Hello` 增加可选 `info: WireAdapterInfo`（`events` / `event_tags` /
+    `supports_at` / `supports_reply`，全部有默认值，老适配器不写也能握手）。
+  - `AdapterInstance` 增加运行时 `manifest`；`process` 适配器在启动时把静态声明和
+    hello 里的能力合成一份，交给 `Outbounds` 按连接保存。`describe_plugins` /
+    `platform_methods` 优先读这条连接的运行时 manifest，缺失时退回 `PluginManager`
+    按 `kind` 的静态声明。
+  - `describe_plugins` 的 `adapters` 数组因此能看到外置适配器声明的 `events` /
+    `event_tags` / `supports_at` / `supports_reply`，与内置/动态库适配器一致。
+    子进程重启后 outbound 句柄和目录会更新，这份能力声明保持启动时的快照。
 
 ## 参考
 

@@ -334,7 +334,11 @@ impl DylibAdapterFactory {
             );
         });
 
-        Ok(AdapterInstance { outbound, launch })
+        Ok(AdapterInstance {
+            outbound,
+            launch,
+            manifest: self.manifest.clone(),
+        })
     }
 }
 

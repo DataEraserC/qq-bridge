@@ -13,6 +13,8 @@ use acb_proto::{Element, RoomId};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::adapter::AdapterManifest;
+
 /// 一次平台方法调用可能顺带产生的流水记录（由适配器翻译，core 负责落库）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutgoingRecord {
@@ -629,6 +631,8 @@ pub struct Outbounds {
     by_connection: std::collections::HashMap<String, Arc<Mutex<Box<dyn Outbound>>>>,
     /// 单连接/测试用的兜底通道：没有按连接注册时，所有房间都交给它。
     fallback: Option<Arc<Mutex<Box<dyn Outbound>>>>,
+    /// 每条连接运行时上报的 manifest（含 hello 里的入站能力）。
+    manifests: std::collections::HashMap<String, AdapterManifest>,
 }
 
 impl Outbounds {
@@ -649,6 +653,21 @@ impl Outbounds {
         self.by_connection
             .insert(connection.into(), Arc::new(Mutex::new(outbound)));
         self
+    }
+
+    /// 记下这条连接运行时上报的 manifest（`describe_plugins` / `list_rooms` 用）。
+    pub fn with_manifest(
+        mut self,
+        connection: impl Into<String>,
+        manifest: AdapterManifest,
+    ) -> Self {
+        self.manifests.insert(connection.into(), manifest);
+        self
+    }
+
+    /// 读运行时 manifest；没有就回 `None`，由上层退回插件目录的静态声明。
+    pub fn manifest(&self, connection: &str) -> Option<AdapterManifest> {
+        self.manifests.get(connection).cloned()
     }
 
     /// 已经接了哪些连接。

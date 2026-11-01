@@ -51,10 +51,21 @@ function error(id, kind, detail) {
   reply(id, { outcome: "error", error: { kind, detail } })
 }
 
-// 第一条必须是 hello。
-write({ type: "hello", name: "example-process", catalog: catalog() })
+// 第一条必须是 hello。info 声明这条连接的入站能力：会发哪些事件、打哪些跨平台标签，
+// 以及支不支持 at/回复唤醒；describe_plugins 会原样展示。
+write({
+  type: "hello",
+  name: "example-process",
+  catalog: catalog(),
+  info: {
+    events: ["example.greet"],
+    event_tags: ["notice"],
+    supports_at: true,
+    supports_reply: true,
+  },
+})
 
-// 启动后主动发一条入站事件，方便看出桥真的收到了。
+// 启动后主动发一条入站消息和一条平台事件，方便看出桥真的收到了。
 write({
   type: "event",
   record: {
@@ -65,6 +76,26 @@ write({
     elements: [{ type: "text", text: "来自外置进程示例的问候" }],
     at_self: false,
     platform_id: "ex-event-1",
+    reply_to_self: false,
+  },
+})
+
+write({
+  type: "event",
+  record: {
+    room: { connection: "example", path: ["group", "1"] },
+    kind: {
+      kind: "event",
+      event: "example.greet",
+      tags: ["notice"],
+      payload: { from: "10001" },
+      summary: "示例用户打了个招呼",
+    },
+    sender: { id: "10001", name: "示例用户", role: null },
+    at: AT,
+    elements: [],
+    at_self: false,
+    platform_id: null,
     reply_to_self: false,
   },
 })

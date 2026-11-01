@@ -71,7 +71,8 @@ decide = function(request, options) ... options.extra.blocked ... end
 
 ## 外置进程适配器
 
-`process/adapter.mjs` 用 Node 写了一个最小适配器：说 hello、发一条入站事件、回 send/call。
+`process/adapter.mjs` 用 Node 写了一个最小适配器：说 hello（声明事件/标签能力）、
+发一条入站消息和一条平台事件、回 send/call。
 
 ```toml
 [[connections]]
@@ -85,11 +86,13 @@ account = "example-bot"
 command = ["node", "examples/process/adapter.mjs"]
 ```
 
-会话订阅 `example:group/1` 后，启动适配器时会收到一条示例事件；`platform_methods`
-里能看到 `example.echo` / `example.send`。
+会话订阅 `example:group/1` 后，启动适配器时会收到示例消息与事件；`platform_methods`
+里能看到 `example.echo` / `example.send`；`describe_plugins` 的 `adapters` 里能看到
+`events = ["example.greet"]`、`event_tags = ["notice"]`。
 
-任何语言都能写：只要第一行是 hello，之后一行一条 JSON，按 `id` 回 reply 即可。
-完整 wire 形状见 `crates/adapter-api` 和 [docs/05-adapters.md](../docs/05-adapters.md)。
+任何语言都能写：只要第一行是 hello（带 `info` 声明入站能力），之后一行一条 JSON，
+按 `id` 回 reply 即可。完整 wire 形状见 `crates/adapter-api` 和
+[docs/05-adapters.md](../docs/05-adapters.md)。
 
 ## 动态库
 

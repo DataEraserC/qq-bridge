@@ -87,9 +87,12 @@ command = ["/path/to/adapter", "--stdio"]
 ```
 
 - 子进程启动后第一行必须是 `hello`，带上自己的平台方法目录；超时（默认 10 秒）没等到就启动失败。
+- `hello.info` 可以声明这条连接的入站能力：`events`（会产生的平台事件名，如
+  `example.greet`）、`event_tags`（跨平台语义标签，如 `notice`）、`supports_at` /
+  `supports_reply`。不写就按「不声明」处理；`describe_plugins` 会展示这些字段。
 - 入站事件发 `event`；`send` / `call` 按 `id` 回 `reply`，错误用 `kind` 分类（`bad_params` / `forbidden` / `unavailable` …）。
 - 子进程退出后自动重启：500ms 起按倍数退避、最多 10 秒；重启期间未完成的请求明确报「适配器进程退出了」。
-  重启成功后沿用同一个 outbound 句柄，平台方法目录按新 hello 更新。
+  重启成功后沿用同一个 outbound 句柄，平台方法目录按新 hello 更新；能力声明是启动时快照。
 - 子进程崩溃后，未完成的请求明确报「通道不可用」；桥退出时发 `shutdown`，2 秒内不收尾就 kill。
 - 一个最小的参考实现见 `crates/adapters/process/src/bin/fixture.rs`。
 - 想直接抄一个可运行的 Node 版本，见 [`examples/process/adapter.mjs`](../examples/process/adapter.mjs)。
