@@ -6,6 +6,7 @@
 pub mod adapter;
 pub mod config;
 pub mod endpoint;
+pub mod event_queue;
 pub mod engine;
 pub mod memory;
 pub mod outbound;
@@ -21,6 +22,7 @@ pub use adapter::{
     AdapterCapability, AdapterError, AdapterFactory, AdapterInstance, AdapterManifest,
     AdapterRegistry, ADAPTER_API_VERSION,
 };
+pub use event_queue::{drain_events, EventQueue, EventReceiver};
 pub use config::{
     Config, Connection, ConsoleConfig, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_RECORDS_PER_ROOM,
     DEFAULT_STORAGE_PATH, DEFAULT_WORKTREES_ROOT, EndpointConfig, Harness, KNOWN_ADAPTERS,

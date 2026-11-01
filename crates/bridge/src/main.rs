@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use acb_adapter_onebot11::OneBotAdapterFactory;
 use acb_kernel::{
-    AdapterRegistry, Bridge, Config, ControlRegistry, FileRelay, Outbounds, SqliteStore, serve,
+    AdapterRegistry, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds,
+    SqliteStore, drain_events, serve,
 };
 
 mod config_patch;
@@ -76,10 +77,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut adapters = AdapterRegistry::<SqliteStore>::new();
     adapters.register(std::sync::Arc::new(OneBotAdapterFactory))?;
 
+    // 入站队列：适配器只往里丢记录，core 的 drain 线程统一 ingest。
+    let (events, event_rx) = EventQueue::channel();
+
     let mut outbounds = Outbounds::new();
     let mut launches = Vec::new();
     for connection in &config.connections {
-        let instance = adapters.create(connection)?;
+        let instance = adapters.create(connection, events.clone())?;
         outbounds = outbounds.with(connection.id.clone(), instance.outbound);
         launches.push(instance.launch);
     }
@@ -96,6 +100,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.validate_plugins()?;
+    }
+
+    // core 的入站 drain 线程：所有适配器的事件都从这里进流水，顺序由队列保证。
+    {
+        let bridge = Arc::clone(&bridge);
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || drain_events(bridge, event_rx, shutdown));
     }
 
     for launch in launches {

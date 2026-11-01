@@ -7,17 +7,17 @@
 //! 两处特意设计的地方：
 //! - **动作走队列**：`send` 只是把动作塞进队列，由这个线程统一写 socket 并按 `echo` 配对
 //!   回包，写读永远只有一个人，不会串字节。
-//! - **喂事件用 `try_lock`**：桥上那把锁可能正被回合线程拿着（它在等平台回话）。这里抢不到
-//!   锁就把事件攒着，绝不在等锁的时候卡住写动作——否则就是互相等死。
+//! - **事件走队列**：适配器只把 `RecordDraft` 丢进 core 的 `EventQueue`，不拿桥的锁，
+//!   也不直接调 `ingest`。真正入库由 core 的 drain 线程统一做。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use acb_kernel::{Bridge, RecordDraft, Store};
+use acb_kernel::{Bridge, EventQueue, Store};
 use serde_json::Value;
 use tungstenite::error::Error as WsError;
 use tungstenite::{Message, WebSocket};
@@ -168,17 +168,15 @@ fn endpoint_of(url: &str) -> Result<String, LinkError> {
 }
 
 /// 一条连接的主循环：写动作、喂事件、读回包。连不上或断了就返回。
-pub fn pump<S: Store>(
+pub fn pump(
     mut ws: Ws,
     actions: Receiver<Action>,
-    bridge: &Mutex<Bridge<S>>,
+    events: &EventQueue,
     connection: &str,
     admin_qqs: &[String],
     shutdown: &AtomicBool,
 ) -> Result<(), LinkError> {
     let mut waiting: HashMap<String, Sender<Result<Value, LinkError>>> = HashMap::new();
-    // 抢不到桥的锁时，事件先在这里排队。
-    let mut backlog: VecDeque<RecordDraft> = VecDeque::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         // 1. 把排队的动作写出去。写和读在同一个线程，必须严格串行。
@@ -199,19 +197,15 @@ pub fn pump<S: Store>(
             }
         }
 
-        // 2. 顺手把攒下的事件喂进去。抢不到锁就先放着，绝不在这里卡住。
-        feed(bridge, &mut backlog);
-
-        // 3. 读一帧。
+        // 2. 读一帧。事件由 handle_text 丢进 core 的入站队列。
         match ws.read() {
             Ok(Message::Text(text)) => {
                 handle_text(
                     text.as_str(),
-                    bridge,
+                    events,
                     connection,
                     admin_qqs,
                     &mut waiting,
-                    &mut backlog,
                 );
             }
             // tungstenite 收到 ping 会自动回 pong，这里只兜一手。
@@ -242,13 +236,12 @@ fn is_timeout(error: &std::io::Error) -> bool {
     )
 }
 
-fn handle_text<S: Store>(
+fn handle_text(
     text: &str,
-    bridge: &Mutex<Bridge<S>>,
+    events: &EventQueue,
     connection: &str,
     admin_qqs: &[String],
     waiting: &mut HashMap<String, Sender<Result<Value, LinkError>>>,
-    backlog: &mut VecDeque<RecordDraft>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         eprintln!("适配器 {connection}：收到一段不是 JSON 的内容，丢掉");
@@ -265,8 +258,9 @@ fn handle_text<S: Store>(
 
     match event::parse(connection, &value, admin_qqs) {
         Ok(Parsed::Record(draft)) => {
-            backlog.push_back(draft);
-            feed(bridge, backlog);
+            if !events.submit(draft) {
+                eprintln!("适配器 {connection}：入站队列已关闭，丢掉一条记录");
+            }
         }
         Ok(Parsed::Ignored(reason)) => {
             // 心跳之类，不值得每次都打日志。
@@ -275,20 +269,6 @@ fn handle_text<S: Store>(
             }
         }
         Err(error) => eprintln!("适配器 {connection}：这条事件读不懂：{error}"),
-    }
-}
-
-/// 把攒下的事件喂给桥。抢不到锁就立刻返回，等下一轮。
-fn feed<S: Store>(bridge: &Mutex<Bridge<S>>, backlog: &mut VecDeque<RecordDraft>) {
-    while !backlog.is_empty() {
-        let Ok(mut guard) = bridge.try_lock() else {
-            return;
-        };
-        let draft = backlog.pop_front().expect("刚检查过不为空");
-        if let Err(error) = guard.ingest(draft) {
-            // 记不下来是真问题，说清楚，别装作没事。
-            eprintln!("适配器：这条事件没能写进流水：{error}");
-        }
     }
 }
 
@@ -307,6 +287,7 @@ pub fn supervise<S: Store + Send + 'static>(
     admin_qqs: Vec<String>,
     bridge: Arc<Mutex<Bridge<S>>>,
     shutdown: Arc<AtomicBool>,
+    events: EventQueue,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match connect(&url, token.as_deref(), READ_TICK) {
@@ -324,7 +305,14 @@ pub fn supervise<S: Store + Send + 'static>(
                     std::thread::spawn(move || probe_login(&sender, &bridge, &connection));
                 }
 
-                let outcome = pump(ws, actions, &bridge, &connection, &admin_qqs, &shutdown);
+                let outcome = pump(
+                    ws,
+                    actions,
+                    &events,
+                    &connection,
+                    &admin_qqs,
+                    &shutdown,
+                );
                 slot.clear();
                 if shutdown.load(Ordering::Relaxed) {
                     break;

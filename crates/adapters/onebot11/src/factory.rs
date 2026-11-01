@@ -40,7 +40,11 @@ impl<S: Store + Send + 'static> AdapterFactory<S> for OneBotAdapterFactory {
         &MANIFEST
     }
 
-    fn create(&self, connection: &Connection) -> Result<AdapterInstance<S>, AdapterError> {
+    fn create(
+        &self,
+        connection: &Connection,
+        events: acb_kernel::EventQueue,
+    ) -> Result<AdapterInstance<S>, AdapterError> {
         let slot = LinkSlot::new();
         let outbound = Box::new(OneBotOutbound::new(slot.clone(), connection.id.clone()));
 
@@ -50,7 +54,9 @@ impl<S: Store + Send + 'static> AdapterFactory<S> for OneBotAdapterFactory {
         let admin_qqs = connection.admin_qqs.clone();
         let launch: Box<dyn FnOnce(Arc<Mutex<Bridge<S>>>, Arc<AtomicBool>) + Send> =
             Box::new(move |bridge, shutdown| {
-                supervise(slot, url, token, id, admin_qqs, bridge, shutdown);
+                supervise(
+                    slot, url, token, id, admin_qqs, bridge, shutdown, events,
+                );
             });
 
         Ok(AdapterInstance { outbound, launch })

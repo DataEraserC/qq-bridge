@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::config::{Connection, Transport};
 use crate::engine::Bridge;
+use crate::event_queue::EventQueue;
 use crate::outbound::Outbound;
 use crate::storage::Store;
 
@@ -65,7 +66,13 @@ impl<S: Store> std::fmt::Debug for AdapterInstance<S> {
 pub trait AdapterFactory<S: Store>: Send + Sync {
     fn manifest(&self) -> &AdapterManifest;
 
-    fn create(&self, connection: &Connection) -> Result<AdapterInstance<S>, AdapterError>;
+    /// 实例化一条连接。`events` 是 core 的入站队列写端；适配器只往里丢，
+    /// 不直接调 `Bridge::ingest`。
+    fn create(
+        &self,
+        connection: &Connection,
+        events: EventQueue,
+    ) -> Result<AdapterInstance<S>, AdapterError>;
 }
 
 /// 注册表错误。
@@ -131,7 +138,11 @@ impl<S: Store> AdapterRegistry<S> {
     }
 
     /// 按连接配置实例化。连接里的 `kind` / `transport` 必须和 manifest 对得上。
-    pub fn create(&self, connection: &Connection) -> Result<AdapterInstance<S>, AdapterError> {
+    pub fn create(
+        &self,
+        connection: &Connection,
+        events: EventQueue,
+    ) -> Result<AdapterInstance<S>, AdapterError> {
         let factory = self
             .factories
             .get(&connection.kind)
@@ -153,7 +164,7 @@ impl<S: Store> AdapterRegistry<S> {
             });
         }
 
-        factory.create(connection)
+        factory.create(connection, events)
     }
 
     /// 已注册的 manifest（给控制台/诊断用）。
@@ -216,12 +227,18 @@ mod tests {
         fn create(
             &self,
             _connection: &Connection,
+            _events: EventQueue,
         ) -> Result<AdapterInstance<MemoryStore>, AdapterError> {
             Ok(AdapterInstance {
                 outbound: Box::new(FakeOutbound),
                 launch: Box::new(|_bridge, _shutdown| {}),
             })
         }
+    }
+
+    fn events() -> EventQueue {
+        let (queue, _receiver) = EventQueue::channel();
+        queue
     }
 
     fn connection(kind: &str, transport: Transport) -> Connection {
@@ -247,12 +264,12 @@ mod tests {
         assert_eq!(registry.manifests()[0].kind, "fake");
 
         let instance = registry
-            .create(&connection("fake", Transport::WsClient))
+            .create(&connection("fake", Transport::WsClient), events())
             .expect("能实例化");
         let _ = instance.outbound;
 
         let bad_transport = registry
-            .create(&connection("fake", Transport::WsServer))
+            .create(&connection("fake", Transport::WsServer), events())
             .expect_err("transport 不支持");
         assert!(matches!(
             bad_transport,
@@ -260,7 +277,7 @@ mod tests {
         ));
 
         let unknown = registry
-            .create(&connection("nope", Transport::WsClient))
+            .create(&connection("nope", Transport::WsClient), events())
             .expect_err("kind 不存在");
         assert!(matches!(unknown, AdapterError::UnknownKind(_)));
     }
