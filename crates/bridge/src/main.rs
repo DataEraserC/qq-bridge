@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use acb_adapter_onebot11::OneBotAdapterFactory;
+use acb_adapter_process::ProcessAdapterFactory;
 use acb_kernel::{
     AdapterHost, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds, PluginManager,
     SqliteStore, drain_events, serve,
@@ -82,8 +83,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(lua) = LuaLoader::from_env() {
         plugins.install_loader(&lua)?;
     }
-    // 内置平台适配器也登记在 Root 里；动态/外置适配器以后走同一张表。
+    // 平台适配器也登记在 Root 里：内置 OneBot、外置进程（动态库在 P3 走同一张表）。
     plugins.register_adapter(Arc::new(OneBotAdapterFactory))?;
+    plugins.register_adapter(Arc::new(ProcessAdapterFactory))?;
 
     // 入站队列：适配器只往里丢记录，core 的 drain 线程统一 ingest。
     let (events, event_rx) = EventQueue::channel();
@@ -298,7 +300,7 @@ fn print_summary(config: &Config, path: &str) {
             connection.platform,
             connection.kind,
             connection.transport.as_str(),
-            connection.url,
+            connection.url.as_deref().unwrap_or("（无地址）"),
             connection.account
         );
     }

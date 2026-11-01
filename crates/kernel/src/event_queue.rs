@@ -22,6 +22,13 @@ pub struct EventReceiver {
     rx: Receiver<RecordDraft>,
 }
 
+impl EventReceiver {
+    /// 等一条事件。测试和 conformance 用；core 的 drain 线程走同一个队列。
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<RecordDraft, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+}
+
 impl EventQueue {
     pub fn channel() -> (EventQueue, EventReceiver) {
         let (tx, rx) = channel();

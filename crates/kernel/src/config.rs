@@ -154,28 +154,42 @@ impl Default for StorageConfig {
 }
 
 /// 连接方式。协议相同、连接方向不同，就是两种连接。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 内置只认 `ws-client` / `ws-server` / `process`；外置/动态适配器可以声明自己的
+/// transport，由 manifest 在启动时校验，config 层不写死。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
     /// 正向 WebSocket：桥当客户端，主动连平台开出来的 WS 服务端。
     WsClient,
     /// 反向 WebSocket：桥当服务端，等平台连过来。还没实现。
     WsServer,
+    /// 外置进程：桥按连接配置启动适配器子进程，走 stdio wire 协议。
+    Process,
+    /// 适配器自己声明的连接方式。
+    Other(String),
 }
 
 impl Transport {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::WsClient => "ws-client",
             Self::WsServer => "ws-server",
+            Self::Process => "process",
+            Self::Other(other) => other,
         }
     }
 
     pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "ws-client" => Some(Self::WsClient),
-            "ws-server" => Some(Self::WsServer),
-            _ => None,
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
         }
+        Some(match text {
+            "ws-client" => Self::WsClient,
+            "ws-server" => Self::WsServer,
+            "process" => Self::Process,
+            other => Self::Other(other.to_owned()),
+        })
     }
 }
 
@@ -186,12 +200,15 @@ pub struct Connection {
     pub id: String,
     /// 平台名，如 `qq`。给日志、平台特有内容、显示用。
     pub platform: String,
-    /// 适配器种类，目前只有 `onebot11`。
+    /// 适配器种类。内置 `onebot11` / `process`；动态适配器用 `namespace.name`。
     pub kind: String,
     /// 连接方向。
     pub transport: Transport,
-    /// 连接地址，形如 `ws://127.0.0.1:3001`。
-    pub url: String,
+    /// 连接地址。`ws-client` 必填且必须是 `ws://`；外置进程适配器通常不填，
+    /// 用 [`options`](Self::options) 里的启动命令。
+    pub url: Option<String>,
+    /// 适配器专属配置。形状由适配器自己的 manifest / 文档定义，core 不解释。
+    pub options: serde_json::Value,
     /// 访问令牌。OneBot 实现开了 token 就要填，握手时放在 `Authorization` 头里。
     pub token: Option<String>,
     /// 这条连接登录的账号。
@@ -233,9 +250,6 @@ impl DestructivePolicy {
         }
     }
 }
-
-/// 目前认识的适配器种类。加新适配器时在这里登记。
-pub const KNOWN_ADAPTERS: &[&str] = &["onebot11"];
 
 /// 目前认识的记忆存储形式。加新形式时在这里登记。
 pub const KNOWN_MEMORY_KINDS: &[&str] = &["git"];
@@ -685,17 +699,12 @@ pub enum ConfigError {
     DuplicateConnection { connection: String },
     #[error("连接 {connection} 的 platform 不能为空")]
     EmptyConnectionPlatform { connection: String },
-    #[error("连接 {connection} 的种类不认识：{kind}（目前只有 onebot11）")]
-    UnknownKind { connection: String, kind: String },
-    #[error("连接 {connection} 的连接方式不认识：{transport}（ws-client / ws-server）")]
+    #[error("连接 {connection} 的 kind 不能为空")]
+    EmptyConnectionKind { connection: String },
+    #[error("连接 {connection} 的连接方式不认识：{transport}（不能为空）")]
     UnknownTransport {
         connection: String,
         transport: String,
-    },
-    #[error("连接 {connection} 用的是 {transport}，这个还没实现（现在只有 ws-client）")]
-    UnsupportedTransport {
-        connection: String,
-        transport: &'static str,
     },
     #[error("连接 {connection} 的地址不合法：{url}（ws-client 要写成 ws://主机:端口/路径）")]
     BadUrl { connection: String, url: String },
@@ -1200,12 +1209,10 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
         return Err(ConfigError::EmptyConnectionPlatform { connection: id });
     }
 
+    // 适配器种类由注册表在启动时校验：外置/动态适配器可以是任意 namespace.name。
     let kind = raw.kind.trim().to_owned();
-    if !KNOWN_ADAPTERS.contains(&kind.as_str()) {
-        return Err(ConfigError::UnknownKind {
-            connection: id,
-            kind,
-        });
+    if kind.is_empty() {
+        return Err(ConfigError::EmptyConnectionKind { connection: id });
     }
 
     let transport_text = raw.transport.trim().to_owned();
@@ -1214,20 +1221,26 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
             connection: id.clone(),
             transport: transport_text.clone(),
         })?;
-    if transport == Transport::WsServer {
-        return Err(ConfigError::UnsupportedTransport {
-            connection: id,
-            transport: "ws-server",
-        });
-    }
 
-    let url = raw.url.trim().to_owned();
-    // 只支持不加密的 ws://：wss 要拉 TLS 依赖，等真有需求再说。
-    if !(url.starts_with("ws://") && url.len() > "ws://".len()) {
-        return Err(ConfigError::BadUrl {
-            connection: id,
-            url,
-        });
+    let url = raw
+        .url
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    // ws-client 必须有不加密的 ws:// 地址；其它连接方式（process / 平台自定义）
+    // 由适配器自己的 manifest 校验。
+    if transport == Transport::WsClient {
+        let Some(address) = url.as_deref() else {
+            return Err(ConfigError::BadUrl {
+                connection: id,
+                url: "（空）".into(),
+            });
+        };
+        if !(address.starts_with("ws://") && address.len() > "ws://".len()) {
+            return Err(ConfigError::BadUrl {
+                connection: id,
+                url: address.to_owned(),
+            });
+        }
     }
 
     let account = raw.account.map(|value| value.trim().to_owned());
@@ -1236,6 +1249,10 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
         _ => return Err(ConfigError::EmptyAccount { connection: id }),
     };
 
+    let options = serde_json::to_value(&raw.options).map_err(|error| ConfigError::ParseFailed {
+        detail: format!("连接 {id} 的 options 读不懂：{error}"),
+    })?;
+
     let receive = build_receive(&id, raw.receive)?;
     Ok(Connection {
         id,
@@ -1243,6 +1260,7 @@ fn build_connection(raw: RawConnection) -> Result<Connection, ConfigError> {
         kind,
         transport,
         url,
+        options,
         token: raw
             .token
             .map(|token| token.trim().to_owned())
@@ -1653,7 +1671,11 @@ struct RawConnection {
     /// 没写就是 `ws-client`（正向 WS），因为这是现在唯一实现的。
     #[serde(default = "default_transport")]
     transport: String,
-    url: String,
+    /// `ws-client` 必填；外置进程/自定义传输可以不带。
+    url: Option<String>,
+    /// 适配器专属配置；core 原样交给适配器。
+    #[serde(default)]
+    options: toml::value::Table,
     token: Option<String>,
     account: Option<String>,
     /// 系统管理员账号列表，可为空。
@@ -1982,16 +2004,16 @@ mod tests {
         assert!(!empty.allows("group.kick"));
     }
 
+    /// 连接方式不再由 config 写死：manifest 在启动时决定支不支持。
+    /// `ws-server` 能解析，但 onebot11 的 manifest 只有 `ws-client`，注册表会拒绝。
     #[test]
-    fn reverse_websocket_is_rejected_until_it_exists() {
+    fn transport_is_parsed_and_checked_by_the_adapter_manifest() {
         let text = ONE_CONNECTION.replace(
             r#"kind = "onebot11""#,
             "kind = \"onebot11\"\ntransport = \"ws-server\"",
         );
-        assert!(matches!(
-            Config::parse(&config_with(&text, ONE_SESSION)),
-            Err(ConfigError::UnsupportedTransport { .. })
-        ));
+        let config = Config::parse(&config_with(&text, ONE_SESSION)).expect("config 层不拦");
+        assert_eq!(config.connections[0].transport, Transport::WsServer);
     }
 
     #[test]

@@ -29,9 +29,10 @@
 [[connections]]
 id = "qq"              # 连接名：房间前缀、订阅引用都用它
 platform = "qq"        # 属于哪个平台
-kind = "onebot11"      # 用哪个适配器，目前只有这一种
+kind = "onebot11"      # 用哪个适配器（内置 onebot11 / process）
 transport = "ws-client" # 连接方向：桥主动去连（ws-server 还没实现）
-url = "ws://127.0.0.1:3001"
+url = "ws://127.0.0.1:3001"   # ws-client 必填；process 不用
+options = { ... }      # 适配器专属配置；onebot11 目前不需要
 token = "..."          # OneBot 实现开了 access_token 就填
 account = "10001"      # 这个号登录的是谁，必填
 ```
@@ -59,6 +60,35 @@ account = "10001"      # 这个号登录的是谁，必填
 
 设成 `string`（CQ 码）也能跑，但适配器认不出 `[CQ:at,qq=...]` 这种文本里的 @，
 于是「@ 我才醒」就永远不生效。这不是适配器的锅，是平台没给结构化数据。
+
+## 外置进程适配器（`kind = "process"`）
+
+适配器实现不一定要编译进桥。`kind = "process"` 会让桥按配置启动一个子进程，
+双方在 stdin/stdout 上一行一条 JSON（协议定义在 `crates/adapter-api`）：
+
+```text
+core ──▶ 子进程   send / call / shutdown
+core ◀── 子进程   hello（第一行）/ event / reply / log
+```
+
+```toml
+[[connections]]
+id = "demo"
+platform = "demo"
+kind = "process"
+transport = "process"
+account = "bot"
+
+[connections.options]
+command = ["/path/to/adapter", "--stdio"]
+# 可选：args = ["..."], env = { KEY = "value" }, cwd = "/path",
+#       startup_timeout_secs = 10
+```
+
+- 子进程启动后第一行必须是 `hello`，带上自己的平台方法目录；超时（默认 10 秒）没等到就启动失败。
+- 入站事件发 `event`；`send` / `call` 按 `id` 回 `reply`，错误用 `kind` 分类（`bad_params` / `forbidden` / `unavailable` …）。
+- 子进程崩溃后，未完成的请求明确报「通道不可用」；桥退出时发 `shutdown`，2 秒内不收尾就 kill。
+- 一个最小的参考实现见 `crates/adapters/process/src/bin/fixture.rs`。
 
 ## 事件怎么映射
 

@@ -61,11 +61,8 @@ fn example_config_connects_qq_through_onebot_websocket() {
     for connection in &config.connections {
         assert_eq!(connection.kind, "onebot11");
         assert_eq!(connection.transport.as_str(), "ws-client", "正向 WebSocket");
-        assert!(
-            connection.url.starts_with("ws://"),
-            "OneBot 11 走 WebSocket：{}",
-            connection.url
-        );
+        let url = connection.url.as_deref().expect("OneBot 连接必须有地址");
+        assert!(url.starts_with("ws://"), "OneBot 11 走 WebSocket：{url}");
     }
 
     // QQ 房间要按适配器的写法来，否则适配器认不出是群还是私聊。

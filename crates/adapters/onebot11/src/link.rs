@@ -364,7 +364,7 @@ pub fn supervise(
     shutdown: Arc<AtomicBool>,
     events: EventQueue,
 ) {
-    let url = connection.url.clone();
+    let url = connection.url.clone().unwrap_or_default();
     let token = connection.token.clone();
     let id = connection.id.clone();
     let admin_qqs = connection.admin_qqs.clone();

@@ -44,6 +44,12 @@ impl AdapterFactory for OneBotAdapterFactory {
         connection: &Connection,
         events: EventQueue,
     ) -> Result<AdapterInstance, AdapterError> {
+        if connection.url.is_none() {
+            return Err(AdapterError::Create(
+                connection.id.clone(),
+                "onebot11 需要 url（ws://主机:端口/路径）".into(),
+            ));
+        }
         let slot = LinkSlot::new();
         let outbound = Box::new(OneBotOutbound::new(slot.clone(), connection.id.clone()));
 

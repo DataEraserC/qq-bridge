@@ -1,0 +1,12 @@
+[package]
+name = "acb-adapter-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "平台适配器 wire 协议：外置进程与动态库共用"
+
+[dependencies]
+acb-proto = { path = "../proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }

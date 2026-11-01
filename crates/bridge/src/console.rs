@@ -246,7 +246,7 @@ impl<S: Store + Send + 'static> Console<S> {
                 "platform": c.platform,
                 "kind": c.kind,
                 "transport": c.transport.as_str(),
-                "url": mask_url_query(&c.url),
+                "url": c.url.as_deref().map(mask_url_query).unwrap_or_default(),
                 "token": c.token.as_deref().map(mask_secret),
                 "account": c.account,
                 "admin_qqs": c.admin_qqs,

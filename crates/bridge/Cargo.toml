@@ -13,6 +13,7 @@ acb-kernel = { path = "../kernel" }
 acb-plugin-trusted = { path = "../plugins/trusted" }
 acb-plugin-lua = { path = "../plugins/lua" }
 acb-adapter-onebot11 = { path = "../adapters/onebot11" }
+acb-adapter-process = { path = "../adapters/process" }
 acb-proto = { path = "../proto" }
 serde_json = { workspace = true }
 # 配置补丁用：在原 TOML 文档上外科手术式改键，注释排版不丢（ADR-0009）。

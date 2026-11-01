@@ -1,0 +1,17 @@
+[package]
+name = "acb-adapter-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "外置进程平台适配器：stdio 上的 JSON 行 wire 协议"
+
+[dependencies]
+acb-adapter-api = { path = "../../adapter-api" }
+acb-kernel = { path = "../../kernel" }
+acb-proto = { path = "../../proto" }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "acb-adapter-process-fixture"
+path = "src/bin/fixture.rs"

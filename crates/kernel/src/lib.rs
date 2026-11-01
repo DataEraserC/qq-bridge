@@ -17,6 +17,7 @@ pub mod render;
 pub mod sanitize;
 pub mod storage;
 pub mod tools;
+pub mod wire;
 
 pub use adapter::{
     AdapterCapability, AdapterError, AdapterFactory, AdapterHost, AdapterInstance,
@@ -28,7 +29,7 @@ pub use config::{
     AccessPolicy, ClockPolicy, Config, Connection, ConsoleConfig, DEFAULT_MAX_AGE_DAYS,
     DEFAULT_MAX_RECORDS_PER_ROOM, DEFAULT_STORAGE_PATH, DEFAULT_WORKTREES_ROOT, DeliveryPolicy,
     EndpointConfig, Harness,
-    KNOWN_ADAPTERS, KNOWN_MEMORY_KINDS, Memory, OutboundPolicy, Persona, ReceivePolicy,
+    KNOWN_MEMORY_KINDS, Memory, OutboundPolicy, Persona, ReceivePolicy,
     RetentionConfig, Session, StorageConfig, Subscription, Transport, TurnErrorAction,
     TurnErrorActions, TurnErrorPolicy, WakeDecision, WakeInput, WakePolicy,
 };

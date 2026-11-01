@@ -96,7 +96,13 @@ InboundEvent:
   - `AdapterFactory` / `AdapterInstance` 去掉 `Store` 泛型；`launch` 只拿 `AdapterHost`（入站队列 + 退出信号），不再拿 `Bridge`。OneBot 的账号核对改用连接配置快照，适配器侧不再读 core 状态。
   - 适配器登记进 `PluginManager`：`ExtensionPoint::PlatformAdapter`、`ProviderDescriptor.kind`、`register_adapter` / `create_adapter`；删除独立的 `AdapterRegistry`。内置 `onebot11` 和未来的动态/外置适配器走同一套 manifest、版本和能力审计。
   - 验证：`cargo test --workspace` 全绿，`nix build .#acb-bridge` 通过；重启后 1 条连接、2 个 harness 正常连上。
-- **尚未做**：外置进程与动态库两种载体（P2/P3）。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
+- **Phase 3 P2（2026-11-01，外置进程）**：适配器实现可以放在桥进程外。
+  - 新增 `acb-adapter-api`：core 与适配器共用的 JSON wire（`hello` / `event` / `send` / `call` / `reply` / `shutdown`），方法目录、错误分类都有稳定的 wire 形状。
+  - 新增 `acb-adapter-process`（`kind = "process"`，`transport = "process"`）：按 `[connections.options]` 的 `command` / `args` / `env` / `cwd` / `startup_timeout_secs` 启动子进程；第一行必须是 `hello`（带平台方法目录），之后事件进 `EventQueue`、动作按 correlation id 回执。
+  - 子进程崩溃或退出后，未完成的请求明确返回「通道不可用」，不会让 core 无限挂着；退出时发 `shutdown`，2 秒内不收尾就 kill。
+  - 连接配置的 `url` 改为可选，`kind` / `transport` 不再由 config 写死；是否支持某个 transport 由适配器 manifest 在启动时决定。
+  - conformance 测试真启动一个 fixture 子进程，覆盖 hello、入站事件、发送回执、调用回执、错误分类和缺 `command` 的启动失败。
+- **尚未做**：动态库载体（P3）。AccessPolicy provider 已在 ADR-0026 Phase 2d 落地。
 
 ## 参考
 

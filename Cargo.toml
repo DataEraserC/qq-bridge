@@ -2,8 +2,10 @@
 resolver = "3"
 members = [
     "crates/proto",
+    "crates/adapter-api",
     "crates/kernel",
     "crates/adapters/onebot11",
+    "crates/adapters/process",
     "crates/plugins/trusted",
     "crates/plugins/lua",
     "crates/bridge",
