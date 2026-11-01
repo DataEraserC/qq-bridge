@@ -742,6 +742,115 @@ return {
 }
 
 #[test]
+fn shipped_examples_load_and_behave() {
+    // examples/ 是给用户照抄的，不能悄悄坏掉；这里真装载、真调用一遍。
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../examples/lua");
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins
+        .install_loader(&LuaLoader::new(&dir))
+        .expect("示例脚本应当能装载");
+
+    let ids: Vec<String> = plugins
+        .catalog()
+        .into_iter()
+        .map(|info| info.id.to_string())
+        .collect();
+    for expected in ["lua.quiet_hours", "lua.allow_read_only", "lua.drop_noise"] {
+        assert!(
+            ids.iter().any(|id| id == expected),
+            "示例 provider {expected} 没注册；实际有 {ids:?}"
+        );
+    }
+
+    let room = RoomId::new("qq", "group/1").expect("合法");
+
+    // quiet_hours：本地 08:00 攒够 10 条会醒；23:00 不醒；@ 我任何时间都醒。
+    let quiet = ProviderId::parse("lua.quiet_hours").expect("合法");
+    let wake = plugins
+        .resolve_wake(&quiet, &WakePolicy::default())
+        .expect("能解析 quiet_hours");
+    let day = WakeContext {
+        session: "main",
+        room: &room,
+        connection: "qq",
+        platform: "qq",
+        sender_id: "10001",
+        text: "闲聊",
+        at_self: false,
+        reply_to_self: false,
+        event: None,
+        tags: &[],
+        unread: 10,
+        now: 0,
+    };
+    assert_eq!(wake.decide(&WakePolicy::default(), &day), WakeDecision::Wake);
+
+    let night = WakeContext {
+        now: 15 * 3_600_000, // UTC 15:00 = UTC+8 的 23:00
+        ..day
+    };
+    assert_eq!(wake.decide(&WakePolicy::default(), &night), WakeDecision::Stay);
+    let aimed = WakeContext {
+        at_self: true,
+        ..night
+    };
+    assert_eq!(wake.decide(&WakePolicy::default(), &aimed), WakeDecision::Wake);
+
+    // allow_read_only：读放行，发和连接级拒绝。
+    let read_only = ProviderId::parse("lua.allow_read_only").expect("合法");
+    let access = plugins
+        .resolve_access(&read_only, &Default::default())
+        .expect("能解析 allow_read_only");
+    let policy = Default::default();
+    assert_eq!(
+        access.check(&policy, &access_request(&room, AccessAction::Read)),
+        AccessDecision::Allow
+    );
+    assert_eq!(
+        access.check(&policy, &access_request(&room, AccessAction::Send)),
+        AccessDecision::Deny
+    );
+    assert_eq!(
+        access.check(&policy, &access_request(&room, AccessAction::Connection)),
+        AccessDecision::Deny
+    );
+
+    // drop_noise：以 "!!" 开头的正文被丢掉，其它照收。
+    let drop_noise = ProviderId::parse("lua.drop_noise").expect("合法");
+    let receive = plugins
+        .resolve_receive(&drop_noise, &ReceivePolicy::default())
+        .expect("能解析 drop_noise");
+    let sender = Sender {
+        id: "10001".to_owned(),
+        name: "老王".to_owned(),
+        role: None,
+    };
+    let elements = vec![Element::text("!! 刷屏")];
+    let noisy = ReceiveRequest {
+        connection: "qq",
+        platform: "qq",
+        room: &room,
+        sender: &sender,
+        kind: &RecordKind::Message,
+        elements: &elements,
+        text: "!! 刷屏",
+        at_self: false,
+    };
+    assert_eq!(
+        receive.decide(&ReceivePolicy::default(), &noisy),
+        ReceiveDecision::Drop
+    );
+    let normal = ReceiveRequest {
+        text: "你好",
+        ..noisy
+    };
+    assert_eq!(
+        receive.decide(&ReceivePolicy::default(), &normal),
+        ReceiveDecision::Record
+    );
+}
+
+#[test]
 fn receive_provider_runs_from_a_lua_script() {
     let dir = TempDir::new("receive");
     dir.write(

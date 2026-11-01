@@ -14,6 +14,8 @@
   ——快速开始、配置手册、网页控制台、日常使用、排障手册；
 - **开发者文档**（架构、协议、ADR）：https://dataeraserc.github.io/qq-bridge/03-architecture
   ——本仓库 `docs/` 目录的渲染版，想改代码从这里进。
+- **插件示例**：[examples/README.md](examples/README.md)
+  ——Lua 策略、外置进程适配器、动态库参考实现。
 
 ## 现在是什么状态
 

@@ -92,6 +92,7 @@ command = ["/path/to/adapter", "--stdio"]
   重启成功后沿用同一个 outbound 句柄，平台方法目录按新 hello 更新。
 - 子进程崩溃后，未完成的请求明确报「通道不可用」；桥退出时发 `shutdown`，2 秒内不收尾就 kill。
 - 一个最小的参考实现见 `crates/adapters/process/src/bin/fixture.rs`。
+- 想直接抄一个可运行的 Node 版本，见 [`examples/process/adapter.mjs`](../examples/process/adapter.mjs)。
 
 ## 动态库插件（`[[plugins]]`）
 
@@ -119,7 +120,8 @@ kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
   `request` 是 access / receive / clock 的 wire 形状），返回 `WireResult::Decision`：
   access 用 `allow` / `deny`，receive 用 `record` / `drop`，clock 用 `due` / `skip`。
   报错按安全侧兜底（access 拒绝、receive 接收、clock 不触发）。
-- 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`。
+- 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`；策略插件参考
+  `crates/plugins/wake-fixture`。用户可读的示例总览见 [`examples/README.md`](../examples/README.md)。
 
 ### 适配器 manifest 声明什么
 
