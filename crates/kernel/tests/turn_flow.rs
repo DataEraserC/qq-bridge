@@ -455,6 +455,34 @@ fn unacked_records_come_back_marked_as_redelivery() {
     assert!(second.records[1].note.is_none(), "第一次投递不需要旁白");
 }
 
+/// 乱序确认过的记录不能重投：本轮只确认 #2、留下 #1，下一轮只该看到 #1 和新消息。
+#[test]
+fn out_of_order_acks_are_not_delivered_again() {
+    let (mut bridge, _sends) = bridge();
+    bridge
+        .ingest(message("qq:group/123", "10001", "第一句", true))
+        .expect("能记下来");
+    bridge
+        .ingest(message("qq:group/123", "10001", "第二句", true))
+        .expect("能记下来");
+    let first = bridge.poll_turn().expect("能开轮").expect("有活");
+    assert_eq!(first.records.len(), 2);
+
+    // 只确认后面那条：水位被 #1 挡着，但 #2 已经处理完了。
+    bridge
+        .tool_call(&first.ticket, &sessions(), "ack_messages", json!({"ids": [2]}))
+        .expect("能确认");
+    bridge.end_turn(&first.ticket, None).expect("能收工");
+
+    bridge
+        .ingest(message("qq:group/123", "10001", "第三句", true))
+        .expect("能记下来");
+    let second = bridge.poll_turn().expect("能开轮").expect("有活");
+    let ids: Vec<u64> = second.records.iter().map(|record| record.id).collect();
+    assert_eq!(ids, vec![1, 3], "#2 已经确认过，不能再投一遍");
+    assert_eq!(second.records[0].redelivery, Some(2), "#1 仍然要标重投");
+}
+
 // ---------------------------------------------------------------------------
 // 工具面的边界
 // ---------------------------------------------------------------------------

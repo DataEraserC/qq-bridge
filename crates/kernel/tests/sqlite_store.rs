@@ -124,11 +124,13 @@ fn restart_keeps_watermark_and_pending_acks() {
 
     let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
     assert_eq!(store.watermark(&cursor).expect("可读"), 1, "水位要留着");
+    let pending = unread(&store, &cursor, 100).expect("可读");
     assert_eq!(
-        unread(&store, &cursor, 100).expect("可读").len(),
-        2,
-        "重启后未读还是 2、3 两条"
+        pending.len(),
+        1,
+        "重启后未读只剩 2；3 是重启前乱序确认过的，不能再投"
     );
+    assert_eq!(pending[0].id, 2);
     assert_eq!(
         store.ack(&cursor, &[2]).expect("可确认"),
         3,
@@ -701,11 +703,13 @@ fn a_version_two_database_is_migrated_in_place() {
 
     // 四张按房间记账的表都改到了新列名，读得出来就是改对了。
     assert_eq!(store.watermark(&cursor).expect("能读"), 1, "水位要留着");
+    let pending = unread(&store, &cursor, 100).expect("能读");
     assert_eq!(
-        unread(&store, &cursor, 100).expect("能读").len(),
-        2,
-        "水位 1 之后编号 2、3 还没读"
+        pending.len(),
+        1,
+        "只该剩编号 2；3 是升级前乱序确认过的，不能再投"
     );
+    assert_eq!(pending[0].id, 2);
     assert_eq!(
         store.ack(&cursor, &[2]).expect("能确认"),
         3,

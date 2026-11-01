@@ -813,6 +813,29 @@ impl Watermarks for SqliteStore {
 
         Ok(frontier)
     }
+
+    fn acked(&self, cursor: &Cursor) -> Result<Vec<u64>, StorageError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT record_id FROM acks
+                 WHERE session = ?1 AND connection = ?2 AND room_key = ?3
+                 ORDER BY record_id",
+            )
+            .map_err(io_error)?;
+        let rows = statement
+            .query_map(
+                params![cursor.session, cursor.room.connection, cursor.room.key()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(io_error)?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(io_error)?.max(0) as u64);
+        }
+        Ok(ids)
+    }
 }
 
 impl Notes for SqliteStore {

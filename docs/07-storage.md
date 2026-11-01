@@ -23,6 +23,8 @@ path = "/var/lib/acb/bridge.db"
 | `feedback` | 反馈：agent 写的「哪里卡住了」，同指纹合并、次数累加 | 按条，自带会话/房间/现场 |
 | `meta` | 结构版本号 | 一个键值对 |
 
+投递时 `unread` 会同时排除 `acks` 里的编号：乱序确认过的记录不会再投一遍（ADR-0010）。
+
 ```mermaid
 erDiagram
     records {

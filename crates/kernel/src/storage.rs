@@ -3,7 +3,8 @@
 //! 四样东西的关系：
 //! - **流水**是每个房间的完整记录，永久保存，投没投过都在；
 //! - **水位**是「这个设备处理到哪条了」的游标，只经显式确认往前推（ADR-0010）；
-//! - **未读**不是独立存储，是流水里水位之后的部分——算出来的，不是攒出来的。
+//! - **未读**不是独立存储，是流水里水位之后、再减去乱序确认（`acks`）的部分——
+//!   算出来的，不是攒出来的。
 //!
 //! 粒度不一样，别搞混：
 //! - 流水**按房间**，一个房间一条流水，同房间的所有设备看的是同一份历史；
@@ -171,6 +172,12 @@ pub trait Watermarks {
 
     /// 确认这批编号已处理。只前进、不后退；只推进**连续**的前沿——中间缺一条就停在缺口前。
     fn ack(&mut self, cursor: &Cursor, ids: &[u64]) -> Result<u64, StorageError>;
+
+    /// 水位之上、已经单独确认过的编号（乱序确认留下的读集合）。
+    ///
+    /// 投递时必须把这些编号过滤掉：它们已经处理过了，只是前面还有缺口没补上，
+    /// 水位暂时推不过去。不过滤就会把同一条消息反复投给 agent。
+    fn acked(&self, cursor: &Cursor) -> Result<Vec<u64>, StorageError>;
 }
 
 /// 一条水位游标：哪个会话、哪个房间。
@@ -192,13 +199,49 @@ impl Cursor {
     }
 }
 
-/// 未经确认的未读：水位之后的流水。
+/// 未经确认的未读：水位之后、且不在「乱序确认」读集合里的流水。
+///
+/// 只按水位截断是不够的：agent 可能先确认了 #3、却还没确认 #1——`ack` 只推连续
+/// 前沿，所以水位还停在 0，但 #3 已经处理过了。不过滤就会把它再投一遍。
+///
+/// `limit` 按**过滤后**的条数算。中间夹着已确认记录时，会往后多取一点，
+/// 一直凑够 `limit` 条或读到房间末尾。
 pub fn unread<S>(store: &S, cursor: &Cursor, limit: usize) -> Result<Vec<Record>, StorageError>
 where
     S: Transcript + Watermarks,
 {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let watermark = store.watermark(cursor)?;
-    store.since(&cursor.room, watermark, limit)
+    let acked: BTreeSet<u64> = store.acked(cursor)?.into_iter().collect();
+    if acked.is_empty() {
+        return store.since(&cursor.room, watermark, limit);
+    }
+
+    let mut after = watermark;
+    let mut unread = Vec::new();
+    loop {
+        let remaining = limit - unread.len();
+        // 多取 acked.len() 条，补上被过滤掉的洞；够不够下一轮循环会再补。
+        let take = remaining.saturating_add(acked.len()).max(1);
+        let batch = store.since(&cursor.room, after, take)?;
+        let exhausted = batch.len() < take;
+        for record in batch {
+            after = record.id;
+            if acked.contains(&record.id) {
+                continue;
+            }
+            unread.push(record);
+            if unread.len() == limit {
+                return Ok(unread);
+            }
+        }
+        if exhausted {
+            return Ok(unread);
+        }
+    }
 }
 
 /// 笔记的种类。只有话题带状态。
@@ -589,6 +632,14 @@ impl Watermarks for MemoryStore {
         self.watermark.insert(cursor.clone(), frontier);
         Ok(frontier)
     }
+
+    fn acked(&self, cursor: &Cursor) -> Result<Vec<u64>, StorageError> {
+        Ok(self
+            .acked
+            .get(cursor)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default())
+    }
 }
 
 impl Notes for MemoryStore {
@@ -836,6 +887,51 @@ mod tests {
 
         let frontier = store.ack(&main, &[2]).expect("可确认");
         assert_eq!(frontier, 3, "补上 2 之后一次推到 3");
+    }
+
+    /// 乱序确认过的记录不能再投：水位没跨过它，但它已经处理过了。
+    #[test]
+    fn unread_skips_out_of_order_acks() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        let main = cursor("main", &qq);
+        for text in ["a", "b", "c", "d"] {
+            store.append(draft(qq.clone(), text)).expect("可写");
+        }
+
+        assert_eq!(store.ack(&main, &[3]).expect("可确认"), 0, "缺 1、2，水位不动");
+        let pending = unread(&store, &main, 100).expect("可读");
+        assert_eq!(
+            pending.iter().map(|record| record.id).collect::<Vec<_>>(),
+            vec![1, 2, 4],
+            "#3 已经确认过，不能再投"
+        );
+    }
+
+    /// `limit` 按过滤后的条数算：中间夹着已确认的记录时，要继续往后取够。
+    #[test]
+    fn unread_limit_counts_only_returned_records() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        let main = cursor("main", &qq);
+        for index in 1..=6 {
+            store
+                .append(draft(qq.clone(), &format!("m{index}")))
+                .expect("可写");
+        }
+        store.ack(&main, &[2, 4]).expect("可确认");
+
+        let pending = unread(&store, &main, 2).expect("可读");
+        assert_eq!(
+            pending.iter().map(|record| record.id).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        let pending = unread(&store, &main, 4).expect("可读");
+        assert_eq!(
+            pending.iter().map(|record| record.id).collect::<Vec<_>>(),
+            vec![1, 3, 5, 6]
+        );
     }
 
     #[test]
