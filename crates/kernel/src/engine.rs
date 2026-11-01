@@ -249,7 +249,26 @@ fn ticket_prefix() -> String {
 }
 
 impl<S: Store> Bridge<S> {
+    /// 只用内置 provider 的桥。测试和单适配器调用点用这个。
     pub fn new(config: Config, store: S, outbound: Box<dyn Outbound>) -> Self {
+        Self::with_plugins(
+            config,
+            store,
+            outbound,
+            PluginManager::with_native_builtins(),
+        )
+    }
+
+    /// 带一份已经装好 loader / manager 的扩展宿主建桥。
+    ///
+    /// 生产 main 用这个：树外 manager 的安装是启动顺序的一部分，装完再校验配置
+    /// 引用的 provider（未知 provider 在启动时死，不等第一轮）。
+    pub fn with_plugins(
+        config: Config,
+        store: S,
+        outbound: Box<dyn Outbound>,
+        plugins: PluginManager,
+    ) -> Self {
         // 单实现调用点（测试/单适配器）走兜底；生产 main 传进来的本身就是 Outbounds，
         // 再包一层兜底只是多一次转发，不改变按连接分发。
         let outbound = Outbounds::fallback(outbound);
@@ -262,7 +281,7 @@ impl<S: Store> Bridge<S> {
             config,
             store,
             outbound,
-            plugins: PluginManager::with_native_builtins(),
+            plugins,
             pending: VecDeque::new(),
             active: HashMap::new(),
             by_ticket: HashMap::new(),

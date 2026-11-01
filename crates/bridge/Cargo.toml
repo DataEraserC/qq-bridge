@@ -10,6 +10,7 @@ default-run = "acb-bridge"
 
 [dependencies]
 acb-kernel = { path = "../kernel" }
+acb-plugin-trusted = { path = "../plugins/trusted" }
 acb-adapter-onebot11 = { path = "../adapters/onebot11" }
 acb-proto = { path = "../proto" }
 serde_json = { workspace = true }

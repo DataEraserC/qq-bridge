@@ -39,10 +39,12 @@ pub use outbound::{
 };
 pub use plugin::{
     AccessAction, AccessDecision, AccessProvider, AccessRequest, AllRoomsAccessProvider, Capability,
-    DefaultWakeProvider, ElevatedInRoomsAccessProvider, ExtensionPoint, ManagerPlugin, NativeLoader,
+    DefaultWakeProvider, ElevatedInRoomsAccessProvider, ExtensionPoint, Health, LoaderKind,
+    LoaderManifest, MAX_MANAGER_DEPTH, ManagerHealth, ManagerManifest, ManagerPlugin, NativeLoader,
     PluginError, PluginLoader, PluginManager, ProviderDescriptor, ProviderId, ProviderInstance,
-    ProviderOptions, SubscribedAccessProvider, WakeProvider, ALL_ROOMS_ACCESS_PROVIDER,
-    DEFAULT_ACCESS_PROVIDER, ELEVATED_ACCESS_PROVIDER, PLUGIN_API_VERSION,
+    ProviderOptions, ReloadScope, SubscribedAccessProvider, WakeContext, WakeProvider,
+    ALL_ROOMS_ACCESS_PROVIDER, DEFAULT_ACCESS_PROVIDER, ELEVATED_ACCESS_PROVIDER,
+    PLUGIN_API_VERSION,
 };
 pub use storage::{
     Counts, Cursor, Deliveries, FEEDBACK_CAP, Feedback, FeedbackDraft, Feedbacks, MIN_KEPT,

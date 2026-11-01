@@ -99,6 +99,12 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - **策略只回答 allow/deny**；参数、目标、破坏性、记账仍由 core 统一执行。破坏性操作继续由连接的 `allow_destructive` 单独把关，两个维度不互相顶替。
   - 读取/发送/平台调用都走同一个 `AccessRequest`（会话、连接、房间、动作、会话自己的订阅）；连接级请求 `room = None`。
   - 未知 access provider 在启动时拒绝；树外 ManagerPlugin 可以注册 access provider，返回错类型会被 Root 拒绝。
+- **Phase 3a（2026-11-01）**：ManagerPlugin / PluginLoader 契约补齐，先做受信任的树外 manager。
+  - manager 增加 `manifest()`（namespace、api_version、capabilities、options_schema）；Root 安装时校验 API 版本、能力并集、descriptor 的 namespace 和所需能力。
+  - manager 增加 `children()` / `reload()` / `shutdown()` / `health()`；Root 递归安装子树，最多 4 层并拒绝环路；生命周期由 Root 驱动（shutdown 按安装逆序，子 manager 先收）。
+  - loader 增加 `manifest()`（kind、api_version、extensions）与 `unload()`（默认不支持，动态 loader 再覆盖）；Root 加载前校验版本和扩展点。
+  - 新增独立 crate `acb-plugin-trusted`（namespace `trusted`），提供 `trusted.accumulate_only`：只在未读攒够时唤醒，`@`/昵称/拍/引用都不单独叫醒。`TrustedLoader` 把它装进 Root，`main` 启动时安装；配置写 `provider = "trusted.accumulate_only"` 即可启用。
+  - 尚未做：LuaManager / LuaLoader（Phase 3b）。
 
 ## 参考
 

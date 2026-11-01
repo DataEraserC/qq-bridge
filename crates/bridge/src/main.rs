@@ -17,8 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use acb_adapter_onebot11::OneBotAdapterFactory;
 use acb_kernel::{
     AdapterRegistry, Bridge, Config, ControlRegistry, EventQueue, FileRelay, Outbounds,
-    SqliteStore, drain_events, serve,
+    PluginManager, SqliteStore, drain_events, serve,
 };
+use acb_plugin_trusted::TrustedLoader;
 
 mod config_patch;
 mod console;
@@ -88,10 +89,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         launches.push(instance.launch);
     }
 
-    let bridge = Arc::new(Mutex::new(Bridge::new(
+    // 扩展宿主：先装内置 provider，再装树外 manager（ADR-0026 Phase 3）。
+    // 树外 manager 只是把 provider 注册进 Root；配置里引用 `trusted.*` 才生效。
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins.install_loader(&TrustedLoader)?;
+
+    let bridge = Arc::new(Mutex::new(Bridge::with_plugins(
         config.clone(),
         store,
         Box::new(outbounds),
+        plugins,
     )));
 
     // provider id 写错要在启动时死，不能等第一轮才报。

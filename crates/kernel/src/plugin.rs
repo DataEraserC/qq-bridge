@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use acb_proto::RoomId;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::config::{AccessPolicy, Config, WakeDecision, WakeInput, WakePolicy};
@@ -199,6 +200,75 @@ impl ProviderDescriptor {
     }
 }
 
+/// manager 子树最多几层（Root 算第 0 层）。超过就拒绝——防止一棵树无限往下长。
+pub const MAX_MANAGER_DEPTH: usize = 4;
+
+/// 一棵 manager 子树自己的 manifest。Root 用它做 namespace、版本和能力审计。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerManifest {
+    pub namespace: String,
+    pub api_version: u32,
+    /// 子树里所有 provider 需要的能力并集。Root 要求每个 descriptor 所需能力都在这里。
+    pub capabilities: Vec<Capability>,
+    /// 控制台按它生成 options 表单。Phase 3 只原样携带，不执行 schema。
+    pub options_schema: Option<Value>,
+}
+
+impl ManagerManifest {
+    pub fn new(
+        namespace: impl Into<String>,
+        api_version: u32,
+        capabilities: Vec<Capability>,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            api_version,
+            capabilities,
+            options_schema: None,
+        }
+    }
+}
+
+/// 一种载体的 manifest。Root 用它校验版本和声明的扩展点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderManifest {
+    pub kind: LoaderKind,
+    pub api_version: u32,
+    pub extensions: Vec<ExtensionPoint>,
+}
+
+impl LoaderManifest {
+    pub fn new(kind: LoaderKind, api_version: u32, extensions: Vec<ExtensionPoint>) -> Self {
+        Self {
+            kind,
+            api_version,
+            extensions,
+        }
+    }
+}
+
+/// 热重载范围。只换指定 namespace 的子树，或者全部。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadScope {
+    All,
+    Namespace(String),
+}
+
+/// manager 自报的健康状态。Root 只汇总，不会因为 unhealthy 就停掉整个桥。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Health {
+    Healthy,
+    Degraded(String),
+    Unhealthy(String),
+}
+
+/// 一条 health 结果：哪个 namespace、什么状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerHealth {
+    pub namespace: String,
+    pub health: Health,
+}
+
 /// 插件系统错误。工具调用不在这里——那是 `acb_proto::ToolError`。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PluginError {
@@ -236,6 +306,10 @@ pub enum PluginError {
     ReservedNamespace(String),
     #[error("子树管理器 {namespace} 出错：{detail}")]
     Manager { namespace: String, detail: String },
+    #[error("manager 子树太深：{namespace}（上限 {max} 层）")]
+    ManagerDepth { namespace: String, max: usize },
+    #[error("manager 环路：{0}")]
+    ManagerCycle(String),
     #[error("插件加载失败：{0}")]
     Loader(String),
 }
@@ -440,10 +514,13 @@ impl ProviderInstance {
 
 /// 一棵子树的管理者。Root 只和这个接口说话；子树内部怎么注册由它自己决定。
 ///
-/// Phase 1 的 manager 只需要能返回 wake provider；其余扩展点在后续 phase 按
-/// `ExtensionPoint` 扩展 `ProviderInstance`。
+/// 除了解析 provider，manager 还要能报 manifest、被子 manager 嵌套、在轮次边界
+/// 重载、退出时收尾、报告健康状态（ADR-0026 Phase 3）。
 pub trait ManagerPlugin: Send + Sync {
-    fn namespace(&self) -> &str;
+    /// 自己的 namespace、API 版本、能力和 options schema。
+    fn manifest(&self) -> ManagerManifest;
+
+    /// 子树里的 provider 清单。Root 用它做全局 id 唯一性和能力审计。
     fn descriptors(&self) -> Vec<ProviderDescriptor>;
 
     fn instantiate(
@@ -451,6 +528,24 @@ pub trait ManagerPlugin: Send + Sync {
         id: &ProviderId,
         options: ProviderOptions<'_>,
     ) -> Result<ProviderInstance, PluginError>;
+
+    /// 子树里的子 manager。Root 递归安装，并做深度上限与环路检测。
+    fn children(&self) -> Vec<Arc<dyn ManagerPlugin>> {
+        Vec::new()
+    }
+
+    /// 轮次边界热重载。默认什么都不做。
+    fn reload(&self, _scope: &ReloadScope) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    /// 进程退出前收尾。默认什么都不做。
+    fn shutdown(&self) {}
+
+    /// 健康检查。默认健康。
+    fn health(&self) -> Health {
+        Health::Healthy
+    }
 }
 
 /// 一种载体的加载器。`NativeLoader` 是内置实现；动态/进程/Lua 后续加。
@@ -462,9 +557,27 @@ pub enum LoaderKind {
     Script,
 }
 
+impl LoaderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Dynamic => "dynamic",
+            Self::Process => "process",
+            Self::Script => "script",
+        }
+    }
+}
+
 pub trait PluginLoader: Send + Sync {
-    fn kind(&self) -> LoaderKind;
+    /// 载体类型、API 版本、它能带来的扩展点。
+    fn manifest(&self) -> LoaderManifest;
+
     fn install(&self, manager: &mut PluginManager) -> Result<(), PluginError>;
+
+    /// 卸载这个 loader 安装的 provider。默认不支持——动态 loader 再覆盖。
+    fn unload(&self, _manager: &mut PluginManager, id: &ProviderId) -> Result<(), PluginError> {
+        Err(PluginError::Loader(format!("这个 loader 不支持卸载 {id}")))
+    }
 }
 
 /// 内置 loader。它不读文件，只把编译进来的 provider 注册到 Root。
@@ -472,8 +585,12 @@ pub trait PluginLoader: Send + Sync {
 pub struct NativeLoader;
 
 impl PluginLoader for NativeLoader {
-    fn kind(&self) -> LoaderKind {
-        LoaderKind::Native
+    fn manifest(&self) -> LoaderManifest {
+        LoaderManifest::new(
+            LoaderKind::Native,
+            PLUGIN_API_VERSION,
+            vec![ExtensionPoint::Wake, ExtensionPoint::Access],
+        )
     }
 
     fn install(&self, manager: &mut PluginManager) -> Result<(), PluginError> {
@@ -522,21 +639,54 @@ pub struct PluginManager {
     wake: HashMap<ProviderId, Arc<dyn WakeProvider>>,
     access: HashMap<ProviderId, Arc<dyn AccessProvider>>,
     managers: HashMap<String, Arc<dyn ManagerPlugin>>,
+    /// 安装顺序（含嵌套子树）。reload/health 正序，shutdown 逆序。
+    manager_order: Vec<String>,
     descriptors: HashMap<ProviderId, ProviderDescriptor>,
+}
+
+/// 安装前的预检结果：先攒齐整棵子树，再落表，避免装到一半失败留下半棵树。
+struct CollectedManager {
+    namespace: String,
+    manager: Arc<dyn ManagerPlugin>,
+    descriptors: Vec<ProviderDescriptor>,
 }
 
 impl PluginManager {
     /// 带内置 provider 的 Root。`Bridge::new` 用这个，保证默认行为不变。
     pub fn with_native_builtins() -> Self {
         let mut manager = Self::default();
-        NativeLoader
-            .install(&mut manager)
+        manager
+            .install_loader(&NativeLoader)
             .expect("内置 provider 必须能注册");
         manager
     }
 
     /// 安装一个 loader。动态/进程/Lua loader 后续通过这个入口注册。
+    ///
+    /// 先校验 loader 的 manifest：API 版本要对上，声明的扩展点必须是 Root 认识的。
     pub fn install_loader(&mut self, loader: &dyn PluginLoader) -> Result<(), PluginError> {
+        let manifest = loader.manifest();
+        if manifest.api_version != PLUGIN_API_VERSION {
+            return Err(PluginError::ApiVersion {
+                id: format!("loader:{}", manifest.kind.as_str()),
+                found: manifest.api_version,
+                required: PLUGIN_API_VERSION,
+            });
+        }
+        if manifest.extensions.is_empty() {
+            return Err(PluginError::Loader(format!(
+                "{} loader 没声明任何扩展点",
+                manifest.kind.as_str()
+            )));
+        }
+        for point in &manifest.extensions {
+            if !matches!(point, ExtensionPoint::Wake | ExtensionPoint::Access) {
+                return Err(PluginError::UnsupportedExtensionPoint {
+                    id: format!("loader:{}", manifest.kind.as_str()),
+                    point: *point,
+                });
+            }
+        }
         loader.install(self)
     }
 
@@ -576,13 +726,38 @@ impl PluginManager {
         Ok(())
     }
 
-    /// 安装一个树外 manager。它拥有自己的 namespace 和子树注册表；Root 只做
-    /// namespace/id 审计，之后把它子树里的 id 委托给它。
+    /// 安装一棵树外 manager 子树。它拥有自己的 namespace 和子树注册表；Root 只做
+    /// namespace / 版本 / 能力 / id 审计，之后把它子树里的 id 委托给它。
+    ///
+    /// 递归安装子 manager，并检查层级上限与环路。整棵子树先预检、再落表：
+    /// 任何一层不合格都不会留下半棵装好的子树。
     pub fn install_manager(
         &mut self,
         manager: Arc<dyn ManagerPlugin>,
     ) -> Result<(), PluginError> {
-        let namespace = manager.namespace().trim();
+        let mut collected = Vec::new();
+        let mut ancestry = Vec::new();
+        self.collect_manager(manager, &mut ancestry, &mut collected)?;
+        for entry in collected {
+            for descriptor in entry.descriptors {
+                self.descriptors
+                    .insert(descriptor.id.clone(), descriptor);
+            }
+            self.manager_order.push(entry.namespace.clone());
+            self.managers.insert(entry.namespace, entry.manager);
+        }
+        Ok(())
+    }
+
+    /// 预检一棵子树：manifest、descriptor、深度、环路、重复 id/namespace。
+    fn collect_manager(
+        &self,
+        manager: Arc<dyn ManagerPlugin>,
+        ancestry: &mut Vec<String>,
+        collected: &mut Vec<CollectedManager>,
+    ) -> Result<(), PluginError> {
+        let manifest = manager.manifest();
+        let namespace = manifest.namespace.trim().to_owned();
         if namespace.is_empty() {
             return Err(PluginError::Manager {
                 namespace: String::new(),
@@ -590,17 +765,48 @@ impl PluginManager {
             });
         }
         if namespace == BUILTIN_NAMESPACE {
-            return Err(PluginError::ReservedNamespace(namespace.to_owned()));
+            return Err(PluginError::ReservedNamespace(namespace));
         }
-        if self.managers.contains_key(namespace) {
-            return Err(PluginError::DuplicateNamespace(namespace.to_owned()));
+        if ancestry.iter().any(|parent| parent == &namespace) {
+            let mut path = ancestry.clone();
+            path.push(namespace);
+            return Err(PluginError::ManagerCycle(path.join(" -> ")));
+        }
+        if ancestry.len() >= MAX_MANAGER_DEPTH {
+            return Err(PluginError::ManagerDepth {
+                namespace,
+                max: MAX_MANAGER_DEPTH,
+            });
+        }
+        let namespace_ok = namespace
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+        if !namespace_ok {
+            return Err(PluginError::Manager {
+                namespace,
+                detail: "namespace 只能包含字母、数字、下划线和短横线".to_owned(),
+            });
+        }
+        if self.managers.contains_key(&namespace)
+            || collected
+                .iter()
+                .any(|entry| entry.namespace == namespace)
+        {
+            return Err(PluginError::DuplicateNamespace(namespace));
+        }
+        if manifest.api_version != PLUGIN_API_VERSION {
+            return Err(PluginError::ApiVersion {
+                id: format!("manager:{namespace}"),
+                found: manifest.api_version,
+                required: PLUGIN_API_VERSION,
+            });
         }
 
         let descriptors = manager.descriptors();
         for descriptor in &descriptors {
             if descriptor.id.namespace() != namespace {
                 return Err(PluginError::Manager {
-                    namespace: namespace.to_owned(),
+                    namespace: namespace.clone(),
                     detail: format!(
                         "descriptor {} 的 namespace 和 manager 的 {} 不一致",
                         descriptor.id, namespace
@@ -617,18 +823,84 @@ impl PluginManager {
                     });
                 }
             };
+            if !manifest.capabilities.contains(&required) {
+                return Err(PluginError::MissingCapability {
+                    id: format!("manager:{namespace}"),
+                    capability: required,
+                });
+            }
             self.check_descriptor(descriptor, descriptor.extension_point, required)?;
-            if self.descriptors.contains_key(&descriptor.id) {
+            if self.descriptors.contains_key(&descriptor.id)
+                || collected.iter().any(|entry| {
+                    entry
+                        .descriptors
+                        .iter()
+                        .any(|existing| existing.id == descriptor.id)
+                })
+            {
                 return Err(PluginError::DuplicateProvider(descriptor.id.to_string()));
             }
         }
 
-        for descriptor in descriptors {
-            self.descriptors
-                .insert(descriptor.id.clone(), descriptor);
+        collected.push(CollectedManager {
+            namespace: namespace.clone(),
+            manager,
+            descriptors,
+        });
+        ancestry.push(namespace);
+        for child in collected
+            .last()
+            .expect("刚刚推入")
+            .manager
+            .children()
+        {
+            self.collect_manager(child, ancestry, collected)?;
         }
-        self.managers.insert(namespace.to_owned(), manager);
+        ancestry.pop();
         Ok(())
+    }
+
+    /// 轮次边界热重载。返回失败的 namespace 和原因；一个子树失败不影响其他子树。
+    pub fn reload_managers(&self, scope: &ReloadScope) -> Vec<(String, PluginError)> {
+        let mut failures = Vec::new();
+        for namespace in &self.manager_order {
+            if !matches!(scope, ReloadScope::All)
+                && !matches!(scope, ReloadScope::Namespace(wanted) if wanted == namespace)
+            {
+                continue;
+            }
+            let Some(manager) = self.managers.get(namespace) else {
+                continue;
+            };
+            if let Err(error) = manager.reload(scope) {
+                failures.push((namespace.clone(), error));
+            }
+        }
+        failures
+    }
+
+    /// 汇总所有 manager 的自报健康状态（按安装顺序）。
+    pub fn manager_health(&self) -> Vec<ManagerHealth> {
+        self.manager_order
+            .iter()
+            .filter_map(|namespace| {
+                self.managers
+                    .get(namespace)
+                    .map(|manager| ManagerHealth {
+                        namespace: namespace.clone(),
+                        health: manager.health(),
+                    })
+            })
+            .collect()
+    }
+
+    /// 进程退出前收尾。子 manager 先收，父 manager 后收。
+    pub fn shutdown_managers(&self) {
+        for namespace in self.manager_order.iter().rev() {
+            if let Some(manager) = self.managers.get(namespace) {
+                manager.shutdown();
+            }
+        }
     }
 
     /// 解析 wake provider。先查 Root 直接注册的，再按 namespace 委托 manager。
@@ -745,6 +1017,7 @@ impl PluginManager {
 mod tests {
     use super::*;
     use crate::config::{AccessPolicy, Config, WakePolicy};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_room() -> RoomId {
         RoomId::new("qq", "group/1").expect("合法")
@@ -948,8 +1221,8 @@ mod tests {
     struct TestManager;
 
     impl ManagerPlugin for TestManager {
-        fn namespace(&self) -> &str {
-            "test"
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new("test", PLUGIN_API_VERSION, vec![Capability::WakeDecision])
         }
 
         fn descriptors(&self) -> Vec<ProviderDescriptor> {
@@ -999,8 +1272,8 @@ mod tests {
     struct AccessManager;
 
     impl ManagerPlugin for AccessManager {
-        fn namespace(&self) -> &str {
-            "vendor"
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new("vendor", PLUGIN_API_VERSION, vec![Capability::AccessDecision])
         }
 
         fn descriptors(&self) -> Vec<ProviderDescriptor> {
@@ -1043,8 +1316,8 @@ mod tests {
     struct WrongKindManager;
 
     impl ManagerPlugin for WrongKindManager {
-        fn namespace(&self) -> &str {
-            "wrong"
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new("wrong", PLUGIN_API_VERSION, vec![Capability::AccessDecision])
         }
 
         fn descriptors(&self) -> Vec<ProviderDescriptor> {
@@ -1086,8 +1359,8 @@ mod tests {
     fn tree_out_manager_cannot_take_the_builtin_namespace() {
         struct AcbManager;
         impl ManagerPlugin for AcbManager {
-            fn namespace(&self) -> &str {
-                "acb"
+            fn manifest(&self) -> ManagerManifest {
+                ManagerManifest::new("acb", PLUGIN_API_VERSION, Vec::new())
             }
             fn descriptors(&self) -> Vec<ProviderDescriptor> {
                 Vec::new()
@@ -1120,6 +1393,381 @@ mod tests {
         assert!(matches!(
             manager.register_wake(descriptor, Arc::new(DefaultWakeProvider)),
             Err(PluginError::DuplicateProvider(_))
+        ));
+    }
+
+    /// 树外 manager 的嵌套子树：父 manager 自己不提供 provider，子 manager 提供。
+    struct NestedManager {
+        namespace: String,
+        provide: bool,
+        child: Option<Arc<dyn ManagerPlugin>>,
+    }
+
+    fn nested(
+        namespace: &str,
+        provide: bool,
+        child: Option<Arc<dyn ManagerPlugin>>,
+    ) -> Arc<dyn ManagerPlugin> {
+        Arc::new(NestedManager {
+            namespace: namespace.to_owned(),
+            provide,
+            child,
+        })
+    }
+
+    impl ManagerPlugin for NestedManager {
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new(
+                self.namespace.clone(),
+                PLUGIN_API_VERSION,
+                vec![Capability::WakeDecision],
+            )
+        }
+
+        fn descriptors(&self) -> Vec<ProviderDescriptor> {
+            if !self.provide {
+                return Vec::new();
+            }
+            vec![ProviderDescriptor::new(
+                ProviderId::parse(&format!("{}.always", self.namespace)).expect("合法"),
+                ExtensionPoint::Wake,
+                PLUGIN_API_VERSION,
+                vec![Capability::WakeDecision],
+            )]
+        }
+
+        fn instantiate(
+            &self,
+            id: &ProviderId,
+            _options: ProviderOptions<'_>,
+        ) -> Result<ProviderInstance, PluginError> {
+            if self.provide && id.name() == "always" {
+                Ok(ProviderInstance::Wake(Arc::new(AlwaysWake)))
+            } else {
+                Err(PluginError::UnknownProvider(id.to_string()))
+            }
+        }
+
+        fn children(&self) -> Vec<Arc<dyn ManagerPlugin>> {
+            self.child.clone().into_iter().collect()
+        }
+    }
+
+    fn chain(levels: usize) -> Arc<dyn ManagerPlugin> {
+        let mut current = None;
+        for level in (1..=levels).rev() {
+            current = Some(nested(&format!("level{level}"), true, current));
+        }
+        current.expect("至少一层")
+    }
+
+    #[test]
+    fn nested_manager_subtree_is_installed_and_resolved() {
+        let mut manager = PluginManager::with_native_builtins();
+        manager
+            .install_manager(nested(
+                "parent",
+                false,
+                Some(nested("child", true, None)),
+            ))
+            .expect("嵌套子树应当能安装");
+
+        let id = ProviderId::parse("child.always").expect("合法");
+        manager
+            .resolve_wake(&id, &WakePolicy::default())
+            .expect("子 manager 的 provider 应当可解析");
+
+        let health = manager.manager_health();
+        assert_eq!(
+            health
+                .iter()
+                .map(|entry| entry.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent", "child"],
+            "安装顺序应该先父后子"
+        );
+    }
+
+    #[test]
+    fn manager_depth_is_limited() {
+        let mut manager = PluginManager::with_native_builtins();
+        manager
+            .install_manager(chain(MAX_MANAGER_DEPTH))
+            .expect("上限内应当能装");
+
+        let mut manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.install_manager(chain(MAX_MANAGER_DEPTH + 1)),
+            Err(PluginError::ManagerDepth { max, .. }) if max == MAX_MANAGER_DEPTH
+        ));
+    }
+
+    struct SelfCycle;
+
+    impl ManagerPlugin for SelfCycle {
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new("loop", PLUGIN_API_VERSION, vec![Capability::WakeDecision])
+        }
+
+        fn descriptors(&self) -> Vec<ProviderDescriptor> {
+            Vec::new()
+        }
+
+        fn instantiate(
+            &self,
+            id: &ProviderId,
+            _options: ProviderOptions<'_>,
+        ) -> Result<ProviderInstance, PluginError> {
+            Err(PluginError::UnknownProvider(id.to_string()))
+        }
+
+        fn children(&self) -> Vec<Arc<dyn ManagerPlugin>> {
+            vec![Arc::new(SelfCycle)]
+        }
+    }
+
+    #[test]
+    fn manager_cycle_is_rejected() {
+        let mut manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.install_manager(Arc::new(SelfCycle)),
+            Err(PluginError::ManagerCycle(path)) if path == "loop -> loop"
+        ));
+    }
+
+    #[test]
+    fn manager_manifest_is_checked() {
+        struct BadNamespace;
+        impl ManagerPlugin for BadNamespace {
+            fn manifest(&self) -> ManagerManifest {
+                ManagerManifest::new("bad", PLUGIN_API_VERSION, vec![Capability::WakeDecision])
+            }
+            fn descriptors(&self) -> Vec<ProviderDescriptor> {
+                vec![ProviderDescriptor::new(
+                    ProviderId::parse("other.always").expect("合法"),
+                    ExtensionPoint::Wake,
+                    PLUGIN_API_VERSION,
+                    vec![Capability::WakeDecision],
+                )]
+            }
+            fn instantiate(
+                &self,
+                id: &ProviderId,
+                _options: ProviderOptions<'_>,
+            ) -> Result<ProviderInstance, PluginError> {
+                Err(PluginError::UnknownProvider(id.to_string()))
+            }
+        }
+        let mut manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.install_manager(Arc::new(BadNamespace)),
+            Err(PluginError::Manager { .. })
+        ));
+
+        struct BadVersion;
+        impl ManagerPlugin for BadVersion {
+            fn manifest(&self) -> ManagerManifest {
+                ManagerManifest::new(
+                    "badver",
+                    PLUGIN_API_VERSION + 1,
+                    vec![Capability::WakeDecision],
+                )
+            }
+            fn descriptors(&self) -> Vec<ProviderDescriptor> {
+                Vec::new()
+            }
+            fn instantiate(
+                &self,
+                id: &ProviderId,
+                _options: ProviderOptions<'_>,
+            ) -> Result<ProviderInstance, PluginError> {
+                Err(PluginError::UnknownProvider(id.to_string()))
+            }
+        }
+        let mut manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.install_manager(Arc::new(BadVersion)),
+            Err(PluginError::ApiVersion { .. })
+        ));
+
+        struct MissingCapability;
+        impl ManagerPlugin for MissingCapability {
+            fn manifest(&self) -> ManagerManifest {
+                ManagerManifest::new("nocap", PLUGIN_API_VERSION, Vec::new())
+            }
+            fn descriptors(&self) -> Vec<ProviderDescriptor> {
+                vec![ProviderDescriptor::new(
+                    ProviderId::parse("nocap.always").expect("合法"),
+                    ExtensionPoint::Wake,
+                    PLUGIN_API_VERSION,
+                    vec![Capability::WakeDecision],
+                )]
+            }
+            fn instantiate(
+                &self,
+                id: &ProviderId,
+                _options: ProviderOptions<'_>,
+            ) -> Result<ProviderInstance, PluginError> {
+                Err(PluginError::UnknownProvider(id.to_string()))
+            }
+        }
+        let mut manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.install_manager(Arc::new(MissingCapability)),
+            Err(PluginError::MissingCapability {
+                capability: Capability::WakeDecision,
+                ..
+            })
+        ));
+    }
+
+    #[derive(Default)]
+    struct LifecycleManager {
+        reloads: AtomicUsize,
+        shutdowns: AtomicUsize,
+    }
+
+    impl ManagerPlugin for LifecycleManager {
+        fn manifest(&self) -> ManagerManifest {
+            ManagerManifest::new("life", PLUGIN_API_VERSION, vec![Capability::WakeDecision])
+        }
+
+        fn descriptors(&self) -> Vec<ProviderDescriptor> {
+            Vec::new()
+        }
+
+        fn instantiate(
+            &self,
+            id: &ProviderId,
+            _options: ProviderOptions<'_>,
+        ) -> Result<ProviderInstance, PluginError> {
+            Err(PluginError::UnknownProvider(id.to_string()))
+        }
+
+        fn reload(&self, _scope: &ReloadScope) -> Result<(), PluginError> {
+            self.reloads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn shutdown(&self) {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn health(&self) -> Health {
+            Health::Degraded("测试状态".to_owned())
+        }
+    }
+
+    #[test]
+    fn manager_lifecycle_hooks_are_driven_by_root() {
+        let lifecycle = Arc::new(LifecycleManager::default());
+        let mut manager = PluginManager::with_native_builtins();
+        manager
+            .install_manager(lifecycle.clone())
+            .expect("应当能安装");
+
+        assert!(manager.reload_managers(&ReloadScope::All).is_empty());
+        assert_eq!(lifecycle.reloads.load(Ordering::SeqCst), 1);
+
+        // 范围不匹配的 namespace 不该被打扰。
+        assert!(
+            manager
+                .reload_managers(&ReloadScope::Namespace("other".to_owned()))
+                .is_empty()
+        );
+        assert_eq!(lifecycle.reloads.load(Ordering::SeqCst), 1);
+
+        assert!(
+            manager
+                .reload_managers(&ReloadScope::Namespace("life".to_owned()))
+                .is_empty()
+        );
+        assert_eq!(lifecycle.reloads.load(Ordering::SeqCst), 2);
+
+        assert_eq!(
+            manager.manager_health(),
+            vec![ManagerHealth {
+                namespace: "life".to_owned(),
+                health: Health::Degraded("测试状态".to_owned()),
+            }]
+        );
+
+        manager.shutdown_managers();
+        assert_eq!(lifecycle.shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    struct BadVersionLoader;
+
+    impl PluginLoader for BadVersionLoader {
+        fn manifest(&self) -> LoaderManifest {
+            LoaderManifest::new(
+                LoaderKind::Native,
+                PLUGIN_API_VERSION + 1,
+                vec![ExtensionPoint::Wake],
+            )
+        }
+        fn install(&self, _manager: &mut PluginManager) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    struct UnsupportedExtensionLoader;
+
+    impl PluginLoader for UnsupportedExtensionLoader {
+        fn manifest(&self) -> LoaderManifest {
+            LoaderManifest::new(
+                LoaderKind::Process,
+                PLUGIN_API_VERSION,
+                vec![ExtensionPoint::Delivery],
+            )
+        }
+        fn install(&self, _manager: &mut PluginManager) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    struct EmptyLoader;
+
+    impl PluginLoader for EmptyLoader {
+        fn manifest(&self) -> LoaderManifest {
+            LoaderManifest::new(LoaderKind::Script, PLUGIN_API_VERSION, Vec::new())
+        }
+        fn install(&self, _manager: &mut PluginManager) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn loader_manifest_is_checked() {
+        let mut manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            manager.install_loader(&BadVersionLoader),
+            Err(PluginError::ApiVersion { .. })
+        ));
+        assert!(matches!(
+            manager.install_loader(&UnsupportedExtensionLoader),
+            Err(PluginError::UnsupportedExtensionPoint {
+                point: ExtensionPoint::Delivery,
+                ..
+            })
+        ));
+        assert!(matches!(
+            manager.install_loader(&EmptyLoader),
+            Err(PluginError::Loader(_))
+        ));
+
+        assert_eq!(
+            NativeLoader.manifest().extensions,
+            vec![ExtensionPoint::Wake, ExtensionPoint::Access]
+        );
+    }
+
+    #[test]
+    fn native_loader_refuses_to_unload_by_default() {
+        let mut manager = PluginManager::with_native_builtins();
+        assert!(matches!(
+            NativeLoader.unload(&mut manager, &ProviderId::builtin_wake()),
+            Err(PluginError::Loader(_))
         ));
     }
 

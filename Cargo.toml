@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/kernel", "crates/adapters/onebot11", "crates/bridge"]
+members = [
+    "crates/proto",
+    "crates/kernel",
+    "crates/adapters/onebot11",
+    "crates/plugins/trusted",
+    "crates/bridge",
+]
 
 [workspace.package]
 version = "0.1.0"

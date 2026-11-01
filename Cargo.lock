@@ -19,6 +19,7 @@ version = "0.1.0"
 dependencies = [
  "acb-adapter-onebot11",
  "acb-kernel",
+ "acb-plugin-trusted",
  "acb-proto",
  "serde_json",
  "toml_edit",
@@ -35,6 +36,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "acb-plugin-trusted"
+version = "0.1.0"
+dependencies = [
+ "acb-kernel",
 ]
 
 [[package]]
