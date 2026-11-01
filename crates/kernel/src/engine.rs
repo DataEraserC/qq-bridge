@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use acb_proto::element::flatten_text;
 use acb_proto::{
-    Delivery, Element, ErrorCode, MemoryInfo, QuoteRef, Record, RecordKind, RoomId, Sender,
-    SessionInfo, Ticket, ToolError, TurnReason,
+    Delivery, Element, ErrorCode, MemoryInfo, Omitted, QuoteRef, Record, RecordKind, RoomId,
+    Sender, SessionInfo, Ticket, ToolError, TurnReason,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -116,8 +116,11 @@ struct ActiveTurn {
     /// 这一轮替哪个会话说话（决定水位、决定默认发到哪个身份）。
     session: String,
     room: RoomId,
-    /// 本轮投出去的编号。只有这些能被 `ack_messages` 确认。
+    /// 本轮投出去的编号。只有这些（以及本轮读过的）能被 `ack_messages` 确认。
     delivered: BTreeSet<u64>,
+    /// 本轮通过 `get_history` / `fetch_records` / `get_platform_events` 读到的编号。
+    /// 读到但没投递的内容也能确认——水位要能被补读推着走。
+    read: BTreeSet<u64>,
     /// 开轮时冻结的配置。轮次中途热重载只影响下一轮；这一轮所有工具查询
     /// 都用这份快照，否则「轮次边界生效」只是投递批次的边界，不是真的边界。
     config: Arc<Config>,
@@ -129,6 +132,7 @@ struct EndedTurn {
     session: String,
     room: RoomId,
     delivered: BTreeSet<u64>,
+    read: BTreeSet<u64>,
     config: Arc<Config>,
     at: Instant,
 }
@@ -138,6 +142,7 @@ struct TurnCtx {
     session: String,
     room: RoomId,
     delivered: BTreeSet<u64>,
+    read: BTreeSet<u64>,
     /// 这一轮开轮时冻结的配置快照。工具期间不读 `self.config`。
     config: Arc<Config>,
     /// 这一轮还在跑吗。写反馈时记进现场，方便区分「干到一半卡住」和「收工后才想起说」。
@@ -584,6 +589,7 @@ impl<S: Store> Bridge<S> {
                 session: turn.session.clone(),
                 room: turn.room.clone(),
                 delivered: turn.delivered.clone(),
+                read: turn.read.clone(),
                 config: turn.config.clone(),
                 at: Instant::now(),
             },
@@ -659,6 +665,7 @@ impl<S: Store> Bridge<S> {
         let sessions: &[String] = std::slice::from_ref(&turn_session);
         let room = ctx.room.clone();
         let delivered = ctx.delivered.clone();
+        let read = ctx.read.clone();
         let live = ctx.live;
 
         let value = match tool {
@@ -681,15 +688,15 @@ impl<S: Store> Bridge<S> {
             }
             "ack_messages" => {
                 let args: AckArgs = parse(args)?;
-                self.ack(&turn_session, &room, &delivered, args.ids)
+                self.ack(&turn_session, &room, &delivered, &read, args.ids)
             }
             "get_history" => {
                 let args: HistoryArgs = parse(args)?;
-                self.history(&turn_config, sessions, &room, args)
+                self.history(ticket, &turn_config, sessions, &room, args)
             }
             "fetch_records" => {
                 let args: FetchRecordsArgs = parse(args)?;
-                self.fetch_records(&turn_config, sessions, &room, args)
+                self.fetch_records(ticket, &turn_config, sessions, &room, args)
             }
             "list_rooms" => self.list_rooms(&turn_config, sessions),
             "get_notes" => {
@@ -706,7 +713,7 @@ impl<S: Store> Bridge<S> {
             }
             "get_platform_events" => {
                 let args: EventsArgs = parse(args)?;
-                self.events(&turn_config, sessions, &room, args)
+                self.events(ticket, &turn_config, sessions, &room, args)
             }
             // 平台能力：core 不认识任何一个方法名，只做校验和转交（ADR-0020）。
             "platform_methods" => {
@@ -996,6 +1003,7 @@ impl<S: Store> Bridge<S> {
                 session: turn.session.clone(),
                 room: turn.room.clone(),
                 delivered: turn.delivered.clone(),
+                read: turn.read.clone(),
                 config: turn.config.clone(),
                 live: true,
             });
@@ -1028,6 +1036,7 @@ impl<S: Store> Bridge<S> {
             session: ended.session,
             room: ended.room,
             delivered: ended.delivered,
+            read: ended.read,
             config: ended.config,
             live: false,
         })
@@ -1044,7 +1053,29 @@ impl<S: Store> Bridge<S> {
 
     // ---- 内部 ----
 
-    /// 这个会话在这个房间里真正要处理的未读：水位之后、且不是自己说的。
+    /// 记下「本轮读过哪些编号」。只有当前轮房间的读取才算：`ack_messages`
+    /// 只能确认当前轮房间，记到别的房间没有意义。
+    fn mark_read(&mut self, ticket: &Ticket, room: &RoomId, ids: impl IntoIterator<Item = u64>) {
+        let session = self.by_ticket.get(ticket).cloned();
+        if let Some(session) = session {
+            if let Some(turn) = self.active.get_mut(&session) {
+                if &turn.room == room {
+                    turn.read.extend(ids);
+                }
+            }
+            return;
+        }
+        if let Some(turn) = self.ended.get_mut(ticket) {
+            if &turn.room == room {
+                turn.read.extend(ids);
+            }
+        }
+    }
+
+    /// 这个会话在这个房间里真正要处理的未读：水位之后、不在乱序确认里、且不是自己说的。
+    ///
+    /// 取全量再筛选，不再只取「最旧 200 条」——混投策略要同时拿到最旧一小段和最新一批，
+    /// 只取最旧一段会让新消息永远排不上。
     fn pending_records(
         &self,
         session: &str,
@@ -1052,12 +1083,7 @@ impl<S: Store> Bridge<S> {
         account: &str,
     ) -> Result<Vec<Record>, StorageError> {
         let cursor = Cursor::new(session, room.clone());
-        let mut records = unread(&self.store, &cursor, MAX_DELIVERY)?;
-        // unread 只取水位之后的前 MAX_DELIVERY 条——那是**最旧**的一段。极端积压时
-        // 不能把最新的挡在外面：只丢旧不丢新，和 open_turn 的投递截断同一个原则。
-        if records.len() > MAX_DELIVERY {
-            records.drain(..records.len() - MAX_DELIVERY);
-        }
+        let mut records = unread(&self.store, &cursor, usize::MAX)?;
         records.retain(|record| record.sender.id != account);
         Ok(records)
     }
@@ -1268,6 +1294,20 @@ impl<S: Store> Bridge<S> {
         // 引用里的平台编号翻成本房间编号，跟平台编号并排放（ADR-0024）。
         self.fill_quote_refs(&pending.room, &mut records);
 
+        // 先选本轮真正要投的批次，再计数、再进 delivered：
+        // 没投出去的记录不能算「投过」，否则 ack_messages 会放行没见过的编号，
+        // 投递次数也会被白白加上一次。
+        //
+        // 消息过多时给最旧一小段（让水位能继续前进）+ 最新一批（让模型看得到
+        // 眼前的话），中间那段跳过并明确告诉模型编号区间。
+        let limit = if turn_config.delivery_limit == 0 {
+            MAX_DELIVERY
+        } else {
+            turn_config.delivery_limit.min(MAX_DELIVERY)
+        };
+        let omitted = select_delivery(&mut records, limit);
+        let more = omitted.map(|omitted| omitted.count);
+
         let mut delivered = BTreeSet::new();
         let cursor = Cursor::new(pending.session.clone(), pending.room.clone());
         for record in &mut records {
@@ -1301,6 +1341,7 @@ impl<S: Store> Bridge<S> {
                 session: pending.session.clone(),
                 room: pending.room.clone(),
                 delivered,
+                read: BTreeSet::new(),
                 config: turn_config.clone(),
             },
         );
@@ -1319,24 +1360,10 @@ impl<S: Store> Bridge<S> {
                 model: session.model.clone(),
             });
 
-        // 消息过多时不全投。截断只丢**旧**的不丢新的（2026-10-31 用户裁定）——
-        // 模型干活要的是最新上下文，把新消息截掉等于把要回的话截掉；更早的部分
-        // 让模型用 fetch_records 按编号回看（流水里都还在）。
-        let limit = turn_config.delivery_limit;
-        let mut dropped = 0usize;
-        if limit > 0 && records.len() > limit {
-            dropped = records.len() - limit;
-            records.drain(..dropped);
-        }
-        // 再按字节卡一道：条数不多但每条很长时，200 条照样能把 `turn_start` 撑过 1 MiB，
-        // harness 那边帧就解不开了——表现是「连上了又立刻断」，比截断难查十倍。
-        // 同样只丢旧不丢新：fit_records 从最新一条往前装。
-        let keep = fit_records(&records, MAX_DELIVERY_BYTES);
-        dropped += records.len() - keep;
-        records.drain(..records.len() - keep);
-        // 有截断就把「截掉几条更早的」写上，让 harness 提示模型需要时去回看。
-        let more = (dropped > 0).then_some(dropped);
-
+        // 消息过多时不全投：给最旧一小段（让水位能继续前进）+ 最新一批（让模型
+        // 看得到眼前的话），中间那段跳过并明确告诉模型编号区间。只取最新会让
+        // 旧积压永远排不上、水位卡死；只取最旧又会让新消息被积压挡住。
+        // （批次已经在上面的 `select_delivery` 里选好，这里直接用它。）
         Ok(Delivery {
             ticket,
             session: pending.session,
@@ -1346,6 +1373,7 @@ impl<S: Store> Bridge<S> {
             memories,
             session_info,
             more,
+            omitted,
             // 0 = 配置里关了超时，harness 收到就别自己掐。
             turn_timeout_ms: Some(turn_config.turn_timeout_ms()),
         })
@@ -1718,16 +1746,18 @@ impl<S: Store> Bridge<S> {
 
     /// 确认一批记录。
     ///
-    /// 两条规矩，都是为了让「确认」这件事**幂等**：
+    /// 三条规矩，都是为了让「确认」这件事**幂等**：
     /// 1. 已经确认过的编号（<= 当前水位）当成功跳过。重复确认不是错误——以前它报
     ///    bad_request，模型于是以为「确认失败了」，接着往下不再确认，那几条就被反复重投。
-    /// 2. 只有「本轮真的投给过这个会话」的编号才能确认；别的编号报 `not_delivered`，
-    ///    并在错误里说清本轮投的是哪一段，让模型一轮就知道该改什么。
+    /// 2. 只能确认「本轮投给过这个会话」或「本轮通过读工具读到过」的编号；别的编号
+    ///    报 `not_delivered`。读到但没投递的也能确认，补读才能把水位推着走。
+    /// 3. 确认是显式动作，桥不会替 agent 自动推水位。
     fn ack(
         &mut self,
         session: &str,
         room: &RoomId,
         delivered: &BTreeSet<u64>,
+        read: &BTreeSet<u64>,
         ids: Vec<u64>,
     ) -> Result<Value, ToolError> {
         if ids.is_empty() {
@@ -1747,13 +1777,19 @@ impl<S: Store> Bridge<S> {
                 already.push(id);
                 continue;
             }
-            if !delivered.contains(&id) {
+            if !delivered.contains(&id) && !read.contains(&id) {
                 return Err(ToolError::new(
                     ErrorCode::BadRequest,
                     format!(
-                        "[not_delivered] #{id} 这一轮没投给你，确认不了。这一轮投给你的：{range}。\
+                        "[not_delivered] #{id} 这一轮既没投给你，也没读过，确认不了。\
+                         这一轮投给你的：{delivered}；读过的：{read}。\
                          已经确认过的编号不用再确认（跳过去就行）。",
-                        range = delivery_range(delivered)
+                        delivered = delivery_range(delivered),
+                        read = if read.is_empty() {
+                            "（没有）".to_owned()
+                        } else {
+                            delivery_range(read)
+                        }
                     ),
                 ));
             }
@@ -1785,7 +1821,8 @@ impl<S: Store> Bridge<S> {
     }
 
     fn history(
-        &self,
+        &mut self,
+        ticket: &Ticket,
         config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
@@ -1802,21 +1839,39 @@ impl<S: Store> Bridge<S> {
             .since(&room, 0, usize::MAX)
             .map_err(internal)?
             .into_iter()
+            .filter(|record| args.after.is_none_or(|after| record.id > after))
             .filter(|record| args.before.is_none_or(|before| record.id < before))
             .collect();
 
         // 总数一定要给：不给的话「还有多少条」只能靠猜，猜错就以为翻到底了。
         let total = records.len();
-        let skip = total.saturating_sub(limit);
-        records.drain(..skip);
-        let has_more = skip > 0;
-        // 往更早翻：把 oldest-1 当 before 传回来即可（不用记 offset，也不会因为
-        // 中途有新消息进来而错位——新消息都在另一头）。
-        let next_before = if has_more {
-            records.first().map(|record| record.id)
+        // 两个方向：
+        // - 给了 `after`：从旧往新翻（补看更新的消息），一次给最早的 limit 条；
+        // - 没给 `after`：原来的行为，从新往旧翻（看更早的历史）。
+        let (has_more, next_before, next_after) = if args.after.is_some() {
+            records.truncate(limit);
+            let has_more = total > records.len();
+            let next_after = if has_more {
+                records.last().map(|record| record.id)
+            } else {
+                None
+            };
+            (has_more, None, next_after)
         } else {
-            None
+            let skip = total.saturating_sub(limit);
+            records.drain(..skip);
+            let has_more = skip > 0;
+            // 往更早翻：把 oldest-1 当 before 传回来即可（不用记 offset，也不会因为
+            // 中途有新消息进来而错位——新消息都在另一头）。
+            let next_before = if has_more {
+                records.first().map(|record| record.id)
+            } else {
+                None
+            };
+            (has_more, next_before, None)
         };
+        // 读到的编号记进本轮 read set：补读过的未投递内容可以直接确认。
+        self.mark_read(ticket, &room, records.iter().map(|record| record.id));
         self.fill_quote_refs(&room, &mut records);
 
         let rendered: Vec<Value> = records
@@ -1830,13 +1885,15 @@ impl<S: Store> Bridge<S> {
             "returned": rendered.len(),
             "has_more": has_more,
             "next_before": next_before,
+            "next_after": next_after,
             "records": rendered,
         }))
     }
 
     /// 按水位编号精确查一批记录，只返回指定列。
     fn fetch_records(
-        &self,
+        &mut self,
+        ticket: &Ticket,
         config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
@@ -1861,6 +1918,9 @@ impl<S: Store> Bridge<S> {
             .into_iter()
             .filter(|record| wanted.contains(&record.id))
             .collect();
+
+        // 查出几条第几条，都算本轮读过：之后 `ack_messages` 可以确认它们。
+        self.mark_read(ticket, &room, records.iter().map(|record| record.id));
 
         // 找出没查到的编号，一起回给调用方，别让 agent 以为「那些 id 不存在」。
         let mut records = records;
@@ -2007,7 +2067,8 @@ impl<S: Store> Bridge<S> {
     }
 
     fn events(
-        &self,
+        &mut self,
+        ticket: &Ticket,
         config: &Config,
         sessions: &[String],
         turn_room: &RoomId,
@@ -2028,6 +2089,7 @@ impl<S: Store> Bridge<S> {
 
         let total = events.len();
         let page: Vec<Record> = events.into_iter().skip(offset).take(limit).collect();
+        self.mark_read(ticket, &room, page.iter().map(|record| record.id));
         let returned = page.len();
         let has_more = offset + returned < total;
         Ok(json!({
@@ -2532,25 +2594,70 @@ impl<S: Store> Bridge<S> {
     }
 }
 
-/// 按字节预算算「前多少条能一起投」。至少留一条：一条都投不出去，这一轮就别开了。
+/// 每轮从**最旧端**至少带几条。让水位有东西可推，同时不至于把新消息全挤掉。
+const DELIVERY_OLDEST: usize = 5;
+
+/// 从完整未读里选本轮投递的批次：最旧一小段 + 最新一批，中间跳过。
 ///
-/// 从前往后累加，一旦超预算就停在断点上——**顺序不能乱**，投递是按时间读的。
-fn fit_records(records: &[Record], budget: usize) -> usize {
-    // 从最新（尾部）往前装：截断只丢旧不丢新（2026-10-31 用户裁定），跟 open_turn
-    // 的条数截断同一个原则。至少保最新的 1 条——就算它自己超预算，也不能空手开轮。
-    let mut used = 0usize;
-    let mut keep = 0usize;
-    for record in records.iter().rev() {
-        let size = serde_json::to_vec(record)
-            .map(|bytes| bytes.len())
-            .unwrap_or(0);
-        if keep > 0 && used + size > budget {
+/// 返回被跳过的中段（编号区间 + 条数）；没有跳过就给 `None`。
+/// 条数和字节两个预算同时管：字节不够时继续从中间砍，但最旧端至少留 1 条。
+fn select_delivery(records: &mut Vec<Record>, limit: usize) -> Option<Omitted> {
+    let len = records.len();
+    if len == 0 {
+        return None;
+    }
+    let limit = limit.max(1);
+
+    // 条数切法：至少给最新留 1 条；`limit` 大时最旧端最多 5 条。
+    let head_target = DELIVERY_OLDEST.min(limit.saturating_sub(1)).min(len);
+    let tail_target = (limit - head_target).min(len - head_target);
+
+    let sizes: Vec<usize> = records
+        .iter()
+        .map(|record| serde_json::to_vec(record).map(|bytes| bytes.len()).unwrap_or(0))
+        .collect();
+
+    let mut budget = MAX_DELIVERY_BYTES;
+    // 最旧端：从旧往新装；第一条就算超预算也要留着（等同于原来的「至少保一条」）。
+    let mut head_keep = 0usize;
+    while head_keep < head_target {
+        let size = sizes[head_keep];
+        if head_keep > 0 && size > budget {
             break;
         }
-        used += size;
-        keep += 1;
+        budget = budget.saturating_sub(size);
+        head_keep += 1;
     }
-    keep
+
+    // 最新端：从新往旧装，花剩下的预算。
+    let mut tail_keep = 0usize;
+    while tail_keep < tail_target {
+        let index = len - 1 - tail_keep;
+        let size = sizes[index];
+        if size > budget {
+            break;
+        }
+        budget -= size;
+        tail_keep += 1;
+    }
+    // 一条都没留下：至少给最新 1 条，不能空手开轮。
+    if head_keep + tail_keep == 0 {
+        tail_keep = 1;
+    }
+
+    let mut all = std::mem::take(records);
+    let tail = all.split_off(len - tail_keep);
+    let omitted = all.split_off(head_keep);
+    all.extend(tail);
+    *records = all;
+
+    let first = omitted.first()?.id;
+    let last = omitted.last()?.id;
+    Some(Omitted {
+        from: first,
+        to: last,
+        count: omitted.len(),
+    })
 }
 
 /// 「本轮投给你的是哪一段」——错误信息里要能直接照抄的答案。

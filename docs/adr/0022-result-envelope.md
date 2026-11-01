@@ -62,7 +62,7 @@
 同一个病（「悄悄截断，还不说清」）在别处也有，一起按这个 ADR 的原则处理：
 
 - **`get_platform_events` / `memory_search` 以前无声截断**（后者干脆不截，命中上万行时会直接撞上 1 MiB 的帧上限，harness 解帧失败、断连，看起来像「桥挂了」）。现在都带 `total` + 分页。
-- **投递帧也可能超限**：`delivery_limit` 是按条数截的，200 条长消息照样能撑过 1 MiB。现在 `open_turn` 追加一道 512 KiB 的字节预算，`more` 字段照旧告诉 harness 还有几条没投。
+- **投递帧也可能超限**：`delivery_limit` 是按条数截的，200 条长消息照样能撑过 1 MiB。现在 `open_turn` 追加一道 512 KiB 的字节预算，并按「最旧一小段 + 最新一批」选批；跳过的中段用 `omitted {from, to, count}` 明确给编号区间，`more` 等于 `count`。
 
 ## 不这样会怎样
 

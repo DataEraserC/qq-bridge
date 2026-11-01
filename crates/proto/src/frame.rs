@@ -48,12 +48,27 @@ pub struct Delivery {
     /// harness 渲染时据此提示模型「用 fetch_records 抓剩下的」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub more: Option<usize>,
+    /// 被跳过的那段未读：编号区间 + 条数。和 `more` 一起给，
+    /// 让模型能直接按编号回看，不用猜「没投的是哪几条」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted: Option<Omitted>,
     /// 这一轮最多跑多久（毫秒）。`None` = 桥没带（harness 用自己的默认兜底）；
     /// `Some(0)` = 桥明确关闭了超时，harness 别自己掐——等到 turn/end 为止；
     /// `Some(n)` = 超过 n 毫秒还没结束就**主动打断**本侧会话（能打断的打断，
     /// 打断不了的按各自兜底处理），打断算这轮失败，走桥的失败通知。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_timeout_ms: Option<u64>,
+}
+
+/// 本轮被跳过的未读区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Omitted {
+    /// 区间里最早的编号。
+    pub from: u64,
+    /// 区间里最晚的编号。
+    pub to: u64,
+    /// 区间里实际有多少条未读（编号可能有空洞，所以不能用 `to - from + 1`）。
+    pub count: usize,
 }
 
 /// 一个会话在本轮投递里的身份信息。
@@ -327,6 +342,7 @@ mod tests {
                 model: None,
             }),
             more: None,
+            omitted: None,
             turn_timeout_ms: None,
         }
     }

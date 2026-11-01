@@ -89,6 +89,9 @@ pub struct HistoryArgs {
     /// 只看编号小于它的记录（往前翻）。
     #[serde(default)]
     pub before: Option<u64>,
+    /// 只看编号大于它的记录（往后翻，按从旧到新返回）。给了它就走「补看更新消息」模式。
+    #[serde(default)]
+    pub after: Option<u64>,
     /// 只返回这些列。缺省给一个精简子集（id/at/sender/elements）。
     /// 非法列名会报错，并在错误里列出全部合法列名。
     #[serde(default)]

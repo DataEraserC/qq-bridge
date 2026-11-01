@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
     Bridge, Cursor, Element, ErrorCode, Feedbacks, Ingest, MemoryStore, NoteKey, NoteKind, Notes,
-    Outbound, OutboundError, RecordDraft, RoomId, Sender, Sent, Transcript, TurnReason, Watermarks,
-    unread,
+    Omitted, Outbound, OutboundError, RecordDraft, RoomId, Sender, Sent, Transcript, TurnReason,
+    Watermarks, unread,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 const AT: i64 = 1_793_000_000_000;
 
@@ -111,6 +111,20 @@ fn bridge_with_access(provider: &str, rooms: &[&str]) -> (Bridge<MemoryStore>, S
         &format!("{access}\n\n        [[sessions.subscriptions]]"),
         1,
     );
+    let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+    let bridge = Bridge::new(
+        acb_kernel::Config::parse(&text).expect("配置合法"),
+        MemoryStore::new(),
+        Box::new(Recorder {
+            sends: sends.clone(),
+        }),
+    );
+    (bridge, sends)
+}
+
+/// 单轮投递条数上限改小的桥。
+fn bridge_with_limit(limit: usize) -> (Bridge<MemoryStore>, Sends) {
+    let text = format!("delivery_limit = {limit}\n{}", config());
     let sends: Sends = Arc::new(Mutex::new(Vec::new()));
     let bridge = Bridge::new(
         acb_kernel::Config::parse(&text).expect("配置合法"),
@@ -672,6 +686,45 @@ fn ack_messages_refuses_ids_that_were_not_delivered() {
             .expect("可读"),
         2
     );
+}
+
+/// 本轮读到但没投递的内容也能确认：补读要能把水位推着走。
+#[test]
+fn ack_accepts_records_read_this_turn_but_not_delivered() {
+    let (mut bridge, _sends) = bridge_with_limit(1);
+    for text in ["第一句", "第二句", "第三句"] {
+        bridge
+            .ingest(message("qq:group/123", "10001", text, true))
+            .expect("能记下来");
+    }
+    let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
+    let ticket = delivery.ticket;
+    let ids: Vec<u64> = delivery.records.iter().map(|record| record.id).collect();
+    assert_eq!(ids, vec![3], "上限 1 条只给最新的");
+    assert_eq!(
+        delivery.omitted,
+        Some(Omitted {
+            from: 1,
+            to: 2,
+            count: 2
+        })
+    );
+
+    // 补读跳过的两条；读到的编号进本轮 read set。
+    let fetched = bridge
+        .tool_call(&ticket, &sessions(), "fetch_records", json!({"ids": [1, 2]}))
+        .expect("能补读");
+    assert_eq!(fetched["returned"], 2);
+
+    let acked = bridge
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1, 2]}))
+        .expect("读过的编号能确认");
+    assert_eq!(acked["watermark"], 2, "水位推到补读的连续前沿");
+
+    let acked = bridge
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [3]}))
+        .expect("投递过的也能确认");
+    assert_eq!(acked["watermark"], 3);
 }
 
 #[test]
@@ -1782,6 +1835,58 @@ fn history_reports_total_and_how_to_go_further_back() {
     assert_eq!(older["has_more"], false);
 }
 
+/// 给了 after 就从旧往新翻：接着 next_after 往后走，不会重复看同一条。
+#[test]
+fn history_after_pages_forward_without_repeating() {
+    let (mut bridge, _sends) = bridge();
+    for index in 1..=5 {
+        bridge
+            .ingest(message(
+                "qq:group/123",
+                "10001",
+                &format!("第 {index} 条"),
+                true,
+            ))
+            .expect("能记下来");
+    }
+    let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
+
+    let first = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "get_history",
+            json!({"after": 0, "limit": 2}),
+        )
+        .expect("能往后翻");
+    assert_eq!(first["total"], 5);
+    assert_eq!(first["returned"], 2);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["records"][0]["id"], 1);
+    assert_eq!(first["records"][1]["id"], 2);
+    let next_after = first["next_after"].as_u64().expect("给往后翻的锚点");
+    assert_eq!(next_after, 2);
+
+    let second = bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "get_history",
+            json!({"after": next_after, "limit": 2}),
+        )
+        .expect("能接着往后翻");
+    assert_eq!(second["records"][0]["id"], 3, "不能把 #2 再给一遍");
+    assert_eq!(second["records"][1]["id"], 4);
+    assert_eq!(second["next_after"], 4);
+
+    let last = bridge
+        .tool_call(&ticket, &sessions(), "get_history", json!({"after": 4}))
+        .expect("能翻到末尾");
+    assert_eq!(last["records"][0]["id"], 5);
+    assert_eq!(last["has_more"], false);
+    assert_eq!(last["next_after"], Value::Null);
+}
+
 // ---------------------------------------------------------------------------
 // 引用对齐（ADR-0024）
 // ---------------------------------------------------------------------------
@@ -2198,13 +2303,13 @@ fn a_reply_is_acked_for_every_subscriber_not_just_the_speaker() {
 }
 
 // ---------------------------------------------------------------------------
-// 投递截断：只丢旧不丢新（2026-10-31 用户裁定）
+// 投递截断：最旧一小段 + 最新一批，中间明确告知（2026-11-01 用户裁定）
 // ---------------------------------------------------------------------------
 
 #[test]
-fn delivery_truncation_keeps_the_newest_and_drops_the_old() {
-    // 积压 5 条、上限 2 条：投出来的必须是 #4、#5（最新两条），被截掉的是
-    // 更早的 3 条——模型干活要的是最新上下文，把新消息截掉等于把要回的话截掉。
+fn delivery_truncation_keeps_newest_and_a_small_oldest_slice() {
+    // 积压 5 条、上限 2 条：最旧留 1 条（水位要能前进）+ 最新 1 条（模型要看眼前）。
+    // 中间 #2–#4 跳过，编号区间明确告诉模型。
     let text = format!("delivery_limit = 2\n{}", config());
     let sends: Sends = Arc::new(Mutex::new(Vec::new()));
     let mut bridge = Bridge::new(
@@ -2223,6 +2328,15 @@ fn delivery_truncation_keeps_the_newest_and_drops_the_old() {
 
     let delivery = bridge.poll_turn().expect("能开轮").expect("有活");
     let ids: Vec<u64> = delivery.records.iter().map(|r| r.id).collect();
-    assert_eq!(ids, vec![4, 5], "截断必须保留最新的两条");
-    assert_eq!(delivery.more, Some(3), "被截掉的是更早的 3 条");
+    assert_eq!(ids, vec![1, 5], "最旧一条 + 最新一条");
+    assert_eq!(delivery.more, Some(3), "中间跳过 3 条");
+    assert_eq!(
+        delivery.omitted,
+        Some(Omitted {
+            from: 2,
+            to: 4,
+            count: 3
+        }),
+        "跳过的编号区间要明确给出"
+    );
 }

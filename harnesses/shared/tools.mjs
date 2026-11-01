@@ -84,6 +84,7 @@ to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/32362244
   {
     name: "ack_messages",
     description: `确认这批记录处理完了，水位才会往前推。ids 就是投递记录前面的编号。
+本轮通过 get_history / fetch_records / get_platform_events 读到过的编号也可以确认（包括没投递的）。
 不确认就一直算未读，下一轮还会再投一次（投递里会写「第 N 次投递」）。
 确认是幂等的：重复确认已经确认过的编号不算错，会回 already。轮次结束后 60 秒内也还能补确认。`,
     schema: {
@@ -103,14 +104,17 @@ to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/32362244
     name: "get_history",
     description: `翻这个房间过去的记录（含平台事件），用来补上下文。
 返回里有 total（符合条件的总数）、returned（这次给了几条）、has_more；
-要更早的，把 next_before 当 before 再调一次。
-引用对不上时把 quote_ref 加进 columns：它把引用里的平台编号翻成本房间的 #编号。`,
+往前翻：把 next_before 当 before 再调一次。
+往后补看新消息：给 after，它按从旧到新返回，把 next_after 当 after 再调一次。
+引用对不上时把 quote_ref 加进 columns：它把引用里的平台编号翻成本房间的 #编号。
+这一轮读到的编号可以直接用 ack_messages 确认（包括本轮没投递的）。`,
     schema: {
       type: "object",
       properties: {
         room: ROOM_SCHEMA,
         limit: { type: "number", description: "最多几条，默认 20，上限 200" },
         before: { type: "number", description: "只看编号比它小的（往前翻）" },
+        after: { type: "number", description: "只看编号比它大的（往后翻，按从旧到新返回）" },
         columns: COLUMNS_SCHEMA,
       },
       additionalProperties: false,

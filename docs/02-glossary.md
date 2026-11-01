@@ -52,8 +52,8 @@
 |------|------|------|
 | `send_message` | elements（或 text） | 发到**当前轮次**的房间。回执 `ok` / `platform_id` / `at` / `room`，失败直接报错；正文里夹着调用标记被截断时多一个 `trimmed` + 说明；本机文件路径被换成中继 URL 时多一个 `relayed`（ADR-0025） |
 | `send_message_to` | elements, to | 发到别的房间。`to` 的默认可选目标 = **本会话订阅的房间**，越界拒绝；会话可用 `[sessions.access]` 放宽边界（ADR-0026）。跨会话发送已砍（ADR-0017） |
-| `get_history` | room, before, limit, columns | 查房间的流水。带 `total` / `has_more` / `next_before`；`columns` 里有 `quote_ref`（引用对到本房间编号，ADR-0024） |
-| `fetch_records` | room, ids, columns | 按水位编号精确查一批（补投递被截断的部分） |
+| `get_history` | room, before, after, limit, columns | 查房间的流水。带 `total` / `has_more` / `next_before` / `next_after`；给了 `after` 就从旧往新翻（补看新消息），`columns` 里有 `quote_ref`（引用对到本房间编号，ADR-0024） |
+| `fetch_records` | room, ids, columns | 按水位编号精确查一批（补投递被截断的部分）；这轮读到的编号可以 `ack_messages` |
 | `list_rooms` | — | 列出本会话订阅了哪些房间、各自未读多少 |
 | `get_notes` / `set_note` / `del_note` | room, kind, key, value | 房间级笔记（term / member / topic） |
 | `get_platform_events` | room, limit, offset | 查平台事件，带 `total` / `has_more` |

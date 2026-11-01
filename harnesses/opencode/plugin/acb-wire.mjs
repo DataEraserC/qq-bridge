@@ -371,8 +371,17 @@ export function renderTurn(delivery, { now = Date.now() } = {}) {
   }
 
   lines.push("")
-  // 消息太多被截断时，明确告诉模型：截掉的是更早的，最新的都投进来了。
-  if (delivery.more) {
+  // 消息太多被截断时，明确告诉模型：本轮给的是「最旧一小段 + 最新一批」，
+  // 中间那段跳过了，并把编号区间直接给它，省得它猜。
+  if (delivery.omitted) {
+    const omitted = delivery.omitted
+    lines.push(
+      `⚠️ 还有 #${omitted.from}–#${omitted.to} 共 ${omitted.count} 条未读没投（本轮给了最旧一小段和最新一批）。` +
+        `补看用 get_history({ after: ${omitted.from - 1}, before: ${omitted.to + 1} }) 或 fetch_records；` +
+        `读过的编号可以用 ack_messages 确认，水位才会推进。`
+    )
+    lines.push("")
+  } else if (delivery.more) {
     lines.push(
       `⚠️ 投递超限，更早的 ${delivery.more} 条没投进来（本轮只保留最新的）。需要更早的上下文时用 fetch_records 按编号回看。`
     )
