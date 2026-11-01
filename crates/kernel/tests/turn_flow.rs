@@ -747,6 +747,29 @@ fn a_stale_ticket_is_rejected() {
     assert_eq!(error.code, ErrorCode::Unauthorized);
 }
 
+/// 票号带进程前缀：不同桥实例、以及同一实例的下一轮，票面都不会撞。
+#[test]
+fn tickets_are_unique_across_bridge_instances_and_turns() {
+    let (mut first, _sends) = bridge();
+    let (mut second, _sends) = bridge();
+    first
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    second
+        .ingest(message("qq:group/123", "10001", "在吗", true))
+        .expect("能记下来");
+    let first_ticket = first.poll_turn().expect("能开轮").expect("有活").ticket;
+    let other_ticket = second.poll_turn().expect("能开轮").expect("有活").ticket;
+    assert_ne!(first_ticket, other_ticket, "不同桥实例的票不能相同");
+
+    first.end_turn(&first_ticket, None).expect("能收工");
+    first
+        .ingest(message("qq:group/123", "10001", "第二句", true))
+        .expect("能记下来");
+    let next_ticket = first.poll_turn().expect("能开轮").expect("有活").ticket;
+    assert_ne!(next_ticket, first_ticket, "同一实例的下一轮票不能相同");
+}
+
 #[test]
 fn unknown_tools_are_refused() {
     let (mut bridge, _sends) = bridge();
@@ -1367,6 +1390,8 @@ fn turn_failure_falls_back_to_default_when_session_has_no_override() {
     bridge
         .end_turn(&delivery.ticket, Some("模型 400 content-blocked"))
         .expect("能收工");
+    // 通知在 end_turn 里只排队，真正发送由 endpoint 在锁外做；测试里手动发完。
+    bridge.flush_notices();
 
     let sends = sends.lock().expect("没被毒死");
     assert_eq!(sends.len(), 1, "全局默认的失败通知要真的发出去");
@@ -1428,6 +1453,7 @@ fn turn_failure_prefers_session_override_over_default() {
     bridge
         .end_turn(&delivery.ticket, Some("boom"))
         .expect("能收工");
+    bridge.flush_notices();
 
     let sends = sends.lock().expect("没被毒死");
     assert_eq!(sends.len(), 1, "只发会话自己配的那一个");

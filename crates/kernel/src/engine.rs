@@ -13,6 +13,7 @@
 //! 当前会话订阅的所有房间；**跨会话发送被砍掉**——一个会话不能替别的人格发言。
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -217,6 +218,10 @@ pub struct Bridge<S: Store> {
     /// 刚收工的轮次。留 [`TURN_GRACE`]：补确认、写反馈还要用到票上的会话与房间。
     ended: HashMap<Ticket, EndedTurn>,
     ticket_seq: u64,
+    /// 本桥实例的票前缀。和 `ticket_seq` 一起组成票面，跨重启不重复。
+    ticket_prefix: String,
+    /// 排队等着在锁外发出去的失败通知。endpoint 处理完一帧、放下全局锁后执行。
+    pending_notices: Vec<PreparedSend>,
     /// 记忆仓库管理器：负责裸仓库 init 与 worktree checkout。
     memory: MemoryRepo,
     /// 文件中继。配了 `[file_relay]` 才有：发送/平台调用里的本机文件
@@ -227,6 +232,20 @@ pub struct Bridge<S: Store> {
     staged_config: Option<Config>,
     /// 配置版本号：每换一次配置 +1，控制台靠它展示「配置换过没有」。
     config_version: u64,
+}
+
+/// 票前缀：进程启动时间 + 进程号 + 进程内桥实例序号。
+///
+/// 以前票面是「会话-N」，序号从 0 数起，重启后又从 0 数起——上一进程的旧票可能正好
+/// 撞上本进程的新票，被误认成「这一轮」的票。前缀让每个进程、每个桥实例的票空间不相交。
+fn ticket_prefix() -> String {
+    static INSTANCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let instance = INSTANCE.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{}-{instance:x}", std::process::id())
 }
 
 impl<S: Store> Bridge<S> {
@@ -249,6 +268,8 @@ impl<S: Store> Bridge<S> {
             by_ticket: HashMap::new(),
             ended: HashMap::new(),
             ticket_seq: 0,
+            ticket_prefix: ticket_prefix(),
+            pending_notices: Vec::new(),
             memory,
             relay,
             staged_config: None,
@@ -600,6 +621,23 @@ impl<S: Store> Bridge<S> {
         Ok(())
     }
 
+    /// 取出排队等发的失败通知。endpoint 放下全局锁后执行它们，再回来结算。
+    pub(crate) fn take_pending_notices(&mut self) -> Vec<PreparedSend> {
+        std::mem::take(&mut self.pending_notices)
+    }
+
+    /// 把排队的失败通知一口气发完（测试和非 endpoint 调用点用）。
+    ///
+    /// endpoint 不走这里：它要先把全局锁放下，等平台的那段时间不挡别人。
+    pub fn flush_notices(&mut self) {
+        for prepared in self.take_pending_notices() {
+            let sent = prepared.execute();
+            if let Err(error) = self.finish_send(prepared, sent) {
+                eprintln!("失败通知没发成：{error:?}");
+            }
+        }
+    }
+
     /// 按「会话自己的」`on_turn_error` 顺序执行失败通知；会话没配就回退到全局默认
     /// `default_on_turn_error`。一个动作失败不打断后面的。
     fn notify_turn_error(
@@ -623,15 +661,17 @@ impl<S: Store> Bridge<S> {
                 TurnErrorAction::Log => {}
                 TurnErrorAction::Send { room: target } => {
                     let text = format!("[一轮失败] 会话 {session}（{room}）：{error}");
+                    // 这里只组装，不发送：endpoint 会在放下全局锁之后真正等平台。
                     // 失败通知本身发不出去也不该影响主流程，但要把原因记进日志，
                     // 别静默吞掉——否则「为什么没人收到失败提示」会变成查不出的黑洞。
-                    if let Err(err) = self.deliver_out(
+                    match self.prepare_send(
                         config.clone(),
                         session,
-                        &target,
+                        target,
                         vec![Element::text(text)],
                     ) {
-                        eprintln!("失败通知发到 {target} 没成：{err:?}");
+                        Ok(prepared) => self.pending_notices.push(prepared),
+                        Err(err) => eprintln!("失败通知组装失败：{err:?}"),
                     }
                 }
             }
@@ -1330,8 +1370,11 @@ impl<S: Store> Bridge<S> {
         }
 
         self.ticket_seq += 1;
-        let ticket =
-            Ticket::new(format!("{}-{}", pending.session, self.ticket_seq)).expect("票面非空");
+        let ticket = Ticket::new(format!(
+            "{}-{}-{}",
+            pending.session, self.ticket_prefix, self.ticket_seq
+        ))
+        .expect("票面非空");
 
         self.by_ticket
             .insert(ticket.clone(), pending.session.clone());

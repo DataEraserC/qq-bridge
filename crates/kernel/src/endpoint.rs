@@ -489,13 +489,21 @@ pub fn run_connection<S: Store>(
                         }
                     }
                     other => {
-                        let replies = {
+                        let (replies, notices) = {
                             let mut guard = lock(bridge);
                             match session.handle(&mut guard, other) {
-                                Ok(replies) => replies,
+                                Ok(replies) => (replies, guard.take_pending_notices()),
                                 Err(error) => break 'conn Err(error),
                             }
                         };
+                        // 失败通知在锁外真发：等平台的那段时间不挡别的会话。
+                        for prepared in notices {
+                            let sent = prepared.execute();
+                            let mut guard = lock(bridge);
+                            if let Err(error) = guard.finish_send(prepared, sent) {
+                                eprintln!("失败通知没发成：{error:?}");
+                            }
+                        }
                         replies
                     }
                 };

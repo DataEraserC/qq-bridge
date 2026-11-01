@@ -35,8 +35,9 @@ class ControllableDsh {
   }
 
   async ensureWorkspaceTitle(path, title) {
-    this.workspaceCalls.push({ path, title })
-    return { workspaceId: "ws-1", created: this.workspaceCreated }
+    const created = this.workspaceCreated
+    this.workspaceCalls.push({ path, title, created })
+    return { workspaceId: "ws-1", created }
   }
 
   async selectModel(sessionId, choice) {
@@ -235,7 +236,7 @@ test("reset 之后换带代次的新 id，冲突时再兜底换新", async (t) =
   dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
   await first
   assert.equal(dsh.createCalls[0].sessionId, "session-acb-main")
-  assert.equal(dsh.createCalls[0].cwd, "/w", "cwd 要传给 dsh（workspace 归组）")
+  assert.equal(dsh.createCalls[0].workspaceId, "ws-1", "workspace id 要传给 dsh（归组）")
 
   // reset：映射丢掉 + 代次 +1。下一轮必须用新 id，不能撞旧会话。
   driver.resetSession("main")
@@ -270,16 +271,21 @@ test("workspace 标题：只在新建 workspace 时命名，已有的不动", as
   await waitFor(() => dsh.prompts.length === 1, "prompt 没被调")
   dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
   await run
-  assert.deepEqual(dsh.workspaceCalls, [{ path: "/w", title: "QQ 聊天" }])
+  assert.deepEqual(dsh.workspaceCalls, [{ path: "/w", title: "QQ 聊天", created: true }])
 
-  // workspace 已存在（created:false）：第二次建会话不应再发命名请求。
+  // workspace 已存在（created:false）：第二次建会话可以再问一次 workspace，
+  // 但只有 created 的那一次才该命名。
   dsh.workspaceCreated = false
   driver.resetSession("main")
   const second = driver.run(delivery(), link)
   await waitFor(() => dsh.prompts.length === 2, "第二轮 prompt 没被调")
   dsh.lastFollow.push({ type: "turn/end", data: { turn: "t2" } })
   await second
-  assert.equal(dsh.workspaceCalls.length, 1, "已有 workspace 不重复命名")
+  assert.equal(
+    dsh.workspaceCalls.filter((call) => call.created).length,
+    1,
+    "已有 workspace 不重复命名"
+  )
 })
 
 test("callBridge 把工具参数转成带票的 tool_call", async (t) => {
