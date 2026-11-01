@@ -18,6 +18,7 @@ class ControllableDsh {
     this.modelPicks = []
     this.lastFollow = null
     this.createCalls = []
+    this.promptErrors = []
     this.workspaceCalls = []
     // 设了就按它匹配请求的 sessionId 抛 conflict（测驱动的冲突兜底）。
     this.conflictOn = null
@@ -46,6 +47,7 @@ class ControllableDsh {
   }
 
   async prompt(sessionId, content) {
+    if (this.promptErrors.length) throw new Error(this.promptErrors.shift())
     this.prompts.push({ sessionId, content })
     return { accepted: true }
   }
@@ -254,6 +256,25 @@ test("reset 之后换带代次的新 id，冲突时再兜底换新", async (t) =
   dsh.lastFollow.push({ type: "turn/end", data: { turn: "t3" } })
   await third
   assert.match(dsh.createCalls[2].sessionId, /^session-acb-main-r\w+$/, "第三次请求本身就该带新代次")
+})
+
+test("旧 sessionId 失效时重建会话并重试", async (t) => {
+  const bridge = await new FakeBridge().start()
+  const dsh = new ControllableDsh()
+  const link = await connectedLink(bridge)
+  t.after(async () => {
+    link.close()
+    await bridge.stop()
+  })
+
+  const driver = new TurnDriver({ dsh, log: () => {}, cwd: "/w" })
+  dsh.promptErrors.push('session "session-1" not found')
+  const run = driver.run(delivery(), link)
+  await waitFor(() => dsh.prompts.length === 1, "重试后的 prompt 没被调")
+  assert.equal(dsh.createCalls.length, 2, "应当重建一次会话")
+  assert.notEqual(dsh.prompts[0].sessionId, "session-1", "重试用的是新会话")
+  dsh.lastFollow.push({ type: "turn/end", data: { turn: "t1" } })
+  await run
 })
 
 test("workspace 标题：只在新建 workspace 时命名，已有的不动", async (t) => {

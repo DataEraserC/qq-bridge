@@ -239,6 +239,37 @@ fn sender_of(event: &Value, sender_id: &str, admin_qqs: &[String]) -> Sender {
     }
 }
 
+/// 这条 poke 事件缺发送者昵称吗？缺就返回 `(群号, 用户号)`，供调用方查
+/// `get_group_member_info` 补昵称/群名片。查不到或本来就有名字就返回 `None`。
+///
+/// OneBot 的 notice/poke 经常只带 `user_id` / `target_id`，不带 `sender`；直接入库
+/// 会把昵称显示成 QQ 号。
+pub fn poke_missing_sender(event: &Value) -> Option<(String, String)> {
+    let is_poke = event.get("post_type").and_then(Value::as_str) == Some("notice")
+        && event.get("notice_type").and_then(Value::as_str) == Some("notify")
+        && event.get("sub_type").and_then(Value::as_str) == Some("poke");
+    if !is_poke {
+        return None;
+    }
+    let has_name = event.get("sender").is_some_and(|sender| {
+        ["card", "nickname"].iter().any(|key| {
+            sender
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+        })
+    });
+    if has_name {
+        return None;
+    }
+    let group = id_of(event.get("group_id"));
+    let user = id_of(event.get("user_id"));
+    if group.is_empty() || user.is_empty() {
+        return None;
+    }
+    Some((group, user))
+}
+
 /// 事件自带 `sender.role` → 身份。`owner` 群主、`admin` 群管理员、`member` 及空 = 普通群友。
 fn role_of(event: &Value) -> Option<SenderRole> {
     match event
@@ -424,6 +455,44 @@ mod tests {
         };
         assert!(!draft.at_self, "拍的不是我，不该叫醒我");
         assert_eq!(draft.elements, vec![Element::text("[拍了拍 10002]")]);
+    }
+
+    #[test]
+    fn poke_without_sender_asks_for_member_info() {
+        let event = json!({
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "group_id": 123,
+            "user_id": 10001,
+            "target_id": 20002
+        });
+        assert_eq!(
+            poke_missing_sender(&event),
+            Some(("123".to_owned(), "10001".to_owned()))
+        );
+
+        let with_sender = json!({
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "group_id": 123,
+            "user_id": 10001,
+            "sender": { "nickname": "老王", "role": "member" }
+        });
+        assert_eq!(poke_missing_sender(&with_sender), None);
+
+        let private = json!({
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "user_id": 10001
+        });
+        assert_eq!(
+            poke_missing_sender(&private),
+            None,
+            "私聊没有群号，查不了群成员"
+        );
     }
 
     #[test]

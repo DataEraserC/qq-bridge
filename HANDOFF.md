@@ -189,9 +189,9 @@ systemctl --user stop acb-drivers acb-bridge        # 停（顺序：驱动先�
 
 ## 6. 已知边界 / 未完成（下一步可做）
 
-1. **poke 事件昵称兜底**：OneBot 的 notice/poke 事件常不带 sender 字段，昵称显示成 QQ 号。需要 `get_group_member_info` 异步查 API 兜底。**注**：现在有 `platform_call` 了，但那是给模型用的，适配器内部兜底还得自己写（未做）。
-2. **dsh 重启后旧 sessionId 失效的自愈**：seed 的旧 sessionId 若在 dsh 重启后失效，prompt 会失败。需区分「session 失效」vs「模型失败」做自愈兜底（留待观察）。
-3. **git 仓库有个异常的 `~/` 目录**（误创建的），里面是 qqab-memories，待清理（不是关键）。
+1. ~~**poke 事件昵称兜底**~~（已完成 2026-11-01）：事件缺 `sender` 时，`event::poke_missing_sender` 报给 `link.rs`，后者用 `get_group_member_info` 异步补齐昵称/群名片后再入库；查不到就沿用号码。
+2. ~~**dsh 重启后旧 sessionId 失效的自愈**~~（已完成 2026-11-01）：驱动识别「会话不存在」类错误，清缓存、重建会话、重新钉模型和注入人格后重试一轮；模型/网络错误不触发重建。
+3. ~~**git 仓库有个异常的 `~/` 目录**~~（已清理 2026-11-01）：已移到 `/tmp/acb-stray-home-dir-20261101`，仓库里不再有该目录。
 4. ~~平台能力只有 4 个纯读方法~~（已完成）：现在 52 个，覆盖「人在这号上能做的事」，
    全部对着真机 NapCat 探测过。表在 `crates/adapters/onebot11/src/catalog.rs`。
 5. ~~破坏性方法的配置开关~~（已完成）：`[[connections]] allow_destructive = true / ["group.kick"] / 省略`。

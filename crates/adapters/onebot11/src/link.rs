@@ -17,12 +17,13 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use acb_kernel::{Bridge, EventQueue, Store};
-use serde_json::Value;
+use acb_kernel::{Bridge, EventQueue, Outbound, RoomId, Store};
+use serde_json::{Value, json};
 use tungstenite::error::Error as WsError;
 use tungstenite::{Message, WebSocket};
 
 use crate::event::{self, Parsed};
+use crate::outbound::OneBotOutbound;
 
 /// 一条 WebSocket 连接。
 pub type Ws = WebSocket<TcpStream>;
@@ -174,6 +175,7 @@ pub fn pump(
     events: &EventQueue,
     connection: &str,
     admin_qqs: &[String],
+    slot: &LinkSlot,
     shutdown: &AtomicBool,
 ) -> Result<(), LinkError> {
     let mut waiting: HashMap<String, Sender<Result<Value, LinkError>>> = HashMap::new();
@@ -205,6 +207,7 @@ pub fn pump(
                     events,
                     connection,
                     admin_qqs,
+                    slot,
                     &mut waiting,
                 );
             }
@@ -241,6 +244,7 @@ fn handle_text(
     events: &EventQueue,
     connection: &str,
     admin_qqs: &[String],
+    slot: &LinkSlot,
     waiting: &mut HashMap<String, Sender<Result<Value, LinkError>>>,
 ) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
@@ -256,7 +260,27 @@ fn handle_text(
         return;
     }
 
-    match event::parse(connection, &value, admin_qqs) {
+    // 拍一拍常不带 sender：先异步查群成员资料补昵称，再入库。查询线程通过
+    // LinkSlot 发动作，由本线程继续读写回包，不会把 pump 卡死。
+    if let Some((group, user)) = event::poke_missing_sender(&value) {
+        spawn_poke_lookup(
+            value,
+            slot.clone(),
+            connection.to_owned(),
+            admin_qqs.to_vec(),
+            events.clone(),
+            group,
+            user,
+        );
+        return;
+    }
+
+    submit_event(events, connection, &value, admin_qqs);
+}
+
+/// 解析并提交一条事件。正常路径和昵称补查线程都走这里。
+fn submit_event(events: &EventQueue, connection: &str, value: &Value, admin_qqs: &[String]) {
+    match event::parse(connection, value, admin_qqs) {
         Ok(Parsed::Record(draft)) => {
             if !events.submit(draft) {
                 eprintln!("适配器 {connection}：入站队列已关闭，丢掉一条记录");
@@ -270,6 +294,58 @@ fn handle_text(
         }
         Err(error) => eprintln!("适配器 {connection}：这条事件读不懂：{error}"),
     }
+}
+
+/// 查一次群成员资料，把 `sender` 注入原事件后再入库；查不到就沿用号码。
+fn spawn_poke_lookup(
+    raw: Value,
+    slot: LinkSlot,
+    connection: String,
+    admin_qqs: Vec<String>,
+    events: EventQueue,
+    group: String,
+    user: String,
+) {
+    std::thread::spawn(move || {
+        let mut enriched = raw.clone();
+        if let Ok(room) = RoomId::new(&connection, format!("group/{group}")) {
+            let mut outbound = OneBotOutbound::new(slot, &connection);
+            let params = json!({
+                "group_id": number_value(&group),
+                "user_id": number_value(&user),
+            });
+            match outbound.call(&room, "group.get_member_info", &params) {
+                Ok(outcome) => {
+                    let data = &outcome.value;
+                    let nickname = data.get("nickname").and_then(Value::as_str).unwrap_or("");
+                    let card = data.get("card").and_then(Value::as_str).unwrap_or("");
+                    let role = data.get("role").and_then(Value::as_str).unwrap_or("");
+                    if let Value::Object(map) = &mut enriched {
+                        map.insert(
+                            "sender".to_owned(),
+                            json!({
+                                "user_id": user,
+                                "nickname": nickname,
+                                "card": card,
+                                "role": role,
+                            }),
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "适配器 {connection}：查 {user} 的昵称失败，沿用号码：{error}"
+                ),
+            }
+        }
+        submit_event(&events, &connection, &enriched, &admin_qqs);
+    });
+}
+
+/// 数字形式的号传数字，非数字（少见）原样传字符串。
+fn number_value(text: &str) -> Value {
+    text.parse::<u64>()
+        .map(Value::from)
+        .unwrap_or_else(|_| Value::from(text))
 }
 
 fn fail_all(waiting: &mut HashMap<String, Sender<Result<Value, LinkError>>>, reason: &str) {
@@ -311,6 +387,7 @@ pub fn supervise<S: Store + Send + 'static>(
                     &events,
                     &connection,
                     &admin_qqs,
+                    &slot,
                     &shutdown,
                 );
                 slot.clear();

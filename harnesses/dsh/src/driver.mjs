@@ -266,19 +266,9 @@ class TurnDriver {
   async #one(delivery, link) {
     let failure = null
     try {
-      const sessionId = await this.#session(delivery.session, link)
+      let sessionId = await this.#session(delivery.session, link)
       await this.#pinModel(sessionId)
-      let text = renderTurn(delivery)
-      // 人格只在首轮或变更时注入：桥只给语义，dsh 这边把它当成一条 context 消息
-      // 放在本轮最前面。重复注入会白烧 token，所以按签名去重。
-      const personaText = renderPersona(delivery.persona)
-      const signature = personaSignature(delivery.persona)
-      if (personaText && this.personas.get(delivery.session) !== signature) {
-        const updated = this.personas.has(delivery.session) ? "[人格已更新]\n" : ""
-        text = `${updated}${personaText}\n\n${text}`
-        this.personas.set(delivery.session, signature)
-        this.log("info", `会话 ${delivery.session} 注入人格 ${delivery.persona?.id ?? ""}`)
-      }
+      let text = this.#composePrompt(delivery)
       const info = delivery.session_info ?? {}
       const model = info.model ?? "(dsh 默认)"
       this.log(
@@ -286,7 +276,23 @@ class TurnDriver {
         `开轮 ${delivery.ticket}：${delivery.room.connection}:${delivery.room.path.join("/")}，${delivery.records.length} 条，模型 ${model}`,
       )
       // prompt 投话，follow 等这一轮真正结束（turn/end）。
-      await this.dsh.prompt(sessionId, [{ type: "text", text }])
+      try {
+        await this.dsh.prompt(sessionId, [{ type: "text", text }])
+      } catch (error) {
+        if (!isDeadSessionError(error)) throw error
+        // dsh 重启/清理后旧 sessionId 可能失效：重建会话、重新钉模型和人格，再试一次。
+        this.log(
+          "warn",
+          `dsh 会话 ${sessionId} 已失效，重建后重试：${error?.message ?? error}`,
+        )
+        this.sessions.delete(delivery.session)
+        this.modelPinned.delete(sessionId)
+        this.personas.delete(delivery.session)
+        sessionId = await this.#session(delivery.session, link)
+        await this.#pinModel(sessionId)
+        text = this.#composePrompt(delivery)
+        await this.dsh.prompt(sessionId, [{ type: "text", text }])
+      }
       // 超时跟着桥的配置走：0 = 关闭（跑多久都等）；不带 = 旧桥，用 5 分钟兜底。
       const turnFailure = await this.#waitTurnEnd(
         sessionId,
@@ -309,6 +315,25 @@ class TurnDriver {
         this.log("warn", `回 turn_end 失败：${error.message}`)
       }
     }
+  }
+
+  /**
+   * 本轮 prompt 文本：投递正文 + 首轮/变更时的人格卡。
+   *
+   * 人格只在签名变化时注入，重复注入会白烧 token。会话重建后调用方会先清掉签名，
+   * 这里就会把人格重新带上。
+   */
+  #composePrompt(delivery) {
+    let text = renderTurn(delivery)
+    const personaText = renderPersona(delivery.persona)
+    const signature = personaSignature(delivery.persona)
+    if (personaText && this.personas.get(delivery.session) !== signature) {
+      const updated = this.personas.has(delivery.session) ? "[人格已更新]\n" : ""
+      text = `${updated}${personaText}\n\n${text}`
+      this.personas.set(delivery.session, signature)
+      this.log("info", `会话 ${delivery.session} 注入人格 ${delivery.persona?.id ?? ""}`)
+    }
+    return text
   }
 
   /**
@@ -486,6 +511,19 @@ class TurnDriver {
 // ---------------------------------------------------------------------------
 // MCP 工具调用 → 桥的 tool_call
 // ---------------------------------------------------------------------------
+
+/**
+ * dsh 报的错是不是「这个会话已经不存在」。
+ *
+ * 只认会话层面的失效；模型 400 / 网络错误不能触发重建，否则每轮失败都会换个新会话，
+ * 上下文全丢。
+ */
+function isDeadSessionError(error) {
+  const message = String(error?.message ?? error)
+  return /session[^,;]*?(not[ -]?found|not-found|invalid|expired|deleted|does not exist|missing)|(not[ -]?found|unknown|no such)[^,;]*?session/i.test(
+    message,
+  )
+}
 
 /**
  * 把 dsh 的 turn/end reason 翻成给用户看的失败信息；正常结束返回 null。
