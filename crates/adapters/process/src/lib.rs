@@ -51,6 +51,9 @@ use acb_kernel::{
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// 子进程启动后必须在这个时间内说 hello。
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// 子进程退出后的重启退避：从 500ms 起翻倍，最多 10 秒。
+pub const RESTART_DELAY: Duration = Duration::from_millis(500);
+pub const MAX_RESTART_DELAY: Duration = Duration::from_secs(10);
 /// 退出时给子进程收尾的时间，过了就 kill。
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -211,13 +214,76 @@ struct HelloData {
     catalog: Vec<WireMethodSpec>,
 }
 
+/// 一条连接的共享进程状态。重启时换 stdin、清 pending，但 outbound 句柄不变。
+struct SharedProcess {
+    stdin: Mutex<Option<ChildStdin>>,
+    pending: Pending,
+    alive: Arc<AtomicBool>,
+    catalog: Mutex<Arc<[MethodSpec]>>,
+}
+
 fn spawn_process(
     connection: &Connection,
     events: EventQueue,
 ) -> Result<(Box<dyn Outbound>, Box<dyn FnOnce(AdapterHost) + Send>), String> {
     let config = parse_options(connection)?;
     let connection_id = connection.id.clone();
+    let restart_events = events.clone();
 
+    let shared = Arc::new(SharedProcess {
+        stdin: Mutex::new(None),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        alive: Arc::new(AtomicBool::new(false)),
+        catalog: Mutex::new(Arc::from(Vec::<MethodSpec>::new())),
+    });
+
+    let (child, stdin, catalog) = start_child(
+        &config,
+        &connection_id,
+        events,
+        Arc::clone(&shared.pending),
+        Arc::clone(&shared.alive),
+    )?;
+    *shared
+        .stdin
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stdin);
+    *shared
+        .catalog
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = catalog;
+    shared.alive.store(true, Ordering::Relaxed);
+
+    let outbound = ProcessOutbound {
+        shared: Arc::clone(&shared),
+        connection: connection_id.clone(),
+        seq: 0,
+        timeout: REPLY_TIMEOUT,
+    };
+
+    let launch: Box<dyn FnOnce(AdapterHost) + Send> = Box::new(move |host| {
+        supervise(
+            host.shutdown,
+            config,
+            connection_id,
+            shared,
+            restart_events,
+            child,
+        );
+    });
+
+    let outbound: Box<dyn Outbound> = Box::new(outbound);
+    Ok((outbound, launch))
+}
+
+/// 启动一个子进程并等到 hello。失败时把已经起的进程收掉，不留孤儿。
+fn start_child(
+    config: &ProcessConfig,
+    connection: &str,
+    events: EventQueue,
+    pending: Pending,
+    alive: Arc<AtomicBool>,
+) -> Result<(Child, ChildStdin, Arc<[MethodSpec]>), String> {
     let mut command = Command::new(&config.program);
     command
         .args(&config.args)
@@ -247,18 +313,13 @@ fn spawn_process(
         .take()
         .ok_or("子进程没有 stderr（启动方式不对）")?;
 
-    let stdin = Arc::new(Mutex::new(stdin));
-    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-    let alive = Arc::new(AtomicBool::new(true));
-    let internal_stop = Arc::new(AtomicBool::new(false));
-
-    spawn_stderr(connection_id.clone(), stderr);
+    spawn_stderr(connection.to_owned(), stderr);
     let (hello_tx, hello_rx) = mpsc::channel();
     spawn_reader(
-        connection_id.clone(),
+        connection.to_owned(),
         stdout,
         events,
-        Arc::clone(&pending),
+        pending,
         Arc::clone(&alive),
         hello_tx,
     );
@@ -281,8 +342,13 @@ fn spawn_process(
             return Err("子进程没说 hello 就退出了".into());
         }
     };
+    // hello 刚说完就退出的进程不能算启动成功，否则第一次请求会写进死管道。
+    if let Ok(Some(status)) = child.try_wait() {
+        stop_child(&mut child);
+        return Err(format!("子进程说完 hello 就退出了（{status}）"));
+    }
     eprintln!(
-        "适配器 {connection_id}（process）：{} 已启动（{} 个平台方法）",
+        "适配器 {connection}（process）：{} 已启动（{} 个平台方法）",
         hello.name,
         hello.catalog.len()
     );
@@ -292,28 +358,78 @@ fn spawn_process(
         format!("适配器的平台方法目录不合法：{detail}")
     })?;
 
-    let outbound = ProcessOutbound {
-        stdin: Arc::clone(&stdin),
-        pending: Arc::clone(&pending),
-        connection: connection_id.clone(),
-        catalog,
-        alive,
-        seq: 0,
-        timeout: REPLY_TIMEOUT,
-    };
+    Ok((child, stdin, catalog))
+}
 
-    let launch: Box<dyn FnOnce(AdapterHost) + Send> = Box::new(move |host| {
-        monitor_process(
-            host.shutdown,
-            internal_stop,
-            stdin,
-            child,
-            connection_id,
+/// 守着子进程：退出就按退避重启，桥要停才收尾。
+fn supervise(
+    host_shutdown: Arc<AtomicBool>,
+    config: ProcessConfig,
+    connection: String,
+    shared: Arc<SharedProcess>,
+    events: EventQueue,
+    mut child: Child,
+) {
+    let mut delay = RESTART_DELAY;
+    loop {
+        let shutdown = wait_for_exit(&host_shutdown, &shared.stdin, &mut child, &connection);
+        shared.alive.store(false, Ordering::Relaxed);
+        *shared
+            .stdin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let waiting = std::mem::take(
+            &mut *shared
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
-    });
+        for (_, reply) in waiting {
+            let _ = reply.send(Err("适配器进程退出了".into()));
+        }
+        if shutdown {
+            return;
+        }
+        let _ = child.wait();
 
-    let outbound: Box<dyn Outbound> = Box::new(outbound);
-    Ok((outbound, launch))
+        eprintln!(
+            "适配器 {connection}（process）：子进程退出，{} 毫秒后重启",
+            delay.as_millis()
+        );
+        let wake = Instant::now() + delay;
+        while Instant::now() < wake {
+            if host_shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        match start_child(
+            &config,
+            &connection,
+            events.clone(),
+            Arc::clone(&shared.pending),
+            Arc::clone(&shared.alive),
+        ) {
+            Ok((new_child, stdin, catalog)) => {
+                *shared
+                    .stdin
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stdin);
+                *shared
+                    .catalog
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = catalog;
+                shared.alive.store(true, Ordering::Relaxed);
+                child = new_child;
+                delay = RESTART_DELAY;
+            }
+            Err(detail) => {
+                eprintln!("适配器 {connection}（process）：重启失败：{detail}");
+                delay = (delay * 2).min(MAX_RESTART_DELAY);
+            }
+        }
+    }
 }
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<WireResult, String>>>>>;
@@ -427,51 +543,49 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn monitor_process(
-    host_shutdown: Arc<AtomicBool>,
-    internal_stop: Arc<AtomicBool>,
-    stdin: Arc<Mutex<ChildStdin>>,
-    mut child: Child,
-    connection: String,
-) {
+/// 等子进程退出；桥要停时先发 shutdown，超时就 kill。返回 true 表示是桥要停。
+fn wait_for_exit(
+    host_shutdown: &AtomicBool,
+    stdin: &Mutex<Option<ChildStdin>>,
+    child: &mut Child,
+    connection: &str,
+) -> bool {
     loop {
-        if host_shutdown.load(Ordering::Relaxed) || internal_stop.load(Ordering::Relaxed) {
-            break;
+        if host_shutdown.load(Ordering::Relaxed) {
+            let _ = write_line(stdin, &CoreMessage::Shutdown);
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return true,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Ok(None) | Err(_) => {
+                        eprintln!("适配器 {connection}（process）：收尾超时，强制结束");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return true;
+                    }
+                }
+            }
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                internal_stop.store(true, Ordering::Relaxed);
-                return;
-            }
+            Ok(Some(_)) => return false,
             Ok(None) => {}
-            Err(_) => return,
+            Err(_) => return false,
         }
         thread::sleep(Duration::from_millis(100));
     }
-
-    let _ = write_line(&stdin, &CoreMessage::Shutdown);
-    let deadline = Instant::now() + SHUTDOWN_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) | Err(_) => {
-                eprintln!("适配器 {connection}（process）：收尾超时，强制结束");
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
-            }
-        }
-    }
 }
 
-fn write_line(stdin: &Mutex<ChildStdin>, message: &CoreMessage) -> Result<(), String> {
+fn write_line(stdin: &Mutex<Option<ChildStdin>>, message: &CoreMessage) -> Result<(), String> {
     let line = encode_line(message).map_err(|error| error.to_string())?;
     let mut stdin = stdin
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stdin = stdin
+        .as_mut()
+        .ok_or_else(|| "适配器进程没在跑".to_owned())?;
     stdin
         .write_all(format!("{line}\n").as_bytes())
         .and_then(|_| stdin.flush())
@@ -479,40 +593,40 @@ fn write_line(stdin: &Mutex<ChildStdin>, message: &CoreMessage) -> Result<(), St
 }
 
 struct ProcessOutbound {
-    stdin: Arc<Mutex<ChildStdin>>,
-    pending: Pending,
+    shared: Arc<SharedProcess>,
     connection: String,
-    catalog: Arc<[MethodSpec]>,
-    alive: Arc<AtomicBool>,
     seq: u64,
     timeout: Duration,
 }
 
 impl ProcessOutbound {
     fn request(&mut self, message: CoreMessage, id: u64) -> Result<WireResult, String> {
-        if !self.alive.load(Ordering::Relaxed) {
+        if !self.shared.alive.load(Ordering::Relaxed) {
             return Err("适配器进程没在跑".into());
         }
 
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.pending
+        self.shared
+            .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(id, reply_tx);
 
-        if let Err(detail) = write_line(&self.stdin, &message) {
-            self.pending
+        if let Err(detail) = write_line(&self.shared.stdin, &message) {
+            self.shared
+                .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&id);
-            self.alive.store(false, Ordering::Relaxed);
+            self.shared.alive.store(false, Ordering::Relaxed);
             return Err(detail);
         }
 
         match reply_rx.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
-                self.pending
+                self.shared
+                    .pending
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&id);
@@ -555,7 +669,13 @@ impl Outbound for ProcessOutbound {
     }
 
     fn catalog(&self, _connection: &str) -> Arc<[MethodSpec]> {
-        Arc::clone(&self.catalog)
+        Arc::clone(
+            &self
+                .shared
+                .catalog
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     fn call(

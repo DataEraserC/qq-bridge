@@ -88,6 +88,8 @@ command = ["/path/to/adapter", "--stdio"]
 
 - 子进程启动后第一行必须是 `hello`，带上自己的平台方法目录；超时（默认 10 秒）没等到就启动失败。
 - 入站事件发 `event`；`send` / `call` 按 `id` 回 `reply`，错误用 `kind` 分类（`bad_params` / `forbidden` / `unavailable` …）。
+- 子进程退出后自动重启：500ms 起按倍数退避、最多 10 秒；重启期间未完成的请求明确报「适配器进程退出了」。
+  重启成功后沿用同一个 outbound 句柄，平台方法目录按新 hello 更新。
 - 子进程崩溃后，未完成的请求明确报「通道不可用」；桥退出时发 `shutdown`，2 秒内不收尾就 kill。
 - 一个最小的参考实现见 `crates/adapters/process/src/bin/fixture.rs`。
 
@@ -106,7 +108,10 @@ kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
 （`crates/adapter-api`）。插件通过回调 `submit_event` 把入站记录交给桥。
 
 - 动态库和桥同进程：插件 panic、死循环或内存错误会带倒整座桥。需要崩溃隔离就用
-  `kind = "process"`。P3 对动态库调用不加超时（in-process 打断不了）。
+  `kind = "process"`。
+- 动态库的发送/调用带 2 秒超时：插件卡住时 core 拿回错误而不是陪它一起挂着。插件线程
+  本身无法安全打断，超时后这个 handle 视为不可用，需要重启桥。
+- 动态库没有 unload：Root 不保留 loader，适配器连接也持有库的函数指针；要换插件就重启桥。
 - 第三方插件必须声明 `metadata.summary`；wake 插件还必须声明 `effects`
   （至少 `may_wake` / `may_stay_silent`），否则启动时拒绝。
 - 同一个载体也能装决策型策略：manifest 写 `extension = "access"` / `"receive"` / `"clock"`，

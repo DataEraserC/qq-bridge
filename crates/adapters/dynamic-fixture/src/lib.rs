@@ -196,6 +196,14 @@ unsafe extern "C" fn fixture_invoke(handle: *mut c_void, request_json: *const c_
                         detail: "demo fixture 故意失败".into(),
                     },
                 },
+                // 睡过头：测试动态库调用超时。
+                "demo.slow" => {
+                    std::thread::sleep(std::time::Duration::from_millis(2500));
+                    WireResult::Call {
+                        value: json!({ "slow": true }),
+                        record: None,
+                    }
+                }
                 other => WireResult::Error {
                     error: WireError::UnknownMethod {
                         method: other.to_owned(),
@@ -280,6 +288,17 @@ fn catalog() -> Vec<WireMethodSpec> {
         WireMethodSpec {
             name: "demo.fail".into(),
             summary: "永远返回参数错误".into(),
+            tags: vec!["system".into()],
+            risk: "read".into(),
+            scope: "room".into(),
+            params: Vec::new(),
+            targets: Vec::new(),
+            effect: "read".into(),
+            record: "none".into(),
+        },
+        WireMethodSpec {
+            name: "demo.slow".into(),
+            summary: "睡 2.5 秒（测试调用超时）".into(),
             tags: vec!["system".into()],
             risk: "read".into(),
             scope: "room".into(),

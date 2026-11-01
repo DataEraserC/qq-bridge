@@ -152,6 +152,23 @@ fn dynamic_adapter_loads_and_speaks_the_wire_protocol() {
         "{unknown:?}"
     );
 
+    // 插件睡过头：调用方必须在 CALL_TIMEOUT 内拿回错误，而不是陪它一起卡住。
+    let started = std::time::Instant::now();
+    let timeout = outbound
+        .call(&room, "demo.slow", &json!({}))
+        .expect_err("应当超时");
+    assert!(
+        started.elapsed() < Duration::from_millis(2400),
+        "超时控制在 2 秒内，实际 {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(&timeout, CallError::Unavailable(detail) if detail.contains("超时")),
+        "{timeout:?}"
+    );
+    // 等插件线程自己睡醒，避免卸载库时它还在执行代码。
+    thread::sleep(Duration::from_millis(800));
+
     shutdown.store(true, Ordering::Relaxed);
     thread::sleep(Duration::from_millis(300));
 }

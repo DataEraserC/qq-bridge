@@ -121,6 +121,8 @@ fn main() -> std::io::Result<()> {
                             detail: "fixture 故意失败".into(),
                         },
                     },
+                    // 不回执直接退出：测试进程被杀后能不能自动重启。
+                    "fixture.exit" => std::process::exit(0),
                     other => WireResult::Error {
                         error: WireError::UnknownMethod {
                             method: other.to_owned(),
@@ -180,6 +182,17 @@ fn catalog() -> Vec<WireMethodSpec> {
             params: Vec::new(),
             targets: Vec::new(),
             effect: "read".into(),
+            record: "none".into(),
+        },
+        WireMethodSpec {
+            name: "fixture.exit".into(),
+            summary: "直接退出进程（测试自动重启）".into(),
+            tags: vec!["system".into()],
+            risk: "write".into(),
+            scope: "room".into(),
+            params: Vec::new(),
+            targets: Vec::new(),
+            effect: "write".into(),
             record: "none".into(),
         },
     ]

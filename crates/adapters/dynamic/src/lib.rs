@@ -20,9 +20,10 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, ENTRY_SYMBOL, EntryFn, HostV1};
 use acb_adapter_api::{
@@ -45,6 +46,10 @@ use acb_kernel::{
 use libloading::Library;
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicU64;
+
+/// 动态库的一次发送/调用最多等这么久。超时只保证 core 不被卡死；插件线程本身
+/// 无法安全打断，超时后会把该 handle 视为不可用（后续调用继续超时，重启桥即可）。
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 动态库 loader：把配置里声明的 `.so` 装进 Root。
 #[derive(Debug, Default)]
@@ -1037,7 +1042,7 @@ impl Outbound for DylibOutbound {
         }
 
         self.seq += 1;
-        let reply = invoke(
+        let reply = invoke_with_timeout(
             &self.table,
             &self.handle,
             &CoreMessage::Send {
@@ -1045,6 +1050,7 @@ impl Outbound for DylibOutbound {
                 room: room.clone(),
                 elements: elements.to_vec(),
             },
+            CALL_TIMEOUT,
         )
         .map_err(OutboundError::Unavailable)?;
 
@@ -1081,7 +1087,7 @@ impl Outbound for DylibOutbound {
         }
 
         self.seq += 1;
-        let reply = invoke(
+        let reply = invoke_with_timeout(
             &self.table,
             &self.handle,
             &CoreMessage::Call {
@@ -1090,6 +1096,7 @@ impl Outbound for DylibOutbound {
                 method: method.to_owned(),
                 params: params.clone(),
             },
+            CALL_TIMEOUT,
         )
         .map_err(CallError::Unavailable)?;
 
@@ -1144,6 +1151,30 @@ fn invoke(
         .map_err(|error| format!("回执不是合法 JSON：{error}"))
 }
 
+fn invoke_with_timeout(
+    table: &AdapterV1,
+    handle: &Arc<Mutex<AdapterHandle>>,
+    message: &CoreMessage,
+    timeout: Duration,
+) -> Result<AdapterMessage, String> {
+    let table = *table;
+    let handle = Arc::clone(handle);
+    let message = message.clone();
+    let (tx, rx) = mpsc::channel();
+    // 插件的 handle 不是线程安全的：整个 invoke 都在工作线程里，调用方只等结果。
+    thread::spawn(move || {
+        let _ = tx.send(invoke(&table, &handle, &message));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "动态适配器调用超时（{} ms）；插件可能卡住了，需要重启桥",
+            timeout.as_millis()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("动态适配器调用线程没了".into()),
+    }
+}
+
 fn take_owned_string(pointer: *mut c_char, table: &AdapterV1) -> Result<String, String> {
     if pointer.is_null() {
         return Err("适配器返回了空字符串".into());
@@ -1156,9 +1187,30 @@ fn take_owned_string(pointer: *mut c_char, table: &AdapterV1) -> Result<String, 
 }
 
 fn destroy_handle(table: &AdapterV1, handle: &Arc<Mutex<AdapterHandle>>) {
-    let mut guard = handle
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match handle.try_lock() {
+            Ok(mut guard) => {
+                destroy_locked(table, &mut guard);
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut guard = poisoned.into_inner();
+                destroy_locked(table, &mut guard);
+                return;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    eprintln!("动态适配器有调用卡住，跳过 destroy（等重启桥）");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn destroy_locked(table: &AdapterV1, guard: &mut AdapterHandle) {
     if !guard.alive {
         return;
     }

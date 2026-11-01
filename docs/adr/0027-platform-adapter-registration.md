@@ -141,6 +141,14 @@ InboundEvent:
   - `DynamicLoader` 的 loader manifest 列出这五个扩展点；第三方策略插件仍要求
     `metadata.summary`，wake 额外要求 `effects`。conformance 测试用同一个 cdylib
     按环境变量切扩展点，真加载并验证三种判定。
+- **Phase 4 P8（2026-11-01，生命周期）**：载体挂了之后 core 不陪葬。
+  - `process` 适配器子进程退出后自动重启：500ms 起翻倍退避、上限 10 秒；重启期间
+    等待中的请求明确失败，重启成功后沿用同一 outbound 句柄、目录按新 hello 更新。
+    hello 说完立刻退出的进程不算启动成功。
+  - 动态库 `send` / `call` 带 2 秒超时（工作线程里 invoke，调用方只等结果）；
+    超时后 handle 视为不可用。`destroy` 最多等 2 秒，插件卡死时跳过销毁而不是挂住桥。
+  - **动态库 unload 不做**：Root 不保留 loader，适配器连接持有库的函数指针；
+    安全卸载需要先拆连接/停进程，等有连接生命周期管理再做。
 
 ## 参考
 

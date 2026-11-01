@@ -115,6 +115,65 @@ fn process_adapter_speaks_the_wire_protocol() {
 }
 
 #[test]
+fn process_adapter_restarts_after_child_exits() {
+    let (events, receiver) = EventQueue::channel();
+    let mut plugins = PluginManager::with_native_builtins();
+    plugins
+        .register_adapter(Arc::new(ProcessAdapterFactory))
+        .expect("能注册 process 适配器");
+
+    let instance = plugins
+        .create_adapter(
+            &connection(Some(env!(
+                "CARGO_BIN_EXE_acb-adapter-process-fixture"
+            ))),
+            events.clone(),
+        )
+        .expect("能启动子进程");
+
+    let AdapterInstance {
+        mut outbound,
+        launch,
+    } = instance;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let host = AdapterHost {
+        events,
+        shutdown: Arc::clone(&shutdown),
+    };
+    thread::spawn(move || launch(host));
+
+    // 先等第一条事件，确认进程已经在跑。
+    let _ = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("应当收到子进程的入站事件");
+    let room = RoomId::new("fixture", "group/1").expect("合法");
+
+    // 让子进程自己退出；这次调用拿不到回执是预期行为。
+    let _ = outbound.call(&room, "fixture.exit", &json!({}));
+
+    // 退避重启后，原来的 outbound 句柄要能继续用（catalog 和 stdin 都换新的）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match outbound.call(&room, "fixture.echo", &json!({ "text": "after restart" })) {
+            Ok(result) => {
+                assert_eq!(result.value["text"], "after restart");
+                break;
+            }
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "子进程没有自动重启，最后一次错误：{error:?}"
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(300));
+}
+
+#[test]
 fn missing_command_is_a_startup_error() {
     let (events, _receiver) = EventQueue::channel();
     let mut plugins = PluginManager::with_native_builtins();
