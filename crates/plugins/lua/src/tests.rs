@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use acb_kernel::{
     AccessAction, AccessRequest, ClockContext, ClockPolicy, Config, DeliveryPolicy,
-    DeliveryRequest, Element, PluginManager, ProviderId, ReceiveDecision, ReceivePolicy,
+    DeliveryRequest, Element, Omitted, PluginManager, ProviderId, ReceiveDecision, ReceivePolicy,
     ReceiveRequest, Record, RecordKind, ReloadScope, RoomId, SendContext, SendOrigin, Sender, Sent,
     TurnErrorAction, TurnErrorPolicy, TurnErrorRequest, WakeContext, WakeDecision, WakePolicy,
 };
@@ -756,7 +756,14 @@ fn shipped_examples_load_and_behave() {
         .into_iter()
         .map(|info| info.id.to_string())
         .collect();
-    for expected in ["lua.quiet_hours", "lua.allow_read_only", "lua.drop_noise"] {
+    for expected in [
+        "lua.quiet_hours",
+        "lua.allow_read_only",
+        "lua.drop_noise",
+        "lua.recent_only",
+        "lua.signature",
+        "lua.timeout_log_only",
+    ] {
         assert!(
             ids.iter().any(|id| id == expected),
             "示例 provider {expected} 没注册；实际有 {ids:?}"
@@ -849,6 +856,99 @@ fn shipped_examples_load_and_behave() {
         receive.decide(&ReceivePolicy::default(), &normal),
         ReceiveDecision::Record
     );
+
+    // recent_only：只留最新 keep 条，其余标成跳过。
+    let recent_only = ProviderId::parse("lua.recent_only").expect("合法");
+    let delivery_policy = DeliveryPolicy {
+        provider: recent_only.clone(),
+        options: serde_json::json!({ "keep": 2 }),
+    };
+    let composer = plugins
+        .resolve_delivery(&recent_only, &delivery_policy)
+        .expect("能解析 recent_only");
+    let records = vec![record(1, "一"), record(2, "二"), record(3, "三")];
+    let plan = composer.compose(
+        &delivery_policy,
+        &DeliveryRequest {
+            session: "main",
+            room: &room,
+            records: &records,
+            limit: 10,
+        },
+    );
+    assert_eq!(plan.keep, vec![2, 3]);
+    assert_eq!(
+        plan.omitted,
+        Some(Omitted {
+            from: 1,
+            to: 1,
+            count: 1
+        })
+    );
+
+    // signature：普通回复追加签名，失败通知不动。
+    let signature = ProviderId::parse("lua.signature").expect("合法");
+    let hook = plugins
+        .resolve_send_hook(&signature)
+        .expect("能解析 signature");
+    let send_context = SendContext {
+        session: "main",
+        room: &room,
+        origin: SendOrigin::Message,
+    };
+    let mut signed = vec![Element::text("你好")];
+    hook.before_send(&send_context, &mut signed)
+        .expect("签名钩子不该报错");
+    assert_eq!(signed.len(), 2);
+    match &signed[1] {
+        Element::Text { text } => assert_eq!(text, "\n——来自小助手"),
+        other => panic!("最后一段应当是签名文本，收到 {other:?}"),
+    }
+    let mut failure = vec![Element::text("这轮失败了")];
+    hook.before_send(
+        &SendContext {
+            origin: SendOrigin::TurnFailure,
+            ..send_context
+        },
+        &mut failure,
+    )
+    .expect("失败通知不该被改写");
+    assert_eq!(failure.len(), 1);
+    hook.after_send(
+        &send_context,
+        &Sent {
+            platform_id: "p1".into(),
+            at: 123,
+        },
+    );
+
+    // timeout_log_only：超时只记日志，其它失败沿用会话动作。
+    let timeout_log = ProviderId::parse("lua.timeout_log_only").expect("合法");
+    let turn_error_policy = TurnErrorPolicy {
+        provider: timeout_log.clone(),
+        ..Default::default()
+    };
+    let provider = plugins
+        .resolve_turn_error(&timeout_log, &turn_error_policy)
+        .expect("能解析 timeout_log_only");
+    let configured = vec![
+        TurnErrorAction::Log,
+        TurnErrorAction::Send { room: room.clone() },
+    ];
+    let defaults = vec![TurnErrorAction::Send { room: room.clone() }];
+    let timed_out = TurnErrorRequest {
+        session: "main",
+        room: &room,
+        error: "request timeout after 300s",
+        actions: &configured,
+        default_actions: &defaults,
+    };
+    assert_eq!(provider.decide(&timed_out), vec![TurnErrorAction::Log]);
+    let failed = TurnErrorRequest {
+        error: "boom",
+        ..timed_out
+    };
+    assert_eq!(provider.decide(&failed), configured);
 }
 
 #[test]

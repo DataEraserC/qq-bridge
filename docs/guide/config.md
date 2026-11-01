@@ -88,6 +88,41 @@ provider = "acb.access.subscribed"   # 默认：只认订阅
 - 破坏性操作仍由连接的 `allow_destructive` 单独把关，访问策略不能顶替它。
 - `all_rooms` 也只能落在**配置里存在的连接**上——连接本身没配登录账号，发不出去。
 
+### 投递、发送钩子与失败通知
+
+这三类策略都可以换成插件（内置 / Lua / 动态库，ADR-0026 / ADR-0027）：
+
+```toml
+# 一轮投哪些记录：只决定编号，不碰水位和 ack
+[sessions.delivery]
+provider = "acb.delivery.default"
+# 插件专属参数；内置 composer 忽略它
+# [sessions.delivery.options]
+# keep = 20
+
+# 发送前/后钩子：before 可以改写正文，after 只观察回执
+[sessions.outbound]
+before = []
+after = []
+
+# 一轮失败后的通知动作：log / send:<房间>
+[sessions.turn_error]
+provider = "acb.turn_error.default"
+# [sessions.turn_error.options]
+# only = "log"
+```
+
+- delivery 返回的未知编号会被 core 忽略；中间跳过的段用 `omitted` 告诉模型「还有 N 条」。
+  插件报错时回退内置「最旧一小段 + 最新一批」，一轮不会空手开。
+- `before` 按列表顺序执行，任一钩子报错就让这次发送失败；`after` 不影响已经发出去的消息。
+- turn_error 的 provider 只挑动作，不直接发消息；空列表 = 什么都不做。报错时回退
+  会话 `on_turn_error` / 全局 `default_on_turn_error`。
+- `.options` 是自由表：wake / access / delivery / clock / receive 都生效；turn_error
+  的 `.options` 目前只在动态库载体传入（Lua 的 `decide(request)` 没有 options 参数）。
+
+可直接照抄的 Lua 示例：`examples/lua/recent_only.lua`（delivery）、
+`examples/lua/signature.lua`（send）、`examples/lua/timeout_log_only.lua`（turn_error）。
+
 ## 人格与记忆
 
 ```toml

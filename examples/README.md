@@ -17,6 +17,9 @@ examples/lua/
   quiet_hours.lua      wake：夜间不主动醒，@/回复仍然醒
   allow_read_only.lua  access：只放行读
   drop_noise.lua       receive：正文以 "!!" 开头的消息不记流水
+  recent_only.lua      delivery：只投最新 N 条，中间标成跳过
+  signature.lua        send：发送前给正文追加签名
+  timeout_log_only.lua turn_error：超时只记日志，其余沿用会话/全局动作
 ```
 
 让桥装上 LuaLoader（systemd 用户服务）：
@@ -54,6 +57,22 @@ provider = "lua.allow_read_only"
 # 入站策略：按连接（放在 [[connections]] 后面）
 [connections.receive]
 provider = "lua.drop_noise"
+
+# 投递批次：只投最新 20 条
+[sessions.delivery]
+provider = "lua.recent_only"
+
+[sessions.delivery.options]
+keep = 20
+
+# 发送前钩子：普通回复追加签名
+[sessions.outbound]
+before = ["lua.signature"]
+after = []
+
+# 失败通知：超时只记日志
+[sessions.turn_error]
+provider = "lua.timeout_log_only"
 ```
 
 注意：Lua 每次调用最多 50ms；脚本拿不到 Store / 流水 / 配置写入，脚本里的计数器只活在
@@ -68,6 +87,8 @@ decide = function(options, context) ... options.extra.min_count ... end
 -- receive
 decide = function(request, options) ... options.extra.blocked ... end
 ```
+
+Lua 的 `turn_error` 目前只收到 `request`；动态库载体的 `turn_error` 才支持 `.options`。
 
 ## 外置进程适配器
 
@@ -99,7 +120,8 @@ command = ["node", "examples/process/adapter.mjs"]
 动态库示例是 Rust 的 conformance fixture，直接当参考实现看：
 
 - 平台适配器：`crates/adapters/dynamic-fixture`
-- wake / access / receive / clock 策略：`crates/plugins/wake-fixture`
+- wake / access / delivery / send / turn_error / receive / clock 策略：`crates/plugins/wake-fixture`
+  （同一个 cdylib，用 `ACB_FIXTURE_EXTENSION` 切换扩展点）
 
 配置写法：
 
