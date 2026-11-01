@@ -85,14 +85,14 @@ test("tools/call 调用 onCall 并把结果包成 content", async (t) => {
   let called = null
   const { server, port } = await startServer([], async (name, args) => {
     called = { name, args }
-    return "好了"
+    return JSON.stringify({ ok: true })
   })
   t.after(() => server.stop())
 
   const res = await post(port, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "send_message", arguments: { text: "hi" } } })
   assert.equal(res.status, 200)
   assert.deepEqual(called, { name: "send_message", args: { text: "hi" } })
-  assert.equal(res.body.result.content[0].text, "好了")
+  assert.equal(res.body.result.content[0].text, JSON.stringify({ ok: true }))
   assert.equal(res.body.result.isError, false)
 })
 

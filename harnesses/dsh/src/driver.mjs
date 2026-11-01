@@ -563,7 +563,9 @@ async function callBridge(link, name, args) {
   }
   try {
     const result = await link.call(name, wire)
-    if (result === null || result === undefined) return "好了"
+    // 桥返回空 = 平台没有可返回的数据（例如撤回成功）；给一个机器可读的成功标记，
+    // 不要替平台编一句人话。
+    if (result === null || result === undefined) return JSON.stringify({ ok: true })
     return typeof result === "string" ? result : JSON.stringify(result, null, 2)
   } catch (error) {
     const code = error instanceof BridgeError ? error.code : "internal"

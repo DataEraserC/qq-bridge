@@ -332,7 +332,8 @@ async function callBridge(link, name, args) {
   }
   try {
     const result = await link.call(name, wire)
-    if (result === null || result === undefined) return "好了"
+    // 空结果只代表平台没给数据，返回机器可读的成功标记，不编人话。
+    if (result === null || result === undefined) return JSON.stringify({ ok: true })
     return typeof result === "string"
       ? result
       : JSON.stringify(result, null, 2)

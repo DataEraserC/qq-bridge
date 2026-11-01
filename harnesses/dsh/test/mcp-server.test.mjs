@@ -67,7 +67,7 @@ test("tools/call 调用 onCall 并把结果包成 content", async () => {
     tools: [],
     onCall: async (name, args) => {
       called = { name, args }
-      return "好了"
+      return JSON.stringify({ ok: true })
     },
   })
   const { input, push } = feed([])
@@ -78,7 +78,7 @@ test("tools/call 调用 onCall 并把结果包成 content", async () => {
   assert.deepEqual(called, { name: "send_message", args: { text: "hi" } })
   assert.equal(lines[0].id, 3)
   assert.equal(lines[0].result.content[0].type, "text")
-  assert.equal(lines[0].result.content[0].text, "好了")
+  assert.equal(lines[0].result.content[0].text, JSON.stringify({ ok: true }))
   assert.equal(lines[0].result.isError, false)
 })
 
