@@ -2664,7 +2664,7 @@ fn send_hooks_can_rewrite_and_observe() {
         .expect("能记下来");
     let ticket = bridge.poll_turn().expect("能开轮").expect("有活").ticket;
 
-    bridge
+    let receipt = bridge
         .tool_call(
             &ticket,
             &sessions(),
@@ -2672,6 +2672,8 @@ fn send_hooks_can_rewrite_and_observe() {
             json!({"elements": [{"type": "text", "text": "你好"}]}),
         )
         .expect("能发送");
+    // 改写必须如实上报：agent 要知道群里看到的不是自己写的原文。
+    assert_eq!(receipt["modified_by"], json!(["hook.sign"]));
 
     let sends = sends.lock().expect("没被毒死");
     let (_, elements) = &sends[0];

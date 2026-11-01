@@ -57,7 +57,8 @@ ${ELEMENTS_DOC}
 只发一段纯文本时可以只给 text。
 
 回执是真的回执：只有返回里 ok=true 才算发出去了，那时才有 platform_id 和 at。
-失败了会直接给你 error——**不要**在失败之后跟群里说「已经发了」。`,
+失败了会直接给你 error——**不要**在失败之后跟群里说「已经发了」。
+回执里 modified_by 非空 = 桥的发送前钩子改过正文（按顺序列出 provider），群里看到的不是你写的原文。`,
     schema: {
       type: "object",
       properties: { elements: ELEMENTS_SCHEMA, text: TEXT_SCHEMA },
@@ -69,7 +70,8 @@ ${ELEMENTS_DOC}
     description: `发到另一个房间。参数和 send_message 一样，只多一个 to。
 to 的写法是 连接:段/段，例如 qq:group/158296748、qq:private/323622442。
 只能发到「当前会话订阅过的房间」——订阅表在桥的配置里，改不了也不该改。
-跨会话发送已经砍掉：你不能替别的人格/会话发言。`,
+跨会话发送已经砍掉：你不能替别的人格/会话发言。
+回执里 modified_by 非空 = 发送前钩子改过正文，群里看到的不是你写的原文。`,
     schema: {
       type: "object",
       properties: {

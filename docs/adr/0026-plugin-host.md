@@ -143,6 +143,10 @@ ManagerPlugin 本身也要被某个 Loader 实例化，但**不能由它自己�
   - wake provider 新增 `decide_with_reason`：内置/trusted/动态库实现返回命中原因（@、引用、名字、关键词、攒条、拍），Lua 脚本可以返回 `{ decision = "wake", reason = "..." }` 表；原因经 `Delivery.wake_reason` 下发，协议版本升到 5，harness 把它渲染进轮次开头（如「有新消息（@ 了我）」）。
   - P5d：`PluginSource` 非 `Builtin` 的适配器和 manager provider 必须声明 `metadata.summary`；动态库 wake 插件还必须声明 `effects`，否则启动失败。描述从“建议”变成第三方插件准入门槛。
 
+- **Phase 6b（2026-11-01）**：发送改写可追溯。
+  - `before` 钩子执行前后比对元素数组；真的改了正文的钩子按执行顺序记进发送回执的 `modified_by`（provider id 列表），没改的不列。
+  - agent 由此知道「群里看到的不完全是我写的原文」；`after` 钩子只观察，不参与改写明细。
+
 ## 参考
 
 - 平台适配器注册与队列：[ADR-0027](0027-platform-adapter-registration.md)

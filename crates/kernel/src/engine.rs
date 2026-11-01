@@ -186,6 +186,9 @@ pub(crate) struct PreparedSend {
     origin: SendOrigin,
     /// 发送成功后要跑的观察钩子。
     after_hooks: Vec<Arc<dyn SendHook>>,
+    /// 改写正文的发送前钩子（provider id，按执行顺序）。回执里如实告诉 agent
+    /// 「你写的正文被谁改过」，不然它以为发出去的是原文。
+    modified_by: Vec<String>,
 }
 
 impl PreparedSend {
@@ -1771,7 +1774,9 @@ impl<S: Store> Bridge<S> {
             room: &room,
             origin,
         };
-        for hook in &before_hooks {
+        let mut modified_by = Vec::new();
+        for (id, hook) in outbound_policy.before.iter().zip(before_hooks.iter()) {
+            let before = elements.clone();
             hook.before_send(&hook_context, &mut elements)
                 .map_err(|error| {
                     ToolError::new(
@@ -1779,6 +1784,10 @@ impl<S: Store> Bridge<S> {
                         format!("发送前钩子失败：{error}"),
                     )
                 })?;
+            // 只报告真的改了正文的钩子；没改的也在回执里列出来只会变成噪音。
+            if elements != before {
+                modified_by.push(id.to_string());
+            }
         }
         if elements.is_empty() {
             return Err(ToolError::new(
@@ -1816,6 +1825,7 @@ impl<S: Store> Bridge<S> {
             session: session.to_owned(),
             origin,
             after_hooks,
+            modified_by,
         })
     }
 
@@ -1834,6 +1844,7 @@ impl<S: Store> Bridge<S> {
             session,
             origin,
             after_hooks,
+            modified_by,
             ..
         } = prepared;
 
@@ -1915,6 +1926,10 @@ impl<S: Store> Bridge<S> {
                     .map(|(from, to)| json!({"from": from, "to": to}))
                     .collect::<Vec<_>>()
             );
+        }
+        if !modified_by.is_empty() {
+            // 发送前钩子改过正文：不说，模型会以为群里看到的是自己写的原文。
+            receipt["modified_by"] = json!(modified_by);
         }
         Ok(receipt)
     }
