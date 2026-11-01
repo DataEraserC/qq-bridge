@@ -118,11 +118,18 @@ kind = "demo"          # 可选：适配器 manifest 的 kind 必须等于它
 - 动态库没有 unload：Root 不保留 loader，适配器连接也持有库的函数指针；要换插件就重启桥。
 - 第三方插件必须声明 `metadata.summary`；wake 插件还必须声明 `effects`
   （至少 `may_wake` / `may_stay_silent`），否则启动时拒绝。
-- 同一个载体也能装决策型策略：manifest 写 `extension = "access"` / `"receive"` / `"clock"`，
+- 同一个载体也能装决策型策略：manifest 写
+  `extension = "access" | "delivery" | "send" | "turn_error" | "receive" | "clock"`，
   provider id 用 `namespace.name`。插件收到 `CoreMessage::Decide`（`point` 是扩展点，
-  `request` 是 access / receive / clock 的 wire 形状），返回 `WireResult::Decision`：
-  access 用 `allow` / `deny`，receive 用 `record` / `drop`，clock 用 `due` / `skip`。
-  报错按安全侧兜底（access 拒绝、receive 接收、clock 不触发）。
+  `request` 是对应的 wire 形状）：
+  - access / receive / clock 返回 `WireResult::Decision`：access 用 `allow` / `deny`，
+    receive 用 `record` / `drop`，clock 用 `due` / `skip`。
+  - delivery 返回 `WireResult::Delivery`（`plan = null` 表示用内置选批）。
+  - send 的 `before` 返回 `WireResult::Elements` 改写正文，`after` 返回任意回执；
+    `Decision keep` / `ok` 表示不修改。
+  - turn_error 返回 `WireResult::Actions`（空数组 = 什么都不做）。
+  报错按安全侧兜底：access 拒绝、receive 接收、clock 不触发、delivery 回退内置、
+  turn_error 回退默认选择；send 的 `before` 报错则这次发送失败。
 - 一个最小的参考实现见 `crates/adapters/dynamic-fixture/src/lib.rs`；策略插件参考
   `crates/plugins/wake-fixture`。用户可读的示例总览见 [`examples/README.md`](../examples/README.md)。
 
@@ -160,7 +167,7 @@ provider = "vendor.wake"
 threshold = 5
 ```
 
-access / receive / clock / delivery 的策略配置也有同名的 `.options` 自由表；
+access / receive / clock / delivery / turn_error 的策略配置也有同名的 `.options` 自由表；
 `options_schema` 目前只是说明，core 不做强制校验。
 
 插件通过 `CoreMessage::Decide` 收到 `WireWakeRequest`（发送者、正文、@/引用/拍、

@@ -173,6 +173,9 @@ token = "换成你自己的一长串随机字符"
 # 否则回退全局 default_on_turn_error。
 # [sessions.turn_error]
 # provider = "acb.turn_error.default"
+# 插件专属参数；core 不解释，原样交给 provider。
+# [sessions.turn_error.options]
+# only = "log"
 
 # QQ 群：@ 我、引用我的话、叫我名字、攒够 5 条就醒；被拍也醒。
 [[sessions.subscriptions]]

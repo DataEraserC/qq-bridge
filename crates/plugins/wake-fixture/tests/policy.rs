@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use acb_adapter_dynamic::DynamicLoader;
 use acb_kernel::{
     AccessAction, AccessDecision, AccessPolicy, AccessRequest, ClockContext, ClockPolicy,
-    Element, PluginConfig, PluginManager, PluginSource, ProviderId, ReceiveDecision,
-    ReceivePolicy, ReceiveRequest, RecordKind, RoomId, Sender,
+    DeliveryPolicy, DeliveryRequest, Element, Omitted, PluginConfig, PluginManager, PluginSource,
+    ProviderId, ReceiveDecision, ReceivePolicy, ReceiveRequest, Record, RecordKind, RoomId,
+    SendContext, SendOrigin, Sender, Sent, TurnErrorAction, TurnErrorPolicy, TurnErrorRequest,
 };
 
 fn fixture_path() -> PathBuf {
@@ -40,6 +41,23 @@ fn load(path: &PathBuf) -> PluginManager {
         }]))
         .expect("能装载策略插件");
     plugins
+}
+
+fn record(id: u64, text: &str, room: &RoomId, sender: &Sender) -> Record {
+    Record {
+        id,
+        room: room.clone(),
+        kind: RecordKind::Message,
+        sender: sender.clone(),
+        at: id as i64,
+        elements: vec![Element::text(text)],
+        at_self: false,
+        reply_to_self: false,
+        platform_id: None,
+        quote_ref: None,
+        redelivery: None,
+        note: None,
+    }
 }
 
 #[test]
@@ -159,5 +177,107 @@ fn decision_providers_use_the_shared_wire() {
         assert!(provider.is_due(&policy, &context));
         let early = ClockContext { now: 1_000, ..context };
         assert!(!provider.is_due(&policy, &early));
+    }
+
+    // delivery：只保留最后 N 条，其余明确标成跳过。
+    unsafe { std::env::set_var("ACB_FIXTURE_EXTENSION", "delivery") };
+    {
+        let plugins = load(&path);
+        let id = ProviderId::parse("fixture.delivery").expect("id 合法");
+        let policy = DeliveryPolicy {
+            provider: id.clone(),
+            options: serde_json::json!({ "keep_last": 1 }),
+        };
+        let records = vec![
+            record(1, "第一条", &room, &sender),
+            record(2, "第二条", &room, &sender),
+            record(3, "第三条", &room, &sender),
+        ];
+        let request = DeliveryRequest {
+            session: "main",
+            room: &room,
+            records: &records,
+            limit: 10,
+        };
+        let plan = plugins
+            .resolve_delivery(&id, &policy)
+            .expect("能解析 delivery composer")
+            .compose(&policy, &request);
+        assert_eq!(plan.keep, vec![3]);
+        assert_eq!(
+            plan.omitted,
+            Some(Omitted {
+                from: 1,
+                to: 2,
+                count: 2
+            })
+        );
+    }
+
+    // turn_error：插件能按 options 选动作，配置变化能推进已缓存的实例。
+    unsafe { std::env::set_var("ACB_FIXTURE_EXTENSION", "turn_error") };
+    {
+        let plugins = load(&path);
+        let id = ProviderId::parse("fixture.turn_error").expect("id 合法");
+        let actions = vec![
+            TurnErrorAction::Log,
+            TurnErrorAction::Send { room: room.clone() },
+        ];
+        let default_actions = vec![TurnErrorAction::Send { room: room.clone() }];
+        let request = TurnErrorRequest {
+            session: "main",
+            room: &room,
+            error: "boom",
+            actions: &actions,
+            default_actions: &default_actions,
+        };
+
+        let only_log = TurnErrorPolicy {
+            provider: id.clone(),
+            options: serde_json::json!({ "only": "log" }),
+        };
+        let provider = plugins
+            .resolve_turn_error(&id, &only_log)
+            .expect("能解析 turn_error provider");
+        assert_eq!(provider.decide(&request), vec![TurnErrorAction::Log]);
+
+        let prefer_default = TurnErrorPolicy {
+            provider: id.clone(),
+            options: serde_json::json!({ "only": "default" }),
+        };
+        let provider = plugins
+            .resolve_turn_error(&id, &prefer_default)
+            .expect("同一个 provider 能复用");
+        assert_eq!(provider.decide(&request), default_actions);
+    }
+
+    // send：before 改写元素，after 只观察回执。
+    unsafe { std::env::set_var("ACB_FIXTURE_EXTENSION", "send") };
+    {
+        let plugins = load(&path);
+        let id = ProviderId::parse("fixture.send").expect("id 合法");
+        let hook = plugins
+            .resolve_send_hook(&id)
+            .expect("能解析发送钩子");
+        let context = SendContext {
+            session: "main",
+            room: &room,
+            origin: SendOrigin::Message,
+        };
+        let mut elements = vec![Element::text("正文")];
+        hook.before_send(&context, &mut elements)
+            .expect("before 钩子能改写正文");
+        assert_eq!(elements.len(), 2);
+        match &elements[1] {
+            Element::Text { text } => assert_eq!(text, " [fixture-hook]"),
+            other => panic!("应当是追加的文本段，收到 {other:?}"),
+        }
+        hook.after_send(
+            &context,
+            &Sent {
+                platform_id: "p1".into(),
+                at: 123,
+            },
+        );
     }
 }

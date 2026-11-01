@@ -28,20 +28,23 @@ use std::time::{Duration, Instant};
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, ENTRY_SYMBOL, EntryFn, HostV1};
 use acb_adapter_api::{
     AdapterMessage, CoreMessage, WireAccessRequest, WireClockRequest, WireConnection,
-    WireInstanceConfig, WireManifest, WireReceiveRequest, WireResult, WireWakeRequest, decode_line,
-    encode_line,
+    WireDeliveryRequest, WireInstanceConfig, WireManifest, WireReceiveRequest, WireResult,
+    WireSendRequest, WireTurnErrorAction, WireTurnErrorRequest, WireWakeRequest, WireError,
+    decode_line, encode_line,
 };
 use acb_kernel::wire::{call_error, convert_catalog, send_error};
 use acb_kernel::{
     AccessDecision, AccessPolicy, AccessProvider, AccessRequest, AdapterError, AdapterFactory,
     AdapterHost, AdapterInstance, AdapterManifest, CallError, CallOutcome, Capability,
-    ClockContext, ClockPolicy, ClockProvider, Connection, Element, EventQueue, ExtensionPoint,
-    Health, LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin, MethodSpec, Outbound,
-    OutboundError, OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager,
+    ClockContext, ClockPolicy, ClockProvider, Connection, DefaultTurnErrorProvider,
+    DeliveryComposer, DeliveryPlan, DeliveryPolicy, DeliveryRequest, Element, EventQueue,
+    ExtensionPoint, Health, LoaderKind, LoaderManifest, ManagerManifest, ManagerPlugin, MethodSpec,
+    Outbound, OutboundError, OutgoingRecord, PluginConfig, PluginError, PluginLoader, PluginManager,
     PluginMetadata, PluginSource, ProviderDescriptor, ProviderId, ProviderInstance,
     ProviderOptions, ReceiveDecision, ReceivePolicy, ReceiveProvider, ReceiveRequest, RoomId,
-    Sent, WakeContext, WakeDecision, WakePolicy, WakeProvider, WakeVerdict, PLUGIN_API_VERSION,
-    validate_manifest,
+    SendContext, SendHook, Sent, TurnErrorAction, TurnErrorPolicy, TurnErrorProvider,
+    TurnErrorRequest, WakeContext, WakeDecision, WakePolicy, WakeProvider, WakeVerdict,
+    PLUGIN_API_VERSION, default_delivery_plan, validate_manifest,
 };
 use libloading::Library;
 use serde_json::{Value, json};
@@ -74,6 +77,9 @@ impl PluginLoader for DynamicLoader {
                 ExtensionPoint::PlatformAdapter,
                 ExtensionPoint::Wake,
                 ExtensionPoint::Access,
+                ExtensionPoint::Delivery,
+                ExtensionPoint::Send,
+                ExtensionPoint::TurnError,
                 ExtensionPoint::Receive,
                 ExtensionPoint::Clock,
             ],
@@ -193,7 +199,7 @@ impl LoadedPlugin {
                     metadata,
                 )))
             }
-            "access" | "receive" | "clock" => {
+            "access" | "delivery" | "send" | "turn_error" | "receive" | "clock" => {
                 let provider = ProviderId::parse(&wire.id)
                     .map_err(|error| format!("{} provider id 不合法：{error}", wire.extension))?;
                 if provider.namespace() == "acb" {
@@ -218,6 +224,9 @@ impl LoadedPlugin {
                 }
                 let point = match wire.extension.as_str() {
                     "access" => ExtensionPoint::Access,
+                    "delivery" => ExtensionPoint::Delivery,
+                    "send" => ExtensionPoint::Send,
+                    "turn_error" => ExtensionPoint::TurnError,
                     "receive" => ExtensionPoint::Receive,
                     "clock" => ExtensionPoint::Clock,
                     _ => unreachable!("已经按扩展点分流"),
@@ -635,6 +644,9 @@ struct DylibDecisionManager {
 
 enum CachedDecision {
     Access(Arc<DylibAccessProvider>),
+    Delivery(Arc<DylibDeliveryComposer>),
+    Send(Arc<DylibSendHook>),
+    TurnError(Arc<DylibTurnErrorProvider>),
     Receive(Arc<DylibReceiveProvider>),
     Clock(Arc<DylibClockProvider>),
 }
@@ -643,6 +655,9 @@ impl CachedDecision {
     fn instance(&self) -> ProviderInstance {
         match self {
             Self::Access(provider) => ProviderInstance::Access(provider.clone()),
+            Self::Delivery(provider) => ProviderInstance::Delivery(provider.clone()),
+            Self::Send(provider) => ProviderInstance::Send(provider.clone()),
+            Self::TurnError(provider) => ProviderInstance::TurnError(provider.clone()),
             Self::Receive(provider) => ProviderInstance::Receive(provider.clone()),
             Self::Clock(provider) => ProviderInstance::Clock(provider.clone()),
         }
@@ -651,6 +666,9 @@ impl CachedDecision {
     fn destroy(&self) {
         match self {
             Self::Access(provider) => provider.channel.destroy(),
+            Self::Delivery(provider) => provider.channel.destroy(),
+            Self::Send(provider) => provider.channel.destroy(),
+            Self::TurnError(provider) => provider.channel.destroy(),
             Self::Receive(provider) => provider.channel.destroy(),
             Self::Clock(provider) => provider.channel.destroy(),
         }
@@ -680,6 +698,9 @@ impl DylibDecisionManager {
     fn capability(&self) -> Capability {
         match self.point {
             ExtensionPoint::Access => Capability::AccessDecision,
+            ExtensionPoint::Delivery => Capability::DeliverPlan,
+            ExtensionPoint::Send => Capability::SendHook,
+            ExtensionPoint::TurnError => Capability::TurnErrorDecision,
             ExtensionPoint::Receive => Capability::ReceiveDecision,
             ExtensionPoint::Clock => Capability::ClockDecision,
             _ => Capability::AccessDecision,
@@ -720,6 +741,13 @@ impl ManagerPlugin for DylibDecisionManager {
             (ExtensionPoint::Access, ProviderOptions::Access(policy)) => {
                 ("access", access_options(policy))
             }
+            (ExtensionPoint::Delivery, ProviderOptions::Delivery(policy)) => {
+                ("delivery", delivery_options(policy))
+            }
+            (ExtensionPoint::Send, ProviderOptions::None) => ("send", json!({})),
+            (ExtensionPoint::TurnError, ProviderOptions::TurnError(policy)) => {
+                ("turn_error", turn_error_options(policy))
+            }
             (ExtensionPoint::Receive, ProviderOptions::Receive(policy)) => {
                 ("receive", receive_options(policy))
             }
@@ -739,6 +767,16 @@ impl ManagerPlugin for DylibDecisionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(provider) = cached.as_ref() {
+            // turn_error 的 trait 不带 options，实例化时把最新配置推进已有 provider。
+            if let CachedDecision::TurnError(turn_error) = provider {
+                *turn_error
+                    .options
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = options_json
+                    .get("extra")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
             return Ok(provider.instance());
         }
 
@@ -748,7 +786,7 @@ impl ManagerPlugin for DylibDecisionManager {
                 self.table,
                 &self.plugin_id,
                 extension,
-                options_json,
+                options_json.clone(),
             )
             .map_err(|detail| PluginError::Provider {
                 id: id.to_string(),
@@ -756,9 +794,32 @@ impl ManagerPlugin for DylibDecisionManager {
             })?,
         );
         let provider = match extension {
-            "access" => CachedDecision::Access(Arc::new(DylibAccessProvider { channel })),
-            "receive" => CachedDecision::Receive(Arc::new(DylibReceiveProvider { channel })),
-            "clock" => CachedDecision::Clock(Arc::new(DylibClockProvider { channel })),
+            "access" => CachedDecision::Access(Arc::new(DylibAccessProvider {
+                channel: Arc::clone(&channel),
+            })),
+            "delivery" => CachedDecision::Delivery(Arc::new(DylibDeliveryComposer {
+                channel: Arc::clone(&channel),
+            })),
+            "send" => CachedDecision::Send(Arc::new(DylibSendHook {
+                channel: Arc::clone(&channel),
+                provider: id.to_string(),
+            })),
+            "turn_error" => CachedDecision::TurnError(Arc::new(DylibTurnErrorProvider {
+                channel: Arc::clone(&channel),
+                provider: id.to_string(),
+                options: Mutex::new(
+                    options_json
+                        .get("extra")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                ),
+            })),
+            "receive" => CachedDecision::Receive(Arc::new(DylibReceiveProvider {
+                channel: Arc::clone(&channel),
+            })),
+            "clock" => CachedDecision::Clock(Arc::new(DylibClockProvider {
+                channel: Arc::clone(&channel),
+            })),
             other => {
                 return Err(PluginError::Provider {
                     id: id.to_string(),
@@ -925,6 +986,228 @@ impl AccessProvider for DylibAccessProvider {
     }
 }
 
+struct DylibDeliveryComposer {
+    channel: Arc<DecisionChannel>,
+}
+
+impl DeliveryComposer for DylibDeliveryComposer {
+    fn compose(&self, options: &DeliveryPolicy, request: &DeliveryRequest<'_>) -> DeliveryPlan {
+        let wire = WireDeliveryRequest {
+            session: request.session.to_owned(),
+            room: request.room.to_string(),
+            limit: request.limit,
+            records: request.records.to_vec(),
+        };
+        let message = CoreMessage::Decide {
+            id: self.channel.next(),
+            point: "delivery".into(),
+            options: delivery_options(options),
+            request: serde_json::to_value(wire).unwrap_or(Value::Null),
+        };
+        match self.channel.call(&message) {
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Delivery { plan: Some(plan) },
+                ..
+            }) => DeliveryPlan {
+                keep: plan.keep,
+                omitted: plan.omitted,
+            },
+            // plan = null 与 Lua 的 nil 一样：明确要求用内置选批。
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Delivery { plan: None },
+                ..
+            }) => default_delivery_plan(request),
+            Ok(other) => {
+                self.channel
+                    .note_failure(&format!("回执不是投递计划：{other:?}"));
+                default_delivery_plan(request)
+            }
+            Err(detail) => {
+                self.channel.note_failure(&detail);
+                default_delivery_plan(request)
+            }
+        }
+    }
+}
+
+struct DylibTurnErrorProvider {
+    channel: Arc<DecisionChannel>,
+    provider: String,
+    /// 实例化时拿到的插件专属配置；TurnErrorProvider 的 trait 不带 options 参数，
+    /// 所以由 manager 在每次实例化时更新。
+    options: Mutex<Value>,
+}
+
+impl TurnErrorProvider for DylibTurnErrorProvider {
+    fn decide(&self, request: &TurnErrorRequest<'_>) -> Vec<TurnErrorAction> {
+        let wire = WireTurnErrorRequest {
+            session: request.session.to_owned(),
+            room: request.room.to_string(),
+            error: request.error.to_owned(),
+            actions: request
+                .actions
+                .iter()
+                .map(wire_turn_error_action)
+                .collect(),
+            default_actions: request
+                .default_actions
+                .iter()
+                .map(wire_turn_error_action)
+                .collect(),
+        };
+        let message = CoreMessage::Decide {
+            id: self.channel.next(),
+            point: "turn_error".into(),
+            options: json!({
+                "provider": self.provider,
+                "extra": self
+                    .options
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            }),
+            request: serde_json::to_value(wire).unwrap_or(Value::Null),
+        };
+        match self.channel.call(&message) {
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Actions { actions },
+                ..
+            }) => actions
+                .into_iter()
+                .filter_map(|action| parse_turn_error_action(&self.channel, action))
+                .collect(),
+            Ok(other) => {
+                self.channel
+                    .note_failure(&format!("回执不是失败通知动作：{other:?}"));
+                DefaultTurnErrorProvider.decide(request)
+            }
+            Err(detail) => {
+                self.channel.note_failure(&detail);
+                DefaultTurnErrorProvider.decide(request)
+            }
+        }
+    }
+}
+
+fn wire_turn_error_action(action: &TurnErrorAction) -> WireTurnErrorAction {
+    match action {
+        TurnErrorAction::Log => WireTurnErrorAction::Log,
+        TurnErrorAction::Send { room } => WireTurnErrorAction::Send {
+            room: room.to_string(),
+        },
+    }
+}
+
+fn parse_turn_error_action(
+    channel: &DecisionChannel,
+    action: WireTurnErrorAction,
+) -> Option<TurnErrorAction> {
+    match action {
+        WireTurnErrorAction::Log => Some(TurnErrorAction::Log),
+        WireTurnErrorAction::Send { room } => match RoomId::parse(&room) {
+            Ok(room) => Some(TurnErrorAction::Send { room }),
+            Err(error) => {
+                channel.note_failure(&format!("失败通知房间不合法：{room}（{error}）"));
+                None
+            }
+        },
+    }
+}
+
+struct DylibSendHook {
+    channel: Arc<DecisionChannel>,
+    provider: String,
+}
+
+impl SendHook for DylibSendHook {
+    fn before_send(
+        &self,
+        context: &SendContext<'_>,
+        elements: &mut Vec<Element>,
+    ) -> Result<(), PluginError> {
+        let wire = WireSendRequest {
+            session: context.session.to_owned(),
+            room: context.room.to_string(),
+            phase: "before".into(),
+            origin: context.origin.as_str().to_owned(),
+            elements: elements.clone(),
+            platform_id: None,
+            at: None,
+        };
+        let message = CoreMessage::Decide {
+            id: self.channel.next(),
+            point: "send".into(),
+            options: json!({}),
+            request: serde_json::to_value(wire).unwrap_or(Value::Null),
+        };
+        match self.channel.call(&message) {
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Elements { elements: replacement },
+                ..
+            }) => {
+                *elements = replacement;
+                Ok(())
+            }
+            // 插件只实现了 after 时，before 返回 keep 即可明确表示「不改」。
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Decision { decision, .. },
+                ..
+            }) if decision == "keep" || decision == "ok" => Ok(()),
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Error { error: WireError::Unsupported { .. } },
+                ..
+            }) => Ok(()),
+            Ok(AdapterMessage::Reply {
+                result: WireResult::Error { error },
+                ..
+            }) => {
+                self.channel
+                    .note_failure(&format!("发送前钩子报错：{error:?}"));
+                Err(PluginError::Provider {
+                    id: self.provider.clone(),
+                    detail: format!("发送前钩子报错：{error:?}"),
+                })
+            }
+            Ok(other) => {
+                self.channel
+                    .note_failure(&format!("发送前钩子回执不对：{other:?}"));
+                Err(PluginError::Provider {
+                    id: self.provider.clone(),
+                    detail: format!("发送前钩子回执不对：{other:?}"),
+                })
+            }
+            Err(detail) => {
+                self.channel.note_failure(&detail);
+                Err(PluginError::Provider {
+                    id: self.provider.clone(),
+                    detail,
+                })
+            }
+        }
+    }
+
+    fn after_send(&self, context: &SendContext<'_>, sent: &Sent) {
+        let wire = WireSendRequest {
+            session: context.session.to_owned(),
+            room: context.room.to_string(),
+            phase: "after".into(),
+            origin: context.origin.as_str().to_owned(),
+            elements: Vec::new(),
+            platform_id: Some(sent.platform_id.clone()),
+            at: Some(sent.at),
+        };
+        let message = CoreMessage::Decide {
+            id: self.channel.next(),
+            point: "send".into(),
+            options: json!({}),
+            request: serde_json::to_value(wire).unwrap_or(Value::Null),
+        };
+        if let Err(detail) = self.channel.call(&message) {
+            self.channel.note_failure(&detail);
+        }
+    }
+}
+
 struct DylibReceiveProvider {
     channel: Arc<DecisionChannel>,
 }
@@ -998,6 +1281,20 @@ fn access_options(policy: &AccessPolicy) -> Value {
     json!({
         "provider": policy.provider.to_string(),
         "rooms": policy.rooms.iter().map(|room| room.to_string()).collect::<Vec<_>>(),
+        "extra": policy.options,
+    })
+}
+
+fn delivery_options(policy: &DeliveryPolicy) -> Value {
+    json!({
+        "provider": policy.provider.to_string(),
+        "extra": policy.options,
+    })
+}
+
+fn turn_error_options(policy: &TurnErrorPolicy) -> Value {
+    json!({
+        "provider": policy.provider.to_string(),
         "extra": policy.options,
     })
 }

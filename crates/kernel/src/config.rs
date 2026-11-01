@@ -436,12 +436,15 @@ pub struct OutboundPolicy {
 pub struct TurnErrorPolicy {
     /// 失败通知的 provider id。不写就用内置「会话动作优先、否则全局默认」。
     pub provider: ProviderId,
+    /// 插件专属配置；内置 provider 忽略它。
+    pub options: serde_json::Value,
 }
 
 impl Default for TurnErrorPolicy {
     fn default() -> Self {
         Self {
             provider: ProviderId::builtin_turn_error(),
+            options: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 }
@@ -1604,7 +1607,10 @@ fn build_turn_error(session: &str, raw: RawTurnError) -> Result<TurnErrorPolicy,
         })?,
         None => ProviderId::builtin_turn_error(),
     };
-    Ok(TurnErrorPolicy { provider })
+    Ok(TurnErrorPolicy {
+        provider,
+        options: policy_options(raw.options, "失败通知策略")?,
+    })
 }
 
 fn build_wake(session: &str, room: &RoomId, raw: RawWake) -> Result<WakePolicy, ConfigError> {
@@ -1838,6 +1844,9 @@ struct RawOutbound {
 #[derive(Debug, Default, Deserialize)]
 struct RawTurnError {
     provider: Option<String>,
+    /// 插件专属配置；core 原样交给 provider。
+    #[serde(default)]
+    options: toml::value::Table,
 }
 
 #[derive(Debug, Default, Deserialize)]

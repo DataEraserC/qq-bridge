@@ -159,6 +159,16 @@ InboundEvent:
   - `describe_plugins` 的 `adapters` 数组因此能看到外置适配器声明的 `events` /
     `event_tags` / `supports_at` / `supports_reply`，与内置/动态库适配器一致。
     子进程重启后 outbound 句柄和目录会更新，这份能力声明保持启动时的快照。
+- **Phase 4 P10（2026-11-02，策略动态库补齐）**：delivery / send / turn_error 也能走动态库。
+  - `extension = "delivery" | "send" | "turn_error"`：都走 `CoreMessage::Decide`，
+    `point` 标明扩展点。
+  - delivery 的 `request` 带本轮候选流水，返回 `WireResult::Delivery`（`plan = null`
+    表示回退内置选批）；turn_error 返回 `WireResult::Actions`；send 用 `phase`
+    区分 `before` / `after`，`before` 返回 `WireResult::Elements` 改写正文。
+  - `TurnErrorPolicy` 增加 `.options` 自由表；因为 `TurnErrorProvider::decide` 的 trait
+    不带 options，动态库 manager 在每次实例化时把最新配置推进已缓存的 provider。
+  - 报错兜底：delivery 回退内置 composer、turn_error 回退默认选择、send 的
+    `before` 报错则这次发送失败，`after` 只记录失败数。
 
 ## 参考
 

@@ -13,7 +13,7 @@
 //! adapter ──▶ core   Hello（第一行）/ Event / Reply / Log
 //! ```
 
-use acb_proto::{Element, RecordKind, RoomId, Sender};
+use acb_proto::{Element, Omitted, Record, RecordKind, RoomId, Sender};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize as DeriveSerialize};
@@ -227,6 +227,60 @@ pub struct WireClockRequest {
     pub last_record_at: Option<i64>,
 }
 
+/// 投递批次选择的 wire 形状。`records` 是这一轮的候选流水（含 id）。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireDeliveryRequest {
+    pub session: String,
+    pub room: String,
+    pub limit: usize,
+    #[serde(default)]
+    pub records: Vec<Record>,
+}
+
+/// composer 选出的编号与跳过的中段；字段语义同 kernel 的 `DeliveryPlan`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, DeriveSerialize, Deserialize)]
+pub struct WireDeliveryPlan {
+    #[serde(default)]
+    pub keep: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted: Option<Omitted>,
+}
+
+/// 失败通知动作的 wire 形状。
+#[derive(Debug, Clone, PartialEq, Eq, DeriveSerialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireTurnErrorAction {
+    Log,
+    Send { room: String },
+}
+
+/// 失败通知 provider 的输入；动作列表原样给出，插件只负责挑。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireTurnErrorRequest {
+    pub session: String,
+    pub room: String,
+    pub error: String,
+    #[serde(default)]
+    pub actions: Vec<WireTurnErrorAction>,
+    #[serde(default)]
+    pub default_actions: Vec<WireTurnErrorAction>,
+}
+
+/// 发送钩子的 wire 形状。`phase = "before"` 带 `elements`，`"after"` 带 `sent`。
+#[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
+pub struct WireSendRequest {
+    pub session: String,
+    pub room: String,
+    pub phase: String,
+    pub origin: String,
+    #[serde(default)]
+    pub elements: Vec<Element>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
+}
+
 /// 一条入站记录。字段与 kernel 的 `RecordDraft` 对齐，由 core 负责转换。
 #[derive(Debug, Clone, PartialEq, DeriveSerialize, Deserialize)]
 pub struct WireRecord {
@@ -374,6 +428,21 @@ pub enum WireResult {
         decision: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// 投递批次：本轮的编号与跳过的中段；`plan = null` 表示用内置默认选批。
+    Delivery {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<WireDeliveryPlan>,
+    },
+    /// 失败通知动作列表。空数组表示「什么都不做」。
+    Actions {
+        #[serde(default)]
+        actions: Vec<WireTurnErrorAction>,
+    },
+    /// 发送前钩子改写后的元素；空的 `elements` 会让 core 拒绝这次发送。
+    Elements {
+        #[serde(default)]
+        elements: Vec<Element>,
     },
     Sent {
         platform_id: String,

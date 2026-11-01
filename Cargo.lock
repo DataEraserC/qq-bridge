@@ -61,6 +61,7 @@ dependencies = [
  "acb-adapter-api",
  "acb-adapter-dynamic",
  "acb-kernel",
+ "acb-proto",
  "serde_json",
 ]
 

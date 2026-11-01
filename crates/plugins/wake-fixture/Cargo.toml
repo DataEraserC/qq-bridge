@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 acb-adapter-api = { path = "../../adapter-api" }
+acb-proto = { path = "../../proto" }
 serde_json = { workspace = true }
 
 [dev-dependencies]

@@ -10,10 +10,12 @@ use std::sync::Arc;
 
 use acb_adapter_api::abi::{ABI_VERSION, AdapterV1, HostV1};
 use acb_adapter_api::{
-    AdapterMessage, CoreMessage, WireAccessRequest, WireClockRequest, WireError,
-    WireInstanceConfig, WireManifest, WirePluginMetadata, WireReceiveRequest, WireResult,
+    AdapterMessage, CoreMessage, WireAccessRequest, WireClockRequest, WireDeliveryPlan,
+    WireDeliveryRequest, WireError, WireInstanceConfig, WireManifest, WirePluginMetadata,
+    WireReceiveRequest, WireResult, WireSendRequest, WireTurnErrorAction, WireTurnErrorRequest,
     WireWakeRequest, decode_line, encode_line,
 };
+use acb_proto::{Element, Omitted};
 
 struct Fixture {
     stop: Arc<AtomicBool>,
@@ -28,6 +30,9 @@ fn fixture_extension() -> String {
 fn fixture_capability(extension: &str) -> &'static str {
     match extension {
         "access" => "access_decision",
+        "delivery" => "deliver_plan",
+        "send" => "send_hook",
+        "turn_error" => "turn_error_decision",
         "receive" => "receive_decision",
         "clock" => "clock_decision",
         _ => "wake_decision",
@@ -160,6 +165,71 @@ unsafe extern "C" fn wake_invoke(handle: *mut c_void, request_json: *const c_cha
                         reason: None,
                     }
                 }
+                "delivery" => {
+                    let request: WireDeliveryRequest = match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(_) => return std::ptr::null_mut(),
+                    };
+                    // 简单规则：保留最后 N 条（默认 5），其余算跳过。
+                    let keep_last = options
+                        .get("extra")
+                        .and_then(|extra| extra.get("keep_last"))
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(5) as usize;
+                    let keep_from = request.records.len().saturating_sub(keep_last);
+                    let keep = request.records[keep_from..]
+                        .iter()
+                        .map(|record| record.id)
+                        .collect();
+                    let omitted = if keep_from > 0 {
+                        let middle = &request.records[..keep_from];
+                        Some(Omitted {
+                            from: middle.first().expect("非空").id,
+                            to: middle.last().expect("非空").id,
+                            count: middle.len(),
+                        })
+                    } else {
+                        None
+                    };
+                    WireResult::Delivery {
+                        plan: Some(WireDeliveryPlan { keep, omitted }),
+                    }
+                }
+                "turn_error" => {
+                    let request: WireTurnErrorRequest = match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(_) => return std::ptr::null_mut(),
+                    };
+                    // `extra.only = "log" | "default" | "actions"`；不写就按会话动作优先。
+                    let chosen = match options
+                        .get("extra")
+                        .and_then(|extra| extra.get("only"))
+                        .and_then(|value| value.as_str())
+                    {
+                        Some("log") => vec![WireTurnErrorAction::Log],
+                        Some("default") => request.default_actions.clone(),
+                        _ if request.actions.is_empty() => request.default_actions.clone(),
+                        _ => request.actions.clone(),
+                    };
+                    WireResult::Actions { actions: chosen }
+                }
+                "send" => {
+                    let request: WireSendRequest = match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(_) => return std::ptr::null_mut(),
+                    };
+                    if request.phase == "before" {
+                        let mut elements = request.elements;
+                        elements.push(Element::text(" [fixture-hook]"));
+                        WireResult::Elements { elements }
+                    } else {
+                        // after 只观察，回一个明确的「收到」。
+                        WireResult::Decision {
+                            decision: "ok".into(),
+                            reason: None,
+                        }
+                    }
+                }
                 "clock" => {
                     let request: WireClockRequest = match serde_json::from_value(request) {
                         Ok(request) => request,
@@ -186,7 +256,7 @@ unsafe extern "C" fn wake_invoke(handle: *mut c_void, request_json: *const c_cha
             id,
             result: WireResult::Error {
                 error: WireError::Unsupported {
-                    detail: "这个 fixture 只实现 wake".into(),
+                    detail: "这个 fixture 没有实现平台适配器动作".into(),
                 },
             },
         },
