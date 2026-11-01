@@ -473,7 +473,7 @@ pub fn run_connection<S: Store>(
                             }
                             Ok(ToolCallStart::Platform(prepared)) => {
                                 let result = prepared.execute();
-                                let guard = lock(bridge);
+                                let mut guard = lock(bridge);
                                 let result = guard.finish_platform_call(prepared, result);
                                 vec![tool_reply(id, result)]
                             }

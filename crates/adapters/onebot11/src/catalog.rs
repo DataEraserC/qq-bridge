@@ -14,7 +14,9 @@
 
 use std::sync::OnceLock;
 
-use acb_kernel::{MethodSpec, ParamSpec, ParamType, Risk, Scope, TargetSpec, outbound::tags};
+use acb_kernel::{
+    Effect, MethodSpec, ParamSpec, ParamType, RecordMode, Risk, Scope, TargetSpec, outbound::tags,
+};
 
 // ── 参数写法 ──────────────────────────────────────────────────────────────
 //
@@ -60,6 +62,9 @@ const fn m(
         scope: Scope::Room,
         params,
         targets: &[],
+        // 下面两个字段由 `catalog()` 按方法名/风险推导；这里只是静态表的缺省值。
+        effect: Effect::Read,
+        record: RecordMode::None,
     }
 }
 
@@ -82,6 +87,9 @@ const fn cm(
         scope: Scope::Connection,
         params,
         targets: &[],
+        // 下面两个字段由 `catalog()` 按方法名/风险推导；这里只是静态表的缺省值。
+        effect: Effect::Read,
+        record: RecordMode::None,
     }
 }
 
@@ -736,6 +744,9 @@ pub static ROUTES: &[Route] = &[
 ///
 /// `METHODS` 本身保持静态；目标声明在第一次访问时合并进来。这样新增方法时
 /// 不用在两张表里各抄一遍 targets，路由表仍然是唯一真相。
+///
+/// `effect` / `record` 同理：能从风险、标签、方法名推导的就不再手写，
+/// 少一处“加方法时忘了填”的机会。
 pub fn catalog() -> &'static [MethodSpec] {
     static CATALOG: OnceLock<Vec<MethodSpec>> = OnceLock::new();
     CATALOG.get_or_init(|| {
@@ -743,10 +754,38 @@ pub fn catalog() -> &'static [MethodSpec] {
             .iter()
             .map(|method| MethodSpec {
                 targets: targets_of(method.name),
+                effect: effect_of(method),
+                record: record_of(method.name),
                 ..*method
             })
             .collect()
     })
+}
+
+/// 这个方法做什么。发送/撤回/删除按语义认，其余按风险认。
+fn effect_of(method: &MethodSpec) -> Effect {
+    if method.has_tag(tags::RECALL) || DELETE_METHODS.contains(&method.name) {
+        Effect::Delete
+    } else if method.has_tag(tags::SEND) {
+        Effect::Send
+    } else {
+        match method.risk {
+            Risk::Read => Effect::Read,
+            Risk::Write | Risk::Destructive => Effect::Write,
+        }
+    }
+}
+
+/// 名字里带 delete 但没挂 `recall` 标签的几个。
+const DELETE_METHODS: &[&str] = &["friend.delete", "group.delete_file", "group.delete_essence"];
+
+/// 调用成功后要写进流水的那几个。core 靠它判断“这次调用会不会改变房间”。
+fn record_of(method: &str) -> RecordMode {
+    match method {
+        "message.send_group" | "message.send_private" => RecordMode::Message,
+        "message.send_forward" | "group.send_notice" => RecordMode::Event,
+        _ => RecordMode::None,
+    }
 }
 
 fn targets_of(method: &str) -> &'static [TargetSpec] {

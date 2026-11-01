@@ -6,13 +6,16 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use acb_kernel::{CallError, Element, MethodSpec, Outbound, OutboundError, RoomId, Sent};
+use acb_kernel::{
+    CallError, CallOutcome, Element, MethodSpec, Outbound, OutboundError, OutgoingKind,
+    OutgoingRecord, RoomId, Sent,
+};
 use serde_json::{Value, json};
 
 use crate::catalog::{ROUTES, Route, Target, catalog};
 use crate::forward;
 use crate::link::{Action, LinkError, LinkSlot};
-use crate::segment::to_onebot;
+use crate::segment::{from_onebot, to_onebot};
 
 /// 等平台回话的上限。超了就报错，不无限挂着。
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,7 +87,12 @@ impl Outbound for OneBotOutbound {
         catalog()
     }
 
-    fn call(&mut self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
+    fn call(
+        &mut self,
+        room: &RoomId,
+        method: &str,
+        params: &Value,
+    ) -> Result<CallOutcome, CallError> {
         if room.connection != self.connection {
             return Err(CallError::Forbidden(format!(
                 "这条连接叫 {}，收到 {} 的调用",
@@ -94,7 +102,7 @@ impl Outbound for OneBotOutbound {
 
         // 合并转发要一层层取，模型不该为这件事点三次（ADR-0024）。
         if method == "message.forward_content" {
-            return self.forward_tree(params);
+            return self.forward_tree(params).map(CallOutcome::value);
         }
 
         let route = ROUTES
@@ -108,7 +116,9 @@ impl Outbound for OneBotOutbound {
         let action = action_of_route(route, room)?;
         let payload = call_payload(route, room, params)?;
         let response = self.dispatch(action, payload)?;
-        parse_call_response(method, response)
+        let value = parse_call_response(method, response)?;
+        let record = outgoing_record(method, params, &value);
+        Ok(CallOutcome { value, record })
     }
 }
 
@@ -369,6 +379,68 @@ fn private_id_of(room: &RoomId) -> Option<&str> {
     }
 }
 
+/// 发送类方法的流水记录。core 不认识 OneBot 消息段，翻译只能在这里做。
+///
+/// 只认真正改变房间状态的方法：发消息、发合并转发、发群公告。拍一拍、点赞、
+/// 加表情回应这类不改变「房间里的聊天记录」，不记账。
+fn outgoing_record(method: &str, params: &Value, value: &Value) -> Option<OutgoingRecord> {
+    let platform_id = platform_id_of(value);
+    let record = match method {
+        "message.send_group" | "message.send_private" => {
+            let message = params.get("message").cloned().unwrap_or(Value::Null);
+            // 出站不需要判「@ 了我没有」，第二个返回值不用。
+            let (elements, _) = from_onebot(&message, "");
+            OutgoingRecord {
+                kind: OutgoingKind::Message,
+                elements,
+                platform_id,
+                at: None,
+            }
+        }
+        "message.send_forward" => {
+            let count = params
+                .get("messages")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let text = if count > 0 {
+                format!("[合并转发 {count} 条]")
+            } else {
+                "[合并转发]".to_owned()
+            };
+            OutgoingRecord {
+                kind: OutgoingKind::Event("message.send_forward".into()),
+                elements: vec![Element::text(text)],
+                platform_id,
+                at: None,
+            }
+        }
+        "group.send_notice" => {
+            let content = params
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            OutgoingRecord {
+                kind: OutgoingKind::Event("group_notice".into()),
+                elements: vec![Element::text(content)],
+                platform_id,
+                at: None,
+            }
+        }
+        _ => return None,
+    };
+    Some(record)
+}
+
+/// 平台回包的 `message_id`。数字和字符串都收，空串当没有。
+fn platform_id_of(value: &Value) -> Option<String> {
+    match value.get("message_id") {
+        Some(Value::Number(number)) => Some(number.to_string()),
+        Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
 /// 平台回包 → 调用结果。
 ///
 /// 读方法的成功结果在 `data` 里。失败按 retcode 分类：让模型能分清「我参数错了」「我没权限」
@@ -434,11 +506,10 @@ fn parse_response(value: Value) -> Result<Sent, OutboundError> {
         )));
     }
 
-    let platform_id = match value.get("data").and_then(|data| data.get("message_id")) {
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::String(text)) => text.clone(),
-        _ => String::new(),
-    };
+    let platform_id = value
+        .get("data")
+        .and_then(platform_id_of)
+        .unwrap_or_default();
 
     Ok(Sent {
         platform_id,
@@ -456,7 +527,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acb_kernel::{Risk, Scope, TargetRole};
+    use acb_kernel::{Effect, OutgoingKind, RecordMode, Risk, Scope, TargetRole};
 
     #[test]
     fn group_room_maps_to_send_group_msg() {
@@ -844,5 +915,81 @@ mod tests {
         let room = RoomId::new("qq", "private/10001").expect("合法");
         let error = call_payload(route, &room, &json!({"user_id": "1"})).expect_err("补不出来");
         assert!(matches!(error, CallError::BadParams(_)));
+    }
+
+    /// 发送类方法的流水记录：内容由适配器翻译，core 不认识 OneBot 消息段。
+    #[test]
+    fn outgoing_sends_become_transcript_records() {
+        let params = json!({"group_id": "456", "message": [
+            {"type": "text", "data": {"text": "看这个"}},
+            {"type": "image", "data": {"file": "https://example.com/a.png"}},
+        ]});
+        let record = outgoing_record("message.send_group", &params, &json!({"message_id": 9001}))
+            .expect("发送要记账");
+        assert_eq!(record.kind, OutgoingKind::Message);
+        assert_eq!(record.platform_id.as_deref(), Some("9001"));
+        assert_eq!(record.elements.len(), 2);
+        assert!(matches!(record.elements[0], Element::Text { .. }));
+
+        // 读方法不记账：它们不改变房间里的聊天记录。
+        assert!(outgoing_record("message.get", &json!({"message_id": "1"}), &Value::Null).is_none());
+    }
+
+    /// 公告和合并转发在流水里是事件：内容概括成一两句话，不是原样重放。
+    #[test]
+    fn group_notice_and_forward_are_events() {
+        let notice = outgoing_record(
+            "group.send_notice",
+            &json!({"content": "明天维护"}),
+            &json!({"notice_id": 1}),
+        )
+        .expect("公告要记账");
+        assert!(
+            matches!(&notice.kind, OutgoingKind::Event(name) if name == "group_notice"),
+            "{:?}",
+            notice.kind
+        );
+        assert_eq!(notice.elements, vec![Element::text("明天维护")]);
+
+        let forward = outgoing_record(
+            "message.send_forward",
+            &json!({"messages": [{}, {}, {}]}),
+            &json!({"message_id": "f-1"}),
+        )
+        .expect("转发要记账");
+        assert!(
+            matches!(&forward.kind, OutgoingKind::Event(name) if name == "message.send_forward"),
+            "{:?}",
+            forward.kind
+        );
+        assert_eq!(forward.elements, vec![Element::text("[合并转发 3 条]")]);
+    }
+
+    /// 目录的执行契约：哪些方法会改变房间，core 靠这几个字段判断。
+    #[test]
+    fn catalog_declares_effect_and_record() {
+        let methods = catalog();
+        let method = |name: &str| {
+            methods
+                .iter()
+                .find(|method| method.name == name)
+                .unwrap_or_else(|| panic!("没有 {name}"))
+        };
+
+        let send = method("message.send_group");
+        assert_eq!(send.effect, Effect::Send);
+        assert_eq!(send.record, RecordMode::Message);
+
+        let notice = method("group.send_notice");
+        assert_eq!(notice.effect, Effect::Send, "公告也是“发出去”");
+        assert_eq!(notice.record, RecordMode::Event);
+
+        let kick = method("group.kick");
+        assert_eq!(kick.effect, Effect::Write);
+        assert_eq!(kick.record, RecordMode::None, "踢人不写聊天流水");
+
+        let recall = method("message.recall");
+        assert_eq!(recall.effect, Effect::Delete);
+        assert_eq!(recall.record, RecordMode::None);
     }
 }

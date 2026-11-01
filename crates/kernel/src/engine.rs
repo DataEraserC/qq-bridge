@@ -31,8 +31,8 @@ use crate::memory::{
     git_status, list_dir, read_file, search, write_file,
 };
 use crate::outbound::{
-    CallError, MethodSpec, Outbound, OutboundError, OutboundHandle, Outbounds, Risk, Scope, Sent,
-    TargetRole, expand_query,
+    CallError, CallOutcome, MethodSpec, Outbound, OutboundError, OutboundHandle, Outbounds,
+    OutgoingKind, OutgoingRecord, RecordMode, Risk, Scope, Sent, TargetRole, expand_query,
 };
 use crate::plugin::{PluginError, PluginManager, WakeContext};
 use crate::render;
@@ -151,13 +151,14 @@ pub(crate) struct PreparedPlatformCall {
     spec: MethodSpec,
     params: Value,
     args: PlatformCallArgs,
+    /// 开轮时冻结的配置快照。结算写流水时要用它查账号、找订阅者。
+    config: Arc<Config>,
     outbound: OutboundHandle,
 }
 
 impl PreparedPlatformCall {
-    pub(crate) fn execute(&self) -> Result<Value, CallError> {
-        self.outbound
-            .call(&self.room, self.spec.name, &self.params)
+    pub(crate) fn execute(&self) -> Result<CallOutcome, CallError> {
+        self.outbound.call(&self.room, self.spec.name, &self.params)
     }
 }
 
@@ -845,6 +846,7 @@ impl<S: Store> Bridge<S> {
         let ctx = self.turn_ctx(ticket, "platform_call")?;
         let sessions = std::slice::from_ref(&ctx.session);
         let room = self.resolve(&args.room, &ctx.room)?;
+        let config = ctx.config.clone();
 
         let methods = self.outbound.catalog(&room.connection);
         if methods.is_empty() {
@@ -869,6 +871,15 @@ impl<S: Store> Bridge<S> {
             Scope::Connection => {
                 Self::ensure_connection_readable(&ctx.config, sessions, &room.connection)?
             }
+        }
+
+        // 要写流水的方法必须先知道“我是谁”。放在平台调用之前查：平台已经发出去了
+        // 再发现记不了账，那条消息就会在自己的水位上留洞。
+        if spec.record != RecordMode::None && config.account_of_room(&room).is_empty() {
+            return Err(ToolError::new(
+                ErrorCode::Internal,
+                format!("{room} 所属的连接没有配登录账号，不知道自己是谁"),
+            ));
         }
 
         if spec.risk == Risk::Destructive
@@ -903,31 +914,49 @@ impl<S: Store> Bridge<S> {
             spec: *spec,
             params,
             args,
+            config,
             outbound,
         })
     }
 
-    /// 平台结果回来之后：错误映射、查询/分页、最后 fit。这里只拿 `&self`，
-    /// 因为执行期间可能发生了配置热重载，但这一轮的结算不该再读 `self.config` 之外的
-    /// 可变状态——平台调用本身没有改流水/acK 的需求。
+    /// 平台结果回来之后：发送类调用先记账，再做查询/分页，最后 fit。
+    ///
+    /// 记账必须做：模型用 `platform_call` 发的消息也是「自己说的话」。不写流水、
+    /// 不确认，它就会在自己的水位上留一个洞，洞后面的新消息永远推不过去
+    /// （同 `finish_send` 里 2026-10-31 那条教训）。记录内容由适配器翻译
+    /// （`OutgoingRecord`），core 不认识平台消息段。
     pub(crate) fn finish_platform_call(
-        &self,
+        &mut self,
         prepared: PreparedPlatformCall,
-        result: Result<Value, CallError>,
+        result: Result<CallOutcome, CallError>,
     ) -> Result<Value, ToolError> {
-        let result = result.map_err(call_error)?;
-        let grouped = prepared.args.query.group_by.is_some();
-        let result = crate::query::apply_to_value(result, &prepared.args.query)
+        let PreparedPlatformCall {
+            room,
+            spec,
+            args,
+            config,
+            ..
+        } = prepared;
+        let CallOutcome { value, record } = result.map_err(call_error)?;
+
+        if spec.record != RecordMode::None {
+            if let Some(record) = record {
+                self.record_outgoing(&config, &room, record)
+                    .map_err(internal)?;
+            }
+        }
+
+        let grouped = args.query.group_by.is_some();
+        let result = crate::query::apply_to_value(value, &args.query)
             .map_err(|error| ToolError::new(ErrorCode::BadRequest, error.to_string()))?;
         let result = if grouped {
             result
         } else {
-            let limit = prepared
-                .args
+            let limit = args
                 .limit
                 .unwrap_or(DEFAULT_PAGE_LIMIT)
                 .clamp(1, MAX_PAGE_LIMIT);
-            let offset = prepared.args.offset.unwrap_or(0);
+            let offset = args.offset.unwrap_or(0);
             render::slice(result, offset, limit)
         };
         Ok(render::fit("platform_call", result, &self.spill_dir()))
@@ -1437,9 +1466,9 @@ impl<S: Store> Bridge<S> {
         };
 
         let account = config.account_of_room(&room);
-        let record = self
-            .store
-            .append(
+        let (record, watermark) = self
+            .record_and_ack(
+                &config,
                 RecordDraft::message(
                     room.clone(),
                     Sender {
@@ -1455,18 +1484,6 @@ impl<S: Store> Bridge<S> {
                 .with_platform_id(sent.platform_id.clone()),
             )
             .map_err(internal)?;
-
-        // 自己说的话不是未读：写进流水的同时确认掉。
-        //
-        // 必须给**所有订阅这个房间的会话**都确认，不能只确认发消息的这个会话。
-        // 血的教训（2026-10-31 真机）：一个群被两个会话订阅时（dsh 和 dsh-group2），
-        // A 会话发的消息只在 A 的水位上确认掉，B 的水位上永远留一个洞——而水位
-        // 只推连续前沿，洞后面的消息就永远算未读，表现为「同一批积压反复重投」。
-        let mut watermark = 0;
-        for subscriber in Self::subscribers_of(&config, &room) {
-            let cursor = Cursor::new(subscriber.session, room.clone());
-            watermark = self.store.ack(&cursor, &[record.id]).map_err(internal)?;
-        }
 
         // 回执要「像回执」：ok 摆在第一位，发出去了才给 platform_id / at。
         // 失败时这个函数直接返回 Err（调用方拿到的是 error），绝不会出现
@@ -1498,6 +1515,58 @@ impl<S: Store> Bridge<S> {
             );
         }
         Ok(receipt)
+    }
+
+    /// 适配器翻译好的出站记录 → 流水。
+    ///
+    /// 只由 `finish_platform_call` 调用：发送类平台方法（`MethodSpec::record` 非空）
+    /// 成功后由适配器带回实际发出去的内容。平台编号、时间缺省时用本地时间。
+    fn record_outgoing(
+        &mut self,
+        config: &Config,
+        room: &RoomId,
+        record: OutgoingRecord,
+    ) -> Result<(Record, u64), BridgeError> {
+        let account = config.account_of_room(room);
+        let sender = Sender {
+            id: account.clone(),
+            name: account,
+            role: None,
+        };
+        let at = record.at.unwrap_or_else(now_millis);
+        let mut draft = match record.kind {
+            OutgoingKind::Message => {
+                RecordDraft::message(room.clone(), sender, at, record.elements, false)
+            }
+            OutgoingKind::Event(event) => {
+                RecordDraft::event(room.clone(), sender, at, event, record.elements, false)
+            }
+        };
+        if let Some(platform_id) = record.platform_id {
+            draft = draft.with_platform_id(platform_id);
+        }
+        self.record_and_ack(config, draft)
+    }
+
+    /// 写一条「自己发出去的」记录，并对**所有订阅者**确认。
+    ///
+    /// 必须给所有订阅者确认，不能只确认发消息的这个会话。血的教训（2026-10-31 真机）：
+    /// 一个群被两个会话订阅时（dsh 和 dsh-group2），A 会话发的消息只在 A 的水位上确认，
+    /// B 的水位上永远留一个洞——而水位只推连续前沿，洞后面的消息就永远算未读，
+    /// 表现为「同一批积压反复重投」。
+    fn record_and_ack(
+        &mut self,
+        config: &Config,
+        draft: RecordDraft,
+    ) -> Result<(Record, u64), BridgeError> {
+        let room = draft.room.clone();
+        let record = self.store.append(draft)?;
+        let mut watermark = 0;
+        for subscriber in Self::subscribers_of(config, &room) {
+            let cursor = Cursor::new(subscriber.session, room.clone());
+            watermark = self.store.ack(&cursor, &[record.id])?;
+        }
+        Ok((record, watermark))
     }
 
     /// 两段式发送结算后，endpoint 用同一个口做分页/落盘。
@@ -2715,6 +2784,7 @@ fn describe_method(spec: &MethodSpec) -> Value {
         "summary": spec.summary,
         "tags": spec.tags,
         "risk": spec.risk.as_str(),
+        "effect": spec.effect.as_str(),
         "scope": spec.scope.as_str(),
         "params": spec.params_schema(),
         "example": spec.example_call(),

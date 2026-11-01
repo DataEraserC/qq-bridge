@@ -33,8 +33,9 @@ pub use endpoint::{Conn, ControlRegistry, EndpointError, handshake, run_connecti
 pub use relay::{FileRelay, RelayError};
 pub use engine::{Bridge, BridgeError, Ingest, MAX_DELIVERY, Pruned};
 pub use outbound::{
-    CallError, MethodSpec, Outbound, OutboundError, Outbounds, ParamSpec, ParamType, Risk, Scope, Sent,
-    TargetRole, TargetSpec,
+    CallError, CallOutcome, Effect, MethodSpec, Outbound, OutboundError, OutgoingKind,
+    OutgoingRecord, Outbounds, ParamSpec, ParamType, RecordMode, Risk, Scope, Sent, TargetRole,
+    TargetSpec,
 };
 pub use plugin::{
     Capability, DefaultWakeProvider, ExtensionPoint, ManagerPlugin, NativeLoader, PluginError,

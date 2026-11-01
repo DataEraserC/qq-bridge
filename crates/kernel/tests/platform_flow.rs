@@ -6,9 +6,10 @@
 use std::sync::{Arc, Mutex};
 
 use acb_kernel::{
-    Bridge, CallError, Element, ErrorCode, Ingest, MemoryStore, MethodSpec, Outbound,
-    OutboundError, ParamSpec, ParamType, RecordDraft, Risk, RoomId, Scope, Sender, Sent,
-    TargetSpec, Ticket, outbound::tags,
+    Bridge, CallError, CallOutcome, Cursor, Effect, Element, ErrorCode, Ingest, MemoryStore,
+    MethodSpec, Outbound, OutboundError, OutgoingKind, OutgoingRecord, ParamSpec, ParamType,
+    RecordDraft, RecordMode, Risk, RoomId, Scope, Sender, Sent, TargetSpec, Ticket,
+    Transcript, Watermarks, outbound::tags, unread,
 };
 use serde_json::{Value, json};
 
@@ -43,6 +44,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: FORWARD_PARAMS,
         targets: &[],
+        effect: Effect::Read,
+        record: RecordMode::None,
     },
     MethodSpec {
         name: "group.get_member_info",
@@ -52,6 +55,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: MEMBER_PARAMS,
         targets: GROUP_TARGETS,
+        effect: Effect::Read,
+        record: RecordMode::None,
     },
     MethodSpec {
         name: "message.send_image",
@@ -61,6 +66,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: IMAGE_PARAMS,
         targets: &[],
+        effect: Effect::Send,
+        record: RecordMode::Message,
     },
     MethodSpec {
         name: "group.get_file_url",
@@ -70,6 +77,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: FILE_PARAMS,
         targets: GROUP_TARGETS,
+        effect: Effect::Read,
+        record: RecordMode::None,
     },
     MethodSpec {
         name: "group.kick",
@@ -79,6 +88,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: KICK_PARAMS,
         targets: GROUP_TARGETS,
+        effect: Effect::Write,
+        record: RecordMode::None,
     },
     MethodSpec {
         name: "group.ban",
@@ -88,6 +99,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: KICK_PARAMS,
         targets: GROUP_TARGETS,
+        effect: Effect::Write,
+        record: RecordMode::None,
     },
     MethodSpec {
         name: "group.get_member_list",
@@ -97,6 +110,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Room,
         params: &[],
         targets: GROUP_TARGETS,
+        effect: Effect::Read,
+        record: RecordMode::None,
     },
     // 跟房间无关的那一类：查的是这个号本身有什么，不是房间里发生了什么。
     MethodSpec {
@@ -107,6 +122,8 @@ static METHODS: &[MethodSpec] = &[
         scope: Scope::Connection,
         params: &[],
         targets: &[],
+        effect: Effect::Read,
+        record: RecordMode::None,
     },
 ];
 
@@ -129,19 +146,41 @@ impl Outbound for Platformy {
         if connection == "qq" { METHODS } else { &[] }
     }
 
-    fn call(&mut self, _room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
+    fn call(
+        &mut self,
+        _room: &RoomId,
+        method: &str,
+        params: &Value,
+    ) -> Result<CallOutcome, CallError> {
         self.calls.lock().expect("没被毒死").push((
             method.to_owned(),
             params.clone(),
         ));
         match method {
-            "forward.get_content" => Ok(json!({
+            "forward.get_content" => Ok(CallOutcome::value(json!({
                 "messages": [{"sender": "老王", "text": "转发的正文"}]
-            })),
-            "message.send_image" => Ok(json!({"done": true})),
-            "group.get_member_info" => Ok(json!({"nickname": "老王", "role": "member"})),
-            "group.kick" | "group.ban" => Ok(json!({"done": true})),
-            "friend.list" => Ok(json!({"friends": [{"user_id": "10001", "nickname": "老王"}]})),
+            }))),
+            // 发送类方法要把“实际发出去的内容”翻译成流水记录带回来。
+            "message.send_image" => Ok(CallOutcome {
+                value: json!({"message_id": 9002}),
+                record: Some(OutgoingRecord {
+                    kind: OutgoingKind::Message,
+                    elements: vec![Element::Image {
+                        url: params["file"].as_str().unwrap_or_default().to_owned(),
+                        alt: None,
+                    }],
+                    platform_id: Some("9002".into()),
+                    at: Some(AT),
+                }),
+            }),
+            "group.get_member_info" => Ok(CallOutcome::value(json!({
+                "nickname": "老王",
+                "role": "member"
+            }))),
+            "group.kick" | "group.ban" => Ok(CallOutcome::value(json!({"done": true}))),
+            "friend.list" => Ok(CallOutcome::value(json!({
+                "friends": [{"user_id": "10001", "nickname": "老王"}]
+            }))),
             // 213 人的群：7 个管理员、206 个普通成员。用来验分页和分组计数。
             "group.get_member_list" => {
                 let members: Vec<Value> = (1..=213)
@@ -153,7 +192,7 @@ impl Outbound for Platformy {
                         })
                     })
                     .collect();
-                Ok(json!({"retcode": 0, "data": members}))
+                Ok(CallOutcome::value(json!({"retcode": 0, "data": members})))
             }
             other => Err(CallError::NotImplemented(other.to_owned())),
         }
@@ -473,6 +512,50 @@ fn call_returns_the_platform_result() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "forward.get_content");
     assert_eq!(calls[0].1["id"], "x7/O5");
+}
+
+/// 发送类 `platform_call` 也要进流水：这是模型自己说的话，不记就会在
+/// 自己的水位上留洞，洞后面的新消息永远推不过去。
+#[test]
+fn platform_call_send_is_recorded_and_acked() {
+    let (mut bridge, _calls) = setup();
+    let ticket = open_turn(&mut bridge);
+
+    bridge
+        .tool_call(
+            &ticket,
+            &sessions(),
+            "platform_call",
+            json!({
+                "method": "message.send_image",
+                "params": {"file": "https://example.com/a.png"},
+            }),
+        )
+        .expect("能发");
+
+    let room = RoomId::parse("qq:group/123").expect("房间合法");
+    let stored = bridge.store().since(&room, 1, 10).expect("能读");
+    assert_eq!(stored.len(), 1, "平台调用发的消息要写进流水");
+    assert_eq!(stored[0].sender.id, "bot", "发送者是自己这个号");
+    assert_eq!(stored[0].platform_id.as_deref(), Some("9002"));
+
+    // 先确认轮次里收到的那条，水位才推得动；自己发的那条已经确认过，不能留下洞。
+    let acked = bridge
+        .tool_call(&ticket, &sessions(), "ack_messages", json!({"ids": [1]}))
+        .expect("能确认");
+    assert_eq!(acked["watermark"], 2);
+    assert_eq!(
+        bridge
+            .store()
+            .watermark(&Cursor::new("main", room.clone()))
+            .expect("可读"),
+        2
+    );
+    assert!(
+        unread(bridge.store(), &Cursor::new("main", room), 100)
+            .expect("可读")
+            .is_empty()
+    );
 }
 
 /// 方法名写错：给出同组的近似名，让模型一轮就改对，而不是反复猜。

@@ -48,7 +48,7 @@ AdapterHost:
 - 事件队列有界；满了要背压或断开，不能无声丢。
 - 动作回执用 correlation id + 结果队列；core 不在锁里等平台回话。
 - `MethodSpec` 必须 owned（`Arc<[MethodSpec]>` / `Cow<'static, str>`），动态适配器才能构造目录。
-- `MethodSpec` 必须带执行契约：`target_params`（哪些参数是房间目标、能否覆盖）、`effect`（read/write/send/delete）、`record`（成功后是否写流水/推水位）。core 在不知道方法名的前提下靠这些字段守住边界。
+- `MethodSpec` 必须带执行契约：`targets`（哪些参数是房间目标、哪些是成员目标）、`effect`（read/write/send/delete）、`record`（成功后是否写流水/推水位）。core 在不知道方法名的前提下靠这些字段守住边界。
 
 ### InboundEvent / WakeHints
 
@@ -89,7 +89,9 @@ InboundEvent:
 - **Phase 2b 已落地（target 部分）**：`MethodSpec` 增加 `targets: &[TargetSpec]`；`TargetSpec` 区分 `Room` / `Member`，并声明房间路径类型。kernel 的 `platform_call` 在 `check_params` 之后调用 `check_target_params`，即使适配器自己没检查，core 也会拒绝在 `params` 里换房间目标。OneBot 的 targets 由 `ROUTES` 推导，避免方法表和路由表各抄一份。
 - **Phase 2c-1 已落地**：`AdapterManifest` + `AdapterFactory` + `AdapterRegistry`；`main.rs` 不再知道 `OneBotOutbound` / `LinkSlot` / `supervise` 怎么拼，只注册 `OneBotAdapterFactory`，按连接 `kind` 取 `AdapterInstance`。连接线程仍由适配器自己的 `launch` 启动，core 不持有 socket。
 - **Phase 2c-2 已落地**：`Outbounds` 提供可克隆的 `OutboundHandle`；endpoint 把 `send_message` / `send_message_to` / `platform_call` 拆成“锁内 prepare / 锁外 execute / 锁内 finish”。入站事件走 `EventQueue`，适配器只提交 `RecordDraft`，core 的 `drain_events` 线程统一 `ingest`；适配器侧不再 `try_lock`。
-- **尚未做**：`effect`/`record` 元数据与 `platform_call` 发送记账。这是 Phase 2c 的下一刀。
+- **Phase 2c-3 已落地**：`MethodSpec` 增加 `effect`（read/write/send/delete）与 `record`（none/message/event）；OneBot 的 effect/record 由风险、标签和方法名推导，不维护第二份手写表。
+- **`Outbound::call` 返回 `CallOutcome`**：适配器把发送类方法（发消息、合并转发、群公告）**实际发出去的内容**翻译成 `OutgoingRecord`，core 不认识平台消息段。`finish_platform_call` 成功后写流水并对**所有订阅者** ack，修掉「用 `platform_call` 发的消息在自己水位上留洞、导致积压反复重投」的问题。
+- **尚未做**：动态适配器（外置进程 / 动态加载）；AccessPolicy provider（Phase 2d，`acb.access.*`）。
 
 ## 参考
 

@@ -12,6 +12,76 @@ use acb_proto::{Element, RoomId};
 use serde_json::Value;
 use thiserror::Error;
 
+/// 一次平台方法调用可能顺带产生的流水记录（由适配器翻译，core 负责落库）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutgoingRecord {
+    pub kind: OutgoingKind,
+    pub elements: Vec<Element>,
+    pub platform_id: Option<String>,
+    /// 平台侧时间（Unix 毫秒）；适配器不知道就留 None，由 core 用本地时间。
+    pub at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutgoingKind {
+    Message,
+    Event(String),
+}
+
+/// 平台调用结果：原始返回值 + 可选的「这次调用本身也写了一条流水」。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallOutcome {
+    pub value: Value,
+    pub record: Option<OutgoingRecord>,
+}
+
+impl CallOutcome {
+    pub fn value(value: Value) -> Self {
+        Self {
+            value,
+            record: None,
+        }
+    }
+}
+
+/// 方法的效果，给模型/控制台看，也方便以后审计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    Read,
+    Write,
+    Send,
+    Delete,
+}
+
+impl Effect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effect::Read => "read",
+            Effect::Write => "write",
+            Effect::Send => "send",
+            Effect::Delete => "delete",
+        }
+    }
+}
+
+/// 这个方法调用成功后，core 要不要写一条流水。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordMode {
+    None,
+    Message,
+    Event,
+}
+
+impl RecordMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecordMode::None => "none",
+            RecordMode::Message => "message",
+            RecordMode::Event => "event",
+        }
+    }
+}
+
 /// 一条已经发出去的消息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sent {
@@ -362,6 +432,10 @@ pub struct MethodSpec {
     pub params: &'static [ParamSpec],
     /// 哪些参数是房间目标、哪些是成员目标。空 = 这个方法没有房间目标参数。
     pub targets: &'static [TargetSpec],
+    /// 这个方法做什么（读/写/发送/删除）。
+    pub effect: Effect,
+    /// 调用成功后要不要写流水，以及写消息还是事件。
+    pub record: RecordMode,
 }
 
 impl MethodSpec {
@@ -504,11 +578,19 @@ pub trait Outbound: Send {
         &[]
     }
 
-    /// 调一个平台方法，返回平台原始结果。
+    /// 调一个平台方法，返回平台原始结果，以及这次调用顺带产生的流水记录。
     ///
     /// 白名单、风险、参数形状的校验都由 kernel 先做完，走到这里的方法一定是声明过的、
     /// 参数形状也对得上的。适配器只管「把方法映射成平台动作、把结果原样带回来」。
-    fn call(&mut self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
+    ///
+    /// 发送类方法（`MethodSpec::record` 非 `None`）要把**实际发出去的内容**翻译成
+    /// `OutgoingRecord` 一起带回来：core 不认识平台的消息段，只有适配器知道发的是什么。
+    fn call(
+        &mut self,
+        room: &RoomId,
+        method: &str,
+        params: &Value,
+    ) -> Result<CallOutcome, CallError> {
         let _ = (room, params);
         Err(CallError::UnsupportedPlatform(format!(
             "这条连接（{}）没有声明平台方法，调不了 {method}",
@@ -585,7 +667,12 @@ impl Outbound for Outbounds {
         }
     }
 
-    fn call(&mut self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
+    fn call(
+        &mut self,
+        room: &RoomId,
+        method: &str,
+        params: &Value,
+    ) -> Result<CallOutcome, CallError> {
         match self.handle_for(&room.connection) {
             Some(outbound) => outbound.call(room, method, params),
             None => Err(CallError::Unavailable(format!(
@@ -618,7 +705,12 @@ impl OutboundHandle {
             .catalog(connection)
     }
 
-    pub fn call(&self, room: &RoomId, method: &str, params: &Value) -> Result<Value, CallError> {
+    pub fn call(
+        &self,
+        room: &RoomId,
+        method: &str,
+        params: &Value,
+    ) -> Result<CallOutcome, CallError> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -740,6 +832,8 @@ mod tests {
         scope: Scope::Room,
         params: FORWARD_PARAMS,
         targets: &[],
+        effect: Effect::Read,
+        record: RecordMode::None,
     }];
 
     impl Outbound for Platformy {
@@ -759,8 +853,10 @@ mod tests {
             _room: &RoomId,
             method: &str,
             params: &Value,
-        ) -> Result<Value, CallError> {
-            Ok(serde_json::json!({ "called": method, "params": params }))
+        ) -> Result<CallOutcome, CallError> {
+            Ok(CallOutcome::value(
+                serde_json::json!({ "called": method, "params": params }),
+            ))
         }
     }
 
@@ -780,8 +876,8 @@ mod tests {
         let result = outbounds
             .call(&room, "forward.get_content", &serde_json::json!({"id": "x7"}))
             .expect("声明过就能调");
-        assert_eq!(result["called"], "forward.get_content");
-        assert_eq!(result["params"]["id"], "x7");
+        assert_eq!(result.value["called"], "forward.get_content");
+        assert_eq!(result.value["params"]["id"], "x7");
 
         // 另一条连接没声明，落到默认实现：报平台不支持，而不是静默成功。
         let other = RoomId::new("qq2", "group/1").expect("合法");
@@ -802,6 +898,8 @@ mod tests {
             scope: Scope::Room,
             params: &[],
             targets: &[],
+            effect: Effect::Read,
+            record: RecordMode::None,
         };
         assert_eq!(spec.group(), "group");
     }
@@ -818,6 +916,8 @@ mod tests {
                 scope: Scope::Room,
                 params: &[],
                 targets: &[],
+                effect: Effect::Send,
+                record: RecordMode::Message,
             },
             MethodSpec {
                 name: "group.get_member_info",
@@ -827,6 +927,8 @@ mod tests {
                 scope: Scope::Room,
                 params: &[],
                 targets: &[],
+                effect: Effect::Read,
+                record: RecordMode::None,
             },
         ];
 
