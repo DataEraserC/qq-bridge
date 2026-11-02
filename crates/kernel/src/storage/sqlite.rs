@@ -33,7 +33,9 @@ use super::{
 /// 6 → 7：加 `feedback` 表——agent 的反馈通道（ADR-0021）。新表由建表语句建，不用搬数据。
 /// 7 → 8：事件记录加 `event_meta` JSON（tags / payload / summary），老记录回填空值。
 /// 8 → 9：`records` 加 `labels` JSON；适配器可以给记录追加通用标签（如 recall）。
-pub const SCHEMA_VERSION: i64 = 9;
+/// 9 → 10：`records` 加 `suppressed`；被抑制的记录只进流水，不投递/不唤醒/不计未读，
+///         语义落在记录上，之后新加的订阅者也不会看到它。
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// 建表语句。`IF NOT EXISTS`：新库建、老库不动。
 const SCHEMA: &str = r#"
@@ -59,6 +61,7 @@ CREATE TABLE IF NOT EXISTS records (
     elements    TEXT    NOT NULL,   -- 内容元素的 JSON 数组
     event_meta  TEXT,               -- 仅 kind = event：{tags, payload, summary} JSON
     labels      TEXT,               -- 记录级通用标签 JSON 数组（如 ["recall"]）
+    suppressed  INTEGER NOT NULL DEFAULT 0, -- 0 / 1：只进流水，不投递/不唤醒/不计未读
     PRIMARY KEY (connection, room_key, record_id)
 );
 
@@ -292,6 +295,11 @@ impl SqliteStore {
         // 兼容这一版早期试验库：结构版本已是 9，但只有 recalled 没有 labels。
         self.add_column_if_missing("records", "labels", "TEXT")?;
 
+        // 9 → 10：被抑制的记录。
+        if version < 10 {
+            self.add_column_if_missing("records", "suppressed", "INTEGER NOT NULL DEFAULT 0")?;
+        }
+
         self.conn
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -435,8 +443,9 @@ impl Transcript for SqliteStore {
             .execute(
                 "INSERT INTO records
                  (connection, room_key, room_json, record_id, kind, event, sender_id, sender_name,
-                  sender_role, at, at_self, reply_to_self, platform_id, elements, event_meta, labels)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL)",
+                  sender_role, at, at_self, reply_to_self, platform_id, elements, event_meta, labels,
+                  suppressed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?16)",
                 params![
                     draft.room.connection,
                     draft.room.key(),
@@ -453,6 +462,7 @@ impl Transcript for SqliteStore {
                     draft.platform_id,
                     elements,
                     event_meta,
+                    if draft.suppressed { 1 } else { 0 },
                 ],
             )
             .map_err(io_error)?;
@@ -470,6 +480,7 @@ impl Transcript for SqliteStore {
             platform_id: draft.platform_id,
             quote_ref: None,
             labels: Vec::new(),
+            suppressed: draft.suppressed,
             // 流水里只有原话；重投的旁白由投递时补（见 engine::open_turn）。
             redelivery: None,
             note: None,
@@ -481,7 +492,7 @@ impl Transcript for SqliteStore {
             .conn
             .prepare(
                 "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
-                        reply_to_self, platform_id, elements, event_meta, labels
+                        reply_to_self, platform_id, elements, event_meta, labels, suppressed
                  FROM records
                  WHERE connection = ?1 AND room_key = ?2 AND record_id > ?3
                  ORDER BY record_id
@@ -507,6 +518,7 @@ impl Transcript for SqliteStore {
                         elements: row.get(10)?,
                         event_meta: row.get(11)?,
                         labels: row.get(12)?,
+                        suppressed: row.get::<_, i64>(13)? != 0,
                     })
                 },
             )
@@ -581,7 +593,7 @@ impl Transcript for SqliteStore {
                 // 于是引用一条很老的消息时要一条条往回扫。这里相等条件命中的通常只有
                 // 一行，多一次微小的排序换「不扫全房间」是划算的。
                 "SELECT record_id, kind, event, sender_id, sender_name, sender_role, at, at_self,
-                        reply_to_self, platform_id, elements, event_meta, labels
+                        reply_to_self, platform_id, elements, event_meta, labels, suppressed
                  FROM records INDEXED BY records_platform
                  WHERE connection = ?1 AND room_key = ?2 AND platform_id = ?3
                  ORDER BY record_id DESC
@@ -602,6 +614,7 @@ impl Transcript for SqliteStore {
                         elements: row.get(10)?,
                         event_meta: row.get(11)?,
                         labels: row.get(12)?,
+                        suppressed: row.get::<_, i64>(13)? != 0,
                     })
                 },
             )
@@ -764,6 +777,7 @@ struct RawRow {
     elements: String,
     event_meta: Option<String>,
     labels: Option<String>,
+    suppressed: bool,
 }
 
 impl RawRow {
@@ -813,6 +827,7 @@ impl RawRow {
             platform_id: self.platform_id,
             quote_ref: None,
             labels,
+            suppressed: self.suppressed,
             redelivery: None,
             note: None,
         })
@@ -883,7 +898,8 @@ impl Watermarks for SqliteStore {
             }
         }
 
-        // 水位只推连续前沿：中间缺一条就停在缺口前。
+        // 水位只推连续前沿：中间缺一条就停在缺口前。被抑制的记录从不投递，
+        // 没人会确认它，所以它不构成缺口——水位直接越过去。
         let mut frontier = current;
         loop {
             let next = frontier + 1;
@@ -901,22 +917,36 @@ impl Watermarks for SqliteStore {
                 )
                 .optional()
                 .map_err(io_error)?;
-            if present.is_none() {
-                break;
+            if present.is_some() {
+                transaction
+                    .execute(
+                        "DELETE FROM acks
+                         WHERE session = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
+                        params![
+                            cursor.session,
+                            cursor.room.connection,
+                            cursor.room.key(),
+                            next as i64
+                        ],
+                    )
+                    .map_err(io_error)?;
+                frontier = next;
+                continue;
             }
-            transaction
-                .execute(
-                    "DELETE FROM acks
-                     WHERE session = ?1 AND connection = ?2 AND room_key = ?3 AND record_id = ?4",
-                    params![
-                        cursor.session,
-                        cursor.room.connection,
-                        cursor.room.key(),
-                        next as i64
-                    ],
+            let suppressed: Option<i64> = transaction
+                .query_row(
+                    "SELECT suppressed FROM records
+                     WHERE connection = ?1 AND room_key = ?2 AND record_id = ?3",
+                    params![cursor.room.connection, cursor.room.key(), next as i64],
+                    |row| row.get(0),
                 )
+                .optional()
                 .map_err(io_error)?;
-            frontier = next;
+            if suppressed == Some(1) {
+                frontier = next;
+                continue;
+            }
+            break;
         }
 
         transaction

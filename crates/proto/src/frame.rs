@@ -351,6 +351,7 @@ mod tests {
                 platform_id: None,
                 quote_ref: None,
                 labels: Vec::new(),
+                suppressed: false,
                 redelivery: None,
                 note: None,
             }],

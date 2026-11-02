@@ -50,7 +50,8 @@ pub struct RecordDraft {
     pub target_platform_id: Option<String>,
     /// 给目标记录追加的标签（如 `recall`）。只有带 target 的事件才用得到。
     pub target_labels: Vec<String>,
-    /// 只进流水，不投递、不唤醒、不计未读。适配器自己决定哪些事件属于这一类。
+    /// 只进流水，不投递、不唤醒、不计未读。适配器自己决定哪些事件属于这一类；
+    /// 标记会落库，之后新加的订阅者也按同一规则处理。
     pub suppressed: bool,
 }
 
@@ -275,7 +276,10 @@ impl Cursor {
 /// 只按水位截断是不够的：agent 可能先确认了 #3、却还没确认 #1——`ack` 只推连续
 /// 前沿，所以水位还停在 0，但 #3 已经处理过了。不过滤就会把它再投一遍。
 ///
-/// `limit` 按**过滤后**的条数算。中间夹着已确认记录时，会往后多取一点，
+/// 被适配器声明为 `suppressed` 的记录也不在这里：它们只进流水备查，不投递、
+/// 不计未读。这样语义落在记录上，跟订阅者是什么时候加进来的无关。
+///
+/// `limit` 按**过滤后**的条数算。中间夹着已确认或被抑制的记录时，会往后多取一点，
 /// 一直凑够 `limit` 条或读到房间末尾。
 pub fn unread<S>(store: &S, cursor: &Cursor, limit: usize) -> Result<Vec<Record>, StorageError>
 where
@@ -287,9 +291,6 @@ where
 
     let watermark = store.watermark(cursor)?;
     let acked: BTreeSet<u64> = store.acked(cursor)?.into_iter().collect();
-    if acked.is_empty() {
-        return store.since(&cursor.room, watermark, limit);
-    }
 
     let mut after = watermark;
     let mut unread = Vec::new();
@@ -301,7 +302,7 @@ where
         let exhausted = batch.len() < take;
         for record in batch {
             after = record.id;
-            if acked.contains(&record.id) {
+            if record.suppressed || acked.contains(&record.id) {
                 continue;
             }
             unread.push(record);
@@ -574,6 +575,7 @@ impl Transcript for MemoryStore {
             // 引用对齐是投递时算的（要查库），流水里只留事实本身。
             quote_ref: None,
             labels: Vec::new(),
+            suppressed: draft.suppressed,
             redelivery: None,
             // 流水里存的是原话，旁白只在投递时由调度层补（见 engine::open_turn）。
             note: None,
@@ -725,8 +727,24 @@ impl Watermarks for MemoryStore {
 
         let acked = self.acked.entry(cursor.clone()).or_default();
         let mut frontier = current;
-        while acked.remove(&(frontier + 1)) {
-            frontier += 1;
+        loop {
+            let next = frontier + 1;
+            if acked.remove(&next) {
+                frontier = next;
+                continue;
+            }
+            // 被抑制的记录从不投递，也就没人会确认它；水位要能越过它，
+            // 否则后面所有记录都会被这条「永远读不到」的洞卡住。
+            let suppressed = self
+                .records
+                .get(&cursor.room)
+                .and_then(|records| records.iter().find(|record| record.id == next))
+                .is_some_and(|record| record.suppressed);
+            if suppressed {
+                frontier = next;
+                continue;
+            }
+            break;
         }
         self.watermark.insert(cursor.clone(), frontier);
         Ok(frontier)
@@ -970,6 +988,51 @@ mod tests {
         assert_eq!(unread(&store, &main, 100).expect("可读").len(), 3);
         store.ack(&main, &[1]).expect("可确认");
         assert_eq!(unread(&store, &main, 100).expect("可读").len(), 2);
+    }
+
+    /// 抑制是记录自身的属性：不管谁、什么时候订阅，都不该把它当未读。
+    #[test]
+    fn suppressed_records_are_never_unread_and_watermark_skips_them() {
+        let mut store = MemoryStore::new();
+        let qq = room("qq", "1");
+        let main = cursor("main", &qq);
+        let late = cursor("late", &qq);
+        store.append(draft(qq.clone(), "a")).expect("可写");
+        store
+            .append(
+                RecordDraft::event(
+                    qq.clone(),
+                    Sender {
+                        id: "10001".into(),
+                        name: "老王".into(),
+                        role: None,
+                    },
+                    1_793_000_000_001,
+                    "notice",
+                    vec![Element::text("只进流水")],
+                    false,
+                )
+                .suppressed(true),
+            )
+            .expect("可写");
+        store.append(draft(qq.clone(), "c")).expect("可写");
+
+        // 流水里仍然查得到，只是不算未读。
+        let all = store.since(&qq, 0, 100).expect("可读");
+        assert_eq!(all.len(), 3);
+        assert!(all[1].suppressed);
+
+        for cursor in [&main, &late] {
+            let pending = unread(&store, cursor, 100).expect("可读");
+            assert_eq!(
+                pending.iter().map(|record| record.id).collect::<Vec<_>>(),
+                vec![1, 3],
+                "被抑制的记录不该出现在任何订阅者的未读里"
+            );
+        }
+
+        // 确认 #1、#3 时，水位要越过 #2，不能被它永远卡住。
+        assert_eq!(store.ack(&main, &[1, 3]).expect("可确认"), 3);
     }
 
     #[test]

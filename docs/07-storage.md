@@ -40,6 +40,7 @@ erDiagram
         integer reply_to_self
         text platform_id
         text labels
+        integer suppressed
     }
     watermarks {
         text session
@@ -70,6 +71,7 @@ erDiagram
 - **未读不单独存**。它是「流水里水位之后的部分」，每次现算。不存第二份账，就不会出现两套账对不上。
 - **编号是房间内的**。`qq:group/123` 和 `qq2:group/123`（两个号看同一个群）是两个房间，各自从 1 开始。
 - **流水里只有原话**。`redelivery` / `note`（「第 2 次投递；调 ack_messages 确认 #5…」）不落库，投递时由 `deliveries` 现场算出来。
+- **`suppressed` 是记录属性，不是投递时机**。写进流水后，所有订阅者（包括之后才加的）都不会把它算作未读；确认相邻记录时水位会直接越过它，不会被这个「永远读不到」的洞卡住。
 
 ## 清理：旧流水什么时候可以删
 
@@ -171,6 +173,7 @@ EOF
 | 2 → 3 | 五张表的 `platform` 列改名 `connection`、`room` 列改名 `room_key`；`records` 加 `room_json`；顺手删掉第 1 版留下的重复索引 `records_platform_id` | 房间从「平台 + 房间号」改成「连接 + 路径」。只改名不搬数据，老库照旧读得出来；`room_json` 是后路——以后房间要换成更自由的形状，原始结构还在 |
 | 7 → 8 | `records` 加 `event_meta`（JSON：`tags` / `payload` / `summary`） | 平台事件不只存一个类型名；老事件记录该列为空，读出来按「无标签、无载荷、无摘要」处理 |
 | 8 → 9 | `records` 加 `labels`（JSON 数组） | 适配器给记录追加通用标签（如撤回事件给原消息加 `recall`）；老记录默认空 |
+| 9 → 10 | `records` 加 `suppressed`（0 / 1） | 记录自身声明「只进流水」；不投递、不唤醒、不计未读，之后新加的订阅者也生效 |
 
 ## 已知限制
 

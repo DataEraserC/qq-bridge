@@ -571,9 +571,9 @@ impl<S: Store> Bridge<S> {
         for (subscriber, provider) in subscribers.into_iter().zip(wake_providers) {
             let cursor = Cursor::new(subscriber.session.clone(), room.clone());
 
-            // 只存不投递的事件：自动确认，不进未读/投递，也不叫醒会话。
+            // 只进流水的事件不参与唤醒；未读和确认路径会在存储层跳过它，
+            // 不需要在这里按订阅者补 ack——那样语义就绑在「入库时谁在订阅」上了。
             if suppressed {
-                self.store.ack(&cursor, &[record.id])?;
                 continue;
             }
 

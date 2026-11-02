@@ -217,7 +217,7 @@ access / receive / clock / delivery / turn_error 的策略配置也有同名的 
 适配器还可以给记录声明两个通用动作，core 不解释它们的平台语义：
 
 - `suppressed: true`：只进流水，不投递、不唤醒、不计未读。适配器自己决定哪些事件属于
-  这一类（比如撤回通知）。
+  这一类（比如撤回通知）。这个标记会落库，之后再加进来的订阅者也按同一规则处理。
 - `target_platform_id` + `target_labels`：给这个房间里某条旧记录追加标签。撤回通知用它
   给原消息打 `recall`；harness 看到 `labels` 里有 `recall` 就显示「已撤回」。
 

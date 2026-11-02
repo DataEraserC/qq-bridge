@@ -427,6 +427,55 @@ fn recall_marker_survives_reopen() {
 }
 
 #[test]
+fn suppressed_records_stay_out_of_unread_after_restart() {
+    let db = TempDb::new("suppressed");
+    let qq = room("qq:group/1");
+    let main = Cursor::new("main", qq.clone());
+
+    {
+        let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能打开");
+        store.append(message(&qq, "前")).expect("可写");
+        store
+            .append(
+                RecordDraft::event(
+                    qq.clone(),
+                    Sender {
+                        id: "10001".into(),
+                        name: "老王".into(),
+                        role: None,
+                    },
+                    AT + 1,
+                    "notice",
+                    vec![Element::text("只进流水")],
+                    false,
+                )
+                .suppressed(true),
+            )
+            .expect("可写");
+        store.append(message(&qq, "后")).expect("可写");
+    }
+
+    let mut store = acb_kernel::SqliteStore::open(db.path()).expect("能再打开");
+    let all = store.since(&qq, 0, 100).expect("可读");
+    assert_eq!(all.len(), 3);
+    assert!(all[1].suppressed, "抑制标记要落盘");
+
+    // 后加进来的订阅者 (late) 看到的历史也一样：只进流水，不算未读。
+    for session in ["main", "late"] {
+        let cursor = Cursor::new(session, qq.clone());
+        let pending = unread(&store, &cursor, 100).expect("可读");
+        assert_eq!(
+            pending.iter().map(|record| record.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "{session} 不该看到被抑制的记录"
+        );
+    }
+
+    // 确认首尾两条时，水位要越过被抑制的 #2。
+    assert_eq!(store.ack(&main, &[1, 3]).expect("可确认"), 3);
+}
+
+#[test]
 fn a_newer_schema_is_refused_instead_of_being_written_to() {
     let db = TempDb::new("schema");
     {

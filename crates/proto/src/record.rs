@@ -67,6 +67,11 @@ pub enum RecordKind {
     },
 }
 
+/// `false` 不写进 JSON：内部标记，默认值就够了。
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// 投递给 harness 的最小单位。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -100,6 +105,11 @@ pub struct Record {
     /// core 不解释标签含义。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// 这条记录只进流水：不投递、不唤醒、不计未读。
+    ///
+    /// 由适配器在入站时声明，落库后对所有订阅者生效——包括之后才加进来的会话。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppressed: bool,
     /// 非空表示「第 N 次投递」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redelivery: Option<u32>,
@@ -156,6 +166,7 @@ mod tests {
             platform_id: None,
             quote_ref: None,
             labels: Vec::new(),
+            suppressed: false,
             redelivery: None,
             note: None,
         }

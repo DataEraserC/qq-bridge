@@ -307,7 +307,7 @@ pub struct WireRecord {
     /// 给目标记录追加的标签（如 `recall`）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_labels: Vec<String>,
-    /// 只进流水，不投递、不唤醒、不计未读。
+    /// 只进流水，不投递、不唤醒、不计未读。标记会落库，之后新加的订阅者也生效。
     #[serde(default)]
     pub suppressed: bool,
 }
